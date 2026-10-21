@@ -5,13 +5,16 @@ OpenAI-compatible endpoint. No model provider is called.
 """
 
 import asyncio
+import base64
 import contextlib
+import functools
 import hashlib
 import importlib.metadata
 import json
 import os
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
@@ -28,12 +31,16 @@ from verifiers.v1.tasksets.harbor import taskset as harbor_taskset
 from verifiers.v1.tasksets.harbor.taskset import HarborConfig, parse_task
 from verifiers.v1.utils.loaders import environment_class, load_taskset, taskset_config_type
 
-VERIFIERS_COMMIT = "e888a719adf328c87f271fba39fbc812ca99677b"
+VERIFIERS_VERSION = "0.4.1.dev12"
+# Package entries of the verified wheel's RECORD (SHA256 74d0a324..., source commit e888a719...).
+VERIFIERS_RECORD_DIGEST = "4130103379da1031c9aa9363299df083d453532aea733ade831fcf9c450e1f09"
 HARBOR_VERSION = "0.24.0"
+LITELLM_VERSION = "1.106.0"
 FIXTURES = Path(__file__).parent / "fixtures"
 CONTRACT_TASK = FIXTURES / "contract-task"
 SEPARATE_TASK = FIXTURES / "separate-verifier-task"
 DOCKERFILE_TASK = FIXTURES / "dockerfile-task"
+SLOW_GRADER_TASK = FIXTURES / "slow-grader-task"
 PROVIDER_KEY = "nudi-contract-provider-key"
 HOST_SECRET = "nudi-host-secret-must-not-leak"
 
@@ -227,7 +234,7 @@ def run_episodes(
     rollouts: int = 1,
     taskset: dict | None = None,
     harness: dict | None = None,
-    script: type[ScriptedModel] = ScriptedModel,
+    script: Callable[[str], ScriptedModel] = ScriptedModel,
 ):
     scripted = script(command)
 
@@ -268,15 +275,21 @@ def run_episodes(
 
 
 def run_native_trial(
-    tmp_path: Path, command: str, *, model: str, reasoning_effort: str, duration: float = 2.0
+    tmp_path: Path,
+    command: str,
+    *,
+    model: str,
+    reasoning_effort: str,
+    duration: float = 2.0,
+    task_dir: Path = DOCKERFILE_TASK,
 ):
-    """One native Harbor trial of the Dockerfile-only task with Harbor's Terminus 2."""
+    """One native Harbor trial with Harbor's Terminus 2."""
     scripted = TerminusScript(command, duration)
 
     async def main():
         async with serve(scripted) as base_url:
             config = TrialConfig(
-                task=TaskConfig(path=DOCKERFILE_TASK),
+                task=TaskConfig(path=task_dir),
                 trials_dir=tmp_path / "trials",
                 agent=AgentConfig(
                     name="terminus-2",
@@ -297,9 +310,23 @@ def error_text(episode) -> str:
 
 
 def test_installed_upstream_pins():
-    direct_url = importlib.metadata.distribution("verifiers").read_text("direct_url.json")
-    assert json.loads(direct_url)["vcs_info"]["commit_id"] == VERIFIERS_COMMIT
+    assert importlib.metadata.version("verifiers") == VERIFIERS_VERSION
     assert importlib.metadata.version("harbor") == HARBOR_VERSION
+    assert importlib.metadata.version("litellm") == LITELLM_VERSION
+
+    # The published wheel's source commit is attested, not installed: its SHA256 and
+    # provenance were checked when it was pinned, and VERIFIERS_RECORD_DIGEST derived from its RECORD.
+    verifiers = importlib.metadata.distribution("verifiers")
+    direct_url = json.loads(verifiers.read_text("direct_url.json") or "{}")
+    assert "vcs_info" not in direct_url and "dir_info" not in direct_url
+    entries = sorted(
+        line for line in verifiers.read_text("RECORD").splitlines() if line.startswith("verifiers/")
+    )
+    assert hashlib.sha256("\n".join(entries).encode()).hexdigest() == VERIFIERS_RECORD_DIGEST
+    for path in verifiers.files:
+        if str(path).startswith("verifiers/"):
+            digest = hashlib.sha256(path.locate().read_bytes()).digest()
+            assert path.hash.value == base64.urlsafe_b64encode(digest).rstrip(b"=").decode(), path
 
 
 def test_adapter_drops_task_timeouts_by_default_and_keeps_resources():
@@ -467,7 +494,10 @@ def test_planted_reward_is_removed_and_missing_reward_is_an_error(episode_env):
 
     assert not episode.ok
     assert "produced no reward.json and no valid reward.txt" in error_text(episode)
-    assert all(trace.reward != 1.0 for trace in episode.traces)
+    # Trace.reward sums present values and reads 0.0 here, so check Trace.rewards.
+    (trace,) = episode.traces
+    assert trace.rewards == {"solved": None}
+    assert trace.reward == 0.0
     for _, body in scripted.requests:
         assert body["model"] == "xiaomi_mimo/mimo-v2.6-pro"
         assert body["reasoning_effort"] == "high"
@@ -484,7 +514,7 @@ def test_enabled_task_agent_timeout_stops_agent_then_grades(episode_env):
         taskset={"ignore_timeouts": False},
     )
 
-    # The timeout is an episode outcome, not an error: the verifier still grades.
+    # Upstream records the timeout, adds no error and still grades.
     assert episode.ok, error_text(episode)
     (trace,) = episode.traces
     assert trace.is_timeout
@@ -542,27 +572,31 @@ def test_verifiers_terminus_2_harness_runs_harbor_terminus_2(episode_env):
 def test_native_harbor_terminus_2_runs_dockerfile_task(native_env):
     fixture_digest = tree_digest(DOCKERFILE_TASK)
 
-    result, scripted, trial_dir = run_native_trial(
-        native_env, PROBE_AND_ANSWER, model="xai/grok-4.7", reasoning_effort="xhigh"
-    )
+    # Two sequential trials: each must start without the marker the other wrote.
+    for _ in range(2):
+        result, scripted, trial_dir = run_native_trial(
+            native_env, PROBE_AND_ANSWER, model="xai/grok-4.7", reasoning_effort="xhigh"
+        )
 
-    assert result.exception_info is None, result.exception_info
-    assert result.verifier_result.rewards == {"reward": 1.0, "answer_ok": 1.0}
-    assert len(scripted.requests) == 2
-    for headers, body in scripted.requests:
-        assert headers["Authorization"] == f"Bearer {PROVIDER_KEY}"
-        assert body["model"] == "grok-4.7"
-        assert body["reasoning_effort"] == "xhigh"
-        assert "tools" not in body
-    (observation,) = scripted.observations()
-    assert_probe(observation)
-    assert "api_key_args=0" in observation
-    trajectory = json.loads((trial_dir / "agent" / "trajectory.json").read_text())
-    assert trajectory["schema_version"] == "ATIF-v1.8"
-    # Provider-reported cost for the first call plus LiteLLM's bundled price for the second.
-    assert result.agent_result.cost_usd == pytest.approx(0.0005 + 13 * 2e-06 + 2 * 6e-06)
-    assert trajectory["final_metrics"]["total_cost_usd"] == result.agent_result.cost_usd
-    assert files_with_secrets(trial_dir) == []
+        assert result.exception_info is None, result.exception_info
+        assert result.verifier_result.rewards == {"reward": 1.0, "answer_ok": 1.0}
+        assert len(scripted.requests) == 2
+        for headers, body in scripted.requests:
+            assert headers["Authorization"] == f"Bearer {PROVIDER_KEY}"
+            assert body["model"] == "grok-4.7"
+            assert body["reasoning_effort"] == "xhigh"
+            assert "tools" not in body
+        (observation,) = scripted.observations()
+        assert_probe(observation)
+        assert "api_key_args=0" in observation
+        trajectory = json.loads((trial_dir / "agent" / "trajectory.json").read_text())
+        assert trajectory["schema_version"] == "ATIF-v1.8"
+        # Provider-reported cost for the first call plus LiteLLM's bundled price for the second.
+        assert result.agent_result.cost_usd == pytest.approx(0.0005 + 13 * 2e-06 + 2 * 6e-06)
+        assert trajectory["final_metrics"]["total_cost_usd"] == result.agent_result.cost_usd
+        assert files_with_secrets(trial_dir) == []
+
+    assert len(list((native_env / "trials").iterdir())) == 2
     assert tree_digest(DOCKERFILE_TASK) == fixture_digest
 
 
@@ -610,3 +644,81 @@ def test_native_harbor_applies_task_agent_timeout(native_env):
     assert 19 < (execution.finished_at - execution.started_at).total_seconds() < 30
     assert result.exception_info.exception_type == "AgentTimeoutError"
     assert result.verifier_result.rewards == {"reward": 0.0, "answer_ok": 0.0}
+
+
+def test_enabled_verifier_timeout_stops_grader(episode_env):
+    (episode,), _, _ = run_episodes(
+        episode_env,
+        SLOW_GRADER_TASK,
+        "echo 42 > /app/answer.txt",
+        model="xai/grok-4.7",
+        sampling={},
+        taskset={"ignore_timeouts": False},
+    )
+
+    # The grader is stopped at 5 s: a timeout flag, no error and a missing reward.
+    assert episode.ok, error_text(episode)
+    (trace,) = episode.traces
+    assert trace.is_timeout
+    assert trace.stop_condition == "scoring_timeout"
+    assert trace.errors == []
+    assert trace.rewards == {"solved": None}
+    assert 4 < trace.timing.scoring.duration < 15
+
+
+def test_native_harbor_applies_verifier_timeout(native_env):
+    result, _, _ = run_native_trial(
+        native_env,
+        "echo 42 > /app/answer.txt",
+        model="xai/grok-4.7",
+        reasoning_effort="xhigh",
+        task_dir=SLOW_GRADER_TASK,
+    )
+
+    assert result.exception_info.exception_type == "VerifierTimeoutError"
+    assert result.verifier_result is None
+    verifier = result.verifier
+    assert 4 < (verifier.finished_at - verifier.started_at).total_seconds() < 15
+
+
+def test_native_harbor_separate_grading_receives_only_declared_artifacts(native_env):
+    # Unlike the Verifiers runtime, native Harbor starts an image-only task in / without /app.
+    command = (
+        "echo cwd_$(pwd) app_$(test -d /app && echo present || echo absent); "
+        "mkdir -p /app; echo 42 > /app/answer.txt; echo agent-only > /app/scratch.txt"
+    )
+
+    result, scripted, trial_dir = run_native_trial(
+        native_env, command, model="xai/grok-4.7", reasoning_effort="xhigh", task_dir=SEPARATE_TASK
+    )
+
+    (observation,) = scripted.observations()
+    assert "cwd_/ app_absent" in observation
+    assert result.exception_info is None, result.exception_info
+    assert result.verifier_environment_mode == "separate"
+    assert result.verifier_result.rewards == {"reward": 1.0, "undeclared_file_present": 0.0}
+    collected = trial_dir / "artifacts" / "app"
+    assert (collected / "answer.txt").read_text() == "42\n"
+    assert not (collected / "scratch.txt").exists()
+
+
+def test_verifiers_terminus_2_harness_applies_task_agent_timeout(episode_env):
+    (episode,), scripted, _ = run_episodes(
+        episode_env,
+        CONTRACT_TASK,
+        "sleep 120",
+        model="xai/grok-4.7",
+        sampling={"reasoning_effort": "xhigh"},
+        taskset={"ignore_timeouts": False},
+        harness={"id": "terminus-2", "version": HARBOR_VERSION},
+        script=functools.partial(TerminusScript, duration=60.0),
+    )
+
+    assert episode.ok, error_text(episode)
+    (trace,) = episode.traces
+    assert trace.is_timeout
+    assert trace.stop_condition == "agent_timeout"
+    assert 19 < trace.timing.agent.duration < 30
+    assert len(scripted.requests) == 1
+    assert trace.rewards["reward"].score == 0.0
+    assert trace.metrics["answer_ok"] == 0.0
