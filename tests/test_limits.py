@@ -149,6 +149,24 @@ def test_missing_declarations_run_one_episode_with_exhaustion_warning(declared):
     assert len(warnings) == 1 and "may exhaust" in warnings[0]
 
 
+@pytest.mark.parametrize("declared", [(0, 512), (-1, 512), (1, 0), (1, -512), (0, None), (None, -1)])
+def test_nonpositive_declarations_are_rejected(declared):
+    with pytest.raises(ValueError, match="must be positive"):
+        plan_concurrency(10, 10000, *declared)
+
+
+@pytest.mark.parametrize("environment", ["cpus = 0\nmemory_mb = 512", "cpus = 1\nmemory_mb = -512"])
+def test_nonpositive_declaration_stops_the_run_before_it_writes(tmp_path, monkeypatch, credentials, environment):
+    task = task_variant(tmp_path, CONTRACT_TASK)
+    (task / "task.toml").write_text(
+        f'schema_version = "1.4"\n[environment]\ndocker_image = "python:3.12-slim"\n{environment}\n'
+    )
+
+    with pytest.raises(ValueError, match="must be positive"):
+        new_run(tmp_path, monkeypatch, credentials, task_dir=task)
+    assert not (tmp_path / "run").exists()
+
+
 def test_declared_requirements_come_from_the_raw_task(tmp_path):
     legacy = task_variant(tmp_path, CONTRACT_TASK)
     (legacy / "task.toml").write_text(
@@ -200,6 +218,17 @@ def test_overrides_win_for_their_role(tmp_path, monkeypatch, credentials):
     run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": override})
 
     assert run.record.models == {**DEFAULT_MODELS, "inspector": override}
+
+
+def test_run_models_are_copies_so_changes_reach_no_default_or_other_run(tmp_path, monkeypatch, credentials):
+    override = ModelConfig(model="xai/grok-4.7", api_base="http://override")
+    first = new_run(tmp_path, monkeypatch, credentials, name="first", models={"attacker": override})
+    second = new_run(tmp_path, monkeypatch, credentials, name="second", models={"attacker": override})
+    first.record.models["inspector"].api_base = first.record.models["attacker"].api_base = "http://changed"
+
+    assert DEFAULT_MODELS["inspector"] == ModelConfig(model="xai/grok-4.7", reasoning_effort="xhigh")
+    assert second.record.models["inspector"].api_base is None
+    assert override.api_base == second.record.models["attacker"].api_base == "http://override"
 
 
 def test_environment_credentials_are_used_when_no_file_names_them(tmp_path, monkeypatch):
@@ -285,6 +314,10 @@ class FakeTrial:
 
     def __init__(self, config, outcome):
         self.config, self.outcome = config, outcome
+        self.hooks = {}
+
+    def add_hook(self, event, hook):
+        self.hooks.setdefault(event, []).append(hook)
 
     async def run(self):
         cls = FakeTrial

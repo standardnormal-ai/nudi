@@ -35,6 +35,7 @@ from nudi.records import (
     EpisodeEvent,
     EpisodeResult,
     ErrorRecord,
+    InfrastructureAbort,
     NativeBehavior,
     Role,
     RunConfig,
@@ -109,6 +110,8 @@ def plan_concurrency(
 ) -> tuple[int, list[str]]:
     """Episodes to run at once within 90% of Docker's capacity, and the warnings."""
     for name, need, have in (("CPUs", cpus, docker_cpus), ("MiB of memory", memory_mb, docker_memory_mb)):
+        if need is not None and need <= 0:
+            raise ValueError(f"one episode declares {need} {name}; a declared value must be positive")
         if need is not None and need > have:
             raise CapacityError(f"one episode declares {need} {name}, which exceeds Docker's {have}")
     if cpus is None or memory_mb is None:
@@ -164,7 +167,8 @@ def resolve_credentials(config: RunConfig, models, roles) -> tuple[dict[Role, st
 def start_run(config: RunConfig, roles: frozenset[Role] = ROLES) -> Run:
     """Settle models, credentials, path and capacity for `roles` before any episode starts."""
     check_output(config.output_dir, config.task_dir)
-    models = {**DEFAULT_MODELS, **config.models}
+    # Copies, so a change to one run's models reaches no default or other run.
+    models = {role: model.model_copy() for role, model in {**DEFAULT_MODELS, **config.models}.items()}
     keys, sources = resolve_credentials(config, models, roles)
     path, reasons = select_path(config.task_dir, ORIGINAL_BEHAVIOR)
     if path != "harbor":
@@ -215,7 +219,20 @@ def model_calls(run: Run, role: Role, episode: str):
         current.reset(token)
 
 
-def record_call(run: Run, role: Role, episode: str, request: dict, response=None, error: str | None = None) -> None:
+def refusal_signals(response) -> list[str]:
+    """Explicit refusal signals the provider returned; the model's text is never classified."""
+    choice = response.choices[0]
+    signals = []
+    # LiteLLM's Message has no refusal field; it keeps the provider's under provider_specific_fields.
+    if refusal := (choice.message.provider_specific_fields or {}).get("refusal"):
+        signals.append(f"message.refusal: {refusal}")
+    if choice.finish_reason == "content_filter":
+        signals.append("finish_reason: content_filter")
+    return signals
+
+
+def record_call(run: Run, role: Role, episode: str, request: dict, response=None, error: str | None = None,
+                refusals: list[str] | None = None) -> None:
     model = request["model"]
     usage = getattr(response, "usage", None)
     cost, source = None, "unknown: the request failed"
@@ -235,6 +252,7 @@ def record_call(run: Run, role: Role, episode: str, request: dict, response=None
             cost_source=source,
             provider_cost=getattr(usage, "cost", None),
             error=error,
+            refusals=refusals or [],
         )
     )
     if cost is None:
@@ -264,15 +282,18 @@ class RunCalls(CustomLogger):
 
     async def async_post_call_success_deployment_hook(self, request_data, response, call_type):
         if (scope := current.get()) is not None:
-            record_call(*scope, request_data, response=response)
+            record_call(*scope, request_data, response=response, refusals=refusal_signals(response))
 
     async def async_post_call_failure_deployment_hook(self, request_data, exception, call_type, fallback_depth=None):
         if (scope := current.get()) is not None:
-            record_call(*scope, request_data, error=type(exception).__name__)
+            refusals = [type(exception).__name__] if isinstance(exception, litellm.ContentPolicyViolationError) else []
+            record_call(*scope, request_data, error=type(exception).__name__, refusals=refusals)
 
 
 async def run_role_episode(run: Run, role: Role, *, instruction: str | None = None,
-                           capture_locations: list[str] | None = None, agent=None) -> EpisodeResult:
+                           capture_locations: list[str] | None = None, agent=None,
+                           on_agent_start=None, on_trial_end=None, on_verification=None,
+                           probe: bool = False) -> EpisodeResult:
     """Run one episode of `role` through the run's queue, under its credential and cap.
 
     Its lifecycle events record execution order. `finished` means the runner returned;
@@ -282,6 +303,8 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
     model = run.record.models[role]
     name = f"{len(run.record.episodes):04d}-{role}"
     run.record.episodes.append(name)
+    if probe:
+        run.record.probe_episodes.append(name)
     run.record.events.append(EpisodeEvent(episode=name, event="started"))
     run.save()
     config = EpisodeConfig(
@@ -295,11 +318,21 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
     )
     try:
         capture = None
-        if capture_locations:
+        if capture_locations or on_verification is not None:
             from nudi.checks import capture_submission
 
             async def capture(event):
-                for location in capture_locations:
+                if on_verification is not None:
+                    try:
+                        await on_verification(event)
+                    except InfrastructureAbort:
+                        raise
+                    except Exception as error:
+                        message = str(error)
+                        for secret in run.keys.values():
+                            message = message.replace(secret, "[redacted]")
+                        run.warn(f"{name}: verification observation failed: {type(error).__name__}: {message}")
+                for location in capture_locations or []:
                     try:
                         submission = await capture_submission(event, name, config.output_dir, location)
                         run.record.submissions.append(submission)
@@ -313,10 +346,11 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
                     finally:
                         run.save()
         with model_calls(run, role, name):
-            if instruction is None and agent is None and capture is None:
+            if instruction is None and agent is None and capture is None and on_agent_start is None and on_trial_end is None:
                 result = await run_episode(config, run.queue)
             else:
-                result = await run_episode(config, run.queue, instruction=instruction, agent=agent, capture=capture)
+                result = await run_episode(config, run.queue, instruction=instruction, agent=agent, capture=capture,
+                                           on_agent_start=on_agent_start, on_trial_end=on_trial_end)
         run.record.events.append(EpisodeEvent(episode=name, event="finished"))
         return result
     finally:
@@ -358,9 +392,15 @@ async def simulate(run: Run, episodes: int = 20) -> Simulation:
             name = f"{len(run.record.episodes):04d}-simulator"
             simulation.episodes.append(name)
             try:
-                await run_role_episode(run, "simulator", capture_locations=locations)
+                result = await run_role_episode(run, "simulator", capture_locations=locations)
+                if result.errors:
+                    simulation.failures[name] = [error.model_copy(update={"message": redacted(run, error.message)})
+                                                 for error in result.errors]
             except Exception as error:
-                simulation.failures[name] = ErrorRecord(type=type(error).__name__, message=redacted(run, str(error)))
+                simulation.failures[name] = [ErrorRecord(type=type(error).__name__, message=redacted(run, str(error)))]
+            finally:
+                if refusals := [signal for call in run.record.calls if call.episode == name for signal in call.refusals]:
+                    simulation.refusals[name] = refusals
                 run.save()
 
     try:

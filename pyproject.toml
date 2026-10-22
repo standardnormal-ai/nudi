@@ -1,7 +1,7 @@
 [project]
 name = "nudi"
 version = "0.0.1"
-description = "Inspect Harbor RL tasks by running and retaining episodes."
+description = "Pre-hack and simulate Harbor RL environments"
 readme = "readme.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -11,6 +11,9 @@ dependencies = [
     "harbor==0.24.0",
     "litellm==1.106.0",
 ]
+
+[project.scripts]
+nudi = "nudi.cli:main"
 
 [project.optional-dependencies]
 test = ["pytest"]

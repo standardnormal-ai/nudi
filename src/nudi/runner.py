@@ -35,7 +35,7 @@ from verifiers.v1.tasksets.harbor.taskset import (
 )
 from verifiers.v1.utils.trace_store import type_adapter
 
-from nudi.records import EpisodeResult, ErrorRecord, ExecutionPath, NativeBehavior, EpisodeConfig
+from nudi.records import EpisodeConfig, EpisodeResult, ErrorRecord, ExecutionPath, InfrastructureAbort, NativeBehavior
 
 # task.toml fields the upstream contract tests exercise on both execution paths.
 VERIFIED_FIELDS = {
@@ -246,11 +246,49 @@ def record_trial(trial: TrialResult, output_dir: Path, result: EpisodeResult) ->
 
 
 verification_capture: ContextVar[Callable[[TrialHookEvent], Awaitable[None]] | None] = ContextVar("nudi_capture", default=None)
+agent_start_capture: ContextVar[Callable[[TrialHookEvent], Awaitable[None]] | None] = ContextVar("nudi_agent_start", default=None)
+trial_end_capture: ContextVar[Callable[[TrialHookEvent], Awaitable[None]] | None] = ContextVar("nudi_trial_end", default=None)
+
+
+async def _run_hook(callback: Callable[[TrialHookEvent], Awaitable[None]] | None, event: TrialHookEvent) -> None:
+    """An unset callback does nothing. CancelledError and InfrastructureAbort are re-raised.
+
+    InfrastructureAbort stops the episode after a failed resume. Any other exception is swallowed
+    so the trial continues; the episode callback records its own errors.
+    """
+    if callback is None:
+        return
+    try:
+        await callback(event)
+    except asyncio.CancelledError:
+        raise
+    except InfrastructureAbort:
+        raise
+    except Exception:
+        return
 
 
 async def capture_at_verification(event: TrialHookEvent) -> None:
-    if (capture := verification_capture.get()) is not None:
-        await capture(event)
+    await _run_hook(verification_capture.get(), event)
+
+
+async def capture_at_agent_start(event: TrialHookEvent) -> None:
+    await _run_hook(agent_start_capture.get(), event)
+
+
+async def capture_at_trial_end(event: TrialHookEvent) -> None:
+    await _run_hook(trial_end_capture.get(), event)
+
+
+def ensure_lifecycle_hooks(queue: TrialQueue) -> None:
+    """Register the native boundaries once. Each hook no-ops unless this episode set a callback."""
+    if getattr(queue, "_nudi_lifecycle_registered", False):
+        return
+    queue.on_agent_started(capture_at_agent_start)
+    queue.on_verification_started(capture_at_verification)
+    queue.on_trial_ended(capture_at_trial_end)
+    queue._nudi_lifecycle_registered = True
+    queue._nudi_capture_registered = True
 
 
 def episode_queue(n_concurrent: int) -> TrialQueue:
@@ -260,9 +298,7 @@ def episode_queue(n_concurrent: int) -> TrialQueue:
 
 
 async def run_harbor(config: EpisodeConfig, task_dir: Path, result: EpisodeResult, queue: TrialQueue, agent: AgentConfig | None = None) -> None:
-    if verification_capture.get() is not None and not getattr(queue, "_nudi_capture_registered", False):
-        queue.on_verification_started(capture_at_verification)
-        queue._nudi_capture_registered = True
+    ensure_lifecycle_hooks(queue)
     kwargs = {"api_base": config.api_base, "reasoning_effort": config.reasoning_effort}
     if config.model.startswith("xiaomi_mimo/") and config.reasoning_effort not in (None, "none"):
         # MiMo Chat thinks only when asked through this field; the effort is still sent.
@@ -292,7 +328,7 @@ def check_output(output_dir: Path, task_dir: Path) -> None:
 
 
 async def run_episode(config: EpisodeConfig, queue: TrialQueue | None = None, *, instruction: str | None = None,
-                      agent: AgentConfig | None = None, capture=None) -> EpisodeResult:
+                      agent: AgentConfig | None = None, capture=None, on_agent_start=None, on_trial_end=None) -> EpisodeResult:
     """Run one episode on a disposable task copy; the record is written even on failure.
 
     Native Harbor episodes run through `queue`, shared by a run, or a queue of their own."""
@@ -310,6 +346,8 @@ async def run_episode(config: EpisodeConfig, queue: TrialQueue | None = None, *,
     )
     config.output_dir.mkdir(parents=True, exist_ok=True)
     token = verification_capture.set(capture)
+    agent_token = agent_start_capture.set(on_agent_start)
+    end_token = trial_end_capture.set(on_trial_end)
     try:
         with tempfile.TemporaryDirectory(prefix="nudi-task-") as temp:
             task_dir = Path(temp) / config.task_dir.name
@@ -333,6 +371,8 @@ async def run_episode(config: EpisodeConfig, queue: TrialQueue | None = None, *,
         raise
     finally:
         verification_capture.reset(token)
+        agent_start_capture.reset(agent_token)
+        trial_end_capture.reset(end_token)
         if (config.output_dir / "nudi-evidence").is_dir():
             result.artifacts["nudi_evidence"] = "nudi-evidence"
         (config.output_dir / "episode.json").write_text(result.model_dump_json(indent=2))

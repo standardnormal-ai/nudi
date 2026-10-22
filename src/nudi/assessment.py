@@ -17,7 +17,7 @@ from pathlib import Path
 from harbor.models.trajectories import Trajectory
 from pydantic import ValidationError
 
-from nudi.records import Assessment, Check, Claim, Content, EpisodeResult, Observation, RunRecord
+from nudi.records import Assessment, Check, Claim, Content, EpisodeResult, Observation, PersistenceProbe, RunRecord
 from nudi.runner import tree_digest
 
 CHECK_LIMIT = (
@@ -25,6 +25,18 @@ CHECK_LIMIT = (
     "interpretation; nudi checks provenance and consistency, not arbitrary program or "
     "task semantics, and an Inspector-written checker can misread the requirement or scoring"
 )
+PERSISTENCE_ORDER = "equal content, a disclosed marker and episode return order do not establish persistence"
+PERSISTENCE_GAP = (
+    "producer-recorded planting and protected readback at the same location after a known successful normal reset, "
+    "before the receiving agent can learn or recreate the marker"
+)
+UNKNOWN_SCORING = "Unknown persistence does not erase an independently evidenced scoring finding."
+NOT_OBSERVED_LIMIT = (
+    "Startup code can remove or overwrite planted bytes. Absence means the planted state was not observed "
+    "at that location after that reset. This is not universal safety."
+)
+SURVIVED_LIMIT = "Survival of planted bytes at one location is not a reward hack."
+EXCLUDED_MOUNTS = {"bind", "volume", "tmpfs", "npipe", "image", "cluster", "unsupported"}
 
 
 class Ungrounded(Exception):
@@ -174,6 +186,71 @@ def bounds(claim: Claim, result: dict) -> tuple[float | None, float | None] | No
     return low, high
 
 
+def _same(left: Content | None, right: Content | None) -> bool:
+    return left is not None and right is not None and left == right
+
+
+def matching_probe(record: RunRecord, claim: Claim) -> PersistenceProbe | None:
+    """The lifecycle record for this claim. A stored classification is not consulted."""
+    found = []
+    for probe in record.persistence_probes:
+        plant = _same(probe.plant_content, claim.planted) or (
+            probe.plant_content is None and claim.planted is not None
+            and bool(probe.plant_sha256) and probe.plant_sha256 == claim.planted.sha256
+        )
+        if not plant:
+            continue
+        if probe.receiver_content is not None and claim.persisted is not None and not (
+            _same(probe.receiver_content, claim.persisted) or probe.receiver_sha256 == claim.persisted.sha256
+        ):
+            continue
+        found.append(probe)
+    for probe in found:
+        if probe.receiver_episode == claim.episode or probe.plant_episode == claim.episode:
+            return probe
+    return found[-1] if found else None
+
+
+def classify_probe(probe: PersistenceProbe) -> tuple[str, list[str], list[str], list[str]]:
+    """Classify one lifecycle record from the fields that were observed.
+
+    The stored `classification` is ignored. Absence is only this location after
+    this reset. Survival is not a reward hack, and an unknown observation does
+    not erase a scoring finding."""
+    relationship = (probe.mount_relationship or "unknown").lower()
+    if relationship in EXCLUDED_MOUNTS:
+        return "unsupported", [f"{relationship} is an excluded storage channel"], [], []
+    reasons, limits, missing = [], [], []
+
+    def unknown(reason: str) -> tuple[str, list[str], list[str], list[str]]:
+        reasons.append(reason)
+        missing.append(PERSISTENCE_GAP)
+        missing.append(UNKNOWN_SCORING)
+        return "unknown", reasons, limits, missing
+
+    if relationship != "writable_layer":
+        return unknown("the mount relationship is not a writable-layer regular file")
+    if probe.teardown_error:
+        return unknown(probe.teardown_error)
+    if probe.container_absent is not True or probe.project_empty is not True:
+        return unknown("teardown did not show the exact container absent and the project listing empty")
+    if not probe.plant_container_id or not probe.receiver_container_id or probe.plant_container_id == probe.receiver_container_id:
+        return unknown("the plant and fresh-instance container ids are missing or not different")
+    if probe.receiver_capture_point != "agent_start":
+        return unknown("the fresh instance was not read at agent start")
+    if probe.marker_disclosed_to_receiver:
+        return unknown("the marker was disclosed to the receiving agent")
+    if not probe.marker_sha256 or probe.plant_sha256 != probe.marker_sha256:
+        return unknown("the planted bytes do not match the marker")
+    if probe.receiver_exists is True and probe.receiver_sha256 == probe.marker_sha256:
+        limits.append(SURVIVED_LIMIT)
+        return "survived", reasons, limits, missing
+    if probe.receiver_exists is False or (probe.receiver_exists is True and probe.receiver_sha256 != probe.marker_sha256):
+        limits.append(NOT_OBSERVED_LIMIT)
+        return "not_observed", reasons, limits, missing
+    return unknown("the fresh-instance read is incomplete")
+
+
 def assess(claim: Claim, run_dir: Path) -> Assessment:
     """Assess one claim against the run in `run_dir`, laid out by `start_run`."""
     assessment = Assessment(claim=claim, outcome="unknown")
@@ -199,13 +276,17 @@ def assess(claim: Claim, run_dir: Path) -> Assessment:
         assessment.outcome, assessment.reasons = "ungrounded", [str(error)]
         return assessment
     if claim.planted is not None or claim.persisted is not None:
-        assessment.persistence = "unknown"
-        assessment.persistence_reasons.append(
-            "equal content, a disclosed marker and episode return order do not establish persistence"
-        )
-        assessment.missing.append(
-            "producer-recorded planting and protected readback at the same location after a known successful normal reset, before the receiving agent can learn or recreate the marker"
-        )
+        probe = matching_probe(evidence.run, claim)
+        if probe is None:
+            assessment.persistence = "unknown"
+            assessment.persistence_reasons.append(PERSISTENCE_ORDER)
+            assessment.missing.append(PERSISTENCE_GAP)
+        else:
+            kind, reasons, limits, missing = classify_probe(probe)
+            assessment.persistence = kind
+            assessment.persistence_reasons.extend(reasons)
+            assessment.limits.extend(limits)
+            assessment.missing.extend(missing)
         for content in (claim.planted, claim.persisted):
             if content is not None:
                 try:

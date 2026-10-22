@@ -8,14 +8,22 @@ the credentials file or the host environment only when a call is sent. Paths in
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 NativeBehavior = Literal["shared_grading", "host_harness", "atif"]
 ExecutionPath = Literal["verifiers", "harbor"]
 Role = Literal["simulator", "inspector", "attacker"]
 
 
+class InfrastructureAbort(Exception):
+    """The paused container did not resume, so the affected episode must stop.
+
+    Ordinary observation errors stay Exception and must not use this type.
+    """
+
+
 class ModelConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     model: str
     reasoning_effort: str | None = None
     api_base: str | None = None
@@ -115,6 +123,10 @@ class CallRecord(BaseModel):
     provider_cost: float | None = None
     """The provider's own `usage.cost`, when it reported one."""
     error: str | None = None
+    refusals: list[str] = []
+    """Explicit model refusal signals the provider returned for this call: a message
+    `refusal`, a `content_filter` finish reason or a content policy error. Never inferred
+    from text, and separate from the spending cap's `RunRecord.refused_calls`."""
 
 
 class Observation(BaseModel):
@@ -197,8 +209,11 @@ class Simulation(BaseModel):
     requested: int
     selection: list[ArtifactSelection]
     episodes: list[str] = []
-    failures: dict[str, ErrorRecord] = {}
-    """Episodes whose runner raised; their records keep any partial evidence."""
+    failures: dict[str, list[ErrorRecord]] = {}
+    """Episodes whose runner raised or whose native result reported errors; their
+    records keep any partial evidence, including a reward Harbor still graded."""
+    refusals: dict[str, list[str]] = {}
+    """Episodes with explicit model refusal signals in their calls, failed or not."""
     status: Literal["running", "complete", "partial", "spending_exhausted", "cancelled"] = "running"
 
 
@@ -271,6 +286,42 @@ class EpisodeEvent(BaseModel):
     event: Literal["started", "finished"]
 
 
+class PersistenceProbe(BaseModel):
+    """Host record of one writable-layer planting and the fresh instance that followed it.
+
+    The producer fills the lifecycle fields. Assessment classifies from those fields.
+    A stored `classification` is not accepted on its own."""
+
+    location: str
+    marker_sha256: str = ""
+    plant_episode: str | None = None
+    plant_container_id: str | None = None
+    plant_content: Content | None = None
+    plant_sha256: str | None = None
+    mounts: list[dict] = []
+    path_resolution: dict = {}
+    """Protected observation of lexical parents. Unverified aliases are not writable-layer coverage."""
+    observation_windows: list[dict] = []
+    """Pause, read and resume intervals. A failed resume is an infrastructure failure."""
+    mount_relationship: str = "unknown"
+    container_absent: bool | None = None
+    project_empty: bool | None = None
+    teardown_error: str | None = None
+    teardown_reasons: list[str] = []
+    receiver_episode: str | None = None
+    receiver_container_id: str | None = None
+    receiver_content: Content | None = None
+    receiver_exists: bool | None = None
+    receiver_sha256: str | None = None
+    receiver_capture_point: str | None = None
+    receiver_observed_end: str | None = None
+    receiver_agent_started_at: str | None = None
+    marker_disclosed_to_receiver: bool = False
+    classification: Literal["not_observed", "survived", "unknown", "unsupported"] = "unknown"
+    limits: list[str] = []
+    episodes: list[str] = []
+
+
 class RunRecord(BaseModel):
     task_dir: str
     path: ExecutionPath
@@ -299,6 +350,62 @@ class RunRecord(BaseModel):
     capture_errors: list[CaptureFailure] = []
     replays: list[Replay] = []
     simulation: Simulation | None = None
+    probe_episodes: list[str] = []
+    """Planting and fresh-instance reads. They are not ordinary episodes and not attack successes."""
+    persistence_probes: list[PersistenceProbe] = []
+
+
+class Coverage(BaseModel):
+    """Inspector interpretation of an episode's complete applicable scoring outcome.
+
+    It cites the requirement and scoring sources, the checks of that episode that
+    observed them, and explains why they justify its actual reward, partial credit
+    included. nudi verifies only the references, not semantic completeness."""
+
+    requirements: list[Observation]
+    scoring: Observation
+    checks: list[str]
+    explanation: str
+
+
+class DecisionRule(BaseModel):
+    """Inspector interpretation of how the native grader decides pass, citing its source.
+
+    Exactly one encoding: explicit `pass_values`, or `comparison` with `threshold`.
+    Observed 0/1 rewards alone establish neither; nudi never supplies a threshold."""
+
+    reward: str = "reward"
+    source: Observation
+    pass_values: list[float] = []
+    comparison: Literal[">=", ">", "<=", "<", "=="] | None = None
+    threshold: float | None = None
+
+
+class Ordering(BaseModel):
+    """Inspector interpretation of which direction of a native score is toward completion."""
+
+    reward: str = "reward"
+    source: Observation
+    higher_completes: bool
+
+
+class MetricBasis(BaseModel):
+    """Inspector interpretation of one ordinary episode's whole-task completion.
+
+    Local validity, legitimate partial credit and complete-scoring coverage are not
+    completion. `supported` needs every cited completion requirement observed satisfied
+    by the episode's checks; `violated` needs one observed violation of a cited necessary
+    requirement. Any `unresolved` condition keeps completion unknown. Missing fields
+    mean missing evidence or an older record."""
+
+    completion: Literal["supported", "violated", "unknown"] = "unknown"
+    requirements: list[Observation] = []
+    """Task references to the applicable completion requirements."""
+    checks: list[str] = []
+    explanation: str = ""
+    unresolved: list[str] = []
+    decision: DecisionRule | None = None
+    ordering: Ordering | None = None
 
 
 class Claim(BaseModel):
@@ -317,7 +424,18 @@ class Claim(BaseModel):
     persisted: Content | None = None
     """The same state, retained by the graded episode after the normal reset."""
     interpretation: str = ""
+    full_guidance: str | None = None
+    """Concrete steps that reproduce the suspected loophole, when the Inspector supplies them."""
+    hint_location: str | None = None
+    """Only a file, interface, or component to examine. It excludes the solution and the reproduction recipe."""
     derivation: Derivation | None = None
+    unresolved: list[str] = []
+    """Necessary conditions the Inspector could not establish. With any, the claim
+    neither labels an ordinary episode nor counts as an evidenced issue."""
+    coverage: Coverage | None = None
+    """Required for an ordinary episode's legitimate label; see `Coverage`."""
+    basis: MetricBasis | None = None
+    """For an ordinary episode: the reference that grader metrics use; see `MetricBasis`."""
 
 
 Validity = Literal["supported", "violated", "unknown"]
@@ -352,6 +470,6 @@ class Assessment(BaseModel):
     """Evidence that would settle a provisional claim."""
     limits: list[str] = []
     """What the evidence does not establish, kept for evidenced issues too."""
-    persistence: Literal["not_claimed", "unknown"] = "not_claimed"
-    """Separate from scoring mismatch; no protected normal-reset readback is produced yet."""
+    persistence: Literal["not_claimed", "unknown", "not_observed", "survived", "unsupported"] = "not_claimed"
+    """Separate from scoring mismatch. Absence is only the observed location after that reset."""
     persistence_reasons: list[str] = []
