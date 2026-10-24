@@ -154,7 +154,10 @@ class Endpoint:
             context = json.loads(body["messages"][-1]["content"])
         except (ValueError, TypeError):
             context = {}
-        if "phase" in context:
+        if context.get("phase") == "capture_selection":
+            # The declared artifacts already cover each case's requirements.
+            response = {"locations": []}
+        elif "phase" in context:
             response = self.proposal(context)
             response["applicability"] = {category: {"status": "applicable", "facts": {"terminal": True}, "reason": "The native terminal permits checking retained submission files."} for category in context["categories"]}
         elif "check" in context:
@@ -235,6 +238,10 @@ def test_native_cases_from_installed_wheel(case, tmp_path, monkeypatch):
     (retained / "requests.json").write_text(json.dumps(endpoint.requests, indent=2))
     assert helpers.docker_resources() == before
     assert helpers.tree_digest(task) == digest and helpers.tree_digest(helpers.CONTRACT_TASK) == original
+    selections = [body for body in endpoint.requests if '"phase": "capture_selection"' in body["messages"][-1]["content"]]
+    record = json.loads((output / "run.json").read_text())
+    assert len(selections) == 1 and record["capture_selection"]["status"] == "complete", record["capture_selection"]
+    assert not any("capture selection" in warning for warning in record["warnings"])
     verify_retained(case, retained, result)
 
 

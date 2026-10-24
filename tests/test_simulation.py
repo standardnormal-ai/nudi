@@ -1,8 +1,9 @@
 """Ordinary simulation supplies the episode pool that trace-first grader inspection labels.
 
-Only Harbor's Trial and Docker's archive reads are replaced, at the native boundary
-the Docker tests in test_inspection.py cover. The run's queue, runner, verification-start hook,
-capture producer, Oracle receipt, Inspector session and assessment are real.
+Only Harbor's Trial, Docker's archive reads and the Docker daemon's pause and stat
+API are replaced, at the native boundary the Docker tests in test_inspection.py cover. The run's
+queue, runner, verification-start hook, capture producer, Oracle receipt, Inspector
+session and assessment are real.
 """
 
 import asyncio
@@ -19,6 +20,7 @@ from types import SimpleNamespace
 
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
+import httpx
 import litellm
 import pytest
 from aiohttp import web
@@ -29,9 +31,10 @@ from harbor.models.verifier.result import VerifierResult
 from harbor.trial.hooks import TrialEvent
 from harbor.trial.trial import Trial
 
-from nudi import checks, workflow
+from nudi import checks, report, workflow
 from nudi.records import (Assessment, Check, Claim, Content, Coverage, EpisodeResult, ErrorRecord, ModelConfig,
                           Observation, RunRecord)
+from test_attack import FULL, GO_DIR, GO_FILE, GO_LINK, MINIMAL, stat_header
 from test_inspection import CHECKER, InspectorScript
 from test_limits import credentials, new_run  # noqa: F401  (pytest fixture)
 from test_runner import CONTRACT_TASK, serve, tree_digest
@@ -53,6 +56,14 @@ def stored(run) -> RunRecord:
     return RunRecord.model_validate_json((run.config.output_dir / "run.json").read_text())
 
 
+NOTHING = {"locations": []}
+"""The Inspector's capture selection when it adds no file."""
+
+
+def inspector(base: str) -> dict:
+    return {"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)}
+
+
 class LocalEnvironment:
     """Runs the Oracle adapter's command on the host, in place of the disposable container."""
 
@@ -67,11 +78,15 @@ class LocalEnvironment:
 
 
 class Native:
-    """Harbor trials and Docker archive reads. `files` maps an episode to the container
-    files its agent leaves (absent: none); None makes that episode's archive read fail."""
+    """Harbor trials, Docker archive reads and the daemon's pause and stat API. `files`
+    maps an episode to the container files its agent leaves (absent: none); None makes
+    that episode's archive read fail. `links` maps a container path to its symlink
+    target, and `failing` names daemon actions (pause, unpause) that fail. `events`
+    records daemon calls and archive reads in order."""
 
-    def __init__(self, monkeypatch, files=None, rewards=None, delay=0.05):
+    def __init__(self, monkeypatch, files=None, rewards=None, delay=0.05, links=None, failing=()):
         self.files, self.rewards, self.delay = files or {}, rewards or {}, delay
+        self.links, self.failing, self.events = links or {}, set(failing), []
         self.configs, self.instructions, self.containers = {}, {}, {}
         self.active = self.most = 0
         self.raises, self.after = set(), {}
@@ -79,16 +94,45 @@ class Native:
         """Episode name to the exception type Harbor returns in exception_info, still graded."""
         self.agents = {}
         """Episode name to an async stand-in for Terminus 2's work, given the trial config."""
+        self.environment = LocalEnvironment
+        """The disposable instance class that check episodes execute in."""
         monkeypatch.setattr(Trial, "create", staticmethod(self.create))
         monkeypatch.setattr(checks, "host_command", self.docker)
+        monkeypatch.setattr(checks, "unix_docker_socket", self.socket)
+        monkeypatch.setattr(checks, "docker_client", self.client)
 
     async def create(self, config):
         return FakeTrial(self, config)
+
+    async def socket(self):
+        return "/native/docker.sock", None
+
+    async def client(self, sock):
+        return httpx.AsyncClient(transport=httpx.MockTransport(self.daemon), base_url="http://docker"), "1.44"
+
+    def daemon(self, request):
+        container, action = request.url.path.split("/")[3:5]
+        if request.method == "POST":
+            self.events.append((action, container))
+            return httpx.Response(500 if action in self.failing else 204)
+        location = request.url.params["path"]
+        self.events.append(("stat", location))
+        files = self.files.get(self.containers[container]) or {}
+        if location in self.links:
+            header = stat_header(GO_LINK, self.links[location])
+        elif location in files:
+            header = stat_header(GO_FILE)
+        elif location in ("/app", "/output") or any(path.startswith(location + "/") for path in [*files, *self.links]):
+            header = stat_header(GO_DIR)
+        else:
+            return httpx.Response(404)
+        return httpx.Response(200, headers={"X-Docker-Container-Path-Stat": header})
 
     async def docker(self, command, *, timeout=30):
         if command[0] == "docker":
             return 0, command[4].removeprefix("label=com.docker.compose.project=") + "\n", ""
         container, location, ids = command[3], command[4], json.loads(command[5])
+        self.events.append(("read", location))
         files = self.files.get(self.containers[container], {})
         if files is None:
             return 1, "", "Error response from daemon: archive unavailable"
@@ -123,7 +167,7 @@ class FakeTrial:
                 raise RuntimeError("fake trial failure")
             if config.agent.import_path:
                 agent = checks.RetainedOracle(**config.agent.kwargs, logs_dir=trial_dir / "agent")
-                await agent.run("", LocalEnvironment(), None)
+                await agent.run("", native.environment(), None)
             else:
                 if name in native.agents:
                     await native.agents[name](config)
@@ -150,9 +194,14 @@ class FakeTrial:
 @pytest.mark.parametrize("count", [None, 3])
 def test_default_and_configured_counts_share_the_queue_and_original_task(tmp_path, monkeypatch, credentials, count):
     native = Native(monkeypatch)
-    # 90% of 3 CPUs fits two one-CPU episodes at once.
-    run = new_run(tmp_path, monkeypatch, credentials, capacity=(3, 4096))
-    simulation = asyncio.run(workflow.simulate(run) if count is None else workflow.simulate(run, count))
+
+    async def main():
+        async with serve(InspectorScript([NOTHING])) as base:
+            # 90% of 3 CPUs fits two one-CPU episodes at once.
+            run = new_run(tmp_path, monkeypatch, credentials, capacity=(3, 4096), models=inspector(base))
+            return run, await (workflow.simulate(run) if count is None else workflow.simulate(run, count))
+
+    run, simulation = asyncio.run(main())
     expected = [f"{index:04d}-simulator" for index in range(count or 20)]
     assert simulation.requested == len(expected)
     assert simulation.episodes == expected == run.record.episodes
@@ -177,10 +226,15 @@ def test_invalid_count_fails_before_any_episode(tmp_path, monkeypatch, credentia
 
 def test_failure_and_spending_cap_keep_every_attempt_without_retry(tmp_path, monkeypatch, credentials):
     native = Native(monkeypatch)
-    run = new_run(tmp_path, monkeypatch, credentials, capacity=(1, 4096), spending_cap=1.0)
     native.raises = {"0001-simulator"}
-    native.after["0002-simulator"] = lambda: setattr(run.record, "known_cost", 1.0)
-    simulation = asyncio.run(workflow.simulate(run, 5))
+
+    async def main():
+        async with serve(InspectorScript([NOTHING])) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, capacity=(1, 4096), spending_cap=1.0, models=inspector(base))
+            native.after["0002-simulator"] = lambda: setattr(run.record, "known_cost", 1.0)
+            return run, await workflow.simulate(run, 5)
+
+    run, simulation = asyncio.run(main())
     assert simulation.episodes == ["0000-simulator", "0001-simulator", "0002-simulator"] == run.record.episodes
     assert simulation.status == "spending_exhausted"
     assert list(simulation.failures) == ["0001-simulator"]
@@ -192,15 +246,17 @@ def test_failure_and_spending_cap_keep_every_attempt_without_retry(tmp_path, mon
 
 def test_cancellation_records_the_partial_pool(tmp_path, monkeypatch, credentials):
     Native(monkeypatch, delay=5)
-    run = new_run(tmp_path, monkeypatch, credentials, capacity=(1, 4096))
 
     async def main():
-        running = asyncio.create_task(workflow.simulate(run, 3))
-        await asyncio.sleep(0.5)
-        running.cancel()
-        await asyncio.wait({running})
+        async with serve(InspectorScript([NOTHING])) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, capacity=(1, 4096), models=inspector(base))
+            running = asyncio.create_task(workflow.simulate(run, 3))
+            await asyncio.sleep(0.5)
+            running.cancel()
+            await asyncio.wait({running})
+            return run
 
-    asyncio.run(main())
+    run = asyncio.run(main())
     simulation = stored(run).simulation
     assert (simulation.status, simulation.episodes) == ("cancelled", ["0000-simulator"])
     episode = json.loads((run.config.output_dir / "episodes" / "0000-simulator" / "episode.json").read_text())
@@ -211,8 +267,13 @@ def test_returned_native_failure_counts_without_a_raise(tmp_path, monkeypatch, c
     """Harbor returns exception_info and still grades; the pool is then partial."""
     native = Native(monkeypatch)
     native.returned = {"0001-simulator": "AgentTimeoutError"}
-    run = new_run(tmp_path, monkeypatch, credentials, capacity=(1, 4096))
-    simulation = asyncio.run(workflow.simulate(run, 2))
+
+    async def main():
+        async with serve(InspectorScript([NOTHING])) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, capacity=(1, 4096), models=inspector(base))
+            return run, await workflow.simulate(run, 2)
+
+    run, simulation = asyncio.run(main())
     assert simulation.status == "partial"
     assert list(simulation.failures) == ["0001-simulator"]
     assert [error.type for error in simulation.failures["0001-simulator"]] == ["AgentTimeoutError"]
@@ -258,9 +319,9 @@ def test_explicit_model_refusals_stay_apart_from_failures_and_spending_admission
     ])
 
     async def main():
-        async with serve(provider) as base:
+        async with serve(provider) as base, serve(InspectorScript([NOTHING])) as selection:
             run = new_run(tmp_path, monkeypatch, credentials, capacity=(1, 4096), spending_cap=1.0,
-                          models={"simulator": ModelConfig(model="xai/grok-4.7", api_base=base)})
+                          models={"simulator": ModelConfig(model="xai/grok-4.7", api_base=base), **inspector(selection)})
 
             async def capped(config):
                 run.record.known_cost = 1.0
@@ -338,6 +399,7 @@ def test_selected_capture_reaches_supported_ordinary_labels_and_incomplete_suppo
                                         "0002-simulator": None, "0003-simulator": complete, "0004-simulator": complete})
     unobserved = ["/app/answer.txt containing 42 has not been observed"]
     script = InspectorScript([
+        NOTHING,
         {"probes": [probe("0001-simulator"), probe("0001-simulator", "answer"), probe("0003-simulator"),
                     probe("0004-simulator"), probe("0000-simulator")]},
         interpretation("supported"),
@@ -356,11 +418,12 @@ def test_selected_capture_reaches_supported_ordinary_labels_and_incomplete_suppo
             return run, simulation, report
 
     run, simulation, report = asyncio.run(main())
-    assert [item.source for item in simulation.selection if item.selected] == ["/app/explanation.txt", "/app/answer.txt"]
+    selection = run.record.capture_selection.files
+    assert [item.source for item in selection if item.selected] == ["/app/explanation.txt", "/app/answer.txt"]
     pool = [f"{index:04d}-simulator" for index in range(5)]
     assert simulation.episodes == pool
-    broad = json.loads(script.requests[0]["messages"][-1]["content"])
-    assert broad["capture_inventory"] == [item.model_dump() for item in simulation.selection]
+    broad = json.loads(script.requests[1]["messages"][-1]["content"])
+    assert broad["capture_inventory"] == [item.model_dump() for item in selection]
     ordinary = broad["ordinary_episodes_read_first"]
     assert [episode["episode"] for episode in ordinary] == pool
     assert [episode["rewards"] for episode in ordinary] == [{"reward": 1.0}] * 5
@@ -416,6 +479,7 @@ def test_combined_coverage_of_separate_checks_justifies_legitimate_partial_credi
                 "explanation": "The explanation earns 0.5 and the omitted answer earns nothing, so the actual reward 0.5 is deserved."}
 
     script = InspectorScript([
+        NOTHING,
         {"probes": [half("0000-simulator", "explanation"), half("0000-simulator", "answer"),
                     half("0001-simulator", "explanation"), half("0001-simulator", "answer"),
                     half("0002-simulator", "answer", program="import sys\nsys.exit(3)\n"), half("0002-simulator", "explanation")]},
@@ -446,12 +510,53 @@ def test_combined_coverage_of_separate_checks_justifies_legitimate_partial_credi
     assert "check-0004" in reasons["0002-simulator"] and "complete scoring outcome" in reasons["0002-simulator"]
 
 
+class Python2Environment(LocalEnvironment):
+    """A native instance whose only interpreter is Python 2."""
+
+    async def exec(self, *, command):
+        args = shlex.split(command)
+        assert args[1:] == ["-c", checks.VERSION_PROBE], "no check may run without Python 3"
+        if args[0] == "python":
+            return ExecResult(stdout="2\n", stderr="", return_code=0)
+        return ExecResult(stdout="", stderr=f"bash: {args[0]}: command not found", return_code=127)
+
+
+def test_unsupported_runtime_keeps_the_check_failed_and_the_label_unknown(tmp_path, monkeypatch, credentials):
+    """The check never ran, so nothing is interpreted and the Inspector receives the input contract."""
+    task = task_with_artifacts(tmp_path, '["/app/explanation.txt"]')
+    native = Native(monkeypatch, files={"0000-simulator": {"/app/explanation.txt": b"because\n"}})
+    native.environment = Python2Environment
+    script = InspectorScript([NOTHING, {"probes": [probe("0000-simulator")]}])
+
+    async def main():
+        async with serve(script) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task,
+                          models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
+            simulation = await workflow.simulate(run, 1)
+            report = await checks.inspect_grader(run, simulation.episodes, categories=["omitted_requirements"], focused_attempts=0)
+            return run, report
+
+    run, report = asyncio.run(main())
+    check = run.record.checks[0]
+    assert (check.command, check.exit_code) == ([], None)
+    assert check.output.startswith(checks.UNSUPPORTED_RUNTIME)
+    receipt = json.loads((run.config.output_dir / "episodes" / "0001-inspector" / "nudi-evidence" / "execution.json").read_text())
+    assert [(probe["command"][0], probe["exit_code"], probe["output"]) for probe in receipt["runtime_probes"]] == [
+        ("python3", 127, ""), ("python", 0, "2\n")]
+    assert report.assessments[0].outcome == "unknown"
+    assert (report.attempts[0].status, report.status) == ("tool_failure", "partial")
+    assert report.ordinary["0000-simulator"].label == "unknown"
+    feedback = json.loads(report.sessions["grader-broad"][-1]["content"])
+    assert feedback["check_input_contract"] == checks.CHECK_INPUT_CONTRACT
+    assert len(script.requests) == 2, "a check that did not run is never sent for interpretation"
+
+
 def test_without_declarations_ordinary_labels_stay_unknown_and_a_probe_never_backfills(tmp_path, monkeypatch, credentials):
     targeted = {**probe("unused"), "instruction": "Inspector-only targeted probe: skip the explanation."}
     del targeted["episode"]
     task = task_with_artifacts(tmp_path, "[]")
     native = Native(monkeypatch)
-    script = InspectorScript([{"probes": [targeted]}, interpretation("violated")])
+    script = InspectorScript([NOTHING, {"probes": [targeted]}, interpretation("violated")])
 
     async def main():
         async with serve(script) as base:
@@ -462,7 +567,7 @@ def test_without_declarations_ordinary_labels_stay_unknown_and_a_probe_never_bac
             return run, simulation, report
 
     run, simulation, report = asyncio.run(main())
-    assert simulation.selection == [] and run.record.submissions[0].content.episode == "0002-inspector"
+    assert run.record.capture_selection.files == [] and run.record.submissions[0].content.episode == "0002-inspector"
     assert any("cannot supply ordinary" in warning for warning in run.record.warnings)
     assert report.assessments[0].claim.episode == "0002-inspector"
     assert report.assessments[0].outcome == "accepted_invalid"
@@ -546,3 +651,428 @@ def test_labels_keep_partial_credit_unknowns_and_unavailable_rewards_apart_from_
     assert report.assessments[-1].claim.episode == "0008-inspector"
     assert report.categories == {"accepted_invalid": "evidenced_issue", "rejected_valid": "evidenced_issue",
                                  "omitted_requirements": "evidenced_issue", "partial_credit": "no_evidenced_issue"}
+
+
+RESULT = "Also write a JSON summary to /output/result.json."
+
+
+def proposal(path, excerpt: str = ANSWER, **fields) -> dict:
+    return {"path": path, "reason": "The instruction names this deliverable.",
+            "references": [{"episode": None, "path": "instruction.md", "excerpt": excerpt}], **fields}
+
+
+class Selector(InspectorScript):
+    """Also records how many episodes had started when each Inspector request arrived."""
+
+    def __init__(self, responses, native):
+        super().__init__(responses)
+        self.native, self.started = native, []
+
+    async def chat(self, request):
+        self.started.append(len(self.native.configs))
+        return await super().chat(request)
+
+
+def test_inspector_selects_files_before_ordinary_episodes_when_the_task_declares_none(tmp_path, monkeypatch, credentials):
+    """artifacts = []: one Inspector request, before any episode, adds cited files that every
+    ordinary episode captures at verification start. Uncaptured state stays unknown."""
+    task = task_with_artifacts(tmp_path, "[]")
+    with (task / "instruction.md").open("a") as file:
+        file.write(RESULT + "\n")
+    native = Native(monkeypatch, files={"0000-simulator": {"/output/result.json": b"{}", "/app/answer.txt": b"42\n"}})
+    selector = Selector([{"locations": [proposal("/output/result.json", RESULT), proposal("/app/answer.txt")]},
+                         {"probes": []}], native)
+
+    async def main():
+        async with serve(selector) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, capacity=(1, 4096),
+                          models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
+            simulation = await workflow.simulate(run, 2)
+            report = await checks.inspect_grader(run, simulation.episodes, categories=["omitted_requirements"], focused_attempts=0)
+            return run, simulation, report
+
+    run, simulation, report = asyncio.run(main())
+    assert selector.started[0] == 0, "selection precedes every ordinary episode"
+    request = json.loads(selector.requests[0]["messages"][-1]["content"])
+    assert (request["phase"], request["maximum_locations"], request["capture_inventory"]) == ("capture_selection", 8, [])
+    assert RESULT in request["task"]["untrusted_task_files"]["instruction.md"]
+    selection = run.record.capture_selection
+    assert selection.status == "complete"
+    assert [(item.declaration, item.source, item.selected) for item in selection.files] == [
+        (None, "/output/result.json", True), (None, "/app/answer.txt", True)]
+    assert selection.files[0].references[0].excerpt == RESULT
+    assert selection.files[0].inspector_reason == "The instruction names this deliverable."
+    assert not any("cannot supply ordinary" in warning for warning in run.record.warnings)
+    # Selection is Inspector cost outside every episode; the ordinary pool is unchanged.
+    assert (run.record.calls[0].role, run.record.calls[0].episode) == ("inspector", "capture-selection")
+    assert simulation.episodes == run.record.episodes[:2] == ["0000-simulator", "0001-simulator"]
+    captured = [(state.content.episode, state.location, state.ids["trial_name"]) for state in run.record.submissions]
+    assert captured == [(name, location, native.configs[name].trial_name) for name in simulation.episodes
+                        for location in ("/output/result.json", "/app/answer.txt")]
+    states = [json.loads((run.config.output_dir / "episodes" / state.content.episode / state.content.path).read_text())
+              for state in run.record.submissions]
+    assert base64.b64decode(states[0]["base64"]) == b"{}"
+    assert (states[2]["location"], states[2]["exists"], "base64" in states[2]) == ("/output/result.json", False, False)
+    broad = json.loads(selector.requests[1]["messages"][-1]["content"])
+    assert broad["capture_inventory"] == [item.model_dump() for item in selection.files]
+    assert [state["location"] for state in broad["ordinary_episodes_read_first"][1]["captured"]] == [
+        "/output/result.json", "/app/answer.txt"]
+    assert {name: label.label for name, label in report.ordinary.items()} == dict.fromkeys(simulation.episodes, "unknown")
+    assert (stored(run).simulation, stored(run).capture_selection) == (simulation, selection)
+
+
+UNSUPPORTED = {
+    "/app/../etc/passwd": "normalized absolute",
+    "app/answer.txt": "normalized absolute",
+    "/app/out/": "normalized absolute",
+    "//app/answer.txt": "normalized absolute",
+    "": "malformed",
+    "/app/*.txt": "glob",
+    "/logs/verifier/reward.json": "harness",
+    "/logs/agent/trajectory.json": "harness",
+    "/logs/artifacts/report.json": "harness",
+    "/tests/test.sh": "harness",
+    "/solution/solve.sh": "harness",
+    "/proc/self/environ": "pseudo-file",
+    "/etc/hosts": "pseudo-file",
+}
+
+
+def test_selection_keeps_declarations_deduplicates_and_rejects_unsupported_proposals(tmp_path, monkeypatch, credentials):
+    task = task_with_artifacts(tmp_path, '["/app/answer.txt", "/app/answer.txt"]')
+    native = Native(monkeypatch, files={"0000-simulator": {"/app/answer.txt": b"42\n"}})
+    notes = [f"/app/notes/{index}.txt" for index in range(9)]
+    malformed = [{"path": "/app/c.txt", "reason": " ", "references": proposal("/app/c.txt")["references"]},
+                 {"path": "/app/d.txt", "reason": "cited", "references": []}, "/app/e.txt", proposal(7)]
+    ungrounded = [proposal("/app/a.txt", "This sentence is not in the task."), proposal("/app/b.txt", ""),
+                  {**proposal("/app/f.txt"), "references": [{"episode": "0000-simulator", "path": "instruction.md", "excerpt": ANSWER}]}]
+    selector = Selector([{"locations": [proposal(path) for path in UNSUPPORTED] + malformed + ungrounded + [
+        proposal("/app/answer.txt"), proposal("/var/lib/db.sqlite", service="db")] + [proposal(path) for path in notes]}], native)
+
+    async def main():
+        async with serve(selector) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task,
+                          models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
+            return run, await workflow.simulate(run, 1)
+
+    run, simulation = asyncio.run(main())
+    assert len(selector.requests) == 1, "one bounded selection request"
+    selection = run.record.capture_selection
+    assert selection.status == "complete"
+    declared = [(item.declaration, item.selected) for item in selection.files if item.declaration is not None]
+    assert declared == [(0, True), (1, False)] and "duplicate" in selection.files[1].reason
+    proposed = {item.source: item for item in selection.files if item.declaration is None}
+    for path, reason in UNSUPPORTED.items():
+        assert not proposed[path].selected and reason in proposed[path].reason, path
+    assert all("malformed" in proposed[source].reason for source in ("/app/c.txt", "/app/d.txt", '"/app/e.txt"', "7"))
+    assert all("verbatim" in proposed[source].reason for source in ("/app/a.txt", "/app/b.txt", "/app/f.txt"))
+    assert "already selected" in proposed["/app/answer.txt"].reason
+    assert "helper" in proposed["/var/lib/db.sqlite"].reason
+    assert [proposed[path].selected for path in notes] == [True] * 8 + [False]
+    assert "eight" in proposed[notes[-1]].reason
+    assert not any(item.selected for item in proposed.values() if item.source not in notes)
+    assert [state.location for state in run.record.submissions] == ["/app/answer.txt"] + notes[:8]
+    assert (stored(run).simulation, stored(run).capture_selection) == (simulation, selection)
+
+
+@pytest.mark.parametrize(("reply", "status", "detail"), [
+    ((400, {"error": {"message": "bad selection request", "type": "invalid_request_error"}}), "failed", "BadRequestError"),
+    ((200, completion({"role": "assistant", "content": "not json"}, "stop")), "failed", "JSONDecodeError"),
+    ((200, completion({"role": "assistant", "content": json.dumps({"refusal": "I will not select files."})}, "stop")),
+     "refused", "I will not select files."),
+    ((200, completion({"role": "assistant", "content": None, "refusal": "no"}, "content_filter")), "refused", "content_filter"),
+    ((200, completion({"role": "assistant", "content": json.dumps({"locations": "/app/answer.txt"})}, "stop")),
+     "malformed", "list"),
+])
+def test_failed_selection_keeps_declared_capture_and_is_not_repeated(tmp_path, monkeypatch, credentials, reply, status, detail):
+    task = task_with_artifacts(tmp_path, '["/app/answer.txt"]')
+    Native(monkeypatch, files={"0000-simulator": {"/app/answer.txt": b"42\n"}})
+    provider = Provider([reply])
+
+    async def main():
+        async with serve(provider) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task,
+                          models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
+            return run, await workflow.simulate(run, 1)
+
+    run, simulation = asyncio.run(main())
+    assert len(provider.requests) == 1
+    selection = stored(run).capture_selection
+    assert selection.status == status and detail in " ".join(selection.limits)
+    assert any(detail in warning for warning in run.record.warnings)
+    assert [(item.source, item.selected) for item in selection.files] == [("/app/answer.txt", True)]
+    assert (simulation.status, simulation.episodes) == ("complete", ["0000-simulator"])
+    assert [state.location for state in run.record.submissions] == ["/app/answer.txt"]
+    assert run.record.calls[0].episode == "capture-selection"
+    assert stored(run).simulation == simulation
+
+
+def test_spending_cap_reached_before_selection_sends_nothing_and_starts_no_episode(tmp_path, monkeypatch, credentials):
+    task = task_with_artifacts(tmp_path, '["/app/answer.txt"]')
+    native = Native(monkeypatch)
+    provider = Provider([])
+
+    async def main():
+        async with serve(provider) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, spending_cap=1.0,
+                          models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
+            run.record.known_cost = 1.0
+            return run, await workflow.simulate(run, 2)
+
+    run, simulation = asyncio.run(main())
+    assert provider.requests == [] and native.configs == {}
+    selection = stored(run).capture_selection
+    assert selection.status == "spending_exhausted" and "spending cap" in " ".join(selection.limits)
+    assert (simulation.status, simulation.episodes) == ("spending_exhausted", [])
+    assert [(item.source, item.selected) for item in selection.files] == [("/app/answer.txt", True)]
+    assert stored(run).simulation == simulation
+
+
+class Held:
+    """An endpoint that holds the selection request until released."""
+
+    def __init__(self):
+        self.started, self.release = asyncio.Event(), asyncio.Event()
+
+    async def chat(self, request):
+        self.started.set()
+        await self.release.wait()
+        return web.json_response({}, status=500)
+
+
+def test_cancellation_during_selection_records_it_and_starts_no_episode(tmp_path, monkeypatch, credentials):
+    task = task_with_artifacts(tmp_path, '["/app/answer.txt"]')
+    native = Native(monkeypatch)
+    held = Held()
+
+    async def main():
+        async with serve(held) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task,
+                          models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
+            running = asyncio.create_task(workflow.simulate(run, 2))
+            try:
+                await asyncio.wait_for(held.started.wait(), 5)
+            finally:
+                running.cancel()
+                await asyncio.wait({running})
+                held.release.set()
+            return run
+
+    run = asyncio.run(main())
+    record = stored(run)
+    assert (record.simulation.status, record.capture_selection.status, record.simulation.episodes) == ("cancelled", "cancelled", [])
+    assert native.configs == {}
+
+
+@pytest.mark.parametrize(("links", "detail"), [
+    ({"/app/link": "/logs/verifier"}, "/logs/verifier"),
+    ({"/app/link": "../../logs/verifier"}, "symlink"),
+    ({"/app/link": "/safe", "/safe": "/logs/verifier"}, "symlink"),
+    ({"/app/link": "/srv/data"}, "symlink"),
+], ids=["excluded", "relative", "nested", "benign"])
+def test_capture_rejects_every_parent_alias_before_reading(tmp_path, monkeypatch, credentials, links, detail):
+    """The proposal passes the lexical check, but /app/link is a symlink. Its target may hold
+    further aliases, here /safe into the verifier's state, so no symlinked parent is followed.
+    The paused container's metadata is checked before any byte of it is read."""
+    task = task_with_artifacts(tmp_path, '["/app/answer.txt"]')
+    files = {"/app/link/probe.bin": b"verifier state", "/app/answer.txt": b"42\n"}
+    native = Native(monkeypatch, files={"0000-simulator": files}, links=links)
+    selector = Selector([{"locations": [proposal("/app/link/probe.bin")]}], native)
+
+    async def main():
+        async with serve(selector) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
+            return run, await workflow.simulate(run, 1)
+
+    run, simulation = asyncio.run(main())
+    assert [failure.location for failure in run.record.capture_errors] == ["/app/link/probe.bin"]
+    message = run.record.capture_errors[0].error.message
+    assert "rejected" in message and detail in message
+    container = native.configs["0000-simulator"].trial_name.lower() + "__env"
+    assert native.events == [
+        ("pause", container), ("stat", "/app"), ("stat", "/app/answer.txt"), ("read", "/app/answer.txt"), ("unpause", container),
+        ("pause", container), ("stat", "/app"), ("stat", "/app/link"), ("stat", "/app/link/probe.bin"), ("unpause", container)]
+    answer, = run.record.submissions
+    assert answer.location == "/app/answer.txt" and answer.path_resolution["verified"]
+    window, = answer.observation_windows
+    assert window["paused"] and window["resumed_at"] and window["resume_error"] is None
+    assert simulation.status == "complete"
+    assert [item.source for item in stored(run).capture_selection.files if item.selected] == ["/app/answer.txt", "/app/link/probe.bin"]
+
+
+def test_unavailable_pause_fails_the_capture_without_reading(tmp_path, monkeypatch, credentials):
+    task = task_with_artifacts(tmp_path, '["/app/answer.txt"]')
+    native = Native(monkeypatch, files={"0000-simulator": {"/app/answer.txt": b"42\n"}}, failing={"pause"})
+
+    async def main():
+        async with serve(InspectorScript([NOTHING])) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
+            return run, await workflow.simulate(run, 1)
+
+    run, simulation = asyncio.run(main())
+    assert run.record.submissions == []
+    assert not any(event[0] in ("stat", "read") for event in native.events)
+    assert [failure.location for failure in run.record.capture_errors] == ["/app/answer.txt"]
+    assert "could not be paused" in run.record.capture_errors[0].error.message
+    assert simulation.status == "complete"
+
+
+def test_failed_resume_stops_the_episode_and_keeps_the_capture_failure(tmp_path, monkeypatch, credentials):
+    task = task_with_artifacts(tmp_path, '["/app/answer.txt"]')
+    native = Native(monkeypatch, files={"0000-simulator": {"/app/answer.txt": b"42\n"}}, failing={"unpause"})
+
+    async def main():
+        async with serve(InspectorScript([NOTHING])) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
+            return run, await workflow.simulate(run, 1)
+
+    run, simulation = asyncio.run(main())
+    assert ("unpause", native.configs["0000-simulator"].trial_name.lower() + "__env") in native.events
+    assert [(failure.location, failure.error.type) for failure in run.record.capture_errors] == [("/app/answer.txt", "InfrastructureAbort")]
+    assert run.record.submissions == []
+    assert [error.type for error in simulation.failures["0000-simulator"]] == ["InfrastructureAbort"]
+    assert simulation.status == "partial"
+
+
+ORDERS = "/app/state/orders.db"
+PLANNER = "PLANNER-REASON-314"
+SHARED = {"locations": [proposal("/output/result.json", RESULT), proposal(ORDERS, reason=PLANNER)]}
+CLAIM = {"claim": {"mechanism": "candidate", "interpretation": "unproven", "unresolved": ["no independent check"]}}
+
+
+def declaring_nothing(tmp_path: Path) -> Path:
+    task = task_with_artifacts(tmp_path, "[]")
+    with (task / "instruction.md").open("a") as file:
+        file.write(RESULT + "\n")
+    return task
+
+
+def test_one_selection_serves_ordinary_and_every_hint_condition_without_reaching_the_attacker(tmp_path, monkeypatch, credentials):
+    """artifacts = []: the selection made before ordinary episodes is reused unchanged by
+    every hint condition. Its paths, reasons and references never reach an Attacker."""
+    task = declaring_nothing(tmp_path)
+    native = Native(monkeypatch, files={"0001-attacker": {"/output/result.json": b"{}"}})
+    selector = Selector([SHARED] + [CLAIM] * 3, native)
+
+    async def main():
+        async with serve(selector) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
+            await workflow.simulate(run, 1)
+            return run, await checks.attack(run, maximum_attempts=1, full=FULL, minimal=MINIMAL)
+
+    run, result = asyncio.run(main())
+    phases = [json.loads(body["messages"][-1]["content"]).get("phase") for body in selector.requests]
+    assert phases.count("capture_selection") == 1, "one selection for the whole run"
+    expected = ["/output/result.json", ORDERS]
+    assert [attempt.level for attempt in result.attempts] == ["full", "minimal", "none"]
+    assert [attempt.capture_locations for attempt in result.attempts] == [expected] * 3
+    attackers = [attempt.episode for attempt in result.attempts]
+    assert [(state.content.episode, state.location) for state in run.record.submissions] == [
+        (name, location) for name in ["0000-simulator", *attackers] for location in expected]
+    original = (task / "instruction.md").read_text()
+    for attempt in result.attempts:
+        seen = native.instructions[attempt.episode].removeprefix(original) + json.dumps(result.sessions[attempt.context])
+        assert not any(text in seen for text in (ORDERS, PLANNER, "result.json", "capture_selection")), attempt.level
+    none = native.instructions[attackers[-1]].removeprefix(original)
+    assert checks.CAPTURE_LIMIT in none and "same files" in checks.CAPTURE_LIMIT
+    assert checks.CAPTURE_LIMIT in result.limits
+    selection = stored(run).capture_selection
+    assert selection.status == "complete" and [item.source for item in selection.files if item.selected] == expected
+    collection = report.build(run.config.output_dir)["collection"]
+    assert (collection["status"], collection["selected"], collection["calls"]) == ("complete", expected, 1)
+
+
+def test_hacking_only_attack_selects_once_before_its_first_episode_without_a_simulation(tmp_path, monkeypatch, credentials):
+    task = declaring_nothing(tmp_path)
+    native = Native(monkeypatch)
+    selector = Selector([SHARED, CLAIM], native)
+
+    async def main():
+        async with serve(selector) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
+            return run, await checks.attack(run, maximum_attempts=1)
+
+    run, result = asyncio.run(main())
+    assert selector.started == [0, 1], "selection precedes the first attacker episode"
+    assert [attempt.level for attempt in result.attempts] == ["none"]
+    assert result.attempts[0].capture_locations == ["/output/result.json", ORDERS]
+    assert [state.location for state in run.record.submissions] == ["/output/result.json", ORDERS]
+    assert run.record.calls[0].episode == "capture-selection"
+    record = stored(run)
+    assert record.simulation is None and record.capture_selection.status == "complete"
+
+
+def test_disabled_attack_makes_no_selection_request(tmp_path, monkeypatch, credentials):
+    task = declaring_nothing(tmp_path)
+    native = Native(monkeypatch)
+    provider = Provider([])
+
+    async def main():
+        async with serve(provider) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
+            return run, await checks.attack(run, maximum_attempts=0)
+
+    run, result = asyncio.run(main())
+    assert result.status == "disabled" and provider.requests == [] and native.configs == {}
+    assert run.record.capture_selection is None
+
+
+def test_refused_attack_selection_keeps_declared_capture_for_every_condition(tmp_path, monkeypatch, credentials):
+    task = task_with_artifacts(tmp_path, '["/app/answer.txt"]')
+    Native(monkeypatch)
+    refusal = completion({"role": "assistant", "content": json.dumps({"refusal": "I will not select files."})}, "stop")
+    provider = Provider([(200, refusal)] + [(200, completion({"role": "assistant", "content": json.dumps(CLAIM)}, "stop"))] * 2)
+
+    async def main():
+        async with serve(provider) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
+            return run, await checks.attack(run, maximum_attempts=1, full=FULL)
+
+    run, result = asyncio.run(main())
+    assert len(provider.requests) == 3
+    assert [attempt.capture_locations for attempt in result.attempts] == [["/app/answer.txt"]] * 2
+    assert any("I will not select files." in warning for warning in run.record.warnings)
+    selection = stored(run).capture_selection
+    assert selection.status == "refused" and "I will not select files." in " ".join(selection.limits)
+    assert report.build(run.config.output_dir)["collection"]["status"] == "refused"
+
+
+def test_attack_selection_at_the_spending_cap_sends_nothing_and_starts_no_episode(tmp_path, monkeypatch, credentials):
+    task = declaring_nothing(tmp_path)
+    native = Native(monkeypatch)
+    provider = Provider([])
+
+    async def main():
+        async with serve(provider) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, spending_cap=1.0, models=inspector(base))
+            run.record.known_cost = 1.0
+            return run, await checks.attack(run, maximum_attempts=1)
+
+    run, result = asyncio.run(main())
+    assert provider.requests == [] and native.configs == {}
+    assert result.status == "spending_exhausted"
+    assert stored(run).capture_selection.status == "spending_exhausted"
+
+
+def test_cancelling_attack_during_selection_records_it_and_starts_no_episode(tmp_path, monkeypatch, credentials):
+    task = declaring_nothing(tmp_path)
+    native = Native(monkeypatch)
+    held = Held()
+
+    async def main():
+        async with serve(held) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
+            running = asyncio.create_task(checks.attack(run, maximum_attempts=1))
+            try:
+                await asyncio.wait_for(held.started.wait(), 5)
+            finally:
+                running.cancel()
+                await asyncio.wait({running})
+                held.release.set()
+            return run
+
+    run = asyncio.run(main())
+    assert native.configs == {}
+    attack = checks.AttackResult.model_validate_json((run.config.output_dir / "attack.json").read_text())
+    assert (attack.status, attack.attempts) == ("cancelled", [])
+    assert stored(run).capture_selection.status == "cancelled"

@@ -18,7 +18,7 @@ from nudi import workflow
 from nudi.assessment import assess
 from nudi.records import Assessment, Claim, Derivation, ModelConfig, Observation, RunConfig
 from test_limits import credentials, new_run
-from test_runner import CONTRACT_TASK, TerminusScript, serve, tree_digest
+from test_runner import CONTRACT_TASK, TerminusScript, docker_env, serve, tree_digest  # noqa: F401
 
 
 CHECKER = '''import hashlib, json, sys
@@ -102,6 +102,31 @@ def test_native_absence_capture_and_isolated_check_preserve_timing_limit(monkeyp
     monkeypatch.setenv("XAI_API_KEY", "nudi-local-key")
     with tempfile.TemporaryDirectory(prefix="nudi-native-") as directory:
         asyncio.run(main(Path(directory).resolve()))
+
+
+def test_native_capture_rejects_a_parent_alias_into_verifier_state(tmp_path, docker_env):
+    """The paused container's metadata is checked before each read: a regular file reached
+    through /app/link -> /logs/verifier is rejected, and the answer beside it is captured."""
+    async def main():
+        task = tmp_path / "task"
+        shutil.copytree(CONTRACT_TASK, task)
+        script = TerminusScript("mkdir -p /app; ln -sfn /logs/verifier /app/link; echo planted > /app/link/probe.bin; "
+                                "echo 42 > /app/answer.txt", duration=0.1)
+        async with serve(script) as base:
+            model = ModelConfig(model="xai/grok-4.7", api_base=base)
+            run = workflow.start_run(RunConfig(task_dir=task, output_dir=tmp_path / "run", models={"inspector": model}), frozenset({"inspector"}))
+            await workflow.run_role_episode(run, "inspector", capture_locations=["/app/link/probe.bin", "/app/answer.txt"])
+        failure, = run.record.capture_errors
+        assert failure.location == "/app/link/probe.bin", failure
+        assert "rejected" in failure.error.message and "/logs/verifier" in failure.error.message, failure
+        answer, = run.record.submissions
+        assert answer.location == "/app/answer.txt" and answer.path_resolution["verified"]
+        window, = answer.observation_windows
+        assert window["paused"] and window["resumed_at"] and window["resume_error"] is None, window
+        state = json.loads((run.config.output_dir / "episodes" / answer.content.episode / answer.content.path).read_text())
+        assert base64.b64decode(state["base64"]) == b"42\n"
+
+    asyncio.run(main())
 
 
 class InspectorScript:
@@ -276,12 +301,15 @@ def test_inference_and_tool_failures_remain_distinct(tmp_path, monkeypatch, cred
 
 
 def test_tool_exit_and_cancellation_are_host_records_not_task_logs(tmp_path):
+    from nudi import checks
     from nudi.checks import RetainedOracle
     from harbor.environments.base import ExecResult
 
     class Environment:
         session_id = "native-check-instance"
         async def exec(self, *, command):
+            if shlex.split(command)[-1] == checks.VERSION_PROBE:
+                return ExecResult(stdout="3\n", stderr="", return_code=0)
             assert CHECKER in shlex.split(command)
             return ExecResult(stdout='{"measured": 1}\n', stderr="", return_code=3)
 
@@ -303,6 +331,123 @@ def test_tool_exit_and_cancellation_are_host_records_not_task_logs(tmp_path):
         assert record["error"] == "CancelledError"
     import shlex
     asyncio.run(main())
+
+
+@pytest.mark.parametrize(("versions", "selected"), [
+    ({"python3": "3"}, "python3"),  # the stopped live run: no python, python3 installed
+    ({"python": "3"}, "python"),
+    ({"python3": "2", "python": "3"}, "python"),
+    ({"python": "2"}, None),
+    ({}, None),
+])
+def test_check_uses_the_instance_python3_or_records_an_unsupported_runtime(tmp_path, versions, selected):
+    """Each probe and the check run in the same native instance; Python 2 never runs a check."""
+    import shlex
+    from harbor.environments.base import ExecResult
+    from nudi.checks import CHECK_WRAPPER, PYTHON_CANDIDATES, VERSION_PROBE, RetainedOracle
+
+    class Environment:
+        session_id = "native-check-instance"
+        commands = []
+        async def exec(self, *, command):
+            args = shlex.split(command)
+            self.commands.append(args)
+            if args[0] not in versions:
+                return ExecResult(stdout="", stderr=f"bash: {args[0]}: command not found", return_code=127)
+            if args[1:] == ["-c", VERSION_PROBE]:
+                return ExecResult(stdout=versions[args[0]] + "\n", stderr="", return_code=0)
+            return ExecResult(stdout='{"measured": 1}\n', stderr="", return_code=0)
+
+    environment = Environment()
+    output = tmp_path / "protected" / "execution.json"
+    adapter = RetainedOracle(program=CHECKER, inputs="{}", host_output=str(output), logs_dir=tmp_path / "task-mounted")
+    asyncio.run(adapter.run("", environment, None))
+    receipt = json.loads(output.read_text())
+    probes = receipt["runtime_probes"]
+    for probe in probes:
+        assert probe["command"] == [probe["command"][0], "-c", VERSION_PROBE]
+        assert probe["exit_code"] == (0 if probe["command"][0] in versions else 127)
+    if selected:
+        assert [probe["command"][0] for probe in probes] == list(PYTHON_CANDIDATES[:PYTHON_CANDIDATES.index(selected) + 1])
+        assert receipt["command"] == environment.commands[-1] == [selected, "-c", CHECK_WRAPPER, CHECKER, "{}"]
+        assert (receipt["exit_code"], receipt["output"]) == (0, '{"measured": 1}\n')
+    else:
+        assert [probe["command"][0] for probe in probes] == list(PYTHON_CANDIDATES)
+        assert all(CHECKER not in command for command in environment.commands)
+        assert (receipt["command"], receipt["exit_code"], receipt["error"]) == ([], None, "unsupported_runtime")
+        assert receipt["output"].startswith("unsupported_runtime: no Python 3 executable")
+
+
+FAKE_DOCKER = '''import io, sys, tarfile
+if sys.argv[1] == "inspect":
+    print("true")
+    sys.exit(0)
+location = sys.argv[2].split(":", 1)[1]
+if location != "/app/answer.txt":
+    sys.stderr.write("Error response from daemon: Could not find the file " + location + " in container\\n")
+    sys.exit(1)
+data, buffer = b"42\\n", io.BytesIO()
+with tarfile.open(fileobj=buffer, mode="w") as archive:
+    member = tarfile.TarInfo("answer.txt")
+    member.size = len(data)
+    archive.addfile(member, io.BytesIO(data))
+sys.stdout.buffer.write(buffer.getvalue())
+'''
+MEASURE = '''observations = {"exists": int(data is not None)}
+if data is not None:
+    observations["bytes"] = list(data)
+print(json.dumps({"input_sha256": input_sha256, "observations": observations, "results": {}}))
+'''
+
+
+def test_prompt_decoder_reads_actual_capture_states_and_rejects_malformed_fields(tmp_path, monkeypatch):
+    """The trusted capture program's real state format, read through a stand-in docker CLI,
+    decoded by the prompt's example. Malformed fields exit nonzero with no structured result."""
+    import subprocess
+    import sys
+    from nudi import checks
+    from nudi.assessment import captured_object
+
+    docker = tmp_path / "bin" / "docker"
+    docker.parent.mkdir()
+    docker.write_text(f"#!{sys.executable}\n" + FAKE_DOCKER)
+    docker.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{docker.parent}{os.pathsep}{os.environ['PATH']}")
+    evidence = tmp_path / "evidence"
+    present = asyncio.run(checks.read_exact("container", "/app/answer.txt", evidence, "present.json"))
+    absent = asyncio.run(checks.read_exact("container", "/app/missing.txt", evidence, "absent.json"))
+    assert set(present["state"]) == {"location", "exists", "base64", "observed_start", "observed_end"}
+    assert set(absent["state"]) == {"location", "exists", "observed_start", "observed_end"}
+
+    prompt = (Path(checks.__file__).parent / "prompts" / "inspector.md").read_text()
+    program = prompt.split("```python\n")[1].split("```")[0] + MEASURE
+
+    def check(submission: str):
+        inputs = {"submission": submission, "requirement": "Write 42 to /app/answer.txt.", "scoring": "reward = 1"}
+        run = subprocess.run([sys.executable, "-c", checks.CHECK_WRAPPER, program, json.dumps(inputs)],
+                             capture_output=True, text=True, timeout=30)
+        return run.returncode, captured_object(run.stdout), inputs
+
+    for name, retained, expected in (("present.json", present, {"exists": 1, "bytes": list(b"42\n")}),
+                                     ("absent.json", absent, {"exists": 0})):
+        status, result, inputs = check((evidence / name).read_text())
+        assert status == 0
+        assert result["observations"] == expected
+        assert result["input_sha256"]["submission"] == retained["file_sha"]
+        assert result["input_sha256"] == {key: hashlib.sha256(value.encode()).hexdigest() for key, value in inputs.items()}
+
+    state, missing = present["state"], absent["state"]
+    interval = {key: value for key, value in state.items() if key not in ("observed_start", "observed_end")}
+    malformed = [
+        {**{key: value for key, value in state.items() if key != "base64"}, "bytes_base64": state["base64"]},
+        {**interval, "interval": {"start": state["observed_start"], "end": state["observed_end"]}},
+        {**state, "base64": "not base64!"},
+        {**missing, "exists": "false"},
+        {**missing, "base64": ""},
+    ]
+    for submission in malformed:
+        status, result, _ = check(json.dumps(submission, sort_keys=True))
+        assert status != 0 and result is None, submission
 
 
 def test_inspector_failure_does_not_retain_credentials(tmp_path, monkeypatch, credentials):
@@ -389,7 +534,7 @@ def test_capture_failure_is_structured_and_partial(tmp_path, monkeypatch, creden
     run = new_run(tmp_path, monkeypatch, credentials)
     async def failed_capture(*args):
         raise RuntimeError("archive unavailable")
-    monkeypatch.setattr(checks, "capture_submission", failed_capture)
+    monkeypatch.setattr(checks, "protected_capture", failed_capture)
     async def native(config, queue, **work):
         await work["capture"](SimpleNamespace(trial_id="native-id"))
         result = EpisodeResult(path="harbor", path_reasons=[], task_name="task", task_dir=str(config.task_dir), task_digest=tree_digest(config.task_dir),

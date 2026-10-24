@@ -302,6 +302,17 @@ def test_undeclared_task_runs_one_episode_and_records_the_warning(tmp_path, monk
     assert any("may exhaust" in warning for warning in record.warnings)
 
 
+def test_run_records_the_storage_declaration_as_unenforced(tmp_path, monkeypatch, credentials):
+    task = task_variant(tmp_path, CONTRACT_TASK, "storage_mb = 4096\n")
+
+    record = stored_run(new_run(tmp_path, monkeypatch, credentials, task_dir=task))
+
+    assert record.path == "harbor" and len(record.path_reasons) == 4
+    assert "storage_mb = 4096 is recorded but not enforced" in record.path_reasons[-1]
+    # Storage plays no part in the fit: CPUs and memory alone size concurrency.
+    assert record.capacity.concurrency == 7
+
+
 # Upstream execution: the run's limit reaches Harbor's TrialQueue.
 
 

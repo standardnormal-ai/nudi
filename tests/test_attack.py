@@ -44,11 +44,16 @@ from test_runner import CONTRACT_TASK, PROVIDER_KEY, TerminusScript, docker_env,
 FULL = "FULL-LOOPHOLE-987"
 MINIMAL = "MINIMAL-HINT-654"
 SAFETY = "do not establish that the task is safe"
-CAPTURE_LIMIT = "No-hint attempts receive no broader capture"
+CAPTURE_LIMIT = "Every hint condition captures the same files"
+
+
+def selecting(body) -> bool:
+    return '"phase": "capture_selection"' in body["messages"][-1]["content"]
 
 
 def attack_endpoint(inspector):
-    """Scripted chat endpoint. Attacker and Inspector prompts take different branches."""
+    """Scripted chat endpoint. Attacker and Inspector prompts take different branches;
+    the run's capture selection adds no file."""
 
     class Endpoint:
         def __init__(self):
@@ -58,7 +63,10 @@ def attack_endpoint(inspector):
             body = await request.json()
             self.requests.append(body)
             system = body["messages"][0]["content"]
-            content = {"instruction": "attempt a reward boundary"} if "Attacker" in system else inspector(body)
+            if "Attacker" in system:
+                content = {"instruction": "attempt a reward boundary"}
+            else:
+                content = {"locations": []} if selecting(body) else inspector(body)
             return web.json_response({"id": "attack", "object": "chat.completion", "created": 0, "model": body["model"],
                                        "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(content)}}],
                                        "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}})
@@ -109,7 +117,7 @@ def test_conditions_use_fresh_contexts_and_initial_attempts_precede_repeats(tmp_
             run = new_run(tmp_path, monkeypatch, credentials, models={"attacker": model, "inspector": model})
             sink["run"] = run
             bind_runner(monkeypatch, sink)
-            run.record.simulation = Simulation(requested=1, selection=[], episodes=["ordinary"])
+            run.record.simulation = Simulation(requested=1, episodes=["ordinary"])
             result = await checks.attack(run, full=FULL, minimal=MINIMAL)
             assert result.maximum_attempts == 2
             assert levels(result) == ["full", "minimal", "none", "full", "minimal", "none"]
@@ -1721,7 +1729,7 @@ def test_native_planting_readback_teardown_and_fresh_instance(tmp_path, monkeypa
         async with serve(script) as base:
             model = ModelConfig(model="xai/grok-4.7", api_base=base, reasoning_effort="high")
             run = workflow.start_run(RunConfig(task_dir=task, output_dir=tmp_path / "run", models={"inspector": model}), frozenset({"inspector"}))
-            run.record.simulation = Simulation(requested=1, selection=[], episodes=["ordinary"])
+            run.record.simulation = Simulation(requested=1, episodes=["ordinary"])
             assessment = await checks.persistence_assessment(run, "/app/nudi-persistence.bin")
         assert assessment.persistence == "not_observed", assessment.persistence_reasons
         probe = run.record.persistence_probes[-1]

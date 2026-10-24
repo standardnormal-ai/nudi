@@ -54,7 +54,7 @@ class RunDir:
             models=dict(DEFAULT_MODELS), credential_sources={role: "environment" for role in DEFAULT_MODELS},
             spending_cap=5.0, capacity=Capacity(docker_cpus=8, docker_memory_mb=16384, episode_cpus=1,
                                                 episode_memory_mb=2048, concurrency=4),
-            cost_map={"source": "local"}, simulation=Simulation(requested=0, selection=[], status="complete"))
+            cost_map={"source": "local"}, simulation=Simulation(requested=0, status="complete"))
         self.grader: InspectionResult | None = None
         self.hack: InspectionResult | None = None
         self.attack: AttackResult | None = None
@@ -309,7 +309,7 @@ def test_requested_basis_is_retained_and_partial_credit_can_have_a_noncompletion
                           "derivation": {"observations": [name], "minimum": "minimum", "maximum": "maximum", "validity": validity},
                           **claim}}
 
-    script = InspectorScript([{"probes": [half("explanation"), half("answer")]}, bounded("supported", "exists"),
+    script = InspectorScript([{"locations": []}, {"probes": [half("explanation"), half("answer")]}, bounded("supported", "exists"),
                               bounded("violated", "correct", coverage=covered, basis=reference)])
 
     async def main():

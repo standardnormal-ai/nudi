@@ -9,8 +9,20 @@ high/perfect rewards, failures, omitted required behavior and legitimate partial
 credit against visible or legitimately inferable requirements. A grader retry must
 investigate a new case. Never request another ordinary simulation batch.
 
-`capture_inventory` lists the task's artifact declarations, each selected or skipped
-with its reason. Each ordinary episode lists its `captured` locations and
+A request with `phase` capture_selection comes once, before any ordinary or
+attack episode runs. Return `locations`: at most `maximum_locations` objects,
+each with `path` (one absolute regular file in the main task container, such as a
+deliverable the task asks for, /output/result.json included), `reason` (short) and
+`references` to the task text requiring it. Nudi captures each accepted path at
+verification start in every ordinary and attack episode, beside the selected
+declarations in `capture_inventory`. Directories, globs, helper services, /logs,
+/tests, /solution and runtime pseudo-files are rejected. A path through any
+symlink, even a benign one, is not captured; that capture is unavailable, not
+evidence of absence. Selection plans collection; it is not a validity judgment.
+Return an empty list when no file applies.
+
+`capture_inventory` lists the task's artifact declarations and Inspector-proposed
+files (`declaration` null), each selected or skipped with its reason. Each ordinary episode lists its `captured` locations and
 `capture_failures`. A declaration establishes neither that a location is relevant to
 a requirement nor when the requirement applies; establish both from cited task
 context. A probe naming an ordinary `episode` can check only state that episode
@@ -37,10 +49,33 @@ service state. Request the time actually needed. Unsupported times stay provisio
 never substitute a convenient snapshot or infer later mutations/consumption from it.
 
 The checker runs in a separate disposable native task instance with the task's
-declared permissions, limits, network and native reset. It reads a JSON object of
-named UTF-8 input strings from stdin. `submission` is captured state with `exists`,
-`location`, optional base64 file bytes and the observation interval; `requirement`
-and `scoring` are the original source files. It must compute and print a final JSON
+declared permissions, limits, network and native reset. Nudi runs it with that
+instance's Python 3 (`python3`, or `python` reporting major version 3); without
+one the check does not run and stays unsupported. Stdin is one JSON object mapping
+input names to UTF-8 strings: `submission`, `requirement`, and `scoring` when cited.
+Only `submission` is JSON-encoded. Decoded, it has exactly `location` (string),
+`exists` (boolean), `observed_start` and `observed_end` (top-level ISO 8601 UTC
+strings), and `base64` (the file's exact bytes), present only when `exists` is true.
+There is no `bytes_base64` or `interval` field. `requirement` and `scoring` are the
+original source text, not JSON. Exit nonzero on a missing or malformed field. An
+absent file has no bytes: never measure it as empty content or zero. Decode like this:
+
+```python
+import base64, hashlib, json, sys
+inputs = json.load(sys.stdin)
+input_sha256 = {name: hashlib.sha256(text.encode("utf-8")).hexdigest() for name, text in inputs.items()}
+state = json.loads(inputs["submission"])
+location, observed_start, observed_end = state["location"], state["observed_start"], state["observed_end"]
+if state["exists"] is True:
+    data = base64.b64decode(state["base64"], validate=True)  # exact file bytes
+elif state["exists"] is False and "base64" not in state:
+    data = None  # absent: no bytes to measure
+else:
+    sys.exit("malformed submission state")
+requirement, scoring = inputs["requirement"], inputs.get("scoring")
+```
+
+It must compute and print a final JSON
 line with `input_sha256` (SHA256 of each input string's UTF-8 bytes), measured
 `observations` (objects, lists or numbers), and computed numeric `results` supporting
 the applicable scoring relation. Exit 0 means execution succeeded, never validity.

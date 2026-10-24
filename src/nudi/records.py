@@ -178,6 +178,10 @@ class Submission(BaseModel):
     program: str
     exit_code: int | None = None
     output: str
+    path_resolution: dict = {}
+    """Daemon metadata of the path, checked in the paused container before the read."""
+    observation_windows: list[dict] = []
+    """The pause, read and resume times around that check and read."""
 
 
 class CaptureFailure(BaseModel):
@@ -187,13 +191,15 @@ class CaptureFailure(BaseModel):
 
 
 class ArtifactSelection(BaseModel):
-    """One task.toml artifact declaration and whether ordinary episodes capture it.
+    """One task.toml artifact declaration or Inspector-proposed file, and whether
+    ordinary episodes capture it.
 
-    A declaration establishes neither the location's relevance to a requirement nor
-    the time a requirement applies; the Inspector interprets both."""
+    Neither establishes the location's relevance to a requirement nor the time a
+    requirement applies; the Inspector interprets both. A proposal is collection
+    planning, never a validity judgment."""
 
-    declaration: int
-    """Index in the task's `artifacts` list."""
+    declaration: int | None
+    """Index in the task's `artifacts` list; None for an Inspector-proposed file."""
     source: str
     """The container path, which is the only one captured."""
     service: str | None = None
@@ -201,13 +207,29 @@ class ArtifactSelection(BaseModel):
     """A host path under the trial's artifacts directory; never captured."""
     selected: bool
     reason: str
+    """nudi's reason for selecting or skipping it."""
+    references: list[Observation] = []
+    """For a proposal: the task text it cites; verified verbatim when selected."""
+    inspector_reason: str | None = None
+    """For a proposal: the Inspector's own short reason."""
+
+
+class CaptureSelection(BaseModel):
+    """The files every ordinary and Attacker episode of a run captures, chosen once
+    from the original task before the first of them."""
+
+    files: list[ArtifactSelection]
+    status: Literal["not_requested", "complete", "failed", "refused", "malformed", "spending_exhausted",
+                    "cancelled", "unavailable"] = "not_requested"
+    """The one Inspector request that proposes files beyond the declarations."""
+    limits: list[str] = []
+    """Its failure reason, if any, and what the selection leaves uncaptured."""
 
 
 class Simulation(BaseModel):
     """The ordinary Simulator episodes of a run, every attempted one in start order."""
 
     requested: int
-    selection: list[ArtifactSelection]
     episodes: list[str] = []
     failures: dict[str, list[ErrorRecord]] = {}
     """Episodes whose runner raised or whose native result reported errors; their
@@ -349,6 +371,7 @@ class RunRecord(BaseModel):
     """Host observations collected at the explicitly requested native boundary."""
     capture_errors: list[CaptureFailure] = []
     replays: list[Replay] = []
+    capture_selection: CaptureSelection | None = None
     simulation: Simulation | None = None
     probe_episodes: list[str] = []
     """Planting and fresh-instance reads. They are not ordinary episodes and not attack successes."""

@@ -319,7 +319,7 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
     try:
         capture = None
         if capture_locations or on_verification is not None:
-            from nudi.checks import capture_submission
+            from nudi.checks import protected_capture
 
             async def capture(event):
                 if on_verification is not None:
@@ -334,7 +334,7 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
                         run.warn(f"{name}: verification observation failed: {type(error).__name__}: {message}")
                 for location in capture_locations or []:
                     try:
-                        submission = await capture_submission(event, name, config.output_dir, location)
+                        submission = await protected_capture(event, name, config.output_dir, location)
                         run.record.submissions.append(submission)
                     except Exception as error:
                         message = str(error)
@@ -343,6 +343,8 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
                         run.record.capture_errors.append(CaptureFailure(episode=name, location=location,
                             error=ErrorRecord(type=type(error).__name__, message=message)))
                         run.warn(f"{name}: capture of {location} failed: {type(error).__name__}: {error}")
+                        if isinstance(error, InfrastructureAbort):
+                            raise
                     finally:
                         run.save()
         with model_calls(run, role, name):
@@ -357,27 +359,19 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
         run.save()
 
 
-NO_CAPTURE = (
-    "no task artifact declaration names a supported main-service file, so ordinary episodes capture no state: "
-    "their grader labels stay unknown, and targeted probes cannot supply ordinary label or F1 evidence"
-)
-
-
 async def simulate(run: Run, episodes: int = 20) -> Simulation:
     """Run `episodes` ordinary Simulator episodes of the original task and harness.
 
     Every count takes this path. As many workers as the run's queue runs at once admit
     an episode only while the spending cap allows; admitted episodes finish. Failed
-    episodes stay recorded and are not retried. Selected artifact declarations are
-    captured at verification start for grader inspection, which reuses this pool."""
-    from nudi.checks import redacted, select_artifacts
+    episodes stay recorded and are not retried. The run's capture selection, made before
+    the first episode, is captured at verification start for grader inspection, which
+    reuses this pool."""
+    from nudi.checks import capture_selection, redacted
 
     if type(episodes) is not int or episodes < 1:
         raise ValueError("episodes must be a positive integer")
-    simulation = Simulation(requested=episodes, selection=select_artifacts(run.config.task_dir))
-    locations = [item.source for item in simulation.selection if item.selected]
-    if not locations:
-        run.warn(NO_CAPTURE)
+    simulation = Simulation(requested=episodes)
     run.record.simulation = simulation
     run.save()
 
@@ -404,6 +398,7 @@ async def simulate(run: Run, episodes: int = 20) -> Simulation:
                 run.save()
 
     try:
+        locations = [item.source for item in (await capture_selection(run)).files if item.selected]
         await asyncio.gather(*(worker() for _ in range(min(episodes, run.record.capacity.concurrency))))
         if simulation.status == "running":
             simulation.status = "partial" if simulation.failures else "complete"

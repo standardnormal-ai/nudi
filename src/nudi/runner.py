@@ -50,6 +50,25 @@ VERIFIED_FIELDS = {
     ("environment", "cpus"),
     ("environment", "memory_mb"),
 }
+# Harbor 0.24.0 parses these exactly as if they were omitted, on both paths.
+OMITTED = {
+    ("verifier", "env"): lambda value: value == {},
+    ("solution", "env"): lambda value: value == {},
+}
+# Native Harbor 0.24.0 treats all but storage_mb as omitted, and its Docker environment never
+# reads storage_mb. The adapter is unchecked for them and turns storage into a disk request.
+NATIVE_ONLY = {
+    ("environment", "gpus"): lambda value: type(value) is int and value == 0,
+    ("environment", "allow_internet"): lambda value: value is True,
+    ("environment", "build_timeout_sec"): lambda value: type(value) in (int, float) and value == 600,
+    ("environment", "env"): lambda value: value == {},
+    ("environment", "mcp_servers"): lambda value: value == [],
+    ("environment", "storage_mb"): lambda value: type(value) is int and value > 0,
+}
+STORAGE = (
+    "[environment].storage_mb = {} is recorded but not enforced; Harbor's Docker environment "
+    "sets no storage quota, so disk fit is not established"
+)
 VERSIONED = ("nudi", "verifiers", "harbor", "litellm")
 DOCKERFILE = "Dockerfile-only environment: the Verifiers adapter does not build Dockerfiles"
 # Demonstrated adapter differences, with what requesting the native behavior is called.
@@ -75,19 +94,26 @@ class UnsupportedTask(ValueError):
     """The task uses a feature nudi has not verified, so it is not started."""
 
 
-def unverified_fields(table: dict, prefix: tuple[str, ...] = ()) -> Iterator[tuple[str, ...]]:
+def unverified_fields(table: dict, prefix: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], object]]:
+    known = VERIFIED_FIELDS | OMITTED.keys() | NATIVE_ONLY.keys()
     for key, value in table.items():
         path = (*prefix, key)
         if path in VERIFIED_FIELDS:
             continue
-        if isinstance(value, dict) and any(f[: len(path)] == path for f in VERIFIED_FIELDS):
+        if isinstance(value, dict) and any(len(f) > len(path) and f[: len(path)] == path for f in known):
             yield from unverified_fields(value, path)
         else:
-            yield path
+            yield path, value
 
 
-def check_task(task_dir: Path) -> None:
-    """Reject escaping file references and unverified task features."""
+def label(path: tuple[str, ...]) -> str:
+    return f"[{'.'.join(path[:-1])}].{path[-1]}" if len(path) > 1 else f"[{path[0]}]"
+
+
+def check_task(task_dir: Path) -> dict[tuple[str, ...], object]:
+    """Reject escaping file references and unverified task features.
+
+    Returns the accepted declarations that only native Harbor may run."""
     root = task_dir.resolve()
     for path in sorted(task_dir.rglob("*")):
         if path.is_symlink() and not path.resolve().is_relative_to(root):
@@ -105,31 +131,39 @@ def check_task(task_dir: Path) -> None:
     environment = raw.get("environment", {})
     if isinstance(environment.get("memory"), str) and "memory_mb" not in environment:
         environment["memory_mb"] = environment.pop("memory")
-    for path in unverified_fields(raw):
-        field = f"[{'.'.join(path[:-1])}].{path[-1]}" if len(path) > 1 else f"[{path[0]}]"
-        raise UnsupportedTask(f"{field} is not verified")
+    native_only = {}
+    for path, value in unverified_fields(raw):
+        if path in NATIVE_ONLY and NATIVE_ONLY[path](value):
+            native_only[path] = value
+        elif not (path in OMITTED and OMITTED[path](value)):
+            raise UnsupportedTask(f"{label(path)} is not verified")
 
     config = Task(task_dir).config
     dockerfile = task_dir / "environment" / "Dockerfile"
     if not config.environment.docker_image and not dockerfile.is_file():
         raise UnsupportedTask("the task declares no docker_image or environment/Dockerfile")
+    return native_only
 
 
 def select_path(
     task_dir: Path, native: frozenset[NativeBehavior]
 ) -> tuple[ExecutionPath, list[str]]:
     """The execution path and the reasons for it, decided before anything starts."""
-    check_task(task_dir)
+    native_only = check_task(task_dir)
+    storage_mb = native_only.get(("environment", "storage_mb"))
+    storage = [STORAGE.format(storage_mb)] if storage_mb else []
     try:
         data = parse_task(task_dir, 0, HarborConfig(ignore_timeouts=False))
     except ValueError as error:
         if "needs a pullable docker_image" in str(error):
-            return "harbor", [DOCKERFILE]
+            return "harbor", [DOCKERFILE, *storage]
         raise UnsupportedTask(str(error)) from error
 
     applicable = set(DIFFERENCES) - ({"shared_grading"} if data.verifier is not None else set())
     if requested := sorted(applicable & native):
-        return "harbor", [f"{DIFFERENCES[b][0]}: {DIFFERENCES[b][1]}" for b in requested]
+        return "harbor", [f"{DIFFERENCES[b][0]}: {DIFFERENCES[b][1]}" for b in requested] + storage
+    if native_only:
+        raise UnsupportedTask(f"{label(next(iter(native_only)))} is not verified on the Verifiers adapter")
     accepted = sorted(applicable)
     return "verifiers", [f"accepted adapter difference: {DIFFERENCES[b][1]}" for b in accepted]
 

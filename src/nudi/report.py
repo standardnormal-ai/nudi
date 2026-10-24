@@ -14,7 +14,7 @@ from collections import Counter
 from pathlib import Path
 
 from nudi.assessment import Evidence, Ungrounded, classify_probe
-from nudi.checks import AttackResult, InspectionResult, evidenced
+from nudi.checks import SELECTION_SESSION, AttackResult, InspectionResult, evidenced
 from nudi.records import Assessment, EpisodeResult, MetricBasis, Observation, RunRecord
 
 ANALYSES = ("simulation", "grader", "hack", "attack")
@@ -65,6 +65,7 @@ def build(run_dir: Path, secrets=(), selected=None) -> dict:
         "status": "complete" if all(status == "complete" for status in analyses.values()) else "partial",
         "analyses": analyses,
         "configuration": configuration_section(record, results),
+        "collection": collection(record),
         "ordinary": ordinary(record, results, warnings, notes) if "simulation" in selected and present["simulation"] else None,
         "other_episodes": {
             "inspector": [name for name in record.episodes if name.endswith("-inspector") and name not in record.probe_episodes],
@@ -107,6 +108,20 @@ def scrub(value, secrets: list[str]):
     if isinstance(value, list):
         return [scrub(item, secrets) for item in value]
     return value
+
+
+def collection(record: RunRecord) -> dict | None:
+    """The run's one capture selection, its Inspector cost and every failed capture; None
+    for a run that never selected."""
+    selection = record.capture_selection
+    if selection is None:
+        return None
+    calls = [call for call in record.calls if call.episode == SELECTION_SESSION]
+    return {"status": selection.status, "files": [item.model_dump(mode="json") for item in selection.files],
+            "selected": [item.source for item in selection.files if item.selected], "limits": selection.limits,
+            "calls": len(calls), "known_cost": sum(call.cost or 0.0 for call in calls),
+            "unknown_cost_calls": sum(call.cost is None for call in calls),
+            "capture_failures": [failure.model_dump(mode="json") for failure in record.capture_errors]}
 
 
 def episode(run_dir: Path, name: str) -> EpisodeResult | None:
@@ -481,6 +496,18 @@ def markdown(report: dict) -> str:
     if not config["provenance"]:
         lines.append("- Task digest and version pins: unavailable, no retained episode record")
     lines += ["", "## Analyses", ""] + [f"- {name}: {status}" for name, status in report["analyses"].items()]
+
+    lines += ["", "## Evidence collection", ""]
+    selection = report["collection"]
+    if selection is None:
+        lines.append("No capture selection was recorded.")
+    else:
+        lines.append(f"Selection {selection['status']} in {selection['calls']} Inspector calls; known cost "
+                     f"${selection['known_cost']:.6f}; calls with unknown prices: {selection['unknown_cost_calls']}.")
+        lines.append(f"- Captured files: {', '.join(selection['selected']) or 'none'}")
+        lines += [f"- Limit: {limit}" for limit in selection["limits"]]
+        lines += [f"- {failure['episode']}: capture of {failure['location']} failed: {failure['error']['type']}: "
+                  f"{failure['error']['message']}" for failure in selection["capture_failures"]]
 
     lines += ["", "## Ordinary rewards", ""]
     pool = report["ordinary"]

@@ -20,6 +20,7 @@ os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
 import pytest
 from aiohttp import web
+from harbor.models.task.task import Task
 from verifiers.v1.cli.eval import runner as verifiers_runner
 
 from nudi.records import EpisodeResult, EpisodeConfig
@@ -533,3 +534,199 @@ def test_accepts_supported_legacy_aliases(tmp_path):
 @pytest.mark.parametrize("source", [CONTRACT_TASK, DOCKERFILE_TASK, SEPARATE_TASK, SLOW_GRADER_TASK])
 def test_supported_fixtures_are_accepted(source):
     assert select_path(source, frozenset())[0] in ("verifiers", "harbor")
+
+
+# Synthetic declarations in the shape of a published Harbor task.toml.
+RETAINED_DECLARATIONS = """\
+version = "1.0"
+
+[metadata]
+author_name = "Example Author"
+author_email = "author@example.com"
+difficulty = "medium"
+category = "system-administration"
+tags = [ "example", "git",]
+expert_time_estimate_min = 180.0
+junior_time_estimate_min = 360.0
+
+[verifier]
+timeout_sec = 180.0
+
+[agent]
+timeout_sec = 900.0
+
+[environment]
+build_timeout_sec = 600.0
+cpus = 1
+memory_mb = 2048
+storage_mb = 10240
+gpus = 0
+allow_internet = true
+
+[verifier.env]
+
+[solution.env]
+"""
+# The declarations of terminal-bench 2 image tasks such as fix-git, with their explicit
+# empty collections; descriptive metadata is left out.
+IMAGE_DECLARATIONS = """\
+schema_version = "1.1"
+artifacts = []
+
+[task]
+name = "terminal-bench/fix-git"
+[[task.authors]]
+name = "TheMikeMerrill"
+
+[verifier]
+timeout_sec = 900.0
+
+[agent]
+timeout_sec = 900.0
+
+[environment]
+build_timeout_sec = 600.0
+docker_image = "alexgshaw/fix-git:20251031"
+cpus = 1
+memory_mb = 2048
+storage_mb = 10240
+gpus = 0
+allow_internet = true
+mcp_servers = []
+
+[verifier.env]
+
+[environment.env]
+
+[solution.env]
+"""
+
+
+def task_with(tmp_path: Path, source: Path, toml: str) -> Path:
+    task = task_variant(tmp_path, source)
+    (task / "task.toml").write_text(toml)
+    return task
+
+
+def harbor_reads(task: Path) -> tuple:
+    """What native Harbor's Docker environment and trial read from these declarations."""
+    config = Task(task).config
+    environment = config.environment
+    return (environment.gpus or 0, environment.build_timeout_sec, environment.resolve_baseline(),
+            environment.env, environment.mcp_servers, config.verifier.env, config.solution.env)
+
+
+def test_retained_real_task_declarations_run_on_native_harbor(tmp_path):
+    task = task_with(tmp_path, DOCKERFILE_TASK, RETAINED_DECLARATIONS)
+
+    path, reasons = select_path(task, frozenset({"shared_grading", "host_harness", "atif"}))
+
+    assert path == "harbor"
+    assert reasons[0] == DOCKERFILE
+    assert len(reasons) == 2 and "storage_mb = 10240 is recorded but not enforced" in reasons[1]
+
+
+def test_image_task_declarations_run_on_native_harbor_only(tmp_path):
+    task = task_with(tmp_path, CONTRACT_TASK, IMAGE_DECLARATIONS)
+
+    path, reasons = select_path(task, frozenset({"shared_grading", "host_harness", "atif"}))
+
+    assert path == "harbor" and len(reasons) == 4
+    assert [reason.split(":")[0] for reason in reasons[:3]] == [
+        "ATIF trajectory requested", "host-side Terminus 2 requested", "native shared grading requested"
+    ]
+    assert "storage_mb = 10240 is recorded but not enforced" in reasons[3]
+    with pytest.raises(UnsupportedTask, match="is not verified on the Verifiers adapter"):
+        select_path(task, frozenset())
+
+
+@pytest.mark.parametrize(
+    ("source", "tables", "environment"),
+    [
+        (CONTRACT_TASK, "[verifier.env]\n", ""),
+        (CONTRACT_TASK, "[solution.env]\n", ""),
+        (DOCKERFILE_TASK, "[verifier.env]\n[solution.env]\n", ""),
+        (DOCKERFILE_TASK, "", "gpus = 0\n"),
+        (DOCKERFILE_TASK, "", "allow_internet = true\n"),
+        (DOCKERFILE_TASK, "", "build_timeout_sec = 600.0\n"),
+        (DOCKERFILE_TASK, "", "build_timeout_sec = 600\n"),
+        (DOCKERFILE_TASK, "[environment.env]\n", ""),
+        (DOCKERFILE_TASK, "", "mcp_servers = []\n"),
+    ],
+)
+def test_accepted_default_declarations_equal_omission(tmp_path, source, tables, environment):
+    image = 'docker_image = "python:3.12-slim"\n' if source == CONTRACT_TASK else ""
+    omitted = task_with(tmp_path / "omitted", source, f'schema_version = "1.4"\n[environment]\n{image}cpus = 1\n')
+    declared = task_with(
+        tmp_path / "declared", source, f'schema_version = "1.4"\n{tables}[environment]\n{image}cpus = 1\n{environment}'
+    )
+
+    assert select_path(declared, frozenset()) == select_path(omitted, frozenset())
+    assert harbor_reads(declared) == harbor_reads(omitted)
+
+
+def test_native_storage_declaration_is_kept_and_disclosed_as_unenforced(tmp_path):
+    task = task_with(tmp_path, DOCKERFILE_TASK, 'schema_version = "1.4"\n[environment]\nstorage_mb = 4096\n')
+
+    path, reasons = select_path(task, frozenset())
+
+    assert (path, reasons[:1], len(reasons)) == ("harbor", [DOCKERFILE], 2)
+    assert "storage_mb = 4096 is recorded but not enforced" in reasons[1] and "guarantee" not in reasons[1]
+    assert Task(task).config.environment.storage_mb == 4096
+
+
+@pytest.mark.parametrize(
+    ("tables", "environment", "reason"),
+    [
+        ('[verifier.env]\nTOKEN = "literal"\n', "", r"\[verifier\]\.env"),
+        ("[verifier.env.nested]\n", "", r"\[verifier\]\.env"),
+        ('[solution.env]\nTOKEN = "${HOST_TOKEN}"\n', "", r"\[solution\]\.env"),
+        ("[solution]\nother = 1\n", "", r"\[solution\]\.other"),
+        ("", "gpus = 1\n", r"\[environment\]\.gpus"),
+        ("", "gpus = false\n", r"\[environment\]\.gpus"),
+        ("", "gpus = 0.0\n", r"\[environment\]\.gpus"),
+        ("", 'gpus = "0"\n', r"\[environment\]\.gpus"),
+        ("", "allow_internet = false\n", r"\[environment\]\.allow_internet"),
+        ("", "allow_internet = 1\n", r"\[environment\]\.allow_internet"),
+        ("", 'allow_internet = "true"\n', r"\[environment\]\.allow_internet"),
+        ("", "build_timeout_sec = 900.0\n", r"\[environment\]\.build_timeout_sec"),
+        ("", 'build_timeout_sec = "600"\n', r"\[environment\]\.build_timeout_sec"),
+        ("", "storage_mb = 0\n", r"\[environment\]\.storage_mb"),
+        ("", "storage_mb = -1024\n", r"\[environment\]\.storage_mb"),
+        ("", "storage_mb = 1024.0\n", r"\[environment\]\.storage_mb"),
+        ("", 'storage_mb = "1024"\n', r"\[environment\]\.storage_mb"),
+        ("", "storage_mb = true\n", r"\[environment\]\.storage_mb"),
+        ("", 'storage = "10G"\n', r"\[environment\]\.storage"),
+        ('[environment.env]\nTOKEN = "literal"\n', "", r"\[environment\]\.env"),
+        ("[environment.env.nested]\n", "", r"\[environment\]\.env"),
+        ("", "env = []\n", r"\[environment\]\.env"),
+        ("", 'mcp_servers = [{ name = "tools", transport = "stdio", command = "true" }]\n', r"\[environment\]\.mcp_servers"),
+        ("", "mcp_servers = {}\n", r"\[environment\]\.mcp_servers"),
+        # Only the approved empty collections are accepted.
+        ("", "gpu_types = []\n", r"\[environment\]\.gpu_types"),
+        ("", "allowed_hosts = []\n", r"\[environment\]\.allowed_hosts"),
+        ("[environment.healthcheck]\n", "", r"\[environment\]\.healthcheck"),
+    ],
+)
+def test_native_path_still_rejects_unverified_values_and_types(tmp_path, tables, environment, reason):
+    task = task_with(tmp_path, DOCKERFILE_TASK, f'schema_version = "1.4"\n{tables}[environment]\n{environment}')
+
+    with pytest.raises(UnsupportedTask, match=f"{reason} is not verified"):
+        select_path(task, frozenset())
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    ["gpus = 0", "allow_internet = true", "build_timeout_sec = 600.0", "storage_mb = 1024", "env = {}", "mcp_servers = []"],
+)
+def test_adapter_rejects_declarations_verified_only_on_native_harbor(tmp_path, declaration):
+    task = task_with(
+        tmp_path, CONTRACT_TASK, f'schema_version = "1.4"\n[environment]\ndocker_image = "python:3.12-slim"\n{declaration}\n'
+    )
+    field = declaration.split(" = ")[0]
+
+    with pytest.raises(UnsupportedTask, match=rf"\[environment\]\.{field} is not verified on the Verifiers adapter"):
+        select_path(task, frozenset())
+    # A requested native behavior keeps its existing fallback reason.
+    path, reasons = select_path(task, frozenset({"host_harness"}))
+    assert path == "harbor" and reasons[0].startswith("host-side Terminus 2 requested")

@@ -50,7 +50,7 @@ class Analyses:
     async def simulate(self, run, episodes):
         self.calls.append(("simulate", episodes))
         self.raise_if("simulation")
-        run.record.simulation = Simulation(requested=episodes, selection=[], status="complete")
+        run.record.simulation = Simulation(requested=episodes, status="complete")
         run.save()
         return run.record.simulation
 
