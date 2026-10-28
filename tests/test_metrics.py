@@ -4,6 +4,8 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 from nudi import checks, report, workflow
 from nudi.checks import AttackResult, EpisodeLabel, InspectionResult
 from nudi.records import (
@@ -12,6 +14,7 @@ from nudi.records import (
     Capacity,
     Check,
     Claim,
+    Conclusion,
     Content,
     DecisionRule,
     EpisodeResult,
@@ -24,7 +27,7 @@ from nudi.records import (
     Simulation,
 )
 from nudi.runner import tree_digest
-from test_inspection import InspectorScript
+from test_inspection import InspectorScript, Sandboxes
 from test_limits import credentials, new_run  # noqa: F401  (pytest fixture)
 from test_runner import serve
 from test_simulation import HALF_CHECKERS, HALVES, REFERENCES, Native, probe, task_with_artifacts
@@ -160,7 +163,8 @@ def test_reward_summary_groups_configurations_and_never_turns_missing_or_invalid
     assert nothing["mean"] is None and nothing["sd"] is None and nothing["distribution"] == []
     assert any("no usable" in reason for reason in nothing["unavailable"])
 
-    assert result["other_episodes"] == {"inspector": ["0009-inspector"], "attacker": ["0010-attacker"], "probes": []}
+    # A retained run from before Inspector sandboxes still lists its native Inspector episode.
+    assert result["other_episodes"] == {"sandboxes": [], "inspector": ["0009-inspector"], "attacker": ["0010-attacker"], "probes": []}
     warnings = "\n".join(result["warnings"])
     assert "excluded, never zero" in warnings and unrecorded in warnings
     assert "sample SD" in warnings and "mean" in warnings
@@ -282,6 +286,45 @@ def test_native_decisions_use_exact_encodings_without_tolerance(tmp_path):
     assert [episodes[name]["decision"] for name in names] == ["fail", "pass", "fail", "pass"]
 
 
+def test_one_check_supports_one_requirement_while_violating_another(tmp_path):
+    """A supported A and a violated B from one check stay distinct conclusions."""
+    run = RunDir(tmp_path)
+
+    def mixed(completion, keys):
+        name = run.episode(rewards={"reward": 0.5})
+        assessment = checked(name, f"check-{name}", "sorted", "supported", basis=basis(completion, keys, [f"check-{name}"]))
+        assessment.conclusions = [Conclusion(requirement=requirement("summary"), validity="violated")]
+        run.label(name, "unknown", assessment)
+        return name
+
+    names = [mixed("violated", ["summary"]), mixed("supported", ["sorted", "summary"]), mixed("supported", ["sorted"])]
+    episodes = run.report()["metrics"]["episodes"]
+    assert [episodes[name]["completion"] for name in names] == ["incomplete", "unknown", "unknown"]
+    for name in names[1:]:
+        reasons = " ".join(episodes[name]["completion_reasons"])
+        assert REQUIREMENTS["summary"] in reasons and "violated" in reasons
+    assert "completion basis" in " ".join(episodes[names[2]]["completion_reasons"])
+
+
+def test_conflicting_requirement_conclusions_keep_completion_unknown(tmp_path):
+    run = RunDir(tmp_path)
+    contested = run.episode(rewards={"reward": 1.0})
+    run.label(contested, "unknown", checked(contested, "k0", "sorted", "supported"),
+              checked(contested, "k1", "sorted", "violated", basis=basis("violated", ["sorted"], ["k1"])))
+    claimed = run.episode(rewards={"reward": 1.0})
+    run.label(claimed, "unknown", checked(claimed, "k2", "sorted", "violated"),
+              checked(claimed, "k3", "sorted", "supported", basis=basis("supported", ["sorted"], ["k3"])))
+    # One uncontested violation still decides beside a contested one.
+    decided = run.episode(rewards={"reward": 1.0})
+    run.label(decided, "unknown", checked(decided, "k4", "sorted", "supported"), checked(decided, "k5", "sorted", "violated"),
+              checked(decided, "k6", "summary", "violated", basis=basis("violated", ["sorted", "summary"], ["k5", "k6"])))
+
+    episodes = run.report()["metrics"]["episodes"]
+    assert [episodes[name]["completion"] for name in (contested, claimed, decided)] == ["unknown", "unknown", "incomplete"]
+    for name in (contested, claimed):
+        assert any("conflicting" in reason for reason in episodes[name]["completion_reasons"])
+
+
 COMPLETE = "# Only a reward of 1.0 means the whole task is complete."
 
 
@@ -291,7 +334,8 @@ def test_requested_basis_is_retained_and_partial_credit_can_have_a_noncompletion
     task = task_with_artifacts(tmp_path, '["/app/explanation.txt", "/app/answer.txt"]')
     with (task / "tests" / "test.sh").open("a") as file:
         file.write(f"\n{HALVES}\n{COMPLETE}\n")
-    Native(monkeypatch, files={"0000-simulator": {"/app/explanation.txt": b"because\n"}}, rewards={"0000-simulator": 0.5})
+    native = Native(monkeypatch, files={"0000-simulator": {"/app/explanation.txt": b"because\n"}}, rewards={"0000-simulator": 0.5})
+    Sandboxes(monkeypatch, native=native)
     scoring = {"episode": None, "path": "tests/test.sh", "excerpt": HALVES}
     rule = {"source": {"episode": None, "path": "tests/test.sh", "excerpt": COMPLETE}, "pass_values": [1.0]}
     reference = {"completion": "violated", "requirements": [REFERENCES["answer"]], "checks": ["check-0001"],
@@ -354,3 +398,21 @@ def test_auroc_needs_grounded_ordering_both_classes_and_counts_ties_as_half(tmp_
     assert metrics["episodes"][unordered]["score"] is None
     assert any("no source-grounded score ordering" in reason for reason in metrics["episodes"][unordered]["ordering_reasons"])
     assert not metrics["confusion"]
+
+
+@pytest.mark.parametrize("invalid", ["package", "other_episode"])
+def test_ordinary_metrics_exclude_package_or_other_episode_evidence(tmp_path, invalid):
+    run = RunDir(tmp_path)
+    supported = referenced(run, "supported", {"reward": 1.0}, decision=RULE, ordering=ORDER)
+    violated = referenced(run, "violated", {"reward": 0.0}, decision=RULE, ordering=ORDER)
+    for assessment in run.grader.assessments:
+        if invalid == "package":
+            assessment.execution_scope = "package"
+        else:
+            assessment.check.content.episode = "another-episode"
+    metrics = run.report()["metrics"]
+    assert [(metrics["episodes"][name]["completion"], metrics["episodes"][name]["decision"],
+             metrics["episodes"][name]["score"]) for name in (supported, violated)] == [
+                 ("unknown", None, None), ("unknown", None, None)]
+    assert metrics["confusion"] == [] and metrics["auroc"] == []
+    assert report.reference(supported, run.grader.assessments)[0] == "unknown"

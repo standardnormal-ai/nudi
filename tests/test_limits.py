@@ -410,7 +410,7 @@ def test_lifecycle_orders_episodes_only_when_one_returned_before_the_next_starte
         await run_role_episode(run, "simulator")
         await run_role_episode(run, "attacker")
         await asyncio.gather(run_role_episode(run, "simulator"), run_role_episode(run, "attacker"))
-        running = asyncio.create_task(run_role_episode(run, "inspector"))
+        running = asyncio.create_task(run_role_episode(run, "simulator"))
         await asyncio.sleep(0.1)
         running.cancel()
         await asyncio.wait({running})
@@ -425,7 +425,20 @@ def test_lifecycle_orders_episodes_only_when_one_returned_before_the_next_starte
     assert events[4:6] == [("0002-simulator", "started"), ("0003-attacker", "started")]
     assert sorted(events[6:8]) == [("0002-simulator", "finished"), ("0003-attacker", "finished")]
     # A cancelled episode may still be stopping its container, so it never finishes.
-    assert events[8:] == [("0004-inspector", "started")]
+    assert events[8:] == [("0004-simulator", "started")]
+
+
+def test_inspector_never_runs_as_a_native_task_actor(tmp_path, monkeypatch, credentials):
+    """Inspector work runs in its own package sandboxes, never as a task actor under the actor timer."""
+    fake_trials(monkeypatch, lambda: types.SimpleNamespace(exception_info=None))
+    run = new_run(tmp_path, monkeypatch, credentials)
+
+    with pytest.raises(ValueError, match="sandbox"):
+        asyncio.run(run_role_episode(run, "inspector", instruction="Act inside the task."))
+
+    assert FakeTrial.created == 0
+    assert stored_run(run).episodes == [] and stored_run(run).events == []
+    assert not (run.config.output_dir / "episodes").exists()
 
 
 # Model calls: credentials are injected and costs counted for the run's calls only.
@@ -659,7 +672,7 @@ def test_cap_reached_during_an_episode_refuses_calls_without_inventing_a_reward(
     task = long_agent_budget(tmp_path, CONTRACT_TASK)
 
     run, result = docker_run(
-        docker_env, credentials, script, monkeypatch, "inspector", task=task, spending_cap=TINY_CAP
+        docker_env, credentials, script, monkeypatch, "attacker", task=task, spending_cap=TINY_CAP
     )
 
     assert len(script.requests) == 1

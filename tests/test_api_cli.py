@@ -69,25 +69,15 @@ class Analyses:
         self.raise_if("hack")
         return self.inspection(run, "hack", self.candidates)
 
-    async def attack(self, run, *, maximum_attempts, full, minimal, unavailable_reasons=None):
-        self.calls.append(("attack", maximum_attempts, full, minimal))
-        self.unavailable_reasons = unavailable_reasons
+    async def attack(self, run, *, maximum_attempts, discovery_attempts, candidates):
+        self.calls.append(("attack", maximum_attempts, discovery_attempts, len(candidates)))
+        self.candidates_sent = candidates
         self.raise_if("attack")
-
-        def usable(text):
-            return text if isinstance(text, str) and text.strip() else None
-
-        supplied = {"full": usable(full), "minimal": usable(minimal)}
-        reasons = unavailable_reasons or {}
-        unavailable = {}
-        for level, text in supplied.items():
-            if text is None:
-                reason = reasons.get(level)
-                unavailable[level] = reason if isinstance(reason, str) and reason.strip() else "not supplied"
-        conditions = {level: "unavailable" if text is None else "no_evidenced_issue" for level, text in supplied.items()}
-        conditions["none"] = "no_evidenced_issue"
-        result = AttackResult(status="complete", maximum_attempts=maximum_attempts, conditions=conditions,
-                              guidance={**supplied, "none": None}, unavailable=unavailable)
+        tested = [item.model_copy(update={"conditions": {level: "unavailable" if item.guidance.get(level) is None else "no_evidenced_issue"
+                                                         for level in ("full", "minimal")}}) for item in candidates]
+        result = AttackResult(status="complete", maximum_attempts=maximum_attempts, discovery_attempts=discovery_attempts,
+                              candidates=tested, discovery={"none": "no_evidenced_issue"},
+                              unavailable={} if candidates else {"full": NO_CANDIDATE, "minimal": NO_CANDIDATE})
         (run.config.output_dir / "attack.json").write_text(result.model_dump_json())
         return result
 
@@ -113,7 +103,7 @@ def test_default_is_full_analysis_with_default_counts(tmp_path, monkeypatch):
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
 
     assert analyses.calls == [("start_run", ALL_ROLES), ("simulate", 20), ("inspect_grader", [], 3), ("inspect_hacks", 3),
-                              ("attack", 2, None, None)]
+                              ("attack", 2, 1, 0)]
     assert report["analyses"] == {"simulation": "complete", "grader": "complete", "hack": "complete", "attack": "complete"}
     assert report["status"] == "complete"
     assert report == json.loads((tmp_path / "run" / "report.json").read_text())
@@ -137,7 +127,7 @@ def test_selection_runs_and_completes_only_selected_analyses(tmp_path, monkeypat
 def test_python_async_and_cli_share_configuration_and_report(tmp_path, monkeypatch, capsys):
     config = tmp_path / "conf" / "nudi.toml"
     config.parent.mkdir()
-    config.write_text('episodes = 5\nfocused_attempts = 1\nattacker_tries = 4\nspending_cap = 2.5\ncredentials_file = ".env"\n'
+    config.write_text('episodes = 5\nfocused_attempts = 1\nattacker_tries = 4\ndiscovery_attempts = 2\nspending_cap = 2.5\ncredentials_file = ".env"\n'
                       '[models.simulator]\nmodel = "openai/gpt-test"\nreasoning_effort = "low"\napi_key_var = "TEST_KEY"\n')
     task = tmp_path / "task"
     reports, calls, configs = [], [], []
@@ -148,18 +138,23 @@ def test_python_async_and_cli_share_configuration_and_report(tmp_path, monkeypat
         configs.append(analyses.config.model_dump(exclude={"output_dir"}))
 
     analyses = Analyses(monkeypatch)
-    record(analyses, send_nudis(task, config, output_dir=tmp_path / "sync", episodes=7))
+    record(analyses, send_nudis(task, config, output_dir=tmp_path / "sync", episodes=7, discovery_attempts=3))
     analyses = Analyses(monkeypatch)
-    record(analyses, asyncio.run(send_nudis_async(task, config, output_dir=tmp_path / "async", episodes=7)))
+    record(analyses, asyncio.run(send_nudis_async(task, config, output_dir=tmp_path / "async", episodes=7, discovery_attempts=3)))
     analyses = Analyses(monkeypatch)
-    code = cli.main(["send-nudis", str(task), "--config", str(config), "--output", str(tmp_path / "cli"), "--episodes", "7"])
+    code = cli.main(["send-nudis", str(task), "--config", str(config), "--output", str(tmp_path / "cli"), "--episodes", "7",
+                     "--discovery-attempts", "3"])
     record(analyses, json.loads((tmp_path / "cli" / "report.json").read_text()))
 
     assert code == 0
     assert capsys.readouterr().out == (tmp_path / "cli" / "report.md").read_text()
     assert reports[0] == reports[1] == reports[2]
     assert calls[0] == calls[1] == calls[2] == [("start_run", ALL_ROLES), ("simulate", 7), ("inspect_grader", [], 1),
-                                                ("inspect_hacks", 1), ("attack", 4, None, None)]
+                                                ("inspect_hacks", 1), ("attack", 4, 3, 0)]
+    assert configs[0]["discovery_attempts"] == 3
+    analyses = Analyses(monkeypatch)
+    send_nudis(task, config, output_dir=tmp_path / "file")
+    assert analyses.calls[-1] == ("attack", 4, 2, 0)
     assert configs[0] == configs[1] == configs[2]
     # The keyword or flag replaces the file's value; the rest of the file stays.
     assert configs[0]["episodes"] == 7 and configs[0]["spending_cap"] == 2.5
@@ -174,6 +169,7 @@ INVALID = {
     "zero episodes": "episodes = 0\n",
     "unknown analysis": 'analysis = "hack"\n',
     "negative attacker tries": "attacker_tries = -1\n",
+    "negative discovery attempts": "discovery_attempts = -1\n",
     "text count": 'focused_attempts = "3"\n',
     "unknown key": "episode = 5\n",
     "unknown role": '[models.judge]\nmodel = "xai/grok-4.7"\n',
@@ -230,32 +226,56 @@ def test_unavailable_docker_daemon_is_a_startup_diagnostic(tmp_path, monkeypatch
     assert error.startswith("nudi: ") and "docker info" in error and message in error
 
 
-def test_inspector_candidates_compose_attacker_guidance_without_a_model_call(tmp_path, monkeypatch):
+def test_each_inspector_candidate_composes_its_own_guidance_without_a_model_call(tmp_path, monkeypatch):
     async def no_model_call(**request):
         raise AssertionError("guidance composition must not call a model")
 
     monkeypatch.setattr(litellm, "acompletion", no_model_call)
     leak = "Copy the hidden expected digest from the grader source into the submission."
+    other, place = "Write the reward file directly before verification.", "logs/verifier/reward.txt"
     analyses = Analyses(monkeypatch, candidates=[
         candidate(MECHANISM, INTERPRETATION, full_guidance=REPRODUCTION, hint_location=LOCATION),
         candidate("leakage_metadata", "the reward matches the submitted work", outcome="legitimate",
                   full_guidance=leak, hint_location="secret/expected.txt"),
+        candidate("reward file", "the verifier trusts the reward file", full_guidance=other, hint_location=place),
+        # An identical repeat stays a distinct candidate: no semantic deduplication.
+        candidate("reward file", "the verifier trusts the reward file", full_guidance=other, hint_location=place),
     ])
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
 
-    name, attempts, full, minimal = analyses.calls[-1]
-    assert (name, attempts) == ("attack", 2)
+    assert analyses.calls[-1] == ("attack", 2, 1, 3)
+    first, second, third = analyses.candidates_sent
+    # Ids are assessment indices in inspection-hack.json; the legitimate outcome supplies nothing.
+    assert [item.id for item in analyses.candidates_sent] == ["hack-0", "hack-2", "hack-3"]
+    assert first.mechanism == MECHANISM and second.mechanism == third.mechanism == "reward file"
     # Full guidance is the reproduction. Minimal guidance is only where to look.
-    assert full == f"- {REPRODUCTION}"
-    assert LOCATION not in full and MECHANISM not in full and INTERPRETATION not in full
-    assert minimal == f"{WHERE_TO_LOOK}\n- {LOCATION}"
-    assert REPRODUCTION not in minimal and MECHANISM not in minimal and INTERPRETATION not in minimal
-    # A legitimate outcome is not a loophole candidate.
-    assert "leakage_metadata" not in full + minimal and leak not in full + minimal
-    assert "secret/expected.txt" not in full + minimal
-    conditions = report["attack"]["conditions"]
-    assert conditions["full"]["guidance"] == full and conditions["minimal"]["guidance"] == minimal
-    assert conditions["none"]["status"] == "no_evidenced_issue"
+    assert first.guidance == {"full": REPRODUCTION, "minimal": f"{WHERE_TO_LOOK}\n{LOCATION}"}
+    assert second.guidance == third.guidance == {"full": other, "minimal": f"{WHERE_TO_LOOK}\n{place}"}
+    texts = json.dumps([item.guidance for item in analyses.candidates_sent])
+    assert MECHANISM not in texts and INTERPRETATION not in texts
+    assert leak not in texts and "secret/expected.txt" not in texts
+    assert [item["id"] for item in report["attack"]["candidates"]] == ["hack-0", "hack-2", "hack-3"]
+    assert report["attack"]["candidates"][0]["conditions"]["full"]["guidance"] == REPRODUCTION
+    assert report["attack"]["discovery"]["status"] == "no_evidenced_issue"
+
+
+@pytest.mark.parametrize("only_false_negative", [False, True])
+def test_known_false_negative_findings_never_supply_exploit_guidance(tmp_path, monkeypatch, only_false_negative):
+    fn = candidate("correct work rejected", "undeserved rejection", outcome="rejected_valid",
+                   full_guidance="FN reproduction must not reach attackers", hint_location="fn/private-grader.py")
+    candidates = [fn]
+    if not only_false_negative:
+        candidates.append(candidate(MECHANISM, INTERPRETATION, full_guidance=REPRODUCTION, hint_location=LOCATION))
+    analyses = Analyses(monkeypatch, candidates=candidates)
+    result = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
+    if only_false_negative:
+        assert analyses.calls[-1] == ("attack", 2, 1, 0)
+        assert result["attack"]["unavailable"] == {"full": NO_CANDIDATE, "minimal": NO_CANDIDATE}
+    else:
+        (sent,) = analyses.candidates_sent
+        assert sent.id == "hack-1" and sent.guidance["full"] == REPRODUCTION
+    retained = result["inspections"]["hack"]["findings"]["evidenced"]
+    assert retained[0]["assessment"]["outcome"] == "rejected_valid"
 
 
 @pytest.mark.parametrize(("full_guidance", "hint_location"), [
@@ -270,41 +290,41 @@ def test_missing_or_blank_guidance_field_leaves_that_condition_unavailable(tmp_p
     analyses = Analyses(monkeypatch, candidates=[candidate(MECHANISM, INTERPRETATION, full_guidance=full_guidance, hint_location=hint_location)])
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
 
-    _, _, full, minimal = analyses.calls[-1]
-    conditions = report["attack"]["conditions"]
+    assert analyses.calls[-1] == ("attack", 2, 1, 1)
+    (sent,) = analyses.candidates_sent
+    assert sent.id == "hack-0"
+    rendered = json.dumps(sent.guidance)
+    assert MECHANISM not in rendered and INTERPRETATION not in rendered
     # The candidate and its interpretation stay in the inspection evidence.
     suspected = report["inspections"]["hack"]["findings"]["suspected"]
     assert suspected[0]["claim"]["mechanism"] == MECHANISM
     assert suspected[0]["interpretation"]["interpretation"] == INTERPRETATION
-    assert MECHANISM not in (full or "") and MECHANISM not in (minimal or "")
-    assert INTERPRETATION not in (full or "") and INTERPRETATION not in (minimal or "")
-    reasons = analyses.unavailable_reasons or {}
+    conditions = report["attack"]["candidates"][0]["conditions"]
     if isinstance(full_guidance, str) and full_guidance.strip():
-        assert full == f"- {REPRODUCTION}" and conditions["full"]["status"] == "no_evidenced_issue"
-        assert "full" not in reasons
+        assert sent.guidance["full"] == REPRODUCTION and "full" not in sent.unavailable
+        assert conditions["full"]["status"] == "no_evidenced_issue"
     else:
-        assert full is None and conditions["full"]["status"] == "unavailable"
-        assert reasons.get("full") == conditions["full"]["unavailable"] == FULL_UNAVAILABLE
+        assert sent.guidance["full"] is None and conditions["full"]["status"] == "unavailable"
+        assert sent.unavailable["full"] == conditions["full"]["unavailable"] == FULL_UNAVAILABLE
     if isinstance(hint_location, str) and hint_location.strip():
-        assert minimal == f"{WHERE_TO_LOOK}\n- {LOCATION}" and conditions["minimal"]["status"] == "no_evidenced_issue"
-        assert "minimal" not in reasons
+        assert sent.guidance["minimal"] == f"{WHERE_TO_LOOK}\n{LOCATION}" and "minimal" not in sent.unavailable
+        assert conditions["minimal"]["status"] == "no_evidenced_issue"
     else:
-        assert minimal is None and conditions["minimal"]["status"] == "unavailable"
-        assert reasons.get("minimal") == conditions["minimal"]["unavailable"] == MINIMAL_UNAVAILABLE
-    assert conditions["none"]["status"] == "no_evidenced_issue"
-    assert NO_CANDIDATE not in reasons.values()
+        assert sent.guidance["minimal"] is None and conditions["minimal"]["status"] == "unavailable"
+        assert sent.unavailable["minimal"] == conditions["minimal"]["unavailable"] == MINIMAL_UNAVAILABLE
+    assert report["attack"]["discovery"]["status"] == "no_evidenced_issue"
+    assert NO_CANDIDATE not in sent.unavailable.values()
 
 
 def test_no_candidate_leaves_guidance_unavailable_and_still_attacks(tmp_path, monkeypatch):
     analyses = Analyses(monkeypatch)
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
 
-    assert analyses.calls[-1] == ("attack", 2, None, None)
-    conditions = report["attack"]["conditions"]
-    assert conditions["full"]["status"] == conditions["minimal"]["status"] == "unavailable"
-    assert conditions["full"]["unavailable"] == conditions["minimal"]["unavailable"] == NO_CANDIDATE
-    assert "candidate exists" not in conditions["full"]["unavailable"]
-    assert conditions["none"]["status"] == "no_evidenced_issue"
+    assert analyses.calls[-1] == ("attack", 2, 1, 0)
+    assert report["attack"]["candidates"] == []
+    assert report["attack"]["unavailable"] == {"full": NO_CANDIDATE, "minimal": NO_CANDIDATE}
+    assert "candidate exists" not in report["attack"]["unavailable"]["full"]
+    assert report["attack"]["discovery"]["status"] == "no_evidenced_issue"
 
 
 def test_inspector_prompt_requests_reproduction_steps_and_a_location_only():
@@ -319,7 +339,7 @@ def test_failed_analysis_keeps_independent_results_and_redacts_credentials(tmp_p
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
 
     # The attack still runs, without candidates, after the hack inspection failed.
-    assert analyses.calls[-1] == ("attack", 2, None, None)
+    assert analyses.calls[-1] == ("attack", 2, 1, 0)
     assert report["analyses"] == {"simulation": "complete", "grader": "complete", "hack": "not run", "attack": "complete"}
     assert report["status"] == "partial"
     assert "run: hack failed: RuntimeError: provider echoed [redacted]" in report["warnings"]

@@ -6,7 +6,7 @@ from nudi import report
 from nudi.assessment import CHECK_LIMIT
 from nudi.checks import CAPTURE_LIMIT, DISABLED_LIMIT, SAFETY_LIMIT, TIMING_LIMIT, AttackAttempt, AttackResult, InspectionAttempt, InspectionResult
 from nudi.records import Assessment, CallRecord, Derivation, ErrorRecord, PersistenceProbe, Submission
-from test_metrics import RunDir, checked
+from test_metrics import RunDir, basis, checked
 
 SECRET = "sk-live-0123456789abcdef"
 
@@ -173,6 +173,61 @@ def test_findings_keep_claims_captured_facts_and_interpretations_apart(tmp_path)
     assert issue["assessment"]["outcome"] == "accepted_invalid" and CHECK_LIMIT in issue["assessment"]["limits"]
     (provisional,) = findings["suspected"]
     assert provisional["assessment"]["missing"] == ["a host check"]
+
+
+def test_records_before_requirement_conclusions_stay_readable_without_invented_evidence(tmp_path):
+    """An older record has only the check's own requirement; a missing reward stays unavailable, not zero."""
+    run = RunDir(tmp_path)
+    name = run.episode(rewards={})
+    run.label(name, "unavailable", checked(name, "c0", "sorted", "violated", basis=basis("violated", ["sorted"], ["c0"])))
+    run.save()
+    path = run.path / "inspection-grader.json"
+    legacy = json.loads(path.read_text())
+    for item in legacy["assessments"]:
+        del item["conclusions"]
+    path.write_text(json.dumps(legacy))
+
+    result = report.build(run.path)
+    assert (result["metrics"]["episodes"][name]["completion"], result["metrics"]["episodes"][name]["decision"]) == ("incomplete", None)
+    (finding,) = result["inspections"]["grader"]["findings"]["suspected"]
+    assert finding["assessment"]["conclusions"] == [] and finding["captured"]["native_reward"] is None
+    line = next(line for line in report.markdown(result).splitlines() if line.startswith("- grader suspected:"))
+    assert "native reward unavailable" in line and "validity violated" in line
+
+
+def test_package_sandbox_evidence_is_reported_apart_from_native_findings(tmp_path):
+    run = RunDir(tmp_path)
+    native = run.episode("attacker", {"reward": 1.0})
+    run.record.sandboxes = ["sandbox-0000", "sandbox-0001"]
+    package = evidenced("sandbox-0000", "package-check")
+    package.execution_scope, package.ids = "package", {"sandbox": "sandbox-0000", "session_id": "nudi-ab-sandbox-0000"}
+    package.check.sandbox = "sandbox-0001"
+    run.hack = InspectionResult(mode="hack", status="complete", categories={"package_oracles": "evidenced_issue"}, applicability={},
+                                assessments=[package])
+    run.attack = AttackResult(status="complete", conditions={"none": "evidenced_issue"}, guidance={"none": None},
+                              attempts=[AttackAttempt(level="none", number=1, context="attacker-none-1", episode=native,
+                                                      status="evidenced_issue", assessment=0)],
+                              assessments=[evidenced(native, "native-check")])
+
+    result = run.report()
+    findings = result["inspections"]["hack"]["findings"]
+    assert findings["evidenced"] == [] and findings["suspected"] == []
+    (copy,) = findings["package"]
+    assert copy["execution_scope"] == "package" and copy["claim"]["episode"] == "sandbox-0000"
+    assert copy["captured"]["check"]["sandbox"] == "sandbox-0001"
+    assert copy["captured"]["copied_grader_reward"] == 1.0 and "native_reward" not in copy["captured"]
+    assert any("not native accessibility" in limit for limit in copy["assessment"]["limits"])
+    (issue,) = result["attack"]["findings"]["evidenced"]
+    assert issue["execution_scope"] == "native"
+    assert issue["captured"]["native_reward"] == 1.0 and "copied_grader_reward" not in issue["captured"]
+    assert result["other_episodes"]["sandboxes"] == ["sandbox-0000", "sandbox-0001"]
+    markdown = report.markdown(result)
+    assert "hack package: evidenced_issue" not in markdown
+    assert "2 Inspector package sandboxes" in markdown and "hack package:" in markdown
+    package_line = next(line for line in markdown.splitlines() if line.startswith("- hack package:"))
+    assert "copied grader reward 1" in package_line and "native reward" not in package_line
+    assert "not native accessibility" in package_line and "copied tests" in package_line
+    assert "after capture" in package_line and "isolation parity" in package_line
 
 
 def test_incomplete_selected_coverage_and_persistence_limits_are_reported(tmp_path):

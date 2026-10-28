@@ -13,6 +13,9 @@ from pydantic import BaseModel, ConfigDict, Field
 NativeBehavior = Literal["shared_grading", "host_harness", "atif"]
 ExecutionPath = Literal["verifiers", "harbor"]
 Role = Literal["simulator", "inspector", "attacker"]
+ExecutionScope = Literal["native", "package"]
+"""`native`: the original task harness of a native episode. `package`: an Inspector
+sandbox running a copy of the task package; it never establishes native accessibility."""
 
 
 class InfrastructureAbort(Exception):
@@ -182,6 +185,7 @@ class Submission(BaseModel):
     """Daemon metadata of the path, checked in the paused container before the read."""
     observation_windows: list[dict] = []
     """The pause, read and resume times around that check and read."""
+    execution_scope: ExecutionScope = "native"
 
 
 class CaptureFailure(BaseModel):
@@ -219,7 +223,7 @@ class CaptureSelection(BaseModel):
     from the original task before the first of them."""
 
     files: list[ArtifactSelection]
-    status: Literal["not_requested", "complete", "failed", "refused", "malformed", "spending_exhausted",
+    status: Literal["not_requested", "complete", "failed", "refused", "model_inability", "malformed", "spending_exhausted",
                     "cancelled", "unavailable"] = "not_requested"
     """The one Inspector request that proposes files beyond the declarations."""
     limits: list[str] = []
@@ -242,7 +246,8 @@ class Simulation(BaseModel):
 class Check(BaseModel):
     """An isolated check, recorded host-side by nudi, never by a model.
 
-    `program` is the executed inline source, included verbatim in `command`. Named
+    `program` is the executed source, included verbatim in `command` or uploaded to the
+    `sandbox` that ran it with its inputs as files. Named
     `inputs` identify its immutable bytes; `environment` records the actual disposable
     execution context. Producers must isolate generated code, keep models out of the
     host records, and capture completion, stdout and status independently. Only exit 0
@@ -267,9 +272,27 @@ class Check(BaseModel):
     environment: str | None = None
     inputs: dict[str, Content] = {}
     submission: Submission | None = None
+    sandbox: str | None = None
+    """The Inspector sandbox that ran `program` on the uploaded inputs; `command` then names
+    the uploaded files instead of including the program."""
     timing: str | None = None
     """Inspector interpretation of why the requirement applies at the observed time;
     this is not an additional temporal observation or a stability guarantee."""
+
+
+Validity = Literal["supported", "violated", "unknown"]
+
+
+class Reading(BaseModel):
+    """Inspector interpretation of one further requirement from the same executed check.
+
+    `requirement` cites task text in one of the check's inputs; `observations` name the
+    measured facts it rests on. Its `validity` is that requirement's alone."""
+
+    requirement: Observation
+    observations: list[str]
+    validity: Validity
+    interpretation: str
 
 
 class Derivation(BaseModel):
@@ -278,14 +301,16 @@ class Derivation(BaseModel):
     Observation names refer to the check's measured `observations`; minimum/maximum
     name computed `results` fields, never Inspector-supplied numbers. The Inspector's
     explanation in `Claim.interpretation` connects the requirement and applicable
-    scoring source to these observations and computations. This record cannot prove
-    arbitrary checker semantics.
+    scoring source to these observations and computations. `validity` concerns the
+    check's own requirement and needs no bound; `requirements` reads others from the
+    same execution. This record cannot prove arbitrary checker semantics.
     """
 
     observations: list[str]
     minimum: str | None = None
     maximum: str | None = None
-    validity: Literal["supported", "violated", "unknown"]
+    validity: Validity
+    requirements: list[Reading] = []
 
 
 class Replay(BaseModel):
@@ -306,6 +331,38 @@ class EpisodeEvent(BaseModel):
 
     episode: str
     event: Literal["started", "finished"]
+
+
+class SandboxResult(BaseModel):
+    """Host record of one Inspector sandbox: a copy of the task package in Harbor's Docker
+    environment, with no native actor, Trial, agent or actor timer.
+
+    It establishes only what the copied package did. `ids` identify the sandbox; there are
+    no native trial IDs. Command output is bounded; `cleanup` records the project's
+    containers observed after removal."""
+
+    name: str
+    purpose: Literal["probe", "check"]
+    execution_scope: ExecutionScope = "package"
+    session_id: str
+    ids: dict[str, str]
+    task_dir: str
+    task_digest: str
+    """SHA256 over the original task files when the sandbox started."""
+    copy_digest: str
+    environment: dict
+    """The resources, network policy and image of the copied package's declaration."""
+    files: dict[str, str] = {}
+    """SHA256 of each uploaded file, or tree digest of each uploaded directory, by target path."""
+    commands: list[dict] = []
+    rewards: dict[str, float | None] = {}
+    """Of the copied grader, when it ran; absent is missing, never zero."""
+    grader: dict | None = None
+    errors: list[ErrorRecord] = []
+    cancelled: bool = False
+    verifier_timeout: bool = False
+    cleanup: dict = {}
+    artifacts: dict[str, str] = {"nudi_evidence": "nudi-evidence"}
 
 
 class PersistenceProbe(BaseModel):
@@ -376,6 +433,8 @@ class RunRecord(BaseModel):
     probe_episodes: list[str] = []
     """Planting and fresh-instance reads. They are not ordinary episodes and not attack successes."""
     persistence_probes: list[PersistenceProbe] = []
+    sandboxes: list[str] = []
+    """Inspector package sandboxes in start order, recorded under `sandboxes/`; not episodes."""
 
 
 class Coverage(BaseModel):
@@ -461,15 +520,24 @@ class Claim(BaseModel):
     """For an ordinary episode: the reference that grader metrics use; see `MetricBasis`."""
 
 
-Validity = Literal["supported", "violated", "unknown"]
 Discrepancy = Literal["over", "under", "none", "unknown"]
 Outcome = Literal["accepted_invalid", "rejected_valid", "legitimate", "unknown", "unavailable", "ungrounded"]
+
+
+class Conclusion(BaseModel):
+    """nudi's acceptance of one `Reading`: its validity when the requirement and named
+    facts check out, otherwise unknown with `reasons`."""
+
+    requirement: Observation
+    validity: Validity = "unknown"
+    reasons: list[str] = []
 
 
 class Assessment(BaseModel):
     """The deterministic assessment of one claim.
 
-    `validity` is the Inspector's interpretation of captured facts; `discrepancy` compares
+    `validity` is the Inspector's interpretation of captured facts about the check's own
+    requirement, kept without a native reward or bound; `discrepancy` compares
     native reward with the referenced computed bounds. `accepted_invalid` (violated,
     over) and `rejected_valid` (supported, under) are evidenced issues. `legitimate` means
     an exact supported reward matches, partial credit included. A broad containing
@@ -482,11 +550,15 @@ class Assessment(BaseModel):
     validity: Validity = "unknown"
     discrepancy: Discrepancy = "unknown"
     ids: dict[str, str] = {}
-    """Native identifiers of the graded episode."""
+    """Native identifiers of the graded episode, or the identity of a package sandbox."""
+    execution_scope: ExecutionScope = "native"
+    """Where the graded outcome came from. A package result is not native accessibility."""
     reward: float | None = None
     """The graded episode's native reward; None when missing."""
     errors: list[ErrorRecord] = []
     check: Check | None = None
+    conclusions: list[Conclusion] = []
+    """One per `claim.derivation.requirements` reading, in order; older records have none."""
     replay: Replay | None = None
     reasons: list[str] = []
     missing: list[str] = []

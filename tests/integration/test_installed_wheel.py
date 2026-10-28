@@ -159,7 +159,7 @@ class Endpoint:
             response = {"locations": []}
         elif "phase" in context:
             response = self.proposal(context)
-            response["applicability"] = {category: {"status": "applicable", "facts": {"terminal": True}, "reason": "The native terminal permits checking retained submission files."} for category in context["categories"]}
+            response["applicability"] = {category: {"scope": "package", "status": "applicable", "facts": {"package_copy": True}, "reason": "The Inspector can check the copied package and retained submissions."} for category in context["categories"]}
         elif "check" in context:
             response = self.interpretations.pop(0)
         else:

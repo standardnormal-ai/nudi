@@ -15,7 +15,7 @@ from typing import Literal
 from pydantic import ConfigDict, Field
 
 from nudi import report
-from nudi.checks import InspectionResult, attack, inspect_grader, inspect_hacks, redacted
+from nudi.checks import FULL_UNAVAILABLE, MINIMAL_UNAVAILABLE, Candidate, InspectionResult, attack, inspect_grader, inspect_hacks, redacted
 from nudi.records import RunConfig
 from nudi.workflow import simulate, start_run
 
@@ -36,7 +36,9 @@ class AnalysisConfig(RunConfig):
     focused_attempts: int = Field(3, ge=0, strict=True)
     """Total focused Inspector attempts for each category after broad inspection."""
     attacker_tries: int = Field(2, ge=0, strict=True)
-    """Maximum Attacker attempts for each hint level."""
+    """Maximum Attacker attempts for each candidate and hint level."""
+    discovery_attempts: int = Field(1, ge=0, strict=True)
+    """Total no-hint discovery attempts for the environment. The default is one, with no extra retry."""
 
 
 def configure(task_dir, config, options: dict) -> AnalysisConfig:
@@ -56,9 +58,6 @@ WHERE_TO_LOOK = (
     "Where to look: examine the named file, interface, or component. "
     "This hint excludes the solution and the reproduction recipe."
 )
-NO_CANDIDATE = "no candidate"
-FULL_UNAVAILABLE = "candidate exists but generated full guidance unavailable"
-MINIMAL_UNAVAILABLE = "candidate exists but generated minimal guidance unavailable"
 
 
 def _supplied(value: str | None) -> str | None:
@@ -68,31 +67,31 @@ def _supplied(value: str | None) -> str | None:
 
 
 def guidance(hack: InspectionResult | None) -> dict:
-    """Full and minimal Attacker guidance from the hack Inspector's candidates, composed
-    without a model call.
+    """One candidate per hack finding that can guide reproduction, composed without a model call.
 
-    Full guidance copies `full_guidance`. Minimal guidance is a fixed where-to-look
-    instruction plus `hint_location`. Mechanism and interpretation are never used.
-    A missing or blank field leaves that condition unavailable. No candidate is a
-    different reason from a candidate whose generated guidance is unavailable."""
-    claims = [item.claim for item in hack.assessments if item.outcome != "legitimate"] if hack else []
-    if not claims:
-        return {"full": None, "minimal": None, "unavailable_reasons": {"full": NO_CANDIDATE, "minimal": NO_CANDIDATE}}
-    reproductions, locations = [], []
-    for claim in claims:
-        text, location = _supplied(claim.full_guidance), _supplied(claim.hint_location)
-        if text:
-            reproductions.append(text)
-        if location and location not in locations:
-            locations.append(location)
-    full = "\n".join(f"- {text}" for text in reproductions) if reproductions else None
-    minimal = WHERE_TO_LOOK + "\n" + "\n".join(f"- {location}" for location in locations) if locations else None
-    reasons = {}
-    if full is None:
-        reasons["full"] = FULL_UNAVAILABLE
-    if minimal is None:
-        reasons["minimal"] = MINIMAL_UNAVAILABLE
-    return {"full": full, "minimal": minimal, "unavailable_reasons": reasons}
+    Legitimate outcomes and rejected valid findings supply nothing. Full guidance is that
+    candidate's `full_guidance`. Minimal guidance is the fixed where-to-look line plus
+    that candidate's `hint_location`. Mechanism and interpretation are never copied.
+    A missing or blank field is unavailable for that candidate only. Identical text stays
+    distinct here. Attack shares one native run only for records with the same mechanism
+    and the same full and minimal guidance. A shared hint string alone stays separate.
+    """
+    candidates = []
+    for index, item in enumerate(hack.assessments if hack else []):
+        if item.outcome in ("legitimate", "rejected_valid"):
+            continue
+        full, location = _supplied(item.claim.full_guidance), _supplied(item.claim.hint_location)
+        unavailable = {}
+        if full is None:
+            unavailable["full"] = FULL_UNAVAILABLE
+        if location is None:
+            unavailable["minimal"] = MINIMAL_UNAVAILABLE
+        candidates.append(Candidate(
+            id=f"hack-{index}", mechanism=item.claim.mechanism,
+            guidance={"full": full, "minimal": None if location is None else WHERE_TO_LOOK + "\n" + location},
+            unavailable=unavailable,
+        ))
+    return {"candidates": candidates}
 
 
 async def send_nudis_async(task_dir, config=None, **options) -> dict:
@@ -116,7 +115,8 @@ async def send_nudis_async(task_dir, config=None, **options) -> dict:
         "grader": lambda: inspect_grader(run, run.record.simulation.episodes if run.record.simulation else [],
                                          focused_attempts=settings.focused_attempts),
         "hack": lambda: inspect_hacks(run, focused_attempts=settings.focused_attempts),
-        "attack": lambda: attack(run, maximum_attempts=settings.attacker_tries, **guidance(results.get("hack"))),
+        "attack": lambda: attack(run, maximum_attempts=settings.attacker_tries,
+                                 discovery_attempts=settings.discovery_attempts, **guidance(results.get("hack"))),
     }
     try:
         for name in selected:

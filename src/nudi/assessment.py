@@ -17,8 +17,10 @@ from pathlib import Path
 from harbor.models.trajectories import Trajectory
 from pydantic import ValidationError
 
-from nudi.records import Assessment, Check, Claim, Content, EpisodeResult, Observation, PersistenceProbe, RunRecord
+from nudi.records import (Assessment, Check, Claim, Conclusion, Content, Derivation, EpisodeResult, Observation,
+                          PersistenceProbe, Reading, RunRecord, SandboxResult)
 from nudi.runner import tree_digest
+from nudi.sandbox import CHECK_INPUTS, CHECK_PROGRAM, OUTPUT_LIMIT
 
 CHECK_LIMIT = (
     "the captured program, inputs and measured facts support the Inspector's explicit "
@@ -54,19 +56,27 @@ class Evidence:
         self.graded = self.episode(graded)
         self.task_intact = tree_digest(Path(self.run.task_dir)) == self.graded.task_digest
 
-    def episode(self, name: str) -> EpisodeResult:
-        path = self.run_dir / "episodes" / name / "episode.json"
+    def owner(self, name: str) -> Path:
+        """The directory of an episode, or of an Inspector package sandbox."""
+        return self.run_dir / ("sandboxes" if name in self.run.sandboxes else "episodes") / name
+
+    def scope(self, name: str) -> str:
+        return "package" if name in self.run.sandboxes else "native"
+
+    def episode(self, name: str) -> EpisodeResult | SandboxResult:
         if name not in self.episodes:
-            if name not in self.run.episodes or not path.is_file():
-                raise Ungrounded(f"{name} is not a retained episode of the run")
-            self.episodes[name] = EpisodeResult.model_validate_json(path.read_text())
+            if name in self.run.sandboxes and (self.owner(name) / "sandbox.json").is_file():
+                self.episodes[name] = SandboxResult.model_validate_json((self.owner(name) / "sandbox.json").read_text())
+            elif name in self.run.episodes and (self.owner(name) / "episode.json").is_file():
+                self.episodes[name] = EpisodeResult.model_validate_json((self.owner(name) / "episode.json").read_text())
+            else:
+                raise Ungrounded(f"{name} is not a retained episode or sandbox of the run")
         return self.episodes[name]
 
     def roots(self, episode: str) -> dict[str, Path]:
         """The episode's artifacts that resolve inside its own directory."""
-        episodes = (self.run_dir / "episodes").resolve()
-        owner = (self.run_dir / "episodes" / episode).resolve()
-        if not owner.is_relative_to(episodes):
+        owner = self.owner(episode).resolve()
+        if not owner.is_relative_to(self.owner(episode).parent.resolve()):
             return {}
         resolved = {name: (owner / relative).resolve() for name, relative in self.episode(episode).artifacts.items()}
         return {name: root for name, root in resolved.items() if root.is_relative_to(owner)}
@@ -78,7 +88,7 @@ class Evidence:
             owner = Path(self.run.task_dir).resolve()
             roots = [owner]
         else:
-            owner = (self.run_dir / "episodes" / episode).resolve()
+            owner = self.owner(episode).resolve()
             roots = list(self.roots(episode).values())
         file = (owner / path).resolve()
         if not file.is_file() or not any(file.is_relative_to(root) for root in roots):
@@ -109,9 +119,33 @@ class Evidence:
             self.content(content)
         if check.submission is not None:
             self.content(check.submission.content)
+            if check.submission.execution_scope != self.scope(check.content.episode):
+                raise Ungrounded(f"check {check.id} names a {check.submission.execution_scope} capture of {check.content.episode}")
         self.excerpt(check.requirement)
         if check.scoring is not None:
             self.excerpt(check.scoring)
+        if check.sandbox is not None:
+            self.executed(check)
+
+    def executed(self, check: Check) -> None:
+        """The check sandbox ran exactly this program on exactly these retained inputs."""
+        record = self.episode(check.sandbox) if check.sandbox in self.run.sandboxes else None
+        inputs = json.dumps({name: self.file(content.episode, content.path).read_bytes().decode("utf-8")
+                             for name, content in check.inputs.items()})
+        if (not isinstance(record, SandboxResult) or record.purpose != "check" or check.program is None
+                or record.files.get(CHECK_PROGRAM) != hashlib.sha256(check.program.encode()).hexdigest()
+                or record.files.get(CHECK_INPUTS) != hashlib.sha256(inputs.encode()).hexdigest()):
+            raise Ungrounded(f"check {check.id} differs from the program and inputs sandbox {check.sandbox} executed")
+        if check.exit_code is None:
+            return
+        commands = [command for command in record.commands if command.get("argv") == check.command
+                    and command.get("stdin") == CHECK_INPUTS and check.command[-1:] == [CHECK_PROGRAM]]
+        receipt = commands[-1] if commands else {}
+        expected_code = 125 if receipt.get("truncated") else receipt.get("exit_code")
+        expected_output = f"check output exceeded {OUTPUT_LIMIT} bytes" if receipt.get("truncated") else receipt.get("output")
+        if (not receipt.get("finished_at") or receipt.get("error") or record.cancelled
+                or check.exit_code != expected_code or check.output != expected_output):
+            raise Ungrounded(f"check {check.id} differs from sandbox {check.sandbox}'s completed command receipt")
 
     def input_contains(self, check: Check, source: Observation) -> bool:
         file = self.file(source.episode, source.path)
@@ -163,27 +197,73 @@ def linked_submission(check: Check) -> bool:
     )
 
 
-def bounds(claim: Claim, result: dict) -> tuple[float | None, float | None] | None:
-    """Resolve Inspector references to captured computation results; accept no new scalar."""
-    derivation = claim.derivation
-    observations, results = result.get("observations"), result.get("results")
-    if derivation is None or not claim.interpretation.strip() or not isinstance(observations, dict) or not isinstance(results, dict):
-        return None
-    if not derivation.observations or any(name not in observations for name in derivation.observations):
-        return None
-    # A success flag or a copied explanation is not a measured scoring derivation.
-    if not any(isinstance(observations[name], (int, float, list, dict)) and not isinstance(observations[name], bool)
-               for name in derivation.observations):
-        return None
-    names = (derivation.minimum, derivation.maximum)
-    if all(name is None for name in names) or any(name is not None and name not in results for name in names):
-        return None
-    low, high = [results[name] if name is not None else None for name in names]
+def measured(names: list[str], observations: dict, results: dict) -> list[str]:
+    """Why `names` do not reference measured facts of the check output; empty when they do.
+
+    Names are matched exactly against the top-level `observations` and `results` keys,
+    never aliased, copied or guessed. A Boolean is as measured as a number; copied text
+    is not. Neither type turns an Inspector's asserted verdict into evidence."""
+    problems = []
+    if not names:
+        problems.append("derivation.observations names no field")
+    misplaced = [name for name in names if name not in observations and name in results]
+    absent = [name for name in names if name not in observations and name not in results]
+    if misplaced:
+        problems.append(f"derivation.observations names {misplaced}: keys of `results`, not `observations`")
+    if absent:
+        problems.append(f"derivation.observations names {absent}: absent from both `observations` and `results`")
+    values = [observations[name] for name in names if name in observations]
+    if values and not any(isinstance(value, (bool, int, float, list, dict)) for value in values):
+        problems.append("no named observation is a measured Boolean, number, list or object")
+    return problems
+
+
+def bounds(derivation: Derivation, observations: dict, results: dict) -> tuple[float | None, float | None]:
+    """Resolve Inspector references to captured computation results; accept no new scalar.
+
+    Raises ValueError naming every bound reference defect."""
+    problems = []
+    names = {"minimum": derivation.minimum, "maximum": derivation.maximum}
+    if all(name is None for name in names.values()):
+        problems.append("derivation names neither minimum nor maximum, so no `results` bound is referenced")
+    for field, name in names.items():
+        if name is not None and name not in results:
+            problems.append(f"derivation.{field} {name!r} is " + ("a key of `observations`, not `results`" if name in observations
+                                                                  else "absent from `results`"))
+    if problems:
+        raise ValueError("; ".join(problems))
+    low, high = [results[name] if name is not None else None for name in names.values()]
     if not all(value is None or (type(value) in (int, float) and -sys.float_info.max <= value <= sys.float_info.max) for value in (low, high)):
-        return None
+        raise ValueError("a referenced `results` bound is not a finite number")
     if low is not None and high is not None and low > high:
-        return None
+        raise ValueError("the referenced minimum exceeds the maximum")
     return low, high
+
+
+def conclude(reading: Reading, check: Check, evidence: Evidence, observations: dict, results: dict) -> Conclusion:
+    """One further requirement's validity, verified alone: its cited text is in a check input
+    and its named observations are measured. A defect leaves only this reading unknown."""
+    conclusion = Conclusion(requirement=reading.requirement)
+    try:
+        evidence.excerpt(reading.requirement)
+        if not evidence.input_contains(check, reading.requirement):
+            raise Ungrounded(f"{reading.requirement.path} is not among the check's inputs")
+    except Ungrounded as error:
+        conclusion.reasons.append(str(error))
+    if not reading.interpretation.strip():
+        conclusion.reasons.append("the reading lacks an interpretation")
+    conclusion.reasons += measured(reading.observations, observations, results)
+    if not conclusion.reasons:
+        conclusion.validity = reading.validity
+    return conclusion
+
+
+def conclusions(assessment: Assessment) -> list[tuple[Observation, str]]:
+    """Each requirement-specific validity of the assessment's check: its own requirement,
+    then every further reading. Older records hold only the first."""
+    if assessment.check is None:
+        return []
+    return [(assessment.check.requirement, assessment.validity)] + [(item.requirement, item.validity) for item in assessment.conclusions]
 
 
 def _same(left: Content | None, right: Content | None) -> bool:
@@ -258,6 +338,7 @@ def assess(claim: Claim, run_dir: Path) -> Assessment:
         evidence = Evidence(run_dir, claim.episode)
         graded = evidence.graded
         assessment.ids, assessment.errors = graded.ids, graded.errors
+        assessment.execution_scope = evidence.scope(claim.episode)
         assessment.reward = graded.rewards.get(claim.reward)
         if claim.check is not None:
             matches = [check for check in evidence.run.checks if check.id == claim.check]
@@ -304,12 +385,12 @@ def judge(assessment: Assessment, evidence: Evidence) -> None:
         assessment.reasons.append(reason)
         assessment.missing.append(missing)
 
+    # Without a native reward there is no graded outcome, but measured validity is still kept.
     if reward is None:
         causes = [error.type for error in graded.errors]
-        causes += [flag for flag in ("cancelled", "agent_timeout", "verifier_timeout") if getattr(graded, flag)]
+        causes += [flag for flag in ("cancelled", "agent_timeout", "verifier_timeout") if getattr(graded, flag, False)]
         assessment.outcome = "unavailable"
         assessment.reasons = [f"no native reward {claim.reward!r}; cause: {', '.join(causes) or 'unknown'}"]
-        return
     if check is None:
         return provisional("no check has tested the graded submission", "a host check of the graded submission against the requirement")
     assessment.limits.append(CHECK_LIMIT)
@@ -327,20 +408,37 @@ def judge(assessment: Assessment, evidence: Evidence) -> None:
         )
     if check.exit_code != 0:
         return provisional("the check did not complete successfully; printed output cannot establish validity", "a successful isolated check, with exit code 0")
-    if not check.program or check.program not in check.command or not check.environment or not check.inputs:
+    # A sandbox check's program and inputs are uploaded files whose hashes Evidence.check matched.
+    if not check.program or (check.program not in check.command and check.sandbox is None) or not check.environment or not check.inputs:
         return provisional("the check lacks its executed program, isolation context or immutable inputs", "the actual isolated program/command and hashed input mapping")
     if check.content not in check.inputs.values() or not evidence.input_contains(check, check.requirement):
         return provisional("the check did not record the submission and requirement as inputs", "the evaluated submission and requirement among the check's immutable inputs")
     result = captured_object(check.output)
     if result is None or result.get("input_sha256") != {name: content.sha256 for name, content in check.inputs.items()}:
         return provisional("the check's structured output is malformed or names other input bytes", "structured observations and computations from the recorded input bytes")
+    observations, results, derivation = result.get("observations"), result.get("results"), claim.derivation
+    if not isinstance(observations, dict) or not isinstance(results, dict):
+        return provisional("the check output lacks an `observations` or `results` object", "structured observations and computations from the recorded input bytes")
+    if derivation is None or not claim.interpretation.strip():
+        return provisional("the claim lacks an interpretation or derivation", "an Inspector derivation naming measured observations")
+    problems = measured(derivation.observations, observations, results)
+    if problems:
+        provisional(f"no measured observation supports the claimed validity: {'; '.join(problems)}",
+                    "derivation.observations naming measured facts of the check output")
+    else:
+        assessment.validity = derivation.validity
+    assessment.conclusions = [conclude(item, check, evidence, observations, results) for item in derivation.requirements]
+    if reward is None:
+        return
     if check.scoring is None or not evidence.input_contains(check, check.scoring):
         return provisional("the check lacks an applicable scoring input", "the cited scoring rule among the check's immutable inputs")
-    limits = bounds(claim, result)
-    if limits is None:
-        return provisional("no consistent measured scoring derivation supports the claimed bounds", "Inspector references connecting measured observations, the applicable rule and captured finite computation results")
-    assessment.validity = claim.derivation.validity
-    low, high = limits
+    try:
+        low, high = bounds(derivation, observations, results)
+    except ValueError as error:
+        return provisional(f"no consistent measured scoring derivation supports the claimed bounds: {error}",
+                           "Inspector references connecting the applicable rule to captured finite computation results")
+    if problems:
+        return
     if high is not None and reward > high and not math.isclose(reward, high):
         assessment.discrepancy = "over"
     elif low is not None and reward < low and not math.isclose(reward, low):

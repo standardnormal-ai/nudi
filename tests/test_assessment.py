@@ -17,12 +17,13 @@ import pytest
 from harbor.models.trajectories import Agent, ObservationResult, Step, Trajectory
 from harbor.models.trajectories import Observation as ToolObservation
 
-from nudi.assessment import assess
+from nudi.assessment import assess, conclusions
 from nudi.records import (
     Capacity,
     Check,
     Claim,
     Content,
+    Derivation,
     EpisodeEvent,
     EpisodeResult,
     ErrorRecord,
@@ -657,6 +658,104 @@ def test_supported_scoring_mismatch_survives_provisional_persistence(tmp_path):
     assert assessment.outcome == "accepted_invalid"
     assert assessment.model_dump().get("persistence") == "unknown"
     assert any("reset" in missing or "readback" in missing for missing in assessment.missing)
+
+
+@pytest.mark.parametrize("observations, minimum, maximum, validity, expected", [
+    (["reward"], "reward", "reward", "unknown", ["names ['reward']: keys of `results`, not `observations`"]),
+    (["not_returned"], "reward", "reward", "unknown", ["names ['not_returned']: absent from both `observations` and `results`"]),
+    (["submitted"], None, None, "supported", ["neither minimum nor maximum"]),
+    (["submitted"], "rate", "reward", "supported", ["minimum 'rate' is a key of `observations`, not `results`"]),
+    (["submitted", "reward"], None, None, "unknown", ["names ['reward']: keys of `results`", "neither minimum nor maximum"]),
+], ids=["result_as_observation", "absent_name", "omitted_bounds", "observation_as_bound", "result_and_omitted_bounds"])
+def test_reference_defects_stay_unknown_with_their_specific_cause(tmp_path, observations, minimum, maximum, validity, expected):
+    """A successful check stays usable evidence; a wrong section, absent name or omitted bound is named, never repaired.
+    A bound defect leaves the score comparison unknown, not the measured validity."""
+    run = Run(tmp_path)
+    episode = run.episode({"artifacts/out.txt": SORTED})
+    check = run.measured_check(run.content(episode))
+    assert assess(measured_claim(episode, check, validity="supported"), run.dir).outcome == "legitimate"
+    defective = measured_claim(episode, check, validity="supported", minimum=minimum, maximum=maximum)
+    defective.derivation.observations = observations
+
+    assessment = assess(defective, run.dir)
+
+    assert assessment.check.exit_code == 0
+    assert (assessment.outcome, assessment.validity, assessment.discrepancy) == ("unknown", validity, "unknown")
+    reasons = " ".join(assessment.reasons)
+    assert all(item in reasons for item in expected), reasons
+    assert defective.derivation.observations == observations and (defective.derivation.minimum, defective.derivation.maximum) == (minimum, maximum)
+
+
+FACT_PROGRAM = '''import hashlib, json, pathlib, sys
+raw = {name: pathlib.Path(name).read_bytes() for name in sys.argv[1:]}
+submitted = [int(n) for n in raw["submission.txt"].split()]
+print(json.dumps({"input_sha256": {name: hashlib.sha256(value).hexdigest() for name, value in raw.items()},
+                  "observations": {"ascending": submitted == sorted(submitted), "note": "looks complete"},
+                  "results": {}}))
+'''
+FOUR = Observation(episode=None, path="instruction.md", excerpt="Write the four input numbers to /app/out.txt")
+
+
+def test_measured_boolean_observation_resolves_validity_while_the_score_stays_unknown(tmp_path):
+    """A measured Boolean is a fact like a number. Copied text is not, whatever validity is asserted."""
+    run = Run(tmp_path)
+    episode = run.episode({"artifacts/out.txt": UNSORTED})
+    check = run.measured_check(run.content(episode), program=FACT_PROGRAM)
+
+    assessment = assess(claim(episode, check, derivation=dict(observations=["ascending"], validity="violated")), run.dir)
+
+    assert (assessment.outcome, assessment.validity, assessment.discrepancy) == ("unknown", "violated", "unknown")
+    assert any("neither minimum nor maximum" in reason for reason in assessment.reasons)
+    asserted = assess(claim(episode, check, derivation=dict(observations=["note"], validity="supported")), run.dir)
+    assert (asserted.outcome, asserted.validity) == ("unknown", "unknown")
+    assert any("measured" in reason for reason in asserted.reasons)
+
+
+@pytest.mark.parametrize("missing", ["reward", "scoring"])
+def test_missing_reward_or_scoring_keeps_independently_measured_validity(tmp_path, missing):
+    run = Run(tmp_path)
+    timeout = dict(rewards={}, verifier_timeout=True, errors=[ErrorRecord(type="VerifierTimeoutError", message="")])
+    episode = run.episode({"artifacts/out.txt": UNSORTED}, **(timeout if missing == "reward" else {}))
+    check = run.measured_check(run.content(episode))
+    if missing == "scoring":
+        run.record.checks[-1].scoring = None
+        run.save()
+
+    assessment = assess(measured_claim(episode, check), run.dir)
+
+    assert (assessment.validity, assessment.discrepancy) == ("violated", "unknown")
+    if missing == "reward":
+        assert (assessment.outcome, assessment.reward) == ("unavailable", None)
+        assert "VerifierTimeoutError" in assessment.reasons[0]
+    else:
+        assert assessment.outcome == "unknown" and any("scoring input" in reason for reason in assessment.reasons)
+
+
+def test_one_check_keeps_independent_requirement_conclusions(tmp_path):
+    """One execution supports one requirement and violates another; each reading is verified alone."""
+    run = Run(tmp_path)
+    episode = run.episode({"artifacts/out.txt": UNSORTED}, rewards={"reward": 0.5})
+    check = run.measured_check(run.content(episode))
+    invented = Observation(episode=None, path="instruction.md", excerpt="in any order")
+
+    def reading(requirement, observations, validity, interpretation="All four numbers are written."):
+        return dict(requirement=requirement.model_dump(), observations=observations, validity=validity, interpretation=interpretation)
+
+    the_claim = measured_claim(episode, check)
+    the_claim.derivation = Derivation.model_validate({**the_claim.derivation.model_dump(), "requirements": [
+        reading(FOUR, ["submitted"], "supported"), reading(invented, ["submitted"], "supported"),
+        reading(GRADER_ASSERTION, ["submitted"], "violated"), reading(FOUR, ["reward"], "violated"),
+        reading(FOUR, ["submitted"], "violated", interpretation=" "),
+    ]})
+
+    assessment = assess(the_claim, run.dir)
+
+    assert (assessment.outcome, assessment.validity) == ("legitimate", "violated")
+    assert conclusions(assessment) == [(REQUIREMENT, "violated"), (FOUR, "supported"), (invented, "unknown"),
+                                       (GRADER_ASSERTION, "unknown"), (FOUR, "unknown"), (FOUR, "unknown")]
+    reasons = [" ".join(item.reasons) for item in assessment.conclusions]
+    assert reasons[0] == "" and "does not contain" in reasons[1] and "not among the check's inputs" in reasons[2]
+    assert "keys of `results`" in reasons[3] and "interpretation" in reasons[4]
 
 
 def test_capture_that_prints_a_receipt_then_fails_does_not_link_the_submission(tmp_path):

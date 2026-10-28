@@ -40,6 +40,7 @@ from nudi.records import (
     Role,
     RunConfig,
     RunRecord,
+    SandboxResult,
     Simulation,
 )
 from nudi.runner import UnsupportedTask, check_output, episode_queue, run_episode, select_path
@@ -145,6 +146,14 @@ class Run:
         cap = self.record.spending_cap
         if cap is not None and self.record.known_cost >= cap:
             raise SpendingCapReached(f"known cost ${self.record.known_cost:.6f} reached the spending cap ${cap}")
+
+    def check_sandboxes_closed(self) -> None:
+        """Admit another container only after every Inspector sandbox was removed."""
+        for name in self.record.sandboxes:
+            path = self.config.output_dir / "sandboxes" / name / "sandbox.json"
+            result = SandboxResult.model_validate_json(path.read_text())
+            if result.cleanup.get("removed") is not True:
+                raise InfrastructureAbort(f"{name}: sandbox removal is unverified; another container cannot start")
 
 
 def resolve_credentials(config: RunConfig, models, roles) -> tuple[dict[Role, str], dict[Role, str]]:
@@ -298,8 +307,19 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
 
     Its lifecycle events record execution order. `finished` means the runner returned;
     Harbor may return after a failed environment stop. Neither return nor ordering
-    establishes successful teardown or a normal reset."""
+    establishes successful teardown or a normal reset.
+
+    The Inspector is never a native task actor; it executes only in sandboxes of a package copy."""
+    if role == "inspector":
+        raise ValueError("the Inspector never runs as a native task actor; use an Inspector sandbox")
+    if capture_locations:
+        from nudi.checks import capture_location_problem
+
+        for location in capture_locations:
+            if problem := capture_location_problem(location):
+                raise ValueError(f"capture of {location!r} rejected before native episode: {problem}")
     run.check_cap()
+    run.check_sandboxes_closed()
     model = run.record.models[role]
     name = f"{len(run.record.episodes):04d}-{role}"
     run.record.episodes.append(name)
