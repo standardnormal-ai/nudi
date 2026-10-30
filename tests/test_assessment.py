@@ -202,6 +202,55 @@ def measured_claim(episode, check, *, validity="violated", minimum="reward", max
     ), **fields)
 
 
+@pytest.mark.parametrize("basis", ["assumed", "unknown"])
+def test_measured_computation_does_not_settle_unsupported_requirement_meaning(tmp_path, basis):
+    """A correct computation cannot promote a stated assumption to a requirement."""
+    run = Run(tmp_path)
+    episode = run.episode({"artifacts/out.txt": UNSORTED})
+    content = run.content(episode)
+    check = run.measured_check(content)
+    support = {"basis": basis, "sources": [REQUIREMENT.model_dump()],
+               "rationale": "This requirement is only an assumption.", "uncertainty": []}
+    result = assess(measured_claim(episode, check, requirement_support=support), run.dir)
+    assert result.outcome == "unknown"
+    assert result.validity == "unknown"
+    assert any("requirement support" in reason for reason in result.reasons)
+
+
+def test_supported_inference_keeps_legitimate_partial_credit(tmp_path):
+    run = Run(tmp_path)
+    episode = run.episode({"artifacts/out.txt": UNSORTED}, rewards={"reward": 0.5})
+    check = run.measured_check(run.content(episode))
+    support = {"basis": "inferred", "sources": [REQUIREMENT.model_dump()],
+               "rationale": "The stated ordering requirement determines correct positions.", "uncertainty": []}
+    result = assess(measured_claim(episode, check, requirement_support=support), run.dir)
+    assert result.outcome == "legitimate"
+
+
+@pytest.mark.parametrize("basis", ["explicit", "inferred"])
+@pytest.mark.parametrize(("declaration", "citation"), [
+    ('artifacts = ["/app/explanation.txt"]\n', "task.toml"),
+    ('artifacts=["/app/explanation.txt"]\n', "task.toml"),
+    ('artifacts\t=\t["/app/explanation.txt"]\n', "task.toml"),
+    ('artifacts = ["/app/explanation.txt"]\n', "./task.toml"),
+    ('"artifacts" = ["/app/explanation.txt"]\n', "./task.toml"),
+    ('[[artifacts]]\nsource = "/app/explanation.txt"\n', "./task.toml"),
+])
+def test_artifact_declaration_alone_does_not_support_requirement_or_scoring(tmp_path, basis, declaration, citation):
+    run = Run(tmp_path)
+    (run.task / "task.toml").write_text(declaration)
+    episode = run.episode({"artifacts/out.txt": UNSORTED})
+    check = run.measured_check(run.content(episode))
+    metadata = {"episode": None, "path": citation, "excerpt": declaration.strip()}
+    support = {"basis": basis, "sources": [metadata], "rationale": "The artifact is listed.", "uncertainty": []}
+    requirement = assess(measured_claim(episode, check, requirement_support=support), run.dir)
+    scoring = assess(measured_claim(episode, check, scoring_support=support), run.dir)
+    assert requirement.outcome == scoring.outcome == "unknown"
+    assert requirement.validity == "unknown" and scoring.validity == "violated"
+    assert any("artifact metadata" in reason for reason in requirement.reasons)
+    assert any("artifact metadata" in reason for reason in scoring.reasons)
+
+
 # One counterexample: the evaluated content, the requirement and the scoring together.
 
 

@@ -18,6 +18,7 @@ import contextlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from typing import Literal
 from urllib.parse import urlparse
 
 from harbor.constants import MAIN_SERVICE_NAME
@@ -25,6 +26,7 @@ from harbor.models.task.artifacts import effective_artifact_service, normalize_a
 from harbor.models.trial.paths import EnvironmentPaths
 from harbor.models.task.task import Task
 from pydantic import BaseModel, ValidationError
+from langchain_core.tools import tool
 import litellm
 
 from nudi.assessment import Evidence, assess, classify_probe, conclusions
@@ -37,7 +39,6 @@ from nudi.records import (
     Check,
     Claim,
     Content,
-    Derivation,
     ErrorRecord,
     InfrastructureAbort,
     Observation,
@@ -242,6 +243,8 @@ NOT_SUPPLIED = "not supplied"
 class InspectionAttempt(BaseModel):
     phase: str
     category: str | None = None
+    episode: str | None = None
+    """The ordinary episode an `inspector_swarm` episode session verifies."""
     number: int
     status: str = "running"
     error: str | None = None
@@ -269,6 +272,9 @@ class OrdinaryReview(BaseModel):
 
 class EpisodeLabel(BaseModel):
     label: Outcome
+    basis: Literal["presumed", "verified"] | None = None
+    """`verified` from the episode's own evidence; `presumed` follows the grader's reward and is
+    never evidence. None for a label without either, such as unknown or unavailable."""
     reasons: list[str] = []
     assessments: list[int] = []
     """Indices into `InspectionResult.assessments` of this episode's assessments."""
@@ -276,6 +282,8 @@ class EpisodeLabel(BaseModel):
 
 class InspectionResult(BaseModel):
     mode: str
+    ordinary_inspection: str | None = None
+    """Grader mode: `holistic_inspection`, or `inspector_swarm` with one Inspector per ordinary episode."""
     status: str = "running"
     categories: dict[str, str]
     applicability: dict[str, str]
@@ -284,11 +292,28 @@ class InspectionResult(BaseModel):
     assessments: list[Assessment] = []
     sessions: dict[str, list[dict]] = {}
     ordinary: dict[str, EpisodeLabel] = {}
-    """Grader mode: a label for every ordinary episode, from its own assessments only.
-    Targeted probe episodes are outside the pool; their assessments never label it."""
+    """Grader mode: a label for every ordinary episode. A verified label comes from its own assessments only;
+    a named-normal episode without doubt gets a presumed label. Targeted probe episodes are outside the pool;
+    their assessments never label it."""
+    normal: list[str] = []
+    """`holistic_inspection`: ordinary episodes the Inspector skimmed and named normal."""
     reviews: list[OrdinaryReview] = []
     unreviewed: dict[str, str] = {}
     """Grader mode: why each ordinary episode without a review was not reviewed."""
+    experiments: list[dict] = []
+    artifacts: dict[str, dict[str, str]] = {}
+    """Run-relative retained transcripts, full tool outputs, state and workspace."""
+    limits: list[str] = []
+
+
+class InspectionSummary(BaseModel):
+    """Finish one investigative turn after using tools, without claiming a measured verdict."""
+
+    applicability: dict[str, dict] = {}
+    completed: list[str] = []
+    normal_episodes: list[str] = []
+    """holistic_inspection only: ordinary episodes you skimmed that look normal."""
+    refusal: str | None = None
 
 
 def select_artifacts(task_dir: Path) -> list[ArtifactSelection]:
@@ -335,14 +360,14 @@ class ProviderRefusal(InspectorRefusal):
     """An explicit provider refusal signal, separately from model-declared inability."""
 
 
-# The full Claim schema is not sent: its episode and check identities come from nudi.
+# The generated Claim schema, without the top-level identities nudi supplies.
+CLAIM_SCHEMA = Claim.model_json_schema()
+CLAIM_SCHEMA["properties"] = {key: value for key, value in CLAIM_SCHEMA["properties"].items() if key not in ("episode", "check")}
+CLAIM_SCHEMA["required"] = [key for key in CLAIM_SCHEMA["required"] if key not in ("episode", "check")]
 OUTPUT_SCHEMAS = (
-    "\nJSON Schemas for nested model output. `claim.derivation` is one object matching Derivation; "
-    "`validity` is required inside `derivation`, never on `claim`. Each probe's `requirement` and optional "
-    "`scoring` is one object matching Observation, never a list; omit `scoring` or use null when none applies. "
-    "So is each `derivation.requirements` item's `requirement`. A `reinterpretations` item's `claim` has the same form.\n"
-    f"Derivation: {json.dumps(Derivation.model_json_schema())}\n"
-    f"Observation: {json.dumps(Observation.model_json_schema())}\n"
+    "\nJSON Schema of `claim`, also of a `reinterpretations` item's `claim`. Nudi supplies its episode and check. "
+    "Each probe's `requirement` and optional `scoring` is one Observation object from `$defs`, never a list; omit `scoring` or use null when none applies.\n"
+    f"{json.dumps(CLAIM_SCHEMA)}\n"
 )
 
 
@@ -380,7 +405,7 @@ def interpreted_claim(run, response: dict, **identity) -> Claim:
 
 
 class InspectorSession:
-    """One Inspector context. Only focused retries share its history."""
+    """Scoped capture-selection or Attacker interpretation calls, without interactive tools."""
 
     def __init__(self, run, name: str):
         self.run, self.name = run, name
@@ -630,7 +655,7 @@ def trace_excerpt(run, path: Path) -> tuple[str, bool]:
     if len(head) <= TRACE_LIMIT:
         return head, False
     size = path.stat().st_size
-    marker = f"\n[nudi omitted the middle of this {size}-byte trace here; it is not supplied in this excerpt]\n"
+    marker = f"\n[nudi omitted the middle of this {size}-byte trace here; read the retained_trace file for the complete trace]\n"
     keep = TRACE_LIMIT - len(marker)
     tail_length = keep - keep // 2
     # A UTF-8 character has at most four bytes, so these bytes end with at least
@@ -657,6 +682,7 @@ def ordinary_context(run, pool: list[str]) -> list[dict]:
                          "agent_timeout": result.agent_timeout, "verifier_timeout": result.verifier_timeout,
                          "cancelled": result.cancelled, "trace": trace or None,
                          "trace_truncated": truncated, "artifacts": result.artifacts,
+                         "retained_trace": f"/nudi/evidence/episodes/{name}/{result.artifacts['trajectory']}" if "trajectory" in result.artifacts else None,
                          "captured": [{"location": state.location, "capture_point": state.capture_point}
                                       for state in run.record.submissions if state.content.episode == name],
                          "capture_failures": [failure.model_dump() for failure in run.record.capture_errors if failure.episode == name]})
@@ -705,8 +731,9 @@ def coverage_gaps(name: str, assessment: Assessment, own: list[Assessment]) -> l
 
 
 def label_ordinary(run, pool: list[str], report: InspectionResult) -> dict[str, EpisodeLabel]:
-    """A supported label only from one agreeing set of the episode's own assessments;
-    otherwise unknown with every reason, or unavailable without a native reward.
+    """A verified label only from one agreeing set of the episode's own assessments. Otherwise a
+    named-normal episode without doubt gets a presumed label that follows the grader, and any other
+    episode stays unknown with every reason, or unavailable without a native reward.
 
     An evidenced issue counts with no unresolved condition. Legitimacy needs a coverage
     record whose references check out; a local legitimate check is not enough, and the
@@ -730,8 +757,16 @@ def label_ordinary(run, pool: list[str], report: InspectionResult) -> dict[str, 
         covered = [own[index].claim.coverage.explanation for index, gaps in legitimate.items() if not gaps]
         supported = sorted({assessment.outcome for assessment in own if evidenced(assessment)}) + ["legitimate"] * bool(covered)
         if len(supported) == 1:
-            labels[name] = EpisodeLabel(label=supported[0], reasons=reasons + covered * (supported == ["legitimate"]),
+            labels[name] = EpisodeLabel(label=supported[0], basis="verified", reasons=reasons + covered * (supported == ["legitimate"]),
                                         assessments=indices)
+            continue
+        # Any own issue, inconclusive or unresolved assessment, or failed review, contradicts the presumption.
+        doubted = any(assessment.outcome != "legitimate" or assessment.claim.unresolved for assessment in own) or any(
+            review.episode == name and review.assessment is None for review in report.reviews)
+        if name in report.normal and not doubted:
+            labels[name] = EpisodeLabel(label="legitimate", basis="presumed", assessments=indices, reasons=[
+                f"presumed: the Inspector skimmed this episode and named it normal, so its label follows the grader's reward "
+                f"{graded.rewards['reward']}; this is not evidence of grader correctness"] + reasons)
             continue
         if len(supported) > 1:
             reasons.append(f"its assessments disagree: {', '.join(supported)}")
@@ -789,20 +824,8 @@ async def package_probe(run, setup_program: str, location: str, capture_point: s
     return name
 
 
-async def investigate(run, probe: dict, session: InspectorSession) -> Assessment:
-    """Execute a proposed investigation, then ask that same Inspector to interpret it.
-
-    A `setup_program` runs in a fresh probe sandbox of the package copy: the copied tests
-    are uploaded, the program runs, the location is captured, then Harbor uploads the
-    original host tests again before the copied grader runs.
-    Otherwise the probe names a retained episode. Nothing acts as a native task agent.
-    When the same session interprets the completed check, that claim's attribution is left
-    on the session, including when the claim omits it."""
-    if session is not None:
-        session.final_attribution_compared = False
-        session.final_attribution = None
-    if probe.get("category") == "persistence":
-        return await persistence_assessment(run, str(probe.get("location") or ""))
+async def measure_experiment(run, probe: dict) -> dict:
+    """Validate, capture and compute in fresh sandboxes, returning actual receipts only."""
     if probe.get("instruction"):
         raise ModelOutputFailure("instruction probes are not executed: the Inspector never acts in the task harness; use setup_program")
     try:
@@ -818,6 +841,18 @@ async def investigate(run, probe: dict, session: InspectorSession) -> Assessment
         if probe.get("setup_program") is not None or not probe.get("episode"):
             if not isinstance(probe.get("setup_program"), str) or not probe["setup_program"].strip():
                 raise ValueError("a targeted probe needs a setup_program for an Inspector sandbox, or a retained episode")
+        for reference in (requirement, scoring):
+            if reference is None:
+                continue
+            if reference.episode is None:
+                root = run.config.task_dir.resolve()
+                source = (root / reference.path).resolve()
+                if not source.is_relative_to(root) or not source.is_file():
+                    raise ValueError("reference must name a retained task file")
+                if not reference.excerpt or reference.excerpt not in source.read_text(errors="replace"):
+                    raise ValueError("reference excerpt is not in its source")
+            else:
+                Evidence(run.config.output_dir, reference.episode).excerpt(reference)
         capture_point, timing = probe["capture_point"], probe["timing"]
     except (KeyError, TypeError, ValueError) as error:
         raise ModelOutputFailure(redacted(run, f"Invalid probe: {error}")) from error
@@ -825,17 +860,46 @@ async def investigate(run, probe: dict, session: InspectorSession) -> Assessment
         name = await package_probe(run, probe["setup_program"], probe["location"], capture_point)
     else:
         name = probe["episode"]
-        Evidence(run.config.output_dir, name)
-    claim = Claim(mechanism=probe["category"], episode=name)
+    result = Evidence(run.config.output_dir, name).graded
+    receipt = {"episode": name, "execution_scope": "package" if isinstance(result, SandboxResult) else "native",
+               "rewards": result.rewards, "errors": [error.model_dump() for error in result.errors],
+               "source": result.model_dump(), "requested_time": capture_point, "timing_interpretation": timing,
+               "grading_sequence": ("Capture preceded the original host-test upload and copied grading. Captured replacement test bytes do not prove later execution."
+                                    if isinstance(result, SandboxResult) else "native episode verification")}
     failures = [failure for failure in run.record.capture_errors if failure.episode == name and failure.location == probe["location"]]
     if capture_point == "verification_start" and failures:
         raise RuntimeError("Capture failed: " + failures[-1].model_dump_json())
     submissions = [state for state in run.record.submissions if state.content.episode == name and state.location == probe["location"]]
     if capture_point != "verification_start" or not submissions:
-        assessment = assess(claim, run.config.output_dir)
-        assessment.missing.append(f"independent state at requested time {capture_point!r}; no substitute observation was used")
-        return assessment
+        receipt["missing"] = [f"independent state at requested time {capture_point!r}; no substitute observation was used"]
+        return receipt
     check = await check_submission(run, submissions[-1], requirement, scoring, probe["program"], capture_point=capture_point, timing=timing)
+    receipt["check"] = check.model_dump()
+    return receipt
+
+
+async def investigate(run, probe: dict, session: InspectorSession) -> Assessment:
+    """Execute a proposed investigation, then ask that same Inspector to interpret it.
+
+    A `setup_program` runs in a fresh probe sandbox of the package copy: the copied tests
+    are uploaded, the program runs, the location is captured, then Harbor uploads the
+    original host tests again before the copied grader runs.
+    Otherwise the probe names a retained episode. Nothing acts as a native task agent.
+    When the same session interprets the completed check, that claim's attribution is left
+    on the session, including when the claim omits it."""
+    if session is not None:
+        session.final_attribution_compared = False
+        session.final_attribution = None
+    if probe.get("category") == "persistence":
+        return await persistence_assessment(run, str(probe.get("location") or ""))
+    receipt = await measure_experiment(run, probe)
+    name = receipt["episode"]
+    claim = Claim(mechanism=probe["category"], episode=name)
+    if "check" not in receipt:
+        assessment = assess(claim, run.config.output_dir)
+        assessment.missing.extend(receipt.get("missing", []))
+        return assessment
+    check = Check.model_validate(receipt["check"])
     if check.exit_code != 0:
         claim.check = check.id
         return assess(claim, run.config.output_dir)
@@ -844,7 +908,7 @@ async def investigate(run, probe: dict, session: InspectorSession) -> Assessment
     response = await session.ask(json.dumps({"instruction": f"Interpret this actual completed check and {scope} reward. Return claim only; no new probes. "
                                                             "derivation.observations names exact top-level keys of the check output's `observations`; "
                                                             "minimum and maximum name exact top-level keys of its `results`.",
-                                             "requested_time": capture_point, "timing_interpretation": timing,
+                                             "requested_time": receipt["requested_time"], "timing_interpretation": receipt["timing_interpretation"],
                                              "grading_sequence": ("Capture preceded the original host-test upload and copied grading. Captured replacement test bytes do not prove later execution."
                                                                   if scope == "copied grader" else "native episode verification"),
                                              "check": check.model_dump(), "rewards": result.rewards}))
@@ -865,331 +929,402 @@ async def inspect_hacks(run, *, focused_attempts: int = 3, categories=None) -> I
     return await inspect(run, "hack", [], focused_attempts, list(categories or HACK_CATEGORIES))
 
 
-async def inspect_grader(run, ordinary_pool: list[str], *, focused_attempts: int = 3, categories=None) -> InspectionResult:
-    return await inspect(run, "grader", ordinary_pool, focused_attempts, list(categories or GRADER_CATEGORIES))
+async def inspect_grader(run, ordinary_pool: list[str], *, focused_attempts: int = 3, categories=None,
+                         isolated_inspections: bool = False) -> InspectionResult:
+    """Off, `holistic_inspection`: the Inspector skims every ordinary episode and names normal ones,
+    which get presumed labels. On, `inspector_swarm`: each ordinary episode then gets its own fork of broad."""
+    return await inspect(run, "grader", ordinary_pool, focused_attempts, list(categories or GRADER_CATEGORIES), isolated_inspections)
 
 
-async def inspect(run, mode: str, pool: list[str], focused_attempts: int, categories: list[str]) -> InspectionResult:
+async def inspect(run, mode: str, pool: list[str], focused_attempts: int, categories: list[str], isolated: bool = False) -> InspectionResult:
+    """One broad SDK investigation, then one focused fork of its final conversation per category, with fresh experiments.
+    `isolated` grader inspection then forks broad once per ordinary episode, one after another."""
+    from nudi.inspector import investigation
     from nudi.workflow import MissingCredential, SpendingCapReached
 
     if type(focused_attempts) is not int or focused_attempts < 0:
         raise ValueError("focused_attempts counts total attempts and must be a nonnegative integer")
+    if type(isolated) is not bool:
+        raise ValueError("isolated_inspections must be a boolean")
     allowed = HACK_CATEGORIES if mode == "hack" else GRADER_CATEGORIES
     if not categories or len(set(categories)) != len(categories) or any(category not in allowed for category in categories):
         raise ValueError("categories must be distinct approved inspection categories")
     if "inspector" not in run.keys:
         raise MissingCredential("Inspector credential was not resolved for this run")
+    holistic, swarm = mode == "grader" and not isolated, mode == "grader" and isolated
+    if swarm:
+        # The forks run serially; they are independent and could run in parallel.
+        run.warn(f"inspector_swarm runs one Inspector per ordinary episode, one after another: roughly 3 to 7 minutes per episode "
+                 f"on DeepSeek V4.1 Flash, so {len(pool)} episodes take about {3 * len(pool)} to {7 * len(pool)} minutes")
     context = task_context(run)
-    ordinary = ordinary_context(run, pool) if mode == "grader" else []
-    selection = run.record.capture_selection
-    inventory = [item.model_dump() for item in selection.files] if mode == "grader" and selection else []
-    applicability = {category: "Applicability has not been determined from actual tools/access." for category in categories}
-    restricted = set()
+    # Trace bodies stay on disk at retained_trace; the Inspector reads them with its tools.
+    ordinary = [{key: value for key, value in item.items() if key not in ("trace", "trace_truncated")}
+                for item in ordinary_context(run, pool)] if mode == "grader" else []
+    report = InspectionResult(mode=mode, ordinary_inspection="inspector_swarm" if swarm else "holistic_inspection" if holistic else None,
+                              categories={key: "pending" for key in categories},
+                              applicability={key: "Applicability remains undetermined." for key in categories},
+                              limits=["SDK shell capture retains at most 10 MiB. Bytes beyond that limit are unavailable; only captured bytes remain retrievable."])
+    destination = run.config.output_dir / f"inspection-{mode}.json"
+    incomplete, completed, restricted = set(), set(), set()
+    seen, receipts = {}, {}
+    current = None
+    requested = categories
     if "persistence" in categories:
         restricted.add("persistence")
-        applicability["persistence"] = (
-            "Protected readback after a normal reset is a separate observation, not a reward-hack search: "
-            "focused retries do not run it. A requested writable-layer regular file can be planted by an identified "
-            "Attacker probe in the original harness and read in a fresh instance; unsupported mounts stay excluded."
-        )
-    report = InspectionResult(mode=mode, categories={category: "restricted" if category in restricted else "pending" for category in categories}, applicability=applicability)
-    applicability = report.applicability
-    destination = run.config.output_dir / f"inspection-{mode}.json"
-    seen = set()
-    unavailable_measurements = {}
-    named = {}
-
-    def names_ordinary(probe):
-        return isinstance(probe, dict) and probe.get("episode") in pool and probe.get("setup_program") is None
+        report.categories["persistence"] = "restricted"
+        report.applicability["persistence"] = "Native persistence readback after a normal reset is a separate observation, not a reward-hack search; focused retries do not run it."
 
     def save():
-        destination.write_text(report.model_dump_json(indent=2))
+        destination.write_text(redacted(run, report.model_dump_json(indent=2)))
 
-    def apply_applicability(response, requested, phase):
-        decisions = response.get("applicability", {})
-        for target in requested:
-            if target == "persistence" or report.categories[target] == "evidenced_issue":
+    def indexed(item):
+        """One experiment's identities, status and result, without bodies."""
+        entry = {key: value for key, value in item.items() if key in ("id", "category", "case", "episode", "status", "assessment", "check", "error")}
+        if "assessment" in item:
+            assessment = report.assessments[item["assessment"]]
+            entry.update(outcome=assessment.outcome, unresolved=assessment.claim.unresolved)
+        return entry
+
+    def snapshot():
+        labels = label_ordinary(run, pool, report) if mode == "grader" else {}
+        return {"category_status": report.categories, "applicability": report.applicability,
+                "attempts": [item.model_dump(include={"phase", "category", "status"}) for item in report.attempts],
+                "unreviewed_ordinary_episodes": [name for name in pool if not any(item.episode == name for item in report.reviews)],
+                "unresolved_ordinary_reviews": {name: {"reasons": label.reasons,
+                    "checks": [check.model_dump(include={"id", "requirement", "scoring", "exit_code"})
+                               for check in run.record.checks if check.content.episode == name]}
+                    for name, label in labels.items() if label.label == "unknown" and any(item.episode == name for item in report.reviews)},
+                "experiments": [indexed(item) for item in report.experiments]}
+
+    def apply_applicability(response):
+        for target, decision in response.applicability.items():
+            if target not in requested or target == "persistence" or not isinstance(decision, dict):
                 continue
-            if not isinstance(decisions, dict) or target not in decisions:
-                if phase != "broad":
-                    continue
-                decision = {}
-            else:
-                decision = decisions[target]
-            decision = decision if isinstance(decision, dict) else {}
             scope, facts = decision.get("scope", "package"), decision.get("facts", {})
-            # Accept legacy native facts only as native-access evidence, never as a package restriction.
-            if "scope" not in decision and isinstance(facts, dict) and facts and all(key in context["native_tools"] for key in facts):
-                scope = "native"
             tools = context["inspector_tools"] if scope == "package" else context["native_tools"] if scope == "native" else {}
             grounded = isinstance(facts, dict) and bool(facts) and all(
                 key in tools and type(value) is type(tools[key]) and value == tools[key] for key, value in facts.items())
             status, reason = decision.get("status"), decision.get("reason")
-            supported = grounded and isinstance(reason, str) and bool(reason.strip()) and status in ("applicable", "restricted", "unknown")
-            if not supported:
-                status, reason = "unknown", "No supported applicability determination from actual Inspector tools/access."
+            if not grounded or not isinstance(reason, str) or not reason.strip() or status not in ("applicable", "restricted", "unknown"):
+                status, reason = "unknown", "No supported applicability determination from actual tools/access."
+            # Positive capabilities cannot justify restrictions, and native access cannot restrict package analysis.
+            if status == "restricted" and not any(value is False or value is None for value in facts.values()):
+                status, reason = "unknown", "The cited facts establish no actual capability limit."
             entry = {"scope": scope, "status": status, "facts": facts, "reason": reason}
-            previous = report.applicability_evidence.get(target, {})
             if scope == "native":
-                if not previous:
-                    previous = {"scope": "package", "status": "unknown", "facts": {},
-                                "reason": "Package applicability remains undetermined; native access does not settle it."}
-                previous["native_access"] = entry
-                report.applicability_evidence[target] = previous
-                applicability[target] = previous["reason"]
+                report.applicability_evidence.setdefault(target, {})["native_access"] = entry
                 continue
-            if "native_access" in previous:
-                entry["native_access"] = previous["native_access"]
+            entry.update({key: value for key, value in report.applicability_evidence.get(target, {}).items() if key == "native_access"})
             report.applicability_evidence[target] = entry
-            applicability[target] = reason
-            if status == "applicable":
-                restricted.discard(target)
-            elif supported:
-                # Only a supported determination restricts; unsupported output leaves remaining attempts to determine access.
-                report.categories[target] = status
+            report.applicability[target] = reason
+            if status == "restricted":
                 restricted.add(target)
+                report.categories[target] = "restricted"
 
-    def unresolved_reviews():
-        """Reviewed ordinary episodes whose label stays unknown, with its reasons and the retained checks."""
-        reviewed = list(dict.fromkeys(review.episode for review in report.reviews))
-        retained = {check.id: check for check in run.record.checks}
-        unresolved = {}
-        for name, label in label_ordinary(run, reviewed, report).items():
-            if label.label == "unknown":
-                ids = dict.fromkeys(id for review in report.reviews if review.episode == name for id in review.checks)
-                unresolved[name] = {"reasons": [reason for reason in label.reasons if not reason.startswith("grader inspection ended")],
-                                    "checks": [retained[id].model_dump(mode="json", include={"id", "requirement", "scoring", "inputs", "exit_code", "output", "program"})
-                                               for id in ids]}
-        return unresolved
+    def failure(error, target=None):
+        status, cause = failure_status(run, error)
+        current.status, current.error = status, cause
+        incomplete.update([target] if target in categories else requested)
+        save()
+        if not isinstance(error, Exception) or isinstance(error, (SpendingCapReached, InfrastructureAbort)):
+            raise error
+        return {"status": status, "error": cause, "coverage": "incomplete"}
 
-    def reinterpret(items, unresolved, session):
-        """Assess a corrected interpretation of a check listed in `unresolved`. Nothing runs
-        again and no model call is added: the items come with this attempt's planning response."""
-        if not isinstance(items, list):
-            return ["reinterpretations must be a list"]
-        listed = {item["id"] for review in unresolved.values() for item in review["checks"]}
-        retained = {check.id: check for check in run.record.checks if check.id in listed}
-        errors = []
-        for item in items:
-            if not isinstance(item, dict) or not isinstance(item.get("check"), str) or item["check"] not in retained:
-                unknown = item.get("check") if isinstance(item, dict) else item
-                errors.append(redacted(run, f"reinterpretations name no listed unresolved review check: {unknown}"))
-                continue
-            check = retained[item["check"]]
-            review = OrdinaryReview(episode=check.content.episode, attempt=len(report.attempts) - 1, reinterprets=check.id)
-            report.reviews.append(review)
-            try:
-                assessment = assess(interpreted_claim(run, item, episode=review.episode, check=check.id), run.config.output_dir)
-            except ModelOutputFailure as error:
-                review.status, review.error = failure_status(run, error)
-                errors.append(review.error)
-                session.messages.append({"role": "user", "content": json.dumps({
-                    "investigation_status": review.status, "episode": review.episode, "error": review.error})})
-                save()
-                continue
+    @tool
+    async def inspection_status() -> dict:
+        """Read category status, unreviewed ordinary episodes, unresolved checks and experiment identities."""
+        return snapshot()
+
+    def outside(episode):
+        """An episode session measures and interprets only its own episode."""
+        if current.episode and episode != current.episode:
+            return {"status": "skipped", "reason": f"This session verifies ordinary episode {current.episode} only; {episode} is outside it."}
+        return None
+
+    @tool
+    async def run_experiment(probe: dict) -> dict:
+        """Measure a new case in fresh sandboxes. Supply category, case, location, capture_point, timing,
+        requirement, optional scoring, Python program, and either setup_program or a retained ordinary episode.
+        Receipts contain raw setup/grader/check output, not a validity verdict. Use interpret_experiment afterwards.
+        Workspace files never become experiment inputs. Identical successful cases are not rerun.
+        """
+        if rejected := outside(probe.get("episode")):
+            return rejected
+        target = probe.get("category")
+        ordinary_review = probe.get("episode") in pool and probe.get("setup_program") is None
+        if target == "persistence" and mode == "hack" and target in requested and current.phase == "broad":
+            assessment = await persistence_assessment(run, str(probe.get("location") or ""))
             report.assessments.append(assessment)
-            review.status, review.assessment = "assessed", len(report.assessments) - 1
-            session.messages.append({"role": "user", "content": redacted(run, json.dumps({"investigation_result": assessment.model_dump()}, default=str))})
-            if item.get("category") in categories and evidenced(assessment):
-                report.categories[item["category"]] = "evidenced_issue"
             save()
-        return errors
-
-    async def attempt(session, phase, category, number):
-        record = InspectionAttempt(phase=phase, category=category, number=number)
-        report.attempts.append(record)
-        report.sessions[session.name] = session.messages
+            return {"persistence_result": assessment.model_dump()}
+        if not ordinary_review and (target not in categories or target not in requested or target in restricted or report.categories[target] == "evidenced_issue"):
+            incomplete.update([target] if target in categories else requested)
+            return {"status": "skipped", "coverage": "incomplete", "reason": "Outside this investigation's requested unfinished categories; ordinary reviews remain available."}
+        identity = json.dumps({key: probe.get(key) for key in ("episode", "setup_program", "requirement", "scoring", "location", "capture_point")}, sort_keys=True)
+        if identity in seen:
+            incomplete.add(target)
+            prior = next(item for item in report.experiments if item["id"] == seen[identity])
+            duplicate_status = "unobservable" if prior["status"] == "incomplete" else "duplicate_case"
+            if current.status == "no_evidenced_issue":
+                current.status = duplicate_status
+            return {"status": duplicate_status, "experiment": seen[identity],
+                    "unavailable_measurement": "This retained observation is incomplete." if duplicate_status == "unobservable" else None,
+                    "instruction": "Read the retained receipt. A new name is not a new case; correct its interpretation or investigate a different case."}
+        item = {"id": f"experiment-{len(report.experiments):04d}", "category": target, "case": probe.get("case"), "status": "running"}
+        report.experiments.append(item)
+        seen[identity] = item["id"]
+        review = OrdinaryReview(episode=probe["episode"], attempt=len(report.attempts) - 1) if ordinary_review else None
+        if review is not None:
+            report.reviews.append(review)
+        before, sandboxes_before = len(run.record.checks), len(run.record.sandboxes)
         save()
         try:
-            requested = [category] if category else categories
-            pending = [name for name in pool if all(review.episode != name for review in report.reviews)]
-            instruction = "Investigate a new case." if mode == "grader" and number > 1 else "Inspect the supplied evidence and propose bounded probes."
-            if pending:
-                instruction += " Review each unreviewed ordinary episode with at least one probe naming it."
-            payload = {"mode": mode, "phase": phase, "categories": requested, "applicability": {key: applicability[key] for key in requested},
-                       "task": context, "ordinary_episodes_read_first": ordinary, "unreviewed_ordinary_episodes": pending,
-                       "capture_inventory": inventory, "instruction": instruction}
-            if mode == "grader":
-                payload["unresolved_ordinary_reviews"] = unresolved = unresolved_reviews()
-                if unresolved:
-                    payload["instruction"] += (" Reviewed episodes listed as unresolved keep an unknown label. You may correct an interpretation of a "
-                                               "listed retained check under `reinterpretations`; it is not run again. Other evidence needs a new case.")
-            if mode == "hack":
-                # The same static list the no-hint Attacker receives. Applicability does not filter it.
-                payload["checklist"] = HACK_CHECKLIST
-            response = await session.ask(redacted(run, json.dumps(payload, default=str)))
-            apply_applicability(response, requested, phase)
-            if response.get("refusal"):
-                record.status, record.error = "model_inability", redacted(run, str(response["refusal"]))
-                for target in requested:
-                    if report.categories[target] == "pending":
-                        report.categories[target] = "unknown"
-                return
-            probes = response.get("probes", [])
-            if not isinstance(probes, list):
-                raise ModelOutputFailure("probes must be a list")
-            record.status = "unobservable" if category in restricted else "no_evidenced_issue"
-            repair_errors = []
-            if mode == "grader":
-                repair_errors = reinterpret(response.get("reinterpretations", []), payload["unresolved_ordinary_reviews"], session)
-            named.update({probe["episode"]: len(report.attempts) - 1 for probe in probes if names_ordinary(probe)})
-            # A nonfatal targeted failure ends targeted work in this response; ordinary reviews continue.
-            failure = None
-            for probe in probes:
-                if not isinstance(probe, dict):
-                    raise ModelOutputFailure("each probe must be an object")
-                target = probe.get("category")
-                if target == "persistence" and probe.get("location"):
-                    assessment = await investigate(run, probe, session)
-                    report.assessments.append(assessment)
-                    session.messages.append({"role": "user", "content": redacted(run, json.dumps({"investigation_result": assessment.model_dump()}, default=str))})
-                    save()
-                    continue
-                # Category stops and restrictions govern targeted work; ordinary reviews stay obligations.
-                # Only an evidenced ordinary result changes a category it was not targeting.
-                ordinary_review = names_ordinary(probe)
-                targeted = (failure is None and target in requested and target not in restricted and report.categories[target] != "evidenced_issue"
-                            and report.applicability_evidence.get(target, {}).get("status") == "applicable")
-                if not (targeted or ordinary_review):
-                    continue
-                measurement = json.dumps({key: probe.get(key) for key in (
-                    "episode", "setup_program", "requirement", "scoring", "location", "capture_point")}, sort_keys=True)
-                if measurement in unavailable_measurements:
-                    if targeted:
-                        record.status, record.error = "unobservable", unavailable_measurements[measurement]
-                        report.categories[target] = "unknown"
-                    session.messages.append({"role": "user", "content": json.dumps({
-                        "unavailable_measurement": unavailable_measurements[measurement],
-                        "instruction": "This unchanged observation is unavailable. Investigate a different observable case or update applicability."})})
-                    continue
-                # A renamed label cannot turn an identical episode/probe into a new case.
-                identity = json.dumps({key: probe.get(key) for key in ("episode", "setup_program", "requirement", "location", "capture_point")}, sort_keys=True)
-                if mode == "grader" and identity in seen:
-                    record.status = "duplicate_case"
-                    continue
-                seen.add(identity)
-                review = None
-                if ordinary_review:
-                    review = OrdinaryReview(episode=probe["episode"], attempt=len(report.attempts) - 1)
-                    report.reviews.append(review)
-                    save()
-                before = len(run.record.checks)
-                try:
-                    assessment = await investigate(run, probe, session)
-                except BaseException as error:
-                    seen.discard(identity)
-                    status = failure_status(run, error)
-                    if review is not None:
-                        review.status, review.error = status
-                    if not isinstance(error, Exception) or isinstance(error, (SpendingCapReached, InfrastructureAbort)):
-                        raise
-                    if review is None:
-                        failure = status
-                        continue
-                    # One episode's failed review does not discard the remaining ordinary probes.
-                    session.messages.append({"role": "user", "content": json.dumps({
-                        "investigation_status": review.status, "episode": review.episode, "error": review.error})})
-                    continue
-                finally:
-                    if review is not None:
-                        review.checks = {check.id: check.exit_code for check in run.record.checks[before:]}
-                        save()
+            receipt = await measure_experiment(run, probe)
+            item.update(episode=receipt["episode"], status="measured", check=receipt.get("check", {}).get("id"))
+            receipt.update(id=item["id"], status="measured")
+            receipts[item["id"]] = (receipt, item, review)
+            setup = [command for command in receipt.get("source", {}).get("commands", []) if command.get("argv") == ["sh", SETUP]]
+            if any(command.get("truncated") or command.get("exit_code") != 0 for command in setup):
+                incomplete.add(target)
+                truncated = any(command.get("truncated") for command in setup)
+                current.status = "unobservable" if truncated else "tool_failure"
+                limit = f"{item['id']}: setup output was truncated; uncaptured bytes are unavailable." if truncated else f"{item['id']}: setup failed; raw feedback is retained and coverage is incomplete."
+                receipt.setdefault("limits", []).append(limit)
+                report.limits.append(limit)
+            if "check" not in receipt or receipt["check"]["exit_code"] != 0 or not receipt["rewards"]:
+                item["status"] = receipt["status"] = "incomplete"
+                incomplete.add(target)
+                current.status = "unobservable" if "check" not in receipt or receipt["check"]["exit_code"] is None else "tool_failure"
+                claim = Claim(mechanism=target, episode=receipt["episode"], check=receipt.get("check", {}).get("id"))
+                assessment = assess(claim, run.config.output_dir)
+                assessment.missing.extend(receipt.get("missing", []))
                 report.assessments.append(assessment)
                 if review is not None:
                     review.status, review.assessment = "assessed", len(report.assessments) - 1
-                feedback = {"investigation_result": assessment.model_dump()}
-                if assessment.check is not None and assessment.check.exit_code != 0:
-                    feedback["check_input_contract"] = CHECK_INPUT_CONTRACT
-                unobservable = [error.message for error in assessment.errors if error.type == "UnsupportedRuntime"]
-                if assessment.check is not None and assessment.check.exit_code is None and assessment.check.output.startswith(UNSUPPORTED_RUNTIME):
-                    unobservable.append(UNSUPPORTED_RUNTIME)
-                if assessment.check is None:
-                    unobservable += [missing for missing in assessment.missing if missing.startswith("independent state at requested time")]
-                if unobservable:
-                    reason = "; ".join(unobservable)
-                    unavailable_measurements[measurement] = reason
-                    feedback["unavailable_measurement"] = reason
-                    feedback["instruction"] = "Do not repeat this unavailable observation; investigate a different observable case or update applicability."
-                session.messages.append({"role": "user", "content": redacted(run, json.dumps(feedback))})
-                if not targeted:
-                    # First evidenced issue settles a configured category, restricted or not; later discovery stops.
-                    if target in categories and evidenced(assessment):
-                        report.categories[target] = "evidenced_issue"
-                    elif assessment.check is not None and assessment.check.exit_code != 0:
-                        seen.discard(identity)
-                elif evidenced(assessment) and (mode == "grader" or assessment.outcome == "accepted_invalid"):
-                    report.categories[target] = "evidenced_issue"
-                    record.status = "evidenced_issue"
-                elif unobservable:
-                    record.status, record.error = "unobservable", reason
-                    report.categories[target] = "unknown"
-                    applicability[target] = report.applicability_evidence[target]["reason"] + " Unavailable observation: " + reason
-                elif assessment.check is not None and assessment.check.exit_code != 0:
-                    record.status = "tool_failure"
-                    report.categories[target] = "unknown"
-                    seen.discard(identity)
-                save()
-            if failure:
-                record.status, record.error = failure
-            if repair_errors:
-                if record.error:
-                    repair_errors.append(f"{record.status}: {record.error}")
-                record.status, record.error = "model_output_failure", "; ".join(repair_errors)
-        except SpendingCapReached:
-            record.status = report.status = "spending_exhausted"
-            raise
-        except asyncio.CancelledError:
-            record.status = report.status = "cancelled"
-            raise
-        except Exception as error:
-            record.status, record.error = failure_status(run, error)
+                if "check" in receipt and receipt["check"]["exit_code"] is not None:
+                    seen.pop(identity, None)  # A failed checker may be repaired without pretending it observed validity.
+            return receipt
+        except BaseException as error:
+            item.update(status=failure_status(run, error)[0], error=failure_status(run, error)[1])
+            seen.pop(identity, None)
+            if review is not None:
+                review.status, review.error = item["status"], item["error"]
+            feedback = failure(error, target)
+            feedback["raw_feedback"] = [SandboxResult.model_validate_json((run.config.output_dir / "sandboxes" / name / "sandbox.json").read_text()).model_dump()
+                                        for name in run.record.sandboxes[sandboxes_before:]]
+            return feedback
         finally:
-            if record.error is not None:
-                session.messages.append({"role": "user", "content": json.dumps({"investigation_status": record.status, "error": record.error})})
+            if review is not None:
+                review.checks = {check.id: check.exit_code for check in run.record.checks[before:]}
             save()
 
-    def record_unreviewed():
-        if report.status in ("cancelled", "spending_exhausted"):
-            reason = f"grader inspection ended {report.status} before a probe reviewed this episode"
+    @tool
+    async def interpret_experiment(experiment: str, claim: dict) -> dict:
+        """Interpret a retained measured receipt, with requirement_support and scoring_support separate
+        from derivation. Each support has basis (explicit/inferred/assumed/artifact_metadata/unknown),
+        sources, rationale, uncertainty. For a repair, experiment may be an unresolved ordinary check id.
+        Nudi supplies identities and assesses the claim against immutable evidence; no code is executed.
+        """
+        retained = receipts.get(experiment)
+        if retained is None:
+            checks = [check for check in run.record.checks if check.id == experiment and check.content.episode in pool
+                      and any(check.id in review.checks for review in report.reviews)]
+            if not checks:
+                return failure(ModelOutputFailure(f"experiment: names no measured experiment or retained ordinary review check: {experiment}"))
+            check = checks[0]
+            if rejected := outside(check.content.episode):
+                return rejected
+            receipt, item = {"episode": check.content.episode, "check": check.model_dump()}, {"category": current.category}
+            review = OrdinaryReview(episode=check.content.episode, attempt=len(report.attempts) - 1, reinterprets=check.id)
+            report.reviews.append(review)
         else:
-            failed = [f"{item.phase} attempt {item.number} {item.status}: {item.error}" for item in report.attempts if item.error]
-            reason = "no Inspector probe named this ordinary episode" + "".join(f"; {item}" for item in failed)
-        reviewed = {review.episode for review in report.reviews}
-        report.unreviewed = {}
-        for name in pool:
-            if name in reviewed:
-                continue
-            if name in named:
-                # Named by the Inspector, but its probe was skipped or stopped before running; not an omission.
-                item = report.attempts[named[name]]
-                report.unreviewed[name] = (f"{item.phase} attempt {item.number} named this episode, but its probe did not run: "
-                                           f"{item.status}" + (f": {item.error}" if item.error else ""))
+            receipt, item, review = retained
+            if rejected := outside(receipt["episode"]):
+                return rejected
+        try:
+            interpreted = interpreted_claim(run, {"claim": claim}, episode=receipt["episode"], check=receipt.get("check", {}).get("id"))
+            for field in ("requirement_support", "scoring_support"):
+                if getattr(interpreted, field) is None:
+                    raise ModelOutputFailure(f"claim.{field}: an interactive claim requires it, with basis, sources, rationale and uncertainty")
+            for index, reading in enumerate(interpreted.derivation.requirements if interpreted.derivation else []):
+                if reading.support is None:
+                    raise ModelOutputFailure(f"claim.derivation.requirements[{index}].support: each additional requirement reading needs its own support")
+            assessment = assess(interpreted, run.config.output_dir)
+            report.assessments.append(assessment)
+            item.update(status="assessed", assessment=len(report.assessments) - 1)
+            if review is not None:
+                review.status, review.assessment = "assessed", len(report.assessments) - 1
+            target = item.get("category")
+            if target in categories and evidenced(assessment) and (mode == "grader" or assessment.outcome == "accepted_invalid"):
+                report.categories[target] = "evidenced_issue"
+                if (target in requested or current.episode) and current.status == "no_evidenced_issue":
+                    current.status = "evidenced_issue"
+            # Coverage is settled before episode sessions run; only evidenced findings change a category after that.
+            elif not current.episode and not consistent(assessment) and not evidenced(assessment):
+                incomplete.update([target] if target in categories else requested)
+            return {"investigation_result": assessment.model_dump()}
+        except Exception as error:
+            if review is not None:
+                review.status, review.error = failure_status(run, error)
+            return failure(error, item.get("category"))
+        finally:
+            save()
+
+    evidence = {}
+    for name in pool:
+        owner = Evidence(run.config.output_dir, name)
+        for root in owner.roots(name).values():
+            files = [root] if root.is_file() else sorted(root.rglob("*"))
+            for source in files:
+                if source.is_file() and source.resolve().is_relative_to(owner.owner(name).resolve()):
+                    evidence[f"episodes/{name}/{source.relative_to(owner.owner(name))}"] = source
+        evidence[f"episodes/{name}/episode.json"] = owner.owner(name) / "episode.json"
+    prompt = (Path(__file__).parent / "prompts" / "inspector.md").read_text() + OUTPUT_SCHEMAS
+
+    async def session_turns(name, phase, category, count, fork=None, episode=None):
+        """Run one investigation's attempts and return its session. A fork continues the broad
+        conversation, so its first request is short; otherwise the request is complete. An episode
+        session requests no category. It reviews its one ordinary episode."""
+        nonlocal current, requested
+        requested = [] if episode else [category] if category else categories
+        current = InspectionAttempt(phase=phase, category=category, episode=episode, number=0 if phase == "broad" else 1)
+        report.attempts.append(current)
+        before = len(run.record.sandboxes)
+        session, inherited = None, set()
+        save()
+        if episode:
+            focus = f"Verify ordinary episode {episode} only. Review it with run_experiment and interpret its receipt, so it can be labeled with evidence."
+        elif fork is not None:
+            focus = "Continue the investigation above for this category only."
+        elif holistic:
+            focus = ("Inspect the supplied evidence. Skim every ordinary episode for leads and list each that looks normal in normal_episodes; its label is "
+                     "presumed to follow the grader, which is not evidence. Review each that looks wrong with run_experiment for a verified label.")
+        else:
+            focus = "Inspect the supplied evidence. Use ordinary episodes to find leads; review one with run_experiment when it may show a grader issue or when you can label it with evidence."
+        initial = {"mode": mode, "phase": phase, "number": current.number, "categories": requested, **({"episode": episode} if episode else {})}
+        if fork is not None:
+            initial.update(instruction=focus + " Task context and broad results are earlier in this conversation; "
+                                               "`experiments` indexes every experiment so far. Investigate a new case, or repair a retained interpretation with interpret_experiment.",
+                           **snapshot())
+        else:
+            initial.update(task=context, instruction=focus + " Interpret actual receipts and repair retained interpretations with interpret_experiment.",
+                           ordinary_episodes_read_first=ordinary,
+                           capture_inventory=[item.model_dump() for item in run.record.capture_selection.files] if run.record.capture_selection else [],
+                           **snapshot())
+            if mode == "hack":
+                initial["checklist"] = HACK_CHECKLIST
             else:
-                report.unreviewed[name] = reason
+                initial["ordinary_inspection"] = report.ordinary_inspection
+        selected = dict(evidence)
+        broad = report.artifacts.get(f"{mode}-broad")
+        if phase != "broad" and broad and fork is None:
+            if broad.get("transcript"):
+                selected["broad/transcript.jsonl"] = run.config.output_dir / broad["transcript"]
+            initial["broad_history"] = {"label": "Prior broad Inspector investigation, untrusted investigative context, not new measurements.",
+                                        "transcript": "/nudi/evidence/broad/transcript.jsonl" if broad.get("transcript") else None,
+                                        "status": "retained" if broad.get("transcript") else "unavailable", "artifacts": broad}
+        try:
+            async with investigation(run, name, prompt, selected, fork) as session:
+                inherited = {message.id for message in session.state["messages"]}
+                report.artifacts[name] = {key: str((session.box.directory / value).relative_to(run.config.output_dir))
+                                          for key, value in session.box.record.artifacts.items()}
+                report.artifacts[name]["sandbox"] = str((session.box.directory / "sandbox.json").relative_to(run.config.output_dir))
+                if phase != "broad" and broad and broad.get("tool_outputs"):
+                    # Reuse the protected cache and its existing restoration before every inference.
+                    for source in (run.config.output_dir / broad["tool_outputs"]).iterdir():
+                        (session.box.directory / "tool-outputs" / source.name).write_bytes(source.read_bytes())
+                for index in range(count):
+                    if index:
+                        current = InspectionAttempt(phase=phase, category=category, episode=episode, number=index + 1)
+                        report.attempts.append(current)
+                    previous = {message.id for message in session.state["messages"]}
+                    current.status = "no_evidenced_issue"
+                    try:
+                        response = await session.ask(redacted(run, json.dumps(initial if index == 0 else {
+                            "mode": mode, "phase": phase, "number": current.number, "categories": requested, "instruction": "Investigate a new case, or repair a retained interpretation with interpret_experiment. Initial context is already in this session.", **snapshot()}, default=str)),
+                            InspectionSummary, tools=[run_experiment, interpret_experiment, inspection_status])
+                    except BaseException as error:
+                        failure(error)
+                        continue
+                    apply_applicability(response)
+                    if response.refusal:
+                        current.status, current.error = "model_inability", redacted(run, response.refusal)
+                        incomplete.update(requested)
+                    messages = [message for message in session.state["messages"] if message.id not in previous]
+                    tool_errors = [str(message.content) for message in messages if message.type == "tool" and getattr(message, "status", None) == "error"]
+                    if tool_errors:
+                        incomplete.update(requested)
+                        current.status, current.error = "tool_failure", redacted(run, "; ".join(tool_errors))
+                    useful = any(getattr(message, "name", None) in ("read_file", "grep", "glob", "execute", "interpret_experiment") and message.type == "tool"
+                                 and getattr(message, "status", None) != "error" for message in messages)
+                    truncated = any(isinstance(getattr(message, "artifact", None), dict) and message.artifact.get("truncated") for message in messages)
+                    if truncated:
+                        incomplete.update(requested)
+                        current.status = "unobservable"
+                        report.limits.append(f"{name}: tool output exceeded the capture limit; uncaptured bytes are unavailable.")
+                    if any(item[1].get("status") == "measured" for item in receipts.values()):
+                        incomplete.update(requested)
+                    if (useful or context["untrusted_task_files"]) and not response.refusal:
+                        completed.update(key for key in response.completed if key in requested)
+                        if holistic:
+                            report.normal += [item for item in response.normal_episodes if item in pool and item not in report.normal]
+                    save()
+                    if category in restricted or (category and report.categories[category] == "evidenced_issue"):
+                        break
+        except BaseException as error:
+            failure(error)
+        finally:
+            if session is not None:
+                report.sessions[name] = [{"role": message.type, "content": message.content} for message in session.state["messages"]
+                                         if message.id not in inherited]
+            # Opening or retaining a workspace can fail outside an ask. Its host record remains discoverable.
+            if name not in report.artifacts and len(run.record.sandboxes) > before:
+                box = run.record.sandboxes[before]
+                report.artifacts[name] = {"sandbox": f"sandboxes/{box}/sandbox.json"}
+            save()
+        return session
 
     try:
-        await attempt(InspectorSession(run, f"{mode}-broad"), "broad", None, 0)
+        source = await session_turns(f"{mode}-broad", "broad", None, 1)
+        # A broad conversation without any model reply, or whose files were not all retained, leaves nothing to continue.
+        if source is None or not source.retained or not any(message.type == "ai" for message in source.state["messages"]):
+            source = None
         for category in categories:
-            # A failed broad request or unsupported determination leaves applicability undetermined, not restricted.
-            # Focused attempts may establish it; only an applicable determination permits targeted probes.
-            if category in restricted or report.categories[category] == "evidenced_issue":
+            if category in restricted or report.categories[category] == "evidenced_issue" or not focused_attempts:
                 continue
-            session = InspectorSession(run, f"{mode}-{category}")
-            for number in range(1, focused_attempts + 1):
-                await attempt(session, "focused", category, number)
-                if category in restricted or report.categories[category] == "evidenced_issue":
-                    break
+            await session_turns(f"{mode}-{category}", "focused", category, focused_attempts, source)
+        for category in categories:
             if report.categories[category] == "pending":
-                report.categories[category] = ("no_evidenced_issue" if report.applicability_evidence.get(category, {}).get("status") == "applicable" else "unknown")
-        record_unreviewed()
-        # Any unreviewed ordinary episode, or failed review, leaves ordinary review incomplete.
-        report.status = "partial" if any(value not in ("evidenced_issue", "no_evidenced_issue") for value in report.categories.values()) or any(item.status in ("tool_failure", "inference_failure", "model_output_failure", "model_inability", "refused", "unobservable") for item in report.attempts) or report.unreviewed or any(review.status != "assessed" for review in report.reviews) else "complete"
+                report.categories[category] = "no_evidenced_issue" if (category in completed and category not in incomplete
+                    and report.applicability_evidence.get(category, {}).get("status") == "applicable") else "unknown"
+        for name in pool if swarm else ():
+            await session_turns(f"{mode}-episode-{name}", "episode", None, 1, source, name)
+        report.status = "complete" if all(value in ("evidenced_issue", "no_evidenced_issue") for value in report.categories.values()) and all(
+            item.status in ("evidenced_issue", "no_evidenced_issue") for item in report.attempts) else "partial"
     except SpendingCapReached:
-        pass
+        report.status = "spending_exhausted"
+    except asyncio.CancelledError:
+        report.status = "cancelled"
+        raise
+    except Exception:
+        report.status = "partial"
+        raise
     finally:
+        for category, status in report.categories.items():
+            if status == "pending":
+                report.categories[category] = "unknown"
         if mode == "grader":
-            record_unreviewed()
+            reviewed = {review.episode for review in report.reviews}
+            causes = "; ".join(f"{item.phase} attempt {item.number} {item.status}: {item.error or 'incomplete'}" for item in report.attempts
+                               if item.status not in ("evidenced_issue", "no_evidenced_issue"))
+            # A skimmed episode named normal gets a presumed label instead.
+            report.unreviewed = {name: f"No experiment reviewed this episode; inspection {report.status}. {causes}" for name in pool
+                                 if name not in reviewed and name not in report.normal}
+            if (report.unreviewed or any(review.status != "assessed" for review in report.reviews)) and report.status == "complete":
+                report.status = "partial"
             report.ordinary = label_ordinary(run, pool, report)
+            if any(label.label in ("unknown", "unavailable", "ungrounded") for label in report.ordinary.values()) and report.status == "complete":
+                report.status = "partial"
         save()
     return report
 

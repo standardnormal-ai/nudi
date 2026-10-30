@@ -175,6 +175,20 @@ def test_findings_keep_claims_captured_facts_and_interpretations_apart(tmp_path)
     assert provisional["assessment"]["missing"] == ["a host check"]
 
 
+def test_reports_expose_retained_investigation_evidence_and_capture_limits(tmp_path):
+    run = RunDir(tmp_path)
+    run.hack = InspectionResult(mode="hack", status="partial", categories={"package_oracles": "unknown"}, applicability={},
+        artifacts={"hack-broad": {"transcript": "sandboxes/sandbox-0000/transcript.jsonl",
+                                  "tool_outputs": "sandboxes/sandbox-0000/tool-outputs"}},
+        limits=["SDK shell capture retains at most 10 MiB; uncaptured bytes are unavailable."])
+    result = run.report()
+    visible = result["inspections"]["hack"]
+    assert visible["artifacts"]["hack-broad"]["transcript"].endswith("transcript.jsonl")
+    assert "10 MiB" in visible["limits"][0]
+    markdown = report.markdown(result)
+    assert "sandboxes/sandbox-0000/transcript.jsonl" in markdown and "tool-outputs" in markdown and "10 MiB" in markdown
+
+
 def test_records_before_requirement_conclusions_stay_readable_without_invented_evidence(tmp_path):
     """An older record has only the check's own requirement; a missing reward stays unavailable, not zero."""
     run = RunDir(tmp_path)

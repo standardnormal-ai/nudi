@@ -52,6 +52,10 @@ LIMITATIONS = [
     "Concurrency uses 90% of Docker's CPUs and memory against the task's declarations. "
     "This is not a guarantee: image builds, Docker itself, host processes and the host-side "
     "Terminus 2 harness are not bounded by declarations.",
+    "A held Inspector workspace has its own memory limit, by default the smaller of 512 MiB and the "
+    "task's declaration; measured file, search and JSON work stayed far below 512 MiB, but an "
+    "arbitrary command may exceed the limit and fail. Experiments and native episodes keep the "
+    "task's limits. A workspace and one fresh experiment may together use every Docker CPU.",
     "The spending cap is checked when a call is admitted. Calls admitted before known cost "
     "reaches the cap finish and may exceed the cap. Calls of unknown cost do not count toward it. "
     "Terminus 2 and Harbor's LiteLLM wrapper retry a refused call with backoff, up to 9 attempts, "
@@ -65,6 +69,8 @@ MIMO_LIMITATION = (
     "MiMo requests enable thinking explicitly and send the requested reasoning effort; "
     "whether MiMo gives differentiated intensity for that effort is unverified."
 )
+# Representative workspace file, search and JSON work peaked at 14-16 MiB in the measured task images.
+WORKSPACE_MEMORY_MB = 512
 OVERSHOOT = "known cost exceeded the spending cap: calls admitted before it was reached finished"
 
 logger = logging.getLogger("nudi")
@@ -80,6 +86,11 @@ class MissingCredential(ValueError):
 
 class SpendingCapReached(RuntimeError):
     """Known cost reached the run's spending cap, so no new call or episode starts."""
+
+
+class CapacityUnavailable(RuntimeError):
+    """A held Inspector sandbox leaves no room under the run's concurrency, so another
+    container does not start; it is refused at once rather than queued."""
 
 
 def docker_capacity() -> tuple[int, int]:
@@ -133,6 +144,8 @@ class Run:
     queue: TrialQueue
     keys: dict[Role, str] = field(repr=False)
     """Resolved credentials; held in memory only."""
+    native_episodes: int = 0
+    """Native episodes started and not yet returned, queued or running."""
 
     def save(self) -> None:
         (self.config.output_dir / "run.json").write_text(self.record.model_dump_json(indent=2))
@@ -147,13 +160,44 @@ class Run:
         if cap is not None and self.record.known_cost >= cap:
             raise SpendingCapReached(f"known cost ${self.record.known_cost:.6f} reached the spending cap ${cap}")
 
-    def check_sandboxes_closed(self) -> None:
-        """Admit another container only after every Inspector sandbox was removed."""
+    def admit_container(self, purpose: str) -> None:
+        """Admit another container, a sandbox `purpose` or "native", only after every closed
+        Inspector sandbox was removed. Native episodes alone keep waiting in the run's queue;
+        a held sandbox would make them wait on itself. Otherwise the recorded limits of held
+        sandboxes, the declaration of each native episode in flight and the new container
+        must fit 90% of Docker's CPUs and memory. Undeclared resources keep one container for
+        each slot of the run's concurrency. Only a held workspace and one fresh experiment
+        may use every CPU, still within the memory allowance, with a warning."""
+        held = []
         for name in self.record.sandboxes:
             path = self.config.output_dir / "sandboxes" / name / "sandbox.json"
-            result = SandboxResult.model_validate_json(path.read_text())
-            if result.cleanup.get("removed") is not True:
+            box = SandboxResult.model_validate_json(path.read_text())
+            if "removed" not in box.cleanup:
+                held.append(box)
+            elif box.cleanup["removed"] is not True:
                 raise InfrastructureAbort(f"{name}: sandbox removal is unverified; another container cannot start")
+        if not held and (purpose == "native" or not self.native_episodes):
+            return
+        capacity = self.record.capacity
+        if capacity.episode_cpus is None or capacity.episode_memory_mb is None:
+            if len(held) + self.native_episodes >= capacity.concurrency:
+                raise CapacityUnavailable(f"{len(held)} held sandboxes and {self.native_episodes} native episodes fill the "
+                                          f"run's concurrency of {capacity.concurrency}; another container cannot start")
+            return
+        memory_mb = capacity.workspace_memory_mb if purpose == "workspace" else capacity.episode_memory_mb
+        limits = ([(box.environment["cpus"], box.environment["memory_mb"]) for box in held]
+                  + [(capacity.episode_cpus, capacity.episode_memory_mb)] * self.native_episodes
+                  + [(capacity.episode_cpus, memory_mb)])
+        cpus, memory_mb = map(sum, zip(*limits))
+        headroom = 10 * cpus <= 9 * capacity.docker_cpus
+        pair = [box.purpose for box in held] == ["workspace"] and not self.native_episodes and purpose in ("probe", "check")
+        if 10 * memory_mb > 9 * capacity.docker_memory_mb or not (headroom or pair and cpus <= capacity.docker_cpus):
+            raise CapacityUnavailable(f"{len(held)} held sandboxes and {self.native_episodes} native episodes leave no room "
+                                      f"for another container within 90% of Docker's {capacity.docker_cpus} CPUs and "
+                                      f"{capacity.docker_memory_mb} MiB; it cannot start")
+        if not headroom:
+            self.warn(f"a held Inspector workspace and one fresh experiment use all {capacity.docker_cpus} of Docker's "
+                      "CPUs: no CPU headroom remains for Docker, image builds or host processes")
 
 
 def resolve_credentials(config: RunConfig, models, roles) -> tuple[dict[Role, str], dict[Role, str]]:
@@ -185,6 +229,10 @@ def start_run(config: RunConfig, roles: frozenset[Role] = ROLES) -> Run:
     docker_cpus, docker_memory_mb = docker_capacity()
     cpus, memory_mb = declared_requirements(config.task_dir)
     concurrency, warnings = plan_concurrency(docker_cpus, docker_memory_mb, cpus, memory_mb)
+    workspace_memory_mb = config.workspace_memory_mb or min(WORKSPACE_MEMORY_MB, memory_mb or WORKSPACE_MEMORY_MB)
+    if 10 * workspace_memory_mb > 9 * docker_memory_mb:
+        raise CapacityError(f"the Inspector workspace's {workspace_memory_mb} MiB of memory exceeds 90% of Docker's "
+                            f"{docker_memory_mb} MiB")
     mimo = any(models[role].model.startswith("xiaomi_mimo/") for role in roles)
     record = RunRecord(
         task_dir=str(config.task_dir),
@@ -199,6 +247,7 @@ def start_run(config: RunConfig, roles: frozenset[Role] = ROLES) -> Run:
             episode_cpus=cpus,
             episode_memory_mb=memory_mb,
             concurrency=concurrency,
+            workspace_memory_mb=workspace_memory_mb,
         ),
         cost_map=get_model_cost_map_source_info(),
         warnings=warnings,
@@ -216,15 +265,26 @@ def start_run(config: RunConfig, roles: frozenset[Role] = ROLES) -> Run:
 
 # The run, role and episode of the model calls made in this context.
 current: ContextVar[tuple[Run, Role, str] | None] = ContextVar("nudi_run_calls", default=None)
+pending_calls: ContextVar[dict[str, dict] | None] = ContextVar("nudi_pending_calls", default=None)
 
 
 @contextlib.contextmanager
 def model_calls(run: Run, role: Role, episode: str):
     """Apply the run's credential, cap and accounting to LiteLLM calls made inside."""
     token = current.set((run, role, episode))
+    pending = {}
+    pending_token = pending_calls.set(pending)
     try:
         yield
+    except BaseException as error:
+        # LiteLLM's deployment failure hook does not catch cancellation. Keep admitted
+        # calls without an observed completion, but never duplicate completed callbacks.
+        while pending:
+            _, request = pending.popitem()
+            record_call(run, role, episode, request, error=type(error).__name__)
+        raise
     finally:
+        pending_calls.reset(pending_token)
         current.reset(token)
 
 
@@ -287,14 +347,20 @@ class RunCalls(CustomLogger):
             run.record.refused_calls[episode] = run.record.refused_calls.get(episode, 0) + 1
             run.save()
             raise
+        if (pending := pending_calls.get()) is not None:
+            pending[kwargs["litellm_call_id"]] = {"model": kwargs["model"]}
         return {**kwargs, "api_key": run.keys[role]}
 
     async def async_post_call_success_deployment_hook(self, request_data, response, call_type):
-        if (scope := current.get()) is not None:
+        if ((scope := current.get()) is not None
+                and (pending := pending_calls.get()) is not None
+                and pending.pop(request_data["litellm_call_id"], None) is not None):
             record_call(*scope, request_data, response=response, refusals=refusal_signals(response))
 
     async def async_post_call_failure_deployment_hook(self, request_data, exception, call_type, fallback_depth=None):
-        if (scope := current.get()) is not None:
+        if ((scope := current.get()) is not None
+                and (pending := pending_calls.get()) is not None
+                and pending.pop(request_data["litellm_call_id"], None) is not None):
             refusals = [type(exception).__name__] if isinstance(exception, litellm.ContentPolicyViolationError) else []
             record_call(*scope, request_data, error=type(exception).__name__, refusals=refusals)
 
@@ -319,7 +385,7 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
             if problem := capture_location_problem(location):
                 raise ValueError(f"capture of {location!r} rejected before native episode: {problem}")
     run.check_cap()
-    run.check_sandboxes_closed()
+    run.admit_container("native")
     model = run.record.models[role]
     name = f"{len(run.record.episodes):04d}-{role}"
     run.record.episodes.append(name)
@@ -336,6 +402,7 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
         reasoning_effort=model.reasoning_effort,
         native=ORIGINAL_BEHAVIOR,
     )
+    run.native_episodes += 1
     try:
         capture = None
         if capture_locations or on_verification is not None:
@@ -376,6 +443,7 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
         run.record.events.append(EpisodeEvent(episode=name, event="finished"))
         return result
     finally:
+        run.native_episodes -= 1
         run.save()
 
 

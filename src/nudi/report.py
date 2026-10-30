@@ -227,10 +227,14 @@ def ordinary(record: RunRecord, results: dict, warnings: list[str], notes: list[
 
 def labels(pool: list[str], result: InspectionResult, warnings: list[str]) -> dict:
     """Local grader labels of the ordinary pool, separate from binary metrics."""
-    unreviewed = {"label": "unreviewed", "reasons": ["grader inspection retained no label for this episode"]}
-    episodes = {name: result.ordinary[name].model_dump(mode="json", include={"label", "reasons"})
+    unreviewed = {"label": "unreviewed", "basis": None, "reasons": ["grader inspection retained no label for this episode"]}
+    episodes = {name: result.ordinary[name].model_dump(mode="json", include={"label", "basis", "reasons"})
                 if name in result.ordinary else unreviewed for name in pool}
     counts = dict(sorted(Counter(item["label"] for item in episodes.values()).items()))
+    basis = {kind: sum(item["basis"] == kind for item in episodes.values()) for kind in ("presumed", "verified")}
+    if basis["presumed"]:
+        warnings.append(f"{basis['presumed']} of {len(pool)} ordinary episodes have presumed labels that follow the grader's reward; "
+                        "a presumed label is not evidence of grader correctness")
     lacking = {label: counts[label] for label in UNSUPPORTED_LABELS if label in counts}
     if lacking:
         warnings.append(f"{sum(lacking.values())} of {len(pool)} ordinary episodes have no supported local label "
@@ -243,8 +247,9 @@ def labels(pool: list[str], result: InspectionResult, warnings: list[str]) -> di
     attempted = [name for name in pool if any(item.episode == name for item in result.reviews)]
     review = {"attempted": attempted, "unreviewed": result.unreviewed,
               "unresolved": [name for name in attempted if episodes[name]["label"] == "unknown"],
-              "supported": [name for name, item in episodes.items() if item["label"] not in UNSUPPORTED_LABELS]}
-    return {"counts": counts, "review": review, "episodes": episodes}
+              "supported": [name for name, item in episodes.items()
+                            if item["label"] not in UNSUPPORTED_LABELS and item["basis"] != "presumed"]}
+    return {"mode": result.ordinary_inspection, "counts": counts, "basis": basis, "review": review, "episodes": episodes}
 
 
 def completion_gaps(basis: MetricBasis, own: list[Assessment]) -> list[str]:
@@ -448,6 +453,7 @@ def finding(assessment: Assessment) -> dict:
             "replay": dump(assessment.replay), "planted": dump(claim.planted), "persisted": dump(claim.persisted),
         },
         "interpretation": {"interpretation": claim.interpretation, "timing": check.timing if check else None,
+                           "requirement_support": dump(claim.requirement_support), "scoring_support": dump(claim.scoring_support),
                            "derivation": dump(claim.derivation), "coverage": dump(claim.coverage), "basis": dump(claim.basis)},
         "assessment": {**assessment.model_dump(mode="json", include={"outcome", "validity", "discrepancy", "conclusions", "reasons",
                                                                      "missing", "persistence", "persistence_reasons"}), "limits": limits},
@@ -469,10 +475,11 @@ def inspection(mode: str, result: InspectionResult, warnings: list[str]) -> dict
         if status not in SETTLED:
             reason = result.applicability.get(category)
             warnings.append(f"{mode} category {category} is {status}" + (f": {reason}" if reason else ""))
-    warnings += [f"{mode} {item.phase} attempt {item.number} ({item.category or 'all categories'}) {item.status}: {item.error}"
+    warnings += [f"{mode} {item.phase} attempt {item.number} ({item.category or item.episode or 'all categories'}) {item.status}: {item.error}"
                  for item in result.attempts if item.status in ("refused", "model_inability", "model_output_failure", "unobservable", "inference_failure", "tool_failure")]
     return {"status": result.status, "categories": result.categories, "applicability": result.applicability,
             "applicability_evidence": result.applicability_evidence,
+            "artifacts": result.artifacts, "limits": result.limits, "experiments": result.experiments,
             "attempts": [item.model_dump(mode="json") for item in result.attempts], "findings": findings(result.assessments)}
 
 
@@ -632,11 +639,13 @@ def markdown(report: dict) -> str:
     if report["labels"] is None:
         lines.append("Grader inspection was not selected or not run.")
     else:
-        lines.append(", ".join(f"{label} {count}" for label, count in report["labels"]["counts"].items()) or "No ordinary episode.")
-        review = report["labels"]["review"]
+        labeled = report["labels"]
+        lines.append(f"Mode: {labeled['mode']}; presumed {labeled['basis']['presumed']}, verified {labeled['basis']['verified']}.")
+        lines.append(", ".join(f"{label} {count}" for label, count in labeled["counts"].items()) or "No ordinary episode.")
+        review = labeled["review"]
         lines.append(f"Review attempted for {len(review['attempted'])} (attempted but unresolved {len(review['unresolved'])}), "
                      f"unreviewed {len(review['unreviewed'])}, supported label for {len(review['supported'])}.")
-        lines += [f"- {name}: {item['label']}" for name, item in report["labels"]["episodes"].items()]
+        lines += [f"- {name}: {item['label']}" + (f" ({item['basis']})" if item["basis"] else "") for name, item in labeled["episodes"].items()]
 
     lines += ["", "## Metrics", ""]
     metric = report["metrics"]
@@ -674,6 +683,11 @@ def markdown(report: dict) -> str:
                 if package:
                     entries[-1] += " Limits: " + "; ".join(outcome["limits"])
     lines += entries or ["None retained."]
+
+    for mode, item in report["inspections"].items():
+        for session, artifacts in item["artifacts"].items():
+            lines.append(f"- {mode} retained investigation {session}: " + "; ".join(f"{key}: {path}" for key, path in artifacts.items()))
+        lines += [f"- {mode} limitation: {limit}" for limit in item["limits"]]
 
     lines += ["", "## Attack", ""]
     result = report["attack"]

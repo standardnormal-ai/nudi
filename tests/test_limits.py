@@ -292,6 +292,62 @@ def test_episode_beyond_docker_capacity_stops_before_starting(tmp_path, monkeypa
     assert not (tmp_path / "run").exists()
 
 
+@pytest.mark.parametrize(
+    ("environment", "override", "expected"),
+    [
+        ("cpus = 1\nmemory_mb = 2048", None, 512),
+        ("cpus = 1\nmemory_mb = 256", None, 256),  # never above the task's own ceiling
+        ("cpus = 1", None, 512),
+        ("cpus = 1\nmemory_mb = 2048", 1600, 1600),
+    ],
+)
+def test_workspace_memory_is_the_override_or_the_smaller_of_512_mib_and_the_task_ceiling(
+    tmp_path, monkeypatch, credentials, environment, override, expected
+):
+    task = task_variant(tmp_path, CONTRACT_TASK)
+    (task / "task.toml").write_text(f'schema_version = "1.4"\n[environment]\ndocker_image = "python:3.12-slim"\n{environment}\n')
+
+    record = stored_run(new_run(tmp_path, monkeypatch, credentials, task_dir=task, workspace_memory_mb=override))
+
+    assert record.capacity.workspace_memory_mb == expected
+
+
+@pytest.mark.parametrize("override", [0, -512])
+def test_nonpositive_workspace_memory_is_rejected(tmp_path, override):
+    with pytest.raises(ValueError, match="greater than 0"):
+        RunConfig(task_dir=CONTRACT_TASK, output_dir=tmp_path / "run", workspace_memory_mb=override)
+
+
+@pytest.mark.parametrize(("override", "starts"), [(3518, True), (3519, False), (3909, False)])
+def test_workspace_memory_beyond_the_memory_allowance_stops_before_starting(
+    tmp_path, monkeypatch, credentials, override, starts
+):
+    """Even a lone workspace keeps 10% of the measured VM's 3909 MiB free."""
+    task = task_variant(tmp_path, CONTRACT_TASK)
+    (task / "task.toml").write_text('schema_version = "1.4"\n[environment]\ndocker_image = "python:3.12-slim"\ncpus = 1\nmemory_mb = 2048\n')
+
+    if starts:
+        run = new_run(tmp_path, monkeypatch, credentials, capacity=(2, 3909), task_dir=task, workspace_memory_mb=override)
+        assert run.record.capacity.workspace_memory_mb == override
+    else:
+        with pytest.raises(CapacityError, match="workspace"):
+            new_run(tmp_path, monkeypatch, credentials, capacity=(2, 3909), task_dir=task, workspace_memory_mb=override)
+        assert not (tmp_path / "run").exists()
+
+
+def test_report_of_a_record_without_workspace_memory_claims_no_limit(tmp_path, monkeypatch, credentials):
+    """Workspaces of records made before the field existed inherited the task's limit."""
+    from nudi import report
+
+    run = new_run(tmp_path, monkeypatch, credentials)
+    path = run.config.output_dir / "run.json"
+    legacy = json.loads(path.read_text())
+    del legacy["capacity"]["workspace_memory_mb"]
+    path.write_text(json.dumps(legacy))
+
+    assert report.build(run.config.output_dir)["configuration"]["capacity"]["workspace_memory_mb"] is None
+
+
 def test_undeclared_task_runs_one_episode_and_records_the_warning(tmp_path, monkeypatch, credentials):
     task = task_variant(tmp_path, CONTRACT_TASK)
     (task / "task.toml").write_text('schema_version = "1.4"\n[environment]\ndocker_image = "python:3.12-slim"\n')
@@ -685,3 +741,247 @@ def test_cap_reached_during_an_episode_refuses_calls_without_inventing_a_reward(
     assert record.known_cost > TINY_CAP
     assert (docker_env / "episodes" / episode / result.artifacts["result"]).exists()
     assert files_with_secret(docker_env) == []
+
+
+# Investigation runtime inference: every SDK call keeps the run's route, credential, cap and costs.
+
+
+def inspector_model(base_url: str, priced: bool = True) -> ModelConfig:
+    if priced:
+        return ModelConfig(model="xai/grok-4.7", reasoning_effort="xhigh", api_base=base_url)
+    return ModelConfig(model=UNPRICED, api_key_var="NUDI_UNPRICED_KEY", api_base=base_url)
+
+
+@pytest.mark.parametrize("priced", [True, False])
+def test_investigation_calls_keep_the_run_credential_route_effort_and_cost(tmp_path, monkeypatch, credentials, priced):
+    """A tool call and the structured result are two SDK calls, both under the run's scope."""
+    from nudi import inspector
+    from test_inspection import AgentScript, Finding, Sandboxes
+
+    Sandboxes(monkeypatch)
+    monkeypatch.setenv("XAI_API_KEY", OUTSIDE_KEY)
+    script = AgentScript(("no_such_tool", {}), ("Finding", {"summary": "done"}))
+
+    async def main():
+        async with serve(script) as base_url:
+            run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": inspector_model(base_url, priced)})
+            async with inspector.investigation(run, "hack-broad", "Inspect the copied package.", {}) as session:
+                return run, await session.ask("Investigate.", Finding)
+
+    run, result = asyncio.run(main())
+    assert result.summary == "done" and "is not a valid tool" in script.tool_results()[0]
+    assert [headers["Authorization"] for headers, _ in script.requests] == [f"Bearer {FILE_KEY}"] * 2
+    bodies = [body for _, body in script.requests]
+    assert [body["model"] for body in bodies] == ["grok-4.7" if priced else "nudi-unpriced-model"] * 2
+    assert [body.get("reasoning_effort") for body in bodies] == ["xhigh" if priced else None] * 2
+    record = stored_run(run)
+    assert [(c.role, c.episode) for c in record.calls] == [("inspector", "hack-broad")] * 2
+    if priced:
+        expected = sum(litellm.cost_per_token(model="xai/grok-4.7", prompt_tokens=11, completion_tokens=7))
+        assert (record.known_cost, record.unknown_cost_calls) == (pytest.approx(2 * expected), 0)
+    else:
+        assert [c.cost for c in record.calls] == [None, None]
+        assert (record.known_cost, record.unknown_cost_calls) == (0.0, 2)
+        assert any(UNPRICED in warning for warning in record.warnings)
+    assert not any(FILE_KEY in path.read_text() for path in run.config.output_dir.rglob("*.json*"))
+
+
+def test_compaction_summary_is_refused_once_known_cost_reaches_the_cap(tmp_path, monkeypatch, credentials):
+    """The SDK's summarization call passes the same cap admission: once known cost reaches the
+    cap it is refused before sending, and the turn stops with its transcript kept."""
+    from nudi import inspector
+    from test_inspection import AgentScript, Finding, Sandboxes, sandbox_record, transcript
+
+    Sandboxes(monkeypatch)
+    runs = []
+
+    def reach_cap():
+        runs[0].record.known_cost = runs[0].record.spending_cap
+        return "overflow"
+
+    script = AgentScript(*[("no_such_tool", {"step": step}) for step in range(4)], reach_cap)
+
+    async def main():
+        async with serve(script) as base_url:
+            runs.append(new_run(tmp_path, monkeypatch, credentials, models={"inspector": inspector_model(base_url)}, spending_cap=1.0))
+            async with inspector.investigation(runs[0], "hack-broad", "Inspect the copied package.", {}) as session:
+                with pytest.raises(SpendingCapReached):
+                    await session.ask("Investigate.", Finding)
+            return runs[0], session
+
+    run, session = asyncio.run(main())
+    assert len(script.requests) == 5 and all(body.get("tools") for _, body in script.requests)
+    # LangChain tries summary generation three times; each try is refused before it is sent.
+    assert stored_run(run).refused_calls == {"hack-broad": 3}
+    assert sandbox_record(run, session.box.record.name)["cleanup"]["removed"] is True
+    assert sum(entry["type"] == "tool" for entry in transcript(session)) == 4
+
+
+def test_public_compaction_preserves_records_when_summary_spending_is_exhausted(tmp_path, monkeypatch, credentials):
+    from nudi import checks
+    from test_inspection import AgentScript, Sandboxes, sandbox_record
+
+    Sandboxes(monkeypatch)
+    runs = []
+
+    def reach_cap():
+        runs[0].record.known_cost = 1.0
+        return "overflow"
+
+    script = AgentScript(*[("inspection_status", {}) for _ in range(4)], reach_cap)
+
+    async def main():
+        async with serve(script) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": inspector_model(base)}, spending_cap=1.0)
+            runs.append(run)
+            return run, await checks.inspect_hacks(run, categories=["package_oracles"])
+
+    run, result = asyncio.run(main())
+    assert result.status == "spending_exhausted" and result.categories == {"package_oracles": "unknown"}
+    assert len(result.attempts) == 1 and stored_run(run).refused_calls == {"hack-broad": 3}
+    assert len(script.requests) == 5 and all(body.get("tools") for _, body in script.requests)
+    artifact = run.config.output_dir / result.artifacts["hack-broad"]["transcript"]
+    entries = [json.loads(line) for line in artifact.read_text().splitlines()]
+    assert sum(entry["type"] == "tool" for entry in entries) == 4
+    assert all(sandbox_record(run, name)["cleanup"]["removed"] for name in run.record.sandboxes)
+
+
+@pytest.mark.parametrize("phase", ["agent", "summary"])
+def test_public_cancelled_inference_retains_accounting_and_artifact_references(tmp_path, monkeypatch, credentials, phase):
+    from nudi import checks
+    from test_inspection import AgentScript, Sandboxes, agent_reply, sandbox_record
+
+    Sandboxes(monkeypatch)
+
+    async def main():
+        blocked, release = asyncio.Event(), asyncio.Event()
+
+        class Blocked(AgentScript):
+            async def chat(self, request):
+                body = await request.json()
+                if (phase == "agent" and len(self.requests) == 1) or (phase == "summary" and not body.get("tools")):
+                    self.requests.append((dict(request.headers), body))
+                    blocked.set()
+                    await release.wait()
+                    return agent_reply({"role": "assistant", "content": "late response"})
+                return await super().chat(request)
+
+        script = Blocked(*[("inspection_status", {}) for _ in range(4)], "overflow") if phase == "summary" else Blocked(("inspection_status", {}))
+        async with serve(script) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": inspector_model(base)})
+            running = asyncio.create_task(checks.inspect_hacks(run, categories=["package_oracles"]))
+            await asyncio.wait_for(blocked.wait(), 20)
+            running.cancel()
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(running, 20)
+            finally:
+                release.set()
+            return run, script
+
+    run, script = asyncio.run(main())
+    result = checks.InspectionResult.model_validate_json((run.config.output_dir / "inspection-hack.json").read_text())
+    assert result.status == "cancelled" and result.categories == {"package_oracles": "unknown"}
+    assert len(stored_run(run).calls) == len(script.requests)
+    assert stored_run(run).calls[-1].error == "CancelledError" and stored_run(run).calls[-1].cost is None
+    assert (run.config.output_dir / result.artifacts["hack-broad"]["transcript"]).is_file()
+    assert all(sandbox_record(run, name)["cleanup"]["removed"] for name in run.record.sandboxes)
+
+
+@pytest.mark.parametrize("outcome", ["refusal", "message_refusal", "error"])
+def test_refused_or_failed_inference_stops_the_turn_keeps_records_and_removes_the_workspace(
+    tmp_path, monkeypatch, credentials, outcome
+):
+    from nudi import checks, inspector
+    from test_inspection import AgentScript, Finding, Sandboxes, sandbox_record, transcript
+
+    Sandboxes(monkeypatch)
+    script = AgentScript(("no_such_tool", {}), outcome)
+
+    async def main():
+        async with serve(script) as base_url:
+            run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": inspector_model(base_url)})
+            async with inspector.investigation(run, "hack-broad", "Inspect the copied package.", {}) as session:
+                with pytest.raises(checks.ProviderRefusal if outcome != "error" else checks.InferenceFailure) as raised:
+                    await session.ask("Investigate.", Finding)
+            return run, session, raised.value
+
+    run, session, error = asyncio.run(main())
+    assert FILE_KEY not in str(error)
+    first, *later = stored_run(run).calls
+    assert first.error is None and later
+    if outcome != "error":
+        signal = "finish_reason: content_filter" if outcome == "refusal" else "message.refusal: scripted provider refusal"
+        assert [call.refusals for call in later] == [[signal]]
+    else:
+        assert all(call.error is not None and call.cost is None for call in later)
+    assert sandbox_record(run, session.box.record.name)["cleanup"]["removed"] is True
+    assert [entry["type"] for entry in transcript(session)][:3] == ["human", "ai", "tool"]
+
+
+@pytest.mark.parametrize("phase", ["agent", "summary", "completed"])
+def test_cancelled_sdk_inference_is_accounted_once(tmp_path, monkeypatch, credentials, phase):
+    """A dispatched call with no observed response has unknown cost; a completed call is not duplicated."""
+    from nudi import inspector
+    from test_inspection import AgentScript, Finding, Sandboxes, agent_reply, sandbox_record
+
+    Sandboxes(monkeypatch)
+
+    async def main():
+        blocked, release = asyncio.Event(), asyncio.Event()
+
+        class BlockedScript(AgentScript):
+            async def chat(self, request):
+                body = await request.json()
+                should_block = (phase == "agent" and len(self.requests) == 1) or (phase == "summary" and not body.get("tools"))
+                if should_block:
+                    self.requests.append((dict(request.headers), body))
+                    blocked.set()
+                    await release.wait()
+                    return agent_reply({"role": "assistant", "content": "late response"})
+                return await super().chat(request)
+
+        if phase == "summary":
+            script = BlockedScript(*[("no_such_tool", {"step": step}) for step in range(4)], "overflow")
+        else:
+            script = BlockedScript(("no_such_tool", {}), ("Finding", {"summary": "done"}))
+        if phase == "completed":
+            original = inspector.Transcript.on_llm_end
+
+            async def after_completion(self, response, **kwargs):
+                await original(self, response, **kwargs)
+                blocked.set()
+                await release.wait()
+
+            monkeypatch.setattr(inspector.Transcript, "on_llm_end", after_completion)
+
+        async with serve(script) as base_url:
+            run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": inspector_model(base_url)})
+            sessions = []
+
+            async def investigate():
+                async with inspector.investigation(run, "cancelled-inference", "Inspect.", {}) as session:
+                    sessions.append(session)
+                    await session.ask("Investigate.", Finding)
+
+            running = asyncio.create_task(investigate())
+            await asyncio.wait_for(blocked.wait(), 20)
+            running.cancel()
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(running, 20)
+            finally:
+                release.set()
+            return run, sessions[0], script
+
+    run, session, script = asyncio.run(main())
+    calls = stored_run(run).calls
+    assert len(calls) == len(script.requests), "A dispatched inference disappeared or was recorded twice"
+    assert {(call.role, call.episode) for call in calls} == {("inspector", "cancelled-inference")}
+    if phase == "completed":
+        assert len(calls) == 1 and calls[0].error is None and calls[0].cost is not None
+        assert stored_run(run).unknown_cost_calls == 0
+    else:
+        assert calls[-1].error == "CancelledError" and calls[-1].cost is None
+        assert stored_run(run).unknown_cost_calls == (2 if phase == "summary" else 1)
+    assert sandbox_record(run, session.box.record.name)["cleanup"]["removed"] is True

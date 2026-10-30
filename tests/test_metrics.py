@@ -246,6 +246,30 @@ def test_completion_references_and_native_decisions_count_each_ordinary_episode_
                                           "unavailable": 1, "unknown": 2}
 
 
+def test_reports_show_the_mode_and_presumed_and_verified_counts_without_counting_presumption_as_evidence(tmp_path):
+    run = RunDir(tmp_path)
+    verified = run.episode(rewards={"reward": 1.0})
+    run.label(verified, "legitimate", checked(verified, "c0", "sorted", "supported", outcome="legitimate"),
+              checked(verified, "c1", "summary", "supported", outcome="legitimate",
+                      basis=basis("supported", ["sorted", "summary"], ["c0", "c1"], decision=RULE)))
+    run.grader.ordinary[verified].basis = "verified"
+    presumed = run.episode(rewards={"reward": 0.0})
+    run.grader.ordinary[presumed] = EpisodeLabel(label="legitimate", basis="presumed", reasons=["presumed to follow the grader"])
+    run.grader.ordinary_inspection = "holistic_inspection"
+
+    result = run.report()
+    assert result["labels"]["mode"] == "holistic_inspection"
+    assert result["labels"]["basis"] == {"presumed": 1, "verified": 1}
+    assert result["labels"]["episodes"][presumed]["basis"] == "presumed"
+    assert result["labels"]["review"]["supported"] == [verified]
+    # The confusion matrix uses evidence references only, so a presumed label never becomes a cell.
+    (group,) = result["metrics"]["confusion"]
+    assert group["episodes"] == [verified] and result["metrics"]["episodes"][presumed]["completion"] == "unknown"
+    text = report.markdown(result)
+    assert "Mode: holistic_inspection; presumed 1, verified 1." in text
+    assert f"- {presumed}: legitimate (presumed)" in text and f"- {verified}: legitimate (verified)" in text
+
+
 def test_rewards_alone_never_supply_a_native_decision_and_f1_needs_a_denominator(tmp_path):
     run = RunDir(tmp_path)
     invented = RULE.model_copy(update={"source": Observation(episode=None, path="tests/test.sh", excerpt="at least 0.9")})
@@ -367,6 +391,7 @@ def test_requested_basis_is_retained_and_partial_credit_can_have_a_noncompletion
     run, inspection = asyncio.run(main())
     assert "`basis`" in script.requests[0]["messages"][0]["content"]
     assert inspection.ordinary["0000-simulator"].label == "legitimate"
+    assert inspection.status == "complete", "supported partial scoring and full ordinary coverage remain complete"
     retained = InspectionResult.model_validate_json((run.config.output_dir / "inspection-grader.json").read_text())
     assert retained.assessments[1].claim.basis.completion == "violated"
 

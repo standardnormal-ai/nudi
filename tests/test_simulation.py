@@ -421,8 +421,8 @@ def test_selected_capture_reaches_supported_ordinary_labels_and_incomplete_suppo
     assert report.categories["omitted_requirements"] == "evidenced_issue"
     # The pool is reused: no further ordinary episode. The five checks are package sandboxes.
     assert run.record.episodes == pool
-    assert run.record.sandboxes == [f"sandbox-{index:04d}" for index in range(5)]
-    assert all(sandbox_record(run, name)["purpose"] == "check" for name in run.record.sandboxes)
+    assert len(run.record.sandboxes) == 6 and sandbox_record(run, run.record.sandboxes[0])["purpose"] == "workspace"
+    assert all(sandbox_record(run, name)["purpose"] == "check" for name in run.record.sandboxes[1:])
     assert all(native.instructions[name] == (task / "instruction.md").read_text() for name in pool)
 
 
@@ -712,13 +712,13 @@ def test_corrected_interpretation_uses_the_next_existing_attempt_without_rerunni
     run, inspection = asyncio.run(main())
     built = report.build(run.config.output_dir)
     assert len(script.requests) == len(responses), "a repair adds no model request"
-    assert len(run.record.checks) == 1 and run.record.sandboxes == ["sandbox-0000"], "a repair executes nothing again"
+    assert len(run.record.checks) == 1 and sum(sandbox_record(run, name)["purpose"] == "check" for name in run.record.sandboxes) == 1, "a repair executes nothing again"
     original = inspection.assessments[0]
     assert (original.outcome, original.conclusions) == ("legitimate", [])
     label = inspection.ordinary[name]
     if case == "corrected":
         payload = json.loads(script.requests[3]["messages"][-1]["content"])
-        assert payload["unreviewed_ordinary_episodes"] == [] and "reinterpretations" in payload["instruction"]
+        assert payload["unreviewed_ordinary_episodes"] == [] and "interpret_experiment" in payload["instruction"]
         diagnostics = payload["unresolved_ordinary_reviews"][name]
         assert [item["id"] for item in diagnostics["checks"]] == ["check-0000"] and NEWLINE in json.dumps(diagnostics["reasons"])
         assert [item.status for item in inspection.attempts] == ["no_evidenced_issue", "duplicate_case"]
@@ -737,9 +737,9 @@ def test_corrected_interpretation_uses_the_next_existing_attempt_without_rerunni
 
 @pytest.mark.parametrize(("invalid", "error"), [
     ("unlisted", "check-0009"),
-    ("item", "no listed unresolved review check"),
+    ("item", "no measured experiment"),
     ("claim", "Invalid Claim"),
-    ("list", "reinterpretations must be a list"),
+    ("list", "no measured experiment"),
 ])
 def test_invalid_reinterpretation_preserves_other_repairs_and_ordinary_probes(tmp_path, monkeypatch, credentials, invalid, error):
     """One invalid repair stays a reported failure while independent work uses the same attempt."""
@@ -775,7 +775,7 @@ def test_invalid_reinterpretation_preserves_other_repairs_and_ordinary_probes(tm
     run, inspection = asyncio.run(main())
     built = report.build(run.config.output_dir)
     assert len(script.requests) == 5, "the ordinary probe runs without a replacement planning call"
-    assert len(run.record.checks) == 2 and run.record.sandboxes == ["sandbox-0000", "sandbox-0001"]
+    assert len(run.record.checks) == 2 and sum(sandbox_record(run, name)["purpose"] == "check" for name in run.record.sandboxes) == 2
     assert len(inspection.attempts) == 2 and inspection.attempts[1].status == "model_output_failure"
     assert error in inspection.attempts[1].error and inspection.status == "partial"
     assert inspection.unreviewed == {} and inspection.ordinary[second].label == "legitimate"
@@ -806,25 +806,17 @@ def test_unsupported_runtime_keeps_the_check_failed_and_the_label_unknown(tmp_pa
             return run, report
 
     run, report = asyncio.run(main())
-    check = run.record.checks[0]
-    assert (check.command, check.exit_code) == ([], None)
-    assert check.output.startswith(checks.UNSUPPORTED_RUNTIME)
-    assert run.record.episodes == ["0000-simulator"] and run.record.sandboxes == ["sandbox-0000"]
-    assert not (run.config.output_dir / "episodes" / "0001-inspector").exists()
+    assert run.record.checks == [], "the unsupported workspace offers no checker or inference tools"
+    assert run.record.episodes == ["0000-simulator"]
     record = sandbox_record(run, "sandbox-0000")
+    assert record["purpose"] == "workspace" and record["cleanup"]["removed"] is True
     probes = [entry for entry in record["commands"] if checks.VERSION_PROBE in entry["argv"]]
     assert [(entry["argv"][0], entry["exit_code"]) for entry in probes] == [("python3", 127), ("python", 0)]
     assert probes[1]["output"].strip() == "2"
-    assert all(entry["argv"][1:] != [sandbox.CHECK_PROGRAM] for entry in record["commands"])
-    assert sandboxes.environments["sandbox-0000"].uploads[sandbox.CHECK_PROGRAM]
-    assert report.assessments[0].outcome == "unknown"
-    assert (report.attempts[0].status, report.status) == ("unobservable", "partial")
-    assert report.ordinary["0000-simulator"].label == "unknown"
-    history = [json.loads(message["content"]) for message in report.sessions["grader-broad"][1:]]
-    feedback = next(item for item in reversed(history) if "investigation_result" in item)
-    assert feedback["check_input_contract"] == checks.CHECK_INPUT_CONTRACT
-    assert history[-1]["investigation_status"] == "unobservable"
-    assert len(script.requests) == 2, "a check that did not run is never sent for interpretation"
+    assert sandbox.CHECK_PROGRAM not in sandboxes.environments["sandbox-0000"].uploads
+    assert report.assessments == [] and (report.attempts[0].status, report.status) == ("tool_failure", "partial")
+    assert "python3" in report.attempts[0].error and report.ordinary["0000-simulator"].label == "unknown"
+    assert len(script.requests) == 1, "capture selection stays scoped; no unsupported agent inference starts"
 
 
 def test_without_declarations_ordinary_labels_stay_unknown_and_a_probe_never_backfills(tmp_path, monkeypatch, credentials):
@@ -845,7 +837,7 @@ def test_without_declarations_ordinary_labels_stay_unknown_and_a_probe_never_bac
             return run, simulation, report
 
     run, simulation, report = asyncio.run(main())
-    probe_sandbox = run.record.sandboxes[0]
+    probe_sandbox = next(name for name in run.record.sandboxes if sandbox_record(run, name)["purpose"] == "probe")
     assert run.record.capture_selection.files == []
     assert run.record.submissions[0].content.episode == probe_sandbox
     assert run.record.submissions[0].execution_scope == "package"
@@ -884,6 +876,9 @@ def test_package_assessment_cannot_label_a_native_ordinary_episode(tmp_path, mon
 
 
 def test_labels_keep_partial_credit_unknowns_and_unavailable_rewards_apart_from_probes(tmp_path, monkeypatch, credentials):
+    from test_inspection import mock_experiments
+    Sandboxes(monkeypatch)
+
     def episode(run, name, rewards, errors=()):
         directory = run.config.output_dir / "episodes" / name
         directory.mkdir(parents=True)
@@ -909,7 +904,7 @@ def test_labels_keep_partial_credit_unknowns_and_unavailable_rewards_apart_from_
              ("partial_credit", "0007-simulator", "legitimate", {"coverage": covered}, "check-e", []),
              ("omitted_requirements", "0008-inspector", "accepted_invalid", {}, None, [])]
     probes = [{"category": category, "case": str(index), "location": f"/app/{index}",
-               **({"instruction": "targeted"} if name.endswith("inspector") else {"episode": name})}
+               **({"setup_program": "targeted"} if name.endswith("inspector") else {"episode": name})}
               for index, (category, name, *_) in enumerate(cases)]
     outcomes = iter(cases)
 
@@ -922,7 +917,7 @@ def test_labels_keep_partial_credit_unknowns_and_unavailable_rewards_apart_from_
         return Assessment(claim=Claim(mechanism=probe["case"], episode=name, check=check, **fields), outcome=outcome,
                           check=checked or None, missing=missing, **consistent)
 
-    monkeypatch.setattr(checks, "investigate", investigate)
+    mock_experiments(monkeypatch, investigate)
     script = InspectorScript([{"probes": probes}])
 
     async def main():
@@ -982,6 +977,7 @@ def test_inspector_selects_files_before_ordinary_episodes_when_the_task_declares
     with (task / "instruction.md").open("a") as file:
         file.write(RESULT + "\n")
     native = Native(monkeypatch, files={"0000-simulator": {"/output/result.json": b"{}", "/app/answer.txt": b"42\n"}})
+    Sandboxes(monkeypatch, native=native)
     selector = Selector([{"locations": [proposal("/output/result.json", RESULT), proposal("/app/answer.txt")]},
                          {"probes": []}], native)
 

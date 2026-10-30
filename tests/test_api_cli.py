@@ -59,8 +59,8 @@ class Analyses:
         (run.config.output_dir / f"inspection-{mode}.json").write_text(result.model_dump_json())
         return result
 
-    async def inspect_grader(self, run, ordinary_pool, *, focused_attempts):
-        self.calls.append(("inspect_grader", ordinary_pool, focused_attempts))
+    async def inspect_grader(self, run, ordinary_pool, *, focused_attempts, isolated_inspections):
+        self.calls.append(("inspect_grader", ordinary_pool, focused_attempts, isolated_inspections))
         self.raise_if("grader")
         return self.inspection(run, "grader")
 
@@ -102,7 +102,7 @@ def test_default_is_full_analysis_with_default_counts(tmp_path, monkeypatch):
     analyses = Analyses(monkeypatch)
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
 
-    assert analyses.calls == [("start_run", ALL_ROLES), ("simulate", 20), ("inspect_grader", [], 3), ("inspect_hacks", 3),
+    assert analyses.calls == [("start_run", ALL_ROLES), ("simulate", 20), ("inspect_grader", [], 3, False), ("inspect_hacks", 3),
                               ("attack", 2, 1, 0)]
     assert report["analyses"] == {"simulation": "complete", "grader": "complete", "hack": "complete", "attack": "complete"}
     assert report["status"] == "complete"
@@ -128,6 +128,7 @@ def test_python_async_and_cli_share_configuration_and_report(tmp_path, monkeypat
     config = tmp_path / "conf" / "nudi.toml"
     config.parent.mkdir()
     config.write_text('episodes = 5\nfocused_attempts = 1\nattacker_tries = 4\ndiscovery_attempts = 2\nspending_cap = 2.5\ncredentials_file = ".env"\n'
+                      'workspace_memory_mb = 1024\n'
                       '[models.simulator]\nmodel = "openai/gpt-test"\nreasoning_effort = "low"\napi_key_var = "TEST_KEY"\n')
     task = tmp_path / "task"
     reports, calls, configs = [], [], []
@@ -149,7 +150,7 @@ def test_python_async_and_cli_share_configuration_and_report(tmp_path, monkeypat
     assert code == 0
     assert capsys.readouterr().out == (tmp_path / "cli" / "report.md").read_text()
     assert reports[0] == reports[1] == reports[2]
-    assert calls[0] == calls[1] == calls[2] == [("start_run", ALL_ROLES), ("simulate", 7), ("inspect_grader", [], 1),
+    assert calls[0] == calls[1] == calls[2] == [("start_run", ALL_ROLES), ("simulate", 7), ("inspect_grader", [], 1, False),
                                                 ("inspect_hacks", 1), ("attack", 4, 3, 0)]
     assert configs[0]["discovery_attempts"] == 3
     analyses = Analyses(monkeypatch)
@@ -157,7 +158,11 @@ def test_python_async_and_cli_share_configuration_and_report(tmp_path, monkeypat
     assert analyses.calls[-1] == ("attack", 4, 2, 0)
     assert configs[0] == configs[1] == configs[2]
     # The keyword or flag replaces the file's value; the rest of the file stays.
-    assert configs[0]["episodes"] == 7 and configs[0]["spending_cap"] == 2.5
+    assert configs[0]["episodes"] == 7 and configs[0]["spending_cap"] == 2.5 and configs[0]["workspace_memory_mb"] == 1024
+    analyses = Analyses(monkeypatch)
+    assert cli.main(["send-nudis", str(task), "--config", str(config), "--output", str(tmp_path / "flag"),
+                     "--workspace-memory-mb", "768"]) == 0
+    assert analyses.config.workspace_memory_mb == 768
     assert configs[0]["credentials_file"] == config.parent / ".env"
     assert configs[0]["models"]["simulator"] == {"model": "openai/gpt-test", "reasoning_effort": "low", "api_base": None,
                                                  "api_key_var": "TEST_KEY"}
@@ -175,6 +180,9 @@ INVALID = {
     "unknown role": '[models.judge]\nmodel = "xai/grok-4.7"\n',
     "misspelled model setting": '[models.simulator]\nmodel = "xai/grok-4.7"\nreasoning_efort = "low"\n',
     "nonpositive spending cap": "spending_cap = 0\n",
+    "nonpositive workspace memory": "workspace_memory_mb = 0\n",
+    "text workspace memory": 'workspace_memory_mb = "512"\n',
+    "text isolated inspections": 'isolated_inspections = "yes"\n',
 }
 
 
@@ -189,6 +197,28 @@ def test_invalid_configuration_fails_before_execution(tmp_path, monkeypatch, cap
     assert cli.main(["send-nudis", str(tmp_path / "task"), "--config", str(config), "--output", str(tmp_path / "run")]) == 2
     assert "nudi: " in capsys.readouterr().err
     assert analyses.calls == [] and not (tmp_path / "run").exists()
+
+
+def test_isolated_inspections_switch_parses_from_cli_api_and_file(tmp_path, monkeypatch, capsys):
+    """Off (holistic_inspection) by default; on (inspector_swarm) from the flag, keyword or file. Hack inspection is unchanged."""
+    task, config = tmp_path / "task", tmp_path / "nudi.toml"
+    config.write_text("isolated_inspections = true\n")
+    runs = {"cli off": lambda out: cli.main(["send-nudis", str(task), "--output", str(out)]),
+            "cli on": lambda out: cli.main(["send-nudis", str(task), "--output", str(out), "--isolated-inspections"]),
+            "api on": lambda out: send_nudis(task, output_dir=out, isolated_inspections=True),
+            "api off": lambda out: send_nudis(task, output_dir=out, isolated_inspections=False),
+            "file on": lambda out: send_nudis(task, config, output_dir=out)}
+    found = {}
+    for name, start in runs.items():
+        analyses = Analyses(monkeypatch)
+        start(tmp_path / name)
+        found[name] = [call for call in analyses.calls if call[0] in ("inspect_grader", "inspect_hacks")]
+    assert found == {name: [("inspect_grader", [], 3, name.endswith("on")), ("inspect_hacks", 3)] for name in runs}
+    with pytest.raises(ValidationError):
+        send_nudis(task, output_dir=tmp_path / "invalid", isolated_inspections="yes")
+    with pytest.raises(SystemExit) as error:
+        cli.main(["send-nudis", str(task), "--output", str(tmp_path / "flag"), "--isolated-inspections=yes"])
+    assert error.value.code == 2 and "--isolated-inspections" in capsys.readouterr().err
 
 
 def test_missing_output_directory_fails_before_execution(tmp_path, monkeypatch):

@@ -1188,7 +1188,8 @@ def test_unknown_persistence_does_not_erase_a_scoring_finding(tmp_path):
 
 
 def test_inspector_persistence_request_is_not_an_attack(tmp_path, monkeypatch, credentials):
-    from test_inspection import InspectorScript
+    from test_inspection import InspectorScript, Sandboxes
+    Sandboxes(monkeypatch)
     script = InspectorScript([{"probes": [{"category": "persistence", "location": "/app/nudi-persistence.bin"}]}])
     seen = []
 

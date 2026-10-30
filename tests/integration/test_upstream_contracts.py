@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -36,6 +37,9 @@ VERIFIERS_VERSION = "0.4.1.dev12"
 VERIFIERS_RECORD_DIGEST = "4130103379da1031c9aa9363299df083d453532aea733ade831fcf9c450e1f09"
 HARBOR_VERSION = "0.24.0"
 LITELLM_VERSION = "1.106.0"
+# The Inspector runtime: Deep Agents over ChatLiteLLM, on LangChain's agent and LangGraph.
+SDK_VERSIONS = {"deepagents": "0.7.32", "langchain-litellm": "0.11.1", "langchain": "1.4.7",
+                "langchain-core": "1.7.1", "langgraph": "1.2.18"}
 FIXTURES = Path(__file__).parent / "fixtures"
 CONTRACT_TASK = FIXTURES / "contract-task"
 SEPARATE_TASK = FIXTURES / "separate-verifier-task"
@@ -313,6 +317,7 @@ def test_installed_upstream_pins():
     assert importlib.metadata.version("verifiers") == VERIFIERS_VERSION
     assert importlib.metadata.version("harbor") == HARBOR_VERSION
     assert importlib.metadata.version("litellm") == LITELLM_VERSION
+    assert {name: importlib.metadata.version(name) for name in SDK_VERSIONS} == SDK_VERSIONS
 
     # The published wheel's source commit is attested, not installed: its SHA256 and
     # provenance were checked when it was pinned, and VERIFIERS_RECORD_DIGEST derived from its RECORD.
@@ -722,3 +727,129 @@ def test_verifiers_terminus_2_harness_applies_task_agent_timeout(episode_env):
     assert len(scripted.requests) == 1
     assert trace.rewards["reward"].score == 0.0
     assert trace.metrics["answer_ok"] == 0.0
+
+
+class WorkspaceAgent(ScriptedModel):
+    """Requests one `execute` call in the Inspector workspace, then its structured result."""
+
+    def reply(self, body: dict) -> tuple[dict, str, dict]:
+        done = any(message.get("role") == "tool" for message in body["messages"])
+        name, arguments = ("Finding", {"summary": "done"}) if done else ("execute", {"command": self.command})
+        call = {"index": 0, "id": f"call_{len(self.requests)}", "type": "function",
+                "function": {"name": name, "arguments": json.dumps(arguments)}}
+        return {"role": "assistant", "content": None, "tool_calls": [call]}, "tool_calls", FIRST_USAGE
+
+
+WORKSPACE_TOOLS = {"ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep", "execute"}
+
+
+def test_importing_inspector_preserves_unrelated_chatlitellm_agents():
+    """Importing nudi must not change another caller's SDK tool configuration."""
+    script = r'''
+import asyncio, json, litellm
+from deepagents import create_deep_agent
+from langchain.agents.structured_output import ToolStrategy
+from langchain_litellm import ChatLiteLLM
+from pydantic import BaseModel
+
+class Finding(BaseModel):
+    summary: str
+
+requests = []
+async def completion(**kwargs):
+    requests.append(sorted(tool["function"]["name"] for tool in kwargs["tools"]))
+    return litellm.ModelResponse(choices=[{"index": 0, "finish_reason": "tool_calls", "message": {
+        "role": "assistant", "content": None, "tool_calls": [{"id": "done", "type": "function",
+        "function": {"name": "Finding", "arguments": '{"summary":"done"}'}}]}}])
+litellm.acompletion = completion
+
+async def tools():
+    agent = create_deep_agent(model=ChatLiteLLM(model="openai/nudi-unrelated", api_key="fake-key"),
+                              subagents=[], response_format=ToolStrategy(Finding))
+    await agent.ainvoke({"messages": [{"role": "user", "content": "Finish."}]})
+    return requests[-1]
+
+before = asyncio.run(tools())
+import nudi.inspector
+after = asyncio.run(tools())
+print(json.dumps({"before": before, "after": after}))
+'''
+    completed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30, check=True)
+    offered = json.loads(completed.stdout.splitlines()[-1])
+    assert "task" in offered["before"]
+    assert offered["after"] == offered["before"]
+
+
+def test_deep_agents_workspace_offers_only_file_search_and_shell_tools(tmp_path, monkeypatch):
+    """The released SDK, as nudi assembles it over a Harbor Docker workspace, offers file,
+    search and shell tools and the structured result only: no delegation `task`, todo list,
+    memory files, skills or approval interrupt. Its shell sees no credential or Docker socket."""
+    from pydantic import BaseModel
+
+    from nudi import inspector
+    from nudi.records import ModelConfig, RunConfig
+    from nudi.workflow import start_run
+
+    class Finding(BaseModel):
+        summary: str
+
+    credentials = tmp_path / "credentials.env"
+    credentials.write_text(f"XAI_API_KEY={PROVIDER_KEY}\n")
+    monkeypatch.setenv("NUDI_CONTRACT_HOST_SECRET", HOST_SECRET)
+    probe = (f"echo provider_key_count=$(env | grep -c {masked(PROVIDER_KEY)}); "
+             f"echo host_secret_count=$(env | grep -c {masked(HOST_SECRET)}); "
+             "echo docker_socket_$(test -S /var/run/docker.sock && echo present || echo absent); ls /nudi")
+    scripted = WorkspaceAgent(probe)
+
+    async def main():
+        async with serve(scripted) as base_url:
+            model = ModelConfig(model="xai/grok-4.7", reasoning_effort="xhigh", api_base=base_url)
+            run = start_run(RunConfig(task_dir=CONTRACT_TASK, output_dir=tmp_path / "run", credentials_file=credentials,
+                                      models={"inspector": model}), frozenset({"inspector"}))
+            async with inspector.investigation(run, "contract", "Inspect the copied package.", {}) as session:
+                return session, await session.ask("Investigate.", Finding)
+
+    session, result = asyncio.run(main())
+    assert result.summary == "done" and len(scripted.requests) == 2
+    for _, body in scripted.requests:
+        assert {tool["function"]["name"] for tool in body["tools"]} == WORKSPACE_TOOLS | {"Finding"}
+    output, = scripted.tool_outputs()
+    for expected in ("provider_key_count=0", "host_secret_count=0", "docker_socket_absent", "package"):
+        assert expected in output
+    record = session.box.record
+    # Only nudi's Python probe, the one shell call and the retention listing ran: no memory or skill reads.
+    assert [entry["argv"][:2] for entry in record.commands] == [["python3", "-c"], ["sh", "-c"], ["sh", "-c"]]
+    assert record.cleanup["removed"] is True
+    assert labelled_containers(f"com.docker.compose.project={record.session_id}") == set()
+    assert files_with_secrets(tmp_path / "run") == []
+
+
+def test_workspace_memory_override_reaches_docker_beside_an_experiment_at_task_limits(tmp_path):
+    """Docker enforces the recorded limits: Harbor's override sets the held workspace's memory,
+    a fresh experiment beside it keeps the task's declaration, and both are removed."""
+    from nudi import sandbox
+    from nudi.records import RunConfig
+    from nudi.workflow import start_run
+
+    credentials = tmp_path / "credentials.env"
+    credentials.write_text(f"XAI_API_KEY={PROVIDER_KEY}\n")
+    run = start_run(RunConfig(task_dir=CONTRACT_TASK, output_dir=tmp_path / "run", credentials_file=credentials,
+                              workspace_memory_mb=256), frozenset({"inspector"}))
+
+    def enforced(box) -> dict:
+        container, = labelled_containers(f"com.docker.compose.project={box.record.session_id}")
+        memory, cpus = subprocess.run(["docker", "inspect", "--format", "{{.HostConfig.Memory}} {{.HostConfig.NanoCpus}}",
+                                       container], capture_output=True, text=True, check=True).stdout.split()
+        return {"cpus": int(cpus) // 10**9, "memory_mb": int(memory) // 2**20}
+
+    async def main():
+        async with sandbox.sandbox(run, "workspace") as workspace:
+            async with sandbox.sandbox(run, "check") as check:
+                return [(box.record, enforced(box)) for box in (workspace, check)]
+
+    (workspace, held), (check, fresh) = asyncio.run(main())
+    assert held == {"cpus": workspace.environment["cpus"], "memory_mb": workspace.environment["memory_mb"]} == {"cpus": 1, "memory_mb": 256}
+    assert fresh == {"cpus": check.environment["cpus"], "memory_mb": check.environment["memory_mb"]} == {"cpus": 1, "memory_mb": 512}
+    for record in (workspace, check):
+        assert record.cleanup["removed"] is True
+        assert labelled_containers(f"com.docker.compose.project={record.session_id}") == set()

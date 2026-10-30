@@ -1,9 +1,11 @@
 """Inspector sandboxes: a copy of the task package in Harbor's Docker environment.
 
 The Inspector never acts inside the task harness. A sandbox starts the copied package's
-own environment directly, with its declared resources and network policy, and runs only
+own environment directly, with its declared resources and network policy (a held
+workspace has the run's workspace memory limit instead), and runs only
 nudi's commands: generated setup programs, the copied grader through Harbor's
-`Verifier`, and generated checks. There is no Trial, agent or actor timer. Host records
+`Verifier`, generated checks and, in a held workspace, the Inspector's tool commands.
+There is no Trial, agent or actor timer. Host records
 stay under the run's `sandboxes/` directory, outside the one mounted verifier directory.
 A sandbox result establishes what the copied package did, not native accessibility.
 """
@@ -140,7 +142,9 @@ class Sandbox:
         await self.environment.upload_dir(source, target)
 
     async def upload_text(self, text: str, target: str) -> None:
-        data = text.encode()
+        await self.upload(text.encode(), target)
+
+    async def upload(self, data: bytes, target: str) -> None:
         source = self.scratch / "uploads" / _sha256(target.encode())
         source.parent.mkdir(exist_ok=True)
         source.write_bytes(data)
@@ -148,18 +152,21 @@ class Sandbox:
         self.save()
         await self.environment.upload_file(source, target)
 
-    async def exec(self, argv: list[str], stdin: str = "/dev/null", *, runtime: str | None) -> dict:
-        """Use the selected Python 3 runner, or execute a trusted capability probe directly."""
+    async def exec(self, argv: list[str], stdin: str = "/dev/null", *, runtime: str | None, timeout: int | None = None,
+                   output_limit: int | None = OUTPUT_LIMIT) -> dict:
+        """Use the selected Python 3 runner, or execute a trusted capability probe directly.
+        `timeout` is the caller's own limit for this command, passed to Harbor. The SDK
+        backend uses direct execution and retains complete results before its own eviction."""
         entry = {"argv": list(argv), "stdin": stdin, "exit_code": None, "output": "", "truncated": False,
                  "error": None, "started_at": _now(), "finished_at": None}
         self.record.commands.append(entry)
         self.save()
         try:
             command = argv if runtime is None else [runtime, RUNNER, stdin, *argv]
-            result = await self.environment.exec(shlex.join(command))
+            result = await self.environment.exec(shlex.join(command), timeout_sec=timeout)
             output = ((result.stdout or "") + (result.stderr or "")).encode()
-            entry["truncated"] = len(output) > OUTPUT_LIMIT
-            entry["output"] = output[:OUTPUT_LIMIT].decode(errors="replace")
+            entry["truncated"] = output_limit is not None and len(output) > output_limit
+            entry["output"] = output[:output_limit].decode(errors="replace")
             entry["exit_code"] = result.return_code
         except Exception as error:
             entry["error"] = f"{type(error).__name__}: {error}"
@@ -208,12 +215,13 @@ def _bounded(path: Path) -> tuple[str | None, str | None]:
 async def sandbox(run, purpose: str):
     """Start a fresh sandbox of a copy of the run's task, then always remove it.
 
-    The spending cap is checked first. Removal is shielded from cancellation, and the
-    project's containers are listed afterwards, because upstream stop logs its failures."""
+    The spending cap and the run's container admission are checked first. Removal is
+    shielded from cancellation, and the project's containers are listed afterwards,
+    because upstream stop logs its failures."""
     from nudi import checks
 
     run.check_cap()
-    run.check_sandboxes_closed()
+    run.admit_container(purpose)
     name = f"sandbox-{len(run.record.sandboxes):04d}"
     session_id = f"nudi-{secrets.token_hex(4)}-{name}"
     scratch = Path(tempfile.mkdtemp(prefix=f"nudi-{name}-"))
@@ -225,10 +233,13 @@ async def sandbox(run, purpose: str):
     paths.chmod_dir()
     config = task.config.environment
     policy = config.resolve_baseline()
+    # Harbor's override applies to this environment only; the copied files keep the declaration.
+    override = run.record.capacity.workspace_memory_mb if purpose == "workspace" else None
     record = SandboxResult(
         name=name, purpose=purpose, session_id=session_id, ids={"sandbox": name, "session_id": session_id},
         task_dir=str(run.config.task_dir), task_digest=tree_digest(run.config.task_dir), copy_digest=tree_digest(copy),
-        environment={"type": "docker", "cpus": config.cpus, "memory_mb": config.memory_mb, "docker_image": config.docker_image,
+        environment={"type": "docker", "cpus": config.cpus, "memory_mb": override or config.memory_mb,
+                     "docker_image": config.docker_image,
                      "network_mode": str(policy.network_mode), "allowed_hosts": policy.allowed_hosts})
     box = Sandbox(run, record, task, paths, scratch)
     box.directory.mkdir(parents=True)
@@ -240,7 +251,8 @@ async def sandbox(run, purpose: str):
                                     target=str(EnvironmentPaths.verifier_dir), bind=ServiceVolumeBind(selinux="z"))
         box.environment = EnvironmentFactory.create_environment(
             type=EnvironmentType.DOCKER, environment_dir=task.paths.environment_dir, environment_name=task.short_name,
-            session_id=session_id, trial_paths=paths, task_env_config=config, mounts=[mount], network_policy=policy)
+            session_id=session_id, trial_paths=paths, task_env_config=config, mounts=[mount], network_policy=policy,
+            override_memory_mb=override)
         _protect_startup(box.environment)
         await asyncio.wait_for(box.environment.start(force_build=False), config.build_timeout_sec)
         await box.upload_dir(copy, PACKAGE)

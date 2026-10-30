@@ -316,10 +316,15 @@ def test_native_episode_retains_trial_ids_rewards_and_trajectory(docker_env):
     assert tree_digest(DOCKERFILE_TASK) == digest == result.task_digest
 
 
-def test_adapter_episode_retains_trace_ids_rewards_and_components(docker_env):
-    digest = tree_digest(CONTRACT_TASK)
+def test_adapter_episode_retains_trace_ids_rewards_and_components(docker_env, tmp_path):
+    original_digest = tree_digest(CONTRACT_TASK)
+    task = task_variant(tmp_path, CONTRACT_TASK)
+    manifest = task / "task.toml"
+    # This retention test allows cold imports and tmux installation; deadline enforcement has its own test.
+    manifest.write_text(manifest.read_text().replace("timeout_sec = 20.0", "timeout_sec = 60.0", 1))
+    digest = tree_digest(task)
 
-    result, script = episode(docker_env, CONTRACT_TASK, PROBE)
+    result, script = episode(docker_env, task, PROBE)
 
     assert result.path == "verifiers"
     assert len(result.path_reasons) == 3
@@ -335,7 +340,8 @@ def test_adapter_episode_retains_trace_ids_rewards_and_components(docker_env):
         assert expected in observation, observation
     assert stored(docker_env) == result
     assert files_with_secret(docker_env) == []
-    assert tree_digest(CONTRACT_TASK) == digest == result.task_digest
+    assert tree_digest(task) == digest == result.task_digest
+    assert tree_digest(CONTRACT_TASK) == original_digest
 
 
 @pytest.mark.parametrize(

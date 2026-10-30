@@ -59,6 +59,9 @@ class RunConfig(BaseModel):
     """A dotenv file of credentials, read without changing the process environment."""
     spending_cap: float | None = Field(None, gt=0)
     """Optional US dollar cap on the run's known inference cost. No default."""
+    workspace_memory_mb: int | None = Field(None, gt=0, strict=True)
+    """Memory limit in MiB of a held Inspector workspace; by default the smaller of 512 and
+    the task's declared memory_mb. Experiments and native episodes keep the task's limits."""
 
 
 class EpisodeConfig(BaseModel):
@@ -110,6 +113,9 @@ class Capacity(BaseModel):
     episode_memory_mb: int | None
     concurrency: int
     """Episodes the run's Harbor TrialQueue runs at once."""
+    workspace_memory_mb: int | None = None
+    """Memory limit in MiB that Harbor's override enforces on a held Inspector workspace.
+    None in earlier records, whose workspaces inherited the task's limit."""
 
 
 class CallRecord(BaseModel):
@@ -283,6 +289,19 @@ class Check(BaseModel):
 Validity = Literal["supported", "violated", "unknown"]
 
 
+class Support(BaseModel):
+    """The Inspector's support for meaning, separate from measured computation.
+
+    Inference is permitted when cited context and an explanation support it. An
+    assumption, artifact declaration or unresolved condition cannot establish a rule.
+    """
+
+    basis: Literal["explicit", "inferred", "assumed", "artifact_metadata", "unknown"]
+    sources: list[Observation] = []
+    rationale: str = ""
+    uncertainty: list[str] = []
+
+
 class Reading(BaseModel):
     """Inspector interpretation of one further requirement from the same executed check.
 
@@ -293,6 +312,7 @@ class Reading(BaseModel):
     observations: list[str]
     validity: Validity
     interpretation: str
+    support: Support | None = None
 
 
 class Derivation(BaseModel):
@@ -338,11 +358,12 @@ class SandboxResult(BaseModel):
     environment, with no native actor, Trial, agent or actor timer.
 
     It establishes only what the copied package did. `ids` identify the sandbox; there are
-    no native trial IDs. Command output is bounded; `cleanup` records the project's
-    containers observed after removal."""
+    no native trial IDs. Probe/check command output is bounded; workspace tools use SDK
+    eviction and source capture. `cleanup` records the containers observed after removal."""
 
     name: str
-    purpose: Literal["probe", "check"]
+    purpose: Literal["probe", "check", "workspace"]
+    """A workspace is held for one investigation; probes and checks are fresh experiments."""
     execution_scope: ExecutionScope = "package"
     session_id: str
     ids: dict[str, str]
@@ -351,7 +372,8 @@ class SandboxResult(BaseModel):
     """SHA256 over the original task files when the sandbox started."""
     copy_digest: str
     environment: dict
-    """The resources, network policy and image of the copied package's declaration."""
+    """The enforced resources, network policy and image: the copied package's declaration,
+    except a workspace's memory limit, which is the run's `workspace_memory_mb`."""
     files: dict[str, str] = {}
     """SHA256 of each uploaded file, or tree digest of each uploaded directory, by target path."""
     commands: list[dict] = []
@@ -506,6 +528,9 @@ class Claim(BaseModel):
     persisted: Content | None = None
     """The same state, retained by the graded episode after the normal reset."""
     interpretation: str = ""
+    requirement_support: Support | None = None
+    scoring_support: Support | None = None
+    """Absent in older records. New interactive interpretations supply both."""
     full_guidance: str | None = None
     """Concrete steps that reproduce the suspected loophole, when the Inspector supplies them."""
     hint_location: str | None = None

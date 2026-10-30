@@ -35,6 +35,9 @@ class AnalysisConfig(RunConfig):
     """Ordinary Simulator episodes."""
     focused_attempts: int = Field(3, ge=0, strict=True)
     """Total focused Inspector attempts for each category after broad inspection."""
+    isolated_inspections: bool = Field(False, strict=True)
+    """Grader inspection: off, `holistic_inspection`, presumes labels for episodes the Inspector names normal;
+    on, `inspector_swarm`, verifies each ordinary episode in its own Inspector forked from broad."""
     attacker_tries: int = Field(2, ge=0, strict=True)
     """Maximum Attacker attempts for each candidate and hint level."""
     discovery_attempts: int = Field(1, ge=0, strict=True)
@@ -113,7 +116,8 @@ async def send_nudis_async(task_dir, config=None, **options) -> dict:
     steps = {
         "simulation": lambda: simulate(run, settings.episodes),
         "grader": lambda: inspect_grader(run, run.record.simulation.episodes if run.record.simulation else [],
-                                         focused_attempts=settings.focused_attempts),
+                                         focused_attempts=settings.focused_attempts,
+                                         isolated_inspections=settings.isolated_inspections),
         "hack": lambda: inspect_hacks(run, focused_attempts=settings.focused_attempts),
         "attack": lambda: attack(run, maximum_attempts=settings.attacker_tries,
                                  discovery_attempts=settings.discovery_attempts, **guidance(results.get("hack"))),

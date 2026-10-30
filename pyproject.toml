@@ -10,6 +10,11 @@ dependencies = [
     "verifiers[harbor]==0.4.1.dev12",
     "harbor==0.24.0",
     "litellm==1.106.0",
+    "deepagents==0.7.32",
+    "langchain-litellm==0.11.1",
+    "langchain==1.4.7",
+    "langchain-core==1.7.1",
+    "langgraph==1.2.18",
 ]
 
 [project.scripts]

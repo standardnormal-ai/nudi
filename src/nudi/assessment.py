@@ -11,7 +11,9 @@ Inspector's; this module decides no task semantics.
 import hashlib
 import json
 import math
+import re
 import sys
+import tomllib
 from pathlib import Path
 
 from harbor.models.trajectories import Trajectory
@@ -154,6 +156,55 @@ class Evidence:
             for content in check.inputs.values()
         )
 
+    def artifact_metadata(self, source: Observation) -> bool:
+        """Recognize a citation confined to Harbor's artifact declarations, not task prose."""
+        if source.episode is not None:
+            return False
+        file = self.file(None, source.path)
+        if file != (Path(self.run.task_dir) / "task.toml").resolve():
+            return False
+        declaration = re.compile(r'''^(?:artifacts|"artifacts"|'artifacts')\s*=''')
+        table = re.compile(r'''^\[\[?\s*(?:artifacts|"artifacts"|'artifacts')(?:\s*\]|\s*\.)''')
+        blocks, current = [], []
+        for line in file.read_text().splitlines():
+            if line.lstrip().startswith("[") and current:
+                blocks.append("\n".join(current))
+                current = []
+            if declaration.match(line.strip()) or table.match(line.strip()):
+                current = [line]
+            elif current:
+                current.append(line)
+            if current and declaration.match(current[0].strip()):
+                try:
+                    tomllib.loads("\n".join(current))
+                except tomllib.TOMLDecodeError:
+                    continue
+                blocks.append("\n".join(current))
+                current = []
+        return any(source.excerpt in block for block in blocks + ["\n".join(current)])
+
+
+def support_gaps(support, kind: str, evidence: Evidence) -> list[str]:
+    """Check references and stated uncertainty, without claiming semantic validation."""
+    if support is None:  # Retained records from before interactive inspection remain readable.
+        return []
+    gaps = []
+    if support.basis not in ("explicit", "inferred"):
+        gaps.append(f"{kind} support is {support.basis}")
+    if not support.sources or not support.rationale.strip():
+        gaps.append(f"{kind} support lacks cited context or an explanation")
+    metadata = []
+    for source in support.sources:
+        try:
+            evidence.excerpt(source)
+            metadata.append(evidence.artifact_metadata(source))
+        except Ungrounded as error:
+            gaps.append(f"{kind} support: {error}")
+    if metadata and all(metadata):
+        gaps.append(f"{kind} support cites only artifact metadata; collection declarations establish no requirement or score")
+    gaps += [f"{kind} support unresolved: {item}" for item in support.uncertainty]
+    return gaps
+
 
 def tool_output(trajectory: Path, step_id: int, result: int) -> bytes:
     try:
@@ -252,6 +303,9 @@ def conclude(reading: Reading, check: Check, evidence: Evidence, observations: d
         conclusion.reasons.append(str(error))
     if not reading.interpretation.strip():
         conclusion.reasons.append("the reading lacks an interpretation")
+    conclusion.reasons += support_gaps(reading.support, "requirement", evidence)
+    if reading.support is None and not conclusion.reasons and evidence.artifact_metadata(reading.requirement):
+        conclusion.reasons.append("artifact metadata alone establishes no requirement")
     conclusion.reasons += measured(reading.observations, observations, results)
     if not conclusion.reasons:
         conclusion.validity = reading.validity
@@ -421,7 +475,10 @@ def judge(assessment: Assessment, evidence: Evidence) -> None:
         return provisional("the check output lacks an `observations` or `results` object", "structured observations and computations from the recorded input bytes")
     if derivation is None or not claim.interpretation.strip():
         return provisional("the claim lacks an interpretation or derivation", "an Inspector derivation naming measured observations")
-    problems = measured(derivation.observations, observations, results)
+    requirement_gaps = support_gaps(claim.requirement_support, "requirement", evidence)
+    if claim.requirement_support is None and evidence.artifact_metadata(check.requirement):
+        requirement_gaps.append("requirement support consists only of artifact metadata")
+    problems = measured(derivation.observations, observations, results) + requirement_gaps
     if problems:
         provisional(f"no measured observation supports the claimed validity: {'; '.join(problems)}",
                     "derivation.observations naming measured facts of the check output")
@@ -430,6 +487,9 @@ def judge(assessment: Assessment, evidence: Evidence) -> None:
     assessment.conclusions = [conclude(item, check, evidence, observations, results) for item in derivation.requirements]
     if reward is None:
         return
+    scoring_gaps = support_gaps(claim.scoring_support, "scoring", evidence)
+    if scoring_gaps:
+        return provisional("; ".join(scoring_gaps), "supported scoring context and resolved assumptions")
     if check.scoring is None or not evidence.input_contains(check, check.scoring):
         return provisional("the check lacks an applicable scoring input", "the cited scoring rule among the check's immutable inputs")
     try:

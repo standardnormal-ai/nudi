@@ -101,6 +101,7 @@ class Endpoint:
     def __init__(self, case, requirements):
         self.case, self.requirements = case, requirements
         self.requests, self.ordinary, self.interpretations = [], 0, []
+        self.turn = None
 
     def proposal(self, context):
         if context.get("mode") == "hack":
@@ -126,6 +127,10 @@ class Endpoint:
                     validity = "unknown"
                 claim = {"mechanism": "required work", "interpretation": "The retained capture checks the cited requirement and stated credit.",
                          "derivation": {"observations": ["met"], "minimum": "minimum", "maximum": "maximum", "validity": validity}}
+                claim["requirement_support"] = {"basis": "explicit", "sources": [probes[-1]["requirement"]],
+                                                 "rationale": "The instruction states this requirement.", "uncertainty": []}
+                claim["scoring_support"] = {"basis": "inferred", "sources": [probes[-1]["scoring"]],
+                                             "rationale": "The cited rule connects the measured requirement to credit.", "uncertainty": []}
                 if self.case in ("clean", "strict"):
                     claim["coverage"] = {"requirements": [source("instruction.md", self.requirements[0])], "scoring": source("tests/test.sh", SCORING),
                                          "checks": [f"check-{index:04d}"], "explanation": "This checks the complete single requirement and its stated score."}
@@ -146,9 +151,40 @@ class Endpoint:
                 self.interpretations.append({"claim": claim})
         return {"probes": probes}
 
+    def sdk_message(self, body):
+        text = next(item["content"] for item in reversed(body["messages"]) if item["role"] == "user")
+        context = json.loads(text)
+        if self.turn is None or self.turn["context"] != text:
+            proposal = self.proposal(context)
+            self.turn = {"context": text, "probes": proposal["probes"], "waiting": None}
+        turn = self.turn
+        if turn["waiting"] == "measure":
+            receipt = json.loads(body["messages"][-1]["content"])
+            turn["waiting"] = None
+            if receipt.get("check", {}).get("exit_code") == 0:
+                turn["waiting"] = "interpret"
+                return self.tool_message("interpret_experiment", {"experiment": receipt["id"], **self.interpretations.pop(0)})
+        elif turn["waiting"] == "interpret":
+            turn["waiting"] = None
+        if turn["probes"]:
+            turn["waiting"] = "measure"
+            return self.tool_message("run_experiment", {"probe": turn["probes"].pop(0)})
+        applicability = {category: {"scope": "package", "status": "applicable", "facts": {"package_copy": True},
+                                   "reason": "The Inspector can check the copied package and retained submissions."} for category in context["categories"]}
+        return self.tool_message("InspectionSummary", {"applicability": applicability, "completed": context["categories"]})
+
+    def tool_message(self, name, arguments):
+        return {"role": "assistant", "content": None, "tool_calls": [{"id": f"call_{len(self.requests)}", "type": "function",
+                "function": {"name": name, "arguments": json.dumps(arguments)}}]}
+
     async def chat(self, request):
         body = await request.json()
         self.requests.append(body)
+        if any(item.get("function", {}).get("name") == "run_experiment" for item in body.get("tools", [])):
+            message = self.sdk_message(body)
+            return web.json_response({"id": "nudi-validation", "object": "chat.completion", "created": 0, "model": body["model"],
+                                      "choices": [{"index": 0, "finish_reason": "tool_calls", "message": message}],
+                                      "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}})
         # Inspector uses a JSON context as its last user message.
         try:
             context = json.loads(body["messages"][-1]["content"])
@@ -238,7 +274,8 @@ def test_native_cases_from_installed_wheel(case, tmp_path, monkeypatch):
     (retained / "requests.json").write_text(json.dumps(endpoint.requests, indent=2))
     assert helpers.docker_resources() == before
     assert helpers.tree_digest(task) == digest and helpers.tree_digest(helpers.CONTRACT_TASK) == original
-    selections = [body for body in endpoint.requests if '"phase": "capture_selection"' in body["messages"][-1]["content"]]
+    selections = [body for body in endpoint.requests if isinstance(body["messages"][-1].get("content"), str)
+                  and '"phase": "capture_selection"' in body["messages"][-1]["content"]]
     record = json.loads((output / "run.json").read_text())
     assert len(selections) == 1 and record["capture_selection"]["status"] == "complete", record["capture_selection"]
     assert not any("capture selection" in warning for warning in record["warnings"])
@@ -257,7 +294,8 @@ def verify_retained(case, retained, result=None):
         assert execution["stdout"].endswith(report.markdown(result))
     assert result == json.loads((output / "report.json").read_text())
     assert (output / "report.md").read_text() == report.markdown(result)
-    assert result["analyses"] == {"simulation": "partial" if case == "infrastructure" else "complete", "grader": "complete"}
+    assert result["analyses"] == {"simulation": "partial" if case == "infrastructure" else "complete",
+                                   "grader": "partial" if case in ("ambiguity", "infrastructure") else "complete"}
     expected = {"clean": {"legitimate": 4}, "strict": {"rejected_valid": 1}, "permissive": {"accepted_invalid": 1},
                 "partial": {"legitimate": 1}, "ambiguity": {"unknown": 1}, "infrastructure": {"unavailable": 1}}
     assert result["labels"]["counts"] == expected[case], result["labels"]
@@ -276,7 +314,7 @@ def verify_retained(case, retained, result=None):
         assert metrics["auroc"][0]["auroc"] is None
     else:
         assert metrics["confusion"] == [] and metrics["auroc"] == []
-        assert metrics["episodes"]["0000-simulator"]["completion"] == "unknown"
+        assert metrics["episodes"]["0000-simulator"]["completion"] == ("complete" if case == "infrastructure" else "unknown")
     if case == "infrastructure":
         assert summary["usable"] == 0 and summary["missing"] == ["0000-simulator"]
         episode = json.loads((output / "episodes/0000-simulator/episode.json").read_text())
