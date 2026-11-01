@@ -553,6 +553,26 @@ def test_provider_reported_cost_is_kept_beside_the_estimate(tmp_path, monkeypatc
     assert recorded.cost is not None
 
 
+def test_provider_reported_cost_counts_when_litellm_has_no_price(tmp_path, monkeypatch, credentials):
+    override = ModelConfig(model=UNPRICED, api_key_var="NUDI_UNPRICED_KEY")
+    run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": override}, spending_cap=0.1)
+    endpoint = Endpoint(usage={"cost": 0.25})
+
+    async def main():
+        async with serve(endpoint) as base_url:
+            with model_calls(run, "inspector", "probe"):
+                await call(base_url, model=UNPRICED)
+                with pytest.raises(SpendingCapReached):
+                    await call(base_url, model=UNPRICED)
+
+    asyncio.run(main())
+
+    record = stored_run(run)
+    (recorded,) = record.calls
+    assert (recorded.cost, recorded.cost_source) == (0.25, "provider-reported usage.cost")
+    assert (record.known_cost, record.unknown_cost_calls, record.refused_calls) == (0.25, 0, {"probe": 1})
+
+
 def test_unknown_price_stays_unknown_warns_and_continues(tmp_path, monkeypatch, credentials):
     override = ModelConfig(model=UNPRICED, api_key_var="NUDI_UNPRICED_KEY")
     run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": override}, spending_cap=TINY_CAP)

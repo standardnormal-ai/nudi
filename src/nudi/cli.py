@@ -24,9 +24,9 @@ def main(argv=None) -> int:
     send.add_argument("--output", dest="output_dir", type=Path, help="run directory for records and the report")
     send.add_argument("--analysis", choices=get_args(api.Analysis), help="default full")
     send.add_argument("--episodes", type=int, help="ordinary Simulator episodes, default 20")
-    send.add_argument("--focused-attempts", type=int, help="total focused Inspector attempts per category, default 3")
+    send.add_argument("--focused-attempts", type=int, help="total focused attempts per grader inspector or hack inspector category, default 2")
     send.add_argument("--isolated-inspections", action="store_true", default=None,
-                      help="grader inspection runs one Inspector per ordinary episode (inspector_swarm), about 3 to 7 minutes "
+                      help="runs one grader inspector per ordinary episode (inspector_swarm), about 3 to 7 minutes "
                            "each; default off (holistic_inspection)")
     send.add_argument("--attacker-tries", type=int, help="maximum Attacker attempts per candidate and hint level, default 2")
     send.add_argument("--discovery-attempts", type=int, help="total no-hint discovery attempts, default 1")

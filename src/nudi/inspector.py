@@ -18,8 +18,10 @@ from uuid import uuid4
 
 import litellm
 from deepagents import create_deep_agent
+from deepagents.backends import sandbox as sdk_sandbox
 from deepagents.backends.protocol import ExecuteResponse, FileDownloadResponse, FileUploadResponse
 from deepagents.backends.sandbox import BaseSandbox
+from deepagents.middleware import filesystem as sdk_filesystem
 from deepagents.profiles import GeneralPurposeSubagentProfile, HarnessProfile, register_harness_profile
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.structured_output import StructuredOutputError, ToolStrategy
@@ -30,7 +32,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langsmith import tracing_context
 
 from nudi import checks, sandbox
-from nudi.records import ErrorRecord, InfrastructureAbort
+from nudi.records import ErrorRecord, InfrastructureAbort, write_private
 from nudi.workflow import SpendingCapReached, model_calls
 
 # The profile identity is private to nudi; LiteLLM still receives the configured route.
@@ -38,6 +40,8 @@ register_harness_profile("nudi-inspector", HarnessProfile(
     general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
     excluded_tools=frozenset({"task", "write_todos"}),
 ))
+# A broad search of a task image can outlast the SDK's 10 to 35 s search deadlines, which it reads at call time.
+sdk_sandbox.ASYNC_GREP_TIMEOUT = sdk_sandbox.ASYNC_GLOB_TIMEOUT = sdk_filesystem.GLOB_TIMEOUT = 120
 
 
 class InspectorModel(ChatLiteLLM):
@@ -119,7 +123,7 @@ class Transcript(AsyncCallbackHandler):
 
     def __init__(self, run, directory, backend):
         self.run, self.directory, self.backend, self.seen = run, directory, backend, set()
-        (directory / "transcript.jsonl").touch()
+        write_private(directory / "transcript.jsonl", "")
 
     def save(self, messages):
         with (self.directory / "transcript.jsonl").open("a") as output:
@@ -156,7 +160,7 @@ class Transcript(AsyncCallbackHandler):
                 relative = f"tool-outputs/{digest}"
                 retained = self.directory / relative
                 if not retained.exists():
-                    retained.write_bytes(captured.content)
+                    write_private(retained, captured.content)
                 output.artifact.update(retained_output=relative, sha256=digest)
                 output.content = f"{output.content}\nRetained captured bytes: /nudi/evidence/tool-results/{digest}"
             self.save([output])
@@ -214,7 +218,7 @@ class Investigation:
         self.state, self.closed, self.busy, self.retained = {"messages": []}, False, False, False
         self.checkpointer = InMemorySaver()
         self.ownership = ToolOwnership()
-        (box.directory / "tool-outputs").mkdir()
+        (box.directory / "tool-outputs").mkdir(mode=0o700)
         self.transcript = Transcript(run, box.directory, backend)
         config = run.record.models["inspector"]
         kwargs = {}
@@ -225,10 +229,10 @@ class Investigation:
         self.model = InspectorModel(model=config.model, api_base=config.api_base, api_key=run.keys["inspector"],
                                  model_kwargs=kwargs, streaming=False, max_retries=1, cache=False,
                                  callbacks=[self.transcript])
-        (box.directory / "system-prompt.txt").write_text(checks.redacted(run, prompt))
-        (box.directory / "results.jsonl").touch()
-        (box.directory / "inferences.jsonl").touch()
-        (box.directory / "state.json").write_text('{"messages": []}')
+        write_private(box.directory / "system-prompt.txt", checks.redacted(run, prompt))
+        write_private(box.directory / "results.jsonl", "")
+        write_private(box.directory / "inferences.jsonl", "")
+        write_private(box.directory / "state.json", '{"messages": []}')
         box.record.artifacts.update(transcript="transcript.jsonl", inferences="inferences.jsonl", workspace="workspace",
                                     state="state.json", results="results.jsonl", system_prompt="system-prompt.txt",
                                     tool_outputs="tool-outputs")
@@ -275,7 +279,7 @@ class Investigation:
         finally:
             await checks.finish_cleanup(asyncio.create_task(self.ownership.cancel()))
             self.busy = False
-            (self.box.directory / "state.json").write_text(checks.redacted(
+            write_private(self.box.directory / "state.json", checks.redacted(
                 self.run, json.dumps(self.state, default=lambda value: value.model_dump(), ensure_ascii=False)))
 
     async def fork(self, source):
@@ -299,7 +303,7 @@ class Investigation:
         if listing.exit_code or listing.truncated:
             raise RuntimeError("Workspace retention listing failed or exceeded its output limit")
         root = self.box.directory / "workspace"
-        root.mkdir(exist_ok=True)
+        root.mkdir(mode=0o700, exist_ok=True)
         for name in listing.output.split("\0"):
             if not name:
                 continue
@@ -310,9 +314,7 @@ class Investigation:
             response, = await self.backend.adownload_files([name])
             if response.error:
                 raise RuntimeError(f"Cannot retain {name}: {response.error}")
-            target = root / path.relative_to("/")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(response.content)
+            write_private(root / path.relative_to("/"), response.content)
         self.retained = True
 
 
@@ -351,8 +353,14 @@ async def investigation(run, name: str, prompt: str, evidence: dict[str, Path], 
                 for secret in run.keys.values():
                     data = data.replace(secret.encode(), b"[redacted]")
                 target.write_bytes(data)
-            if fork is not None and (fork.box.directory / "workspace").is_dir():
-                shutil.copytree(fork.box.directory / "workspace", seed, dirs_exist_ok=True)
+            if fork is not None:
+                # Default modes, like the evidence above; the retained copies are owner-only.
+                workspace = fork.box.directory / "workspace"
+                for source in workspace.rglob("*"):
+                    if source.is_file():
+                        target = seed / source.relative_to(workspace)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(source, target)
             await box.upload_dir(seed, "/")
             backend = HarborBackend(box)
             session = Investigation(run, name, prompt, box, backend)

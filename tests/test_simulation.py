@@ -147,8 +147,10 @@ class FakeTrial:
             (trial_dir / "agent").mkdir(parents=True)
             if name in native.raises:
                 raise RuntimeError("fake trial failure")
-            if config.agent.import_path:
-                raise AssertionError(f"a generated check must run in an Inspector sandbox, not native agent {config.agent.import_path}")
+            if config.agent.import_path not in (None, "nudi.runner:HostTerminus"):
+                raise AssertionError(
+                    f"a generated check must run in an Inspector sandbox, not native agent {config.agent.import_path}"
+                )
             if name in native.agents:
                 await native.agents[name](config)
             (trial_dir / "agent" / "trajectory.json").write_text(json.dumps({"ordinary": name}))
@@ -159,7 +161,8 @@ class FakeTrial:
             result = TrialResult(task_name="task", trial_name=config.trial_name, trial_uri=trial_dir.as_uri(),
                                  task_id=LocalTaskId(path=config.task.path), task_checksum="checksum", config=config,
                                  agent_info=AgentInfo(name="fake", version="0"), exception_info=failure,
-                                 verifier_result=VerifierResult(rewards={"reward": native.rewards.get(name, 1.0)}))
+                                 verifier_result=None if native.rewards.get(name, 1.0) is None else VerifierResult(
+                                     rewards={"reward": native.rewards.get(name, 1.0)}))
             native.containers[config.trial_name.lower() + "__env"] = name
             for hook in self.hooks:
                 await hook(SimpleNamespace(trial_name=config.trial_name, trial_id=result.id, result=result))
@@ -190,7 +193,8 @@ def test_default_and_configured_counts_share_the_queue_and_original_task(tmp_pat
     original = (CONTRACT_TASK / "instruction.md").read_text()
     for name in expected:
         agent = native.configs[name].agent
-        assert (agent.name, agent.model_name, agent.import_path) == ("terminus-2", run.record.models["simulator"].model, None)
+        assert (agent.name, agent.model_name, agent.import_path) == (
+            None, run.record.models["simulator"].model, "nudi.runner:HostTerminus")
         assert native.instructions[name] == original
     assert stored(run).simulation == simulation
 
@@ -243,9 +247,11 @@ def test_cancellation_records_the_partial_pool(tmp_path, monkeypatch, credential
     assert episode["cancelled"]
 
 
-def test_returned_native_failure_counts_without_a_raise(tmp_path, monkeypatch, credentials):
-    """Harbor returns exception_info and still grades; the pool is then partial."""
-    native = Native(monkeypatch)
+@pytest.mark.parametrize("reward, status", [(0.0, "complete"), (None, "partial")])
+def test_returned_native_failure_counts_without_a_raise(tmp_path, monkeypatch, credentials, reward, status):
+    """Harbor returns exception_info and still grades. The failure stays recorded; the pool is partial only
+    when the episode has no usable reward."""
+    native = Native(monkeypatch, rewards={"0001-simulator": reward})
     native.returned = {"0001-simulator": "AgentTimeoutError"}
 
     async def main():
@@ -254,11 +260,11 @@ def test_returned_native_failure_counts_without_a_raise(tmp_path, monkeypatch, c
             return run, await workflow.simulate(run, 2)
 
     run, simulation = asyncio.run(main())
-    assert simulation.status == "partial"
+    assert simulation.status == status
     assert list(simulation.failures) == ["0001-simulator"]
     assert [error.type for error in simulation.failures["0001-simulator"]] == ["AgentTimeoutError"]
     timed_out = json.loads((run.config.output_dir / "episodes" / "0001-simulator" / "episode.json").read_text())
-    assert timed_out["agent_timeout"] and timed_out["rewards"] == {"reward": 1.0}
+    assert timed_out["agent_timeout"] and timed_out["rewards"] == ({} if reward is None else {"reward": reward})
     assert stored(run).simulation == simulation
 
 
@@ -353,7 +359,7 @@ REFERENCES = {"explanation": {"episode": None, "path": "instruction.md", "excerp
 
 def probe(episode: str, requirement: str = "explanation") -> dict:
     location, program = ("/app/answer.txt", ANSWER_CHECKER) if requirement == "answer" else ("/app/explanation.txt", CHECKER)
-    return {"category": "omitted_requirements", "case": f"{requirement} in {episode}", "episode": episode,
+    return {"category": "accepted_invalid", "case": f"{requirement} in {episode}", "episode": episode,
             "location": location, "capture_point": "verification_start",
             "timing": "The requirements apply to the submission at verification start.", "program": program,
             "requirement": REFERENCES[requirement], "scoring": REFERENCES["scoring"]}
@@ -395,7 +401,7 @@ def test_selected_capture_reaches_supported_ordinary_labels_and_incomplete_suppo
             run = new_run(tmp_path, monkeypatch, credentials, task_dir=task,
                           models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
             simulation = await workflow.simulate(run, 5)
-            report = await checks.inspect_grader(run, simulation.episodes, categories=["omitted_requirements"], focused_attempts=0)
+            report = await checks.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"], focused_attempts=0)
             return run, simulation, report
 
     run, simulation, report = asyncio.run(main())
@@ -418,7 +424,7 @@ def test_selected_capture_reaches_supported_ordinary_labels_and_incomplete_suppo
     assert "archive unavailable" in reasons["0002-simulator"] and "not evidence of absence" in reasons["0002-simulator"]
     assert unobserved[0] in reasons["0003-simulator"]
     assert ANSWER in reasons["0004-simulator"] and "no cited check" in reasons["0004-simulator"]
-    assert report.categories["omitted_requirements"] == "evidenced_issue"
+    assert report.categories["accepted_invalid"] == "evidenced_issue"
     # The pool is reused: no further ordinary episode. The five checks are package sandboxes.
     assert run.record.episodes == pool
     assert len(run.record.sandboxes) == 6 and sandbox_record(run, run.record.sandboxes[0])["purpose"] == "workspace"
@@ -450,7 +456,7 @@ def test_combined_coverage_of_separate_checks_justifies_legitimate_partial_credi
 
     def half(episode, requirement, program=None):
         name = "correct" if requirement == "answer" else "exists"
-        return {**probe(episode, requirement), "category": "partial_credit", "scoring": scoring,
+        return {**probe(episode, requirement), "category": "accepted_invalid", "scoring": scoring,
                 "program": program or HALF_CHECKERS[name]}
 
     def bounded(validity, name, **claim):
@@ -479,7 +485,7 @@ def test_combined_coverage_of_separate_checks_justifies_legitimate_partial_credi
             run = new_run(tmp_path, monkeypatch, credentials, task_dir=task,
                           models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
             simulation = await workflow.simulate(run, 3)
-            return await checks.inspect_grader(run, simulation.episodes, categories=["partial_credit"], focused_attempts=0)
+            return await checks.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"], focused_attempts=0)
 
     report = asyncio.run(main())
     assessments = report.assessments
@@ -522,7 +528,7 @@ def answer_task(tmp_path: Path) -> Path:
 
 
 def facts_probe(episode: str, requirement: str = "answer") -> dict:
-    return {**probe(episode, "answer"), "category": "partial_credit", "case": f"{requirement} in {episode}",
+    return {**probe(episode, "answer"), "category": "accepted_invalid", "case": f"{requirement} in {episode}",
             "requirement": FACTS[requirement], "scoring": FACTS["scoring"], "program": ANSWER_FACTS}
 
 
@@ -572,7 +578,7 @@ def test_measured_facts_and_requirement_conclusions_reach_labels_and_reports(tmp
         async with serve(script) as base:
             run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
             simulation = await workflow.simulate(run, 6)
-            return run, await checks.inspect_grader(run, simulation.episodes, categories=["partial_credit"], focused_attempts=0)
+            return run, await checks.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"], focused_attempts=0)
 
     run, inspection = asyncio.run(main())
     assert len(script.requests) == 8 and len(run.record.checks) == 6
@@ -593,16 +599,16 @@ def test_measured_facts_and_requirement_conclusions_reach_labels_and_reports(tmp
     assert any("conflicting" in reason for reason in episodes[pool[5]]["completion_reasons"])
     assert built["labels"]["review"]["unresolved"] == [pool[0], pool[1], pool[4], pool[5]]
     assert built["labels"]["review"]["unreviewed"] == {}
-    findings = built["inspections"]["grader"]["findings"]
-    absent = next(item for item in findings["suspected"] if item["claim"]["episode"] == pool[0])
+    findings = built["inspections"]["grader_inspector"]["findings"]
+    absent = next(item for item in findings["inconclusive"] if item["claim"]["episode"] == pool[0])
     assert (absent["assessment"]["validity"], absent["assessment"]["discrepancy"]) == ("violated", "unknown")
     partial = next(item for item in findings["legitimate"] if item["claim"]["episode"] == pool[2])
     assert partial["assessment"]["conclusions"] == [{"requirement": FACTS["newline"], "validity": "violated", "reasons": []}]
     markdown = report.markdown(built).splitlines()
     assert "attempted but unresolved 4" in next(line for line in markdown if line.startswith("Review attempted"))
-    line = next(line for line in markdown if line.startswith("- grader suspected:") and pool[0] in line)
+    line = next(line for line in markdown if line.startswith("- grader_inspector inconclusive:") and pool[0] in line)
     assert "validity violated" in line and "discrepancy unknown" in line
-    line = next(line for line in markdown if line.startswith("- grader legitimate:") and pool[2] in line)
+    line = next(line for line in markdown if line.startswith("- grader_inspector legitimate:") and pool[2] in line)
     assert f"requirement {NEWLINE!r} violated" in line and "native reward 0.5" in line
 
 
@@ -623,7 +629,7 @@ def test_completion_stays_unknown_when_a_cited_check_violation_is_omitted(tmp_pa
         async with serve(script) as base:
             run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
             simulation = await workflow.simulate(run, 1)
-            return run, await checks.inspect_grader(run, simulation.episodes, categories=["partial_credit"], focused_attempts=0)
+            return run, await checks.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"], focused_attempts=0)
 
     run, inspection = asyncio.run(main())
     built = report.build(run.config.output_dir)
@@ -631,11 +637,11 @@ def test_completion_stays_unknown_when_a_cited_check_violation_is_omitted(tmp_pa
     assert episode["completion"] == "unknown"
     reasons = " ".join(episode["completion_reasons"])
     assert NEWLINE in reasons and "violated" in reasons and "completion basis" in reasons
-    assert inspection.ordinary[name].label == "legitimate" and inspection.categories["partial_credit"] == "no_evidenced_issue"
+    assert inspection.ordinary[name].label == "legitimate" and inspection.categories["accepted_invalid"] == "no_evidenced_issue"
     assert inspection.assessments[0].claim.basis.requirements == [Observation.model_validate(FACTS["answer"])]
     markdown = report.markdown(built).splitlines()
     assert any(line.startswith(f"- {name}: completion unknown;") for line in markdown)
-    assert any(line.startswith("- grader legitimate:") and f"requirement {NEWLINE!r} violated" in line for line in markdown)
+    assert any(line.startswith("- grader_inspector legitimate:") and f"requirement {NEWLINE!r} violated" in line for line in markdown)
 
 
 @pytest.mark.parametrize("case", ["uncontested", "conflicting", "unresolved"])
@@ -662,7 +668,7 @@ def test_secondary_conclusions_survive_unknown_primary_validity_in_labels_and_re
         async with serve(script) as base:
             run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
             simulation = await workflow.simulate(run, 1)
-            return run, await checks.inspect_grader(run, simulation.episodes, categories=["partial_credit"], focused_attempts=0)
+            return run, await checks.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"], focused_attempts=0)
 
     run, inspection = asyncio.run(main())
     first = inspection.assessments[0]
@@ -683,7 +689,7 @@ def test_secondary_conclusions_survive_unknown_primary_validity_in_labels_and_re
         assert first.claim.unresolved == ["whether the newline requirement applies"]
     markdown = report.markdown(built).splitlines()
     assert any(line.startswith(f"- {name}: completion {expected};") for line in markdown)
-    assert any(line.startswith("- grader suspected:") and f"requirement {NEWLINE!r} violated" in line for line in markdown)
+    assert any(line.startswith("- grader_inspector inconclusive:") and f"requirement {NEWLINE!r} violated" in line for line in markdown)
 
 
 @pytest.mark.parametrize("case", ["corrected", "exhausted", "invalid"])
@@ -696,7 +702,7 @@ def test_corrected_interpretation_uses_the_next_existing_attempt_without_rerunni
     Sandboxes(monkeypatch, native=native)
     corrected = read("supported", ["number"], readings=[("newline", "supported")], coverage=both(["check-0000"]),
                      basis=metric_basis("supported", ["answer", "newline"], ["check-0000"]))
-    repair = {"check": "check-0009" if case == "invalid" else "check-0000", "category": "partial_credit", **corrected}
+    repair = {"check": "check-0009" if case == "invalid" else "check-0000", "category": "accepted_invalid", **corrected}
     responses = [NOTHING, {"probes": [facts_probe(name)]}, read("supported", ["number"], coverage=both(["check-0000"]))]
     if case != "exhausted":
         responses.append({"probes": [facts_probe(name)], "reinterpretations": [repair]})
@@ -706,7 +712,7 @@ def test_corrected_interpretation_uses_the_next_existing_attempt_without_rerunni
         async with serve(script) as base:
             run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
             simulation = await workflow.simulate(run, 1)
-            return run, await checks.inspect_grader(run, simulation.episodes, categories=["partial_credit"],
+            return run, await checks.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"],
                                                     focused_attempts=0 if case == "exhausted" else 1)
 
     run, inspection = asyncio.run(main())
@@ -749,7 +755,7 @@ def test_invalid_reinterpretation_preserves_other_repairs_and_ordinary_probes(tm
     Sandboxes(monkeypatch, native=native)
     corrected = read("supported", ["number"], readings=[("newline", "supported")], coverage=both(["check-0000"]),
                      basis=metric_basis("supported", ["answer", "newline"], ["check-0000"]))
-    repair = {"check": "check-0000", "category": "partial_credit", **corrected}
+    repair = {"check": "check-0000", "category": "accepted_invalid", **corrected}
     malformed = {
         "unlisted": {**repair, "check": "check-0009"},
         "item": None,
@@ -770,7 +776,7 @@ def test_invalid_reinterpretation_preserves_other_repairs_and_ordinary_probes(tm
         async with serve(script) as base:
             run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
             simulation = await workflow.simulate(run, 2)
-            return run, await checks.inspect_grader(run, simulation.episodes, categories=["partial_credit"], focused_attempts=1)
+            return run, await checks.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"], focused_attempts=1)
 
     run, inspection = asyncio.run(main())
     built = report.build(run.config.output_dir)
@@ -780,7 +786,7 @@ def test_invalid_reinterpretation_preserves_other_repairs_and_ordinary_probes(tm
     assert error in inspection.attempts[1].error and inspection.status == "partial"
     assert inspection.unreviewed == {} and inspection.ordinary[second].label == "legitimate"
     assert built["metrics"]["episodes"][second]["completion"] == "complete"
-    assert built["inspections"]["grader"]["attempts"][1]["status"] == "model_output_failure"
+    assert built["inspections"]["grader_inspector"]["attempts"][1]["status"] == "model_output_failure"
     if invalid == "list":
         assert inspection.ordinary[first].label == "unknown"
     else:
@@ -802,7 +808,7 @@ def test_unsupported_runtime_keeps_the_check_failed_and_the_label_unknown(tmp_pa
             run = new_run(tmp_path, monkeypatch, credentials, task_dir=task,
                           models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
             simulation = await workflow.simulate(run, 1)
-            report = await checks.inspect_grader(run, simulation.episodes, categories=["omitted_requirements"], focused_attempts=0)
+            report = await checks.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"], focused_attempts=0)
             return run, report
 
     run, report = asyncio.run(main())
@@ -833,7 +839,7 @@ def test_without_declarations_ordinary_labels_stay_unknown_and_a_probe_never_bac
             run = new_run(tmp_path, monkeypatch, credentials, task_dir=task,
                           models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
             simulation = await workflow.simulate(run, 2)
-            report = await checks.inspect_grader(run, simulation.episodes, categories=["omitted_requirements"], focused_attempts=0)
+            report = await checks.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"], focused_attempts=0)
             return run, simulation, report
 
     run, simulation, report = asyncio.run(main())
@@ -845,7 +851,7 @@ def test_without_declarations_ordinary_labels_stay_unknown_and_a_probe_never_bac
     assert report.assessments[0].claim.episode == probe_sandbox
     assert report.assessments[0].execution_scope == "package"
     assert report.assessments[0].outcome == "accepted_invalid"
-    assert report.categories["omitted_requirements"] == "evidenced_issue"
+    assert report.categories["accepted_invalid"] == "evidenced_issue"
     assert set(report.ordinary) == {"0000-simulator", "0001-simulator"}
     for label in report.ordinary.values():
         assert label.label == "unknown" and label.assessments == []
@@ -875,6 +881,34 @@ def test_package_assessment_cannot_label_a_native_ordinary_episode(tmp_path, mon
     assert label.label == "unknown" and label.assessments == []
 
 
+def test_a_sole_named_reward_labels_like_reward_and_several_keys_stay_unavailable(tmp_path, monkeypatch, credentials):
+    """The native reward is the pool's sole reward key, as reports read a configuration, else `reward`.
+    Several keys without `reward`, in one episode or across the pool, give none."""
+    def labels(*rewards):
+        run = new_run(tmp_path, monkeypatch, credentials, name="_".join("-".join(item) for item in rewards))
+        pool = ["0000-simulator", "0001-simulator"]
+        for name, episode_rewards in zip(pool, rewards * 2 if len(rewards) == 1 else rewards):
+            directory = run.config.output_dir / "episodes" / name
+            directory.mkdir(parents=True)
+            (directory / "episode.json").write_text(EpisodeResult(
+                path="harbor", path_reasons=[], task_name="task", task_dir=str(run.config.task_dir),
+                task_digest=tree_digest(run.config.task_dir), model="ordinary", reasoning_effort=None,
+                versions={}, rewards=episode_rewards).model_dump_json())
+            run.record.episodes.append(name)
+        run.save()
+        inspection = checks.InspectionResult(mode="grader", status="complete", categories={}, applicability={}, normal=[pool[1]],
+                                            assessments=[Assessment(claim=Claim(mechanism="verified", episode=pool[0]),
+                                                                    outcome="accepted_invalid")])
+        return {name: (label.label, label.basis, label.reasons) for name, label in checks.label_ordinary(run, pool, inspection).items()}
+
+    expected = labels({"reward": 1.0})
+    assert [item[:2] for item in expected.values()] == [("accepted_invalid", "verified"), ("legitimate", "presumed")]
+    assert labels({"passed": 1.0}) == expected
+    for several in (labels({"passed": 1.0, "style": 0.5}), labels({"passed": 1.0}, {"style": 1.0})):
+        assert all(label == "unavailable" for label, *_ in several.values())
+        assert "no native reward 'reward'" in several["0001-simulator"][2][0]
+
+
 def test_labels_keep_partial_credit_unknowns_and_unavailable_rewards_apart_from_probes(tmp_path, monkeypatch, credentials):
     from test_inspection import mock_experiments
     Sandboxes(monkeypatch)
@@ -894,15 +928,16 @@ def test_labels_keep_partial_credit_unknowns_and_unavailable_rewards_apart_from_
                        explanation="One of two scored components is met, so the actual reward 0.5 is deserved.")
     pool = [f"{index:04d}-simulator" for index in range(8)]
     # (category, episode, outcome, claim fields, check id, missing)
-    cases = [("partial_credit", "0000-simulator", "legitimate", {"coverage": covered}, "check-a", []),
-             ("partial_credit", "0001-simulator", "unknown", {}, None, ["independent state at requested time 'grader_read'"]),
-             ("partial_credit", "0004-simulator", "legitimate", {"coverage": covered.model_copy(update={"checks": ["check-c"]})}, "check-c", []),
+    cases = [("accepted_invalid", "0000-simulator", "legitimate", {"coverage": covered}, "check-a", []),
+             ("accepted_invalid", "0001-simulator", "unknown", {}, None, ["independent state at requested time 'grader_read'"]),
+             ("accepted_invalid", "0004-simulator", "legitimate", {"coverage": covered.model_copy(update={"checks": ["check-c"]})}, "check-c", []),
              ("rejected_valid", "0004-simulator", "accepted_invalid", {}, None, []),
-             ("partial_credit", "0005-simulator", "accepted_invalid", {"unresolved": ["whether the requirement applies at verification start"]}, None, []),
-             ("partial_credit", "0006-simulator", "legitimate", {}, "check-d", []),
+             ("accepted_invalid", "0005-simulator", "accepted_invalid", {"unresolved": ["whether the requirement applies at verification start"]}, None, []),
+             ("accepted_invalid", "0006-simulator", "legitimate", {}, "check-d", []),
+             # A setup probe runs only while its category is unsettled; ordinary reviews always run.
+             ("accepted_invalid", "0008-inspector", "accepted_invalid", {}, None, []),
              ("accepted_invalid", "0006-simulator", "accepted_invalid", {}, None, []),
-             ("partial_credit", "0007-simulator", "legitimate", {"coverage": covered}, "check-e", []),
-             ("omitted_requirements", "0008-inspector", "accepted_invalid", {}, None, [])]
+             ("accepted_invalid", "0007-simulator", "legitimate", {"coverage": covered}, "check-e", [])]
     probes = [{"category": category, "case": str(index), "location": f"/app/{index}",
                **({"setup_program": "targeted"} if name.endswith("inspector") else {"episode": name})}
               for index, (category, name, *_) in enumerate(cases)]
@@ -928,7 +963,7 @@ def test_labels_keep_partial_credit_unknowns_and_unavailable_rewards_apart_from_
                 episode(run, name, rewards, ("VerifierRuntimeError",) if index == 2 else ())
             run.save()
             return await checks.inspect_grader(run, pool, focused_attempts=0,
-                                               categories=["accepted_invalid", "rejected_valid", "omitted_requirements", "partial_credit"])
+                                               categories=["accepted_invalid", "rejected_valid"])
 
     report = asyncio.run(main())
     labels = report.ordinary
@@ -945,9 +980,8 @@ def test_labels_keep_partial_credit_unknowns_and_unavailable_rewards_apart_from_
     assert labels["0006-simulator"].label == "accepted_invalid"
     assert labels["0007-simulator"].label == "unknown" and "check-a" in reasons["0007-simulator"]
     assert "complete scoring outcome" in reasons["0007-simulator"]
-    assert report.assessments[-1].claim.episode == "0008-inspector"
-    assert report.categories == {"accepted_invalid": "evidenced_issue", "rejected_valid": "evidenced_issue",
-                                 "omitted_requirements": "evidenced_issue", "partial_credit": "unknown"}
+    assert report.assessments[6].claim.episode == "0008-inspector"
+    assert report.categories == {"accepted_invalid": "evidenced_issue", "rejected_valid": "evidenced_issue"}
 
 
 RESULT = "Also write a JSON summary to /output/result.json."
@@ -986,7 +1020,7 @@ def test_inspector_selects_files_before_ordinary_episodes_when_the_task_declares
             run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, capacity=(1, 4096),
                           models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
             simulation = await workflow.simulate(run, 2)
-            report = await checks.inspect_grader(run, simulation.episodes, categories=["omitted_requirements"], focused_attempts=0)
+            report = await checks.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"], focused_attempts=0)
             return run, simulation, report
 
     run, simulation, report = asyncio.run(main())
@@ -1312,7 +1346,7 @@ def test_disabled_attack_makes_no_selection_request(tmp_path, monkeypatch, crede
             return run, await checks.attack(run, maximum_attempts=0, discovery_attempts=0)
 
     run, result = asyncio.run(main())
-    assert result.status == "disabled" and provider.requests == [] and native.configs == {}
+    assert result.status == "complete" and provider.requests == [] and native.configs == {}
     assert run.record.capture_selection is None
 
 

@@ -8,7 +8,11 @@ import asyncio
 import contextlib
 import hashlib
 import importlib.metadata
+import json
+import math
+import os
 import shutil
+import stat
 import tempfile
 import tomllib
 from collections.abc import Iterator
@@ -16,12 +20,19 @@ from contextvars import ContextVar
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from harbor.agents.terminus_2.terminus_2 import Terminus2
 from harbor.models.job.config import RetryConfig
+from harbor.models.task.artifacts import is_convention_entry, source_host_path
+from harbor.models.task.config import ArtifactConfig
 from harbor.models.task.task import Task
-from harbor.models.trial.config import AgentConfig, TaskConfig, TrialConfig
+from harbor.models.trial.paths import EnvironmentPaths
+from harbor.trial.artifact_handler import artifact_host_path
+from harbor.models.task.verifier_mode import resolve_verifier_environment_definition
+from harbor.models.trial.config import AgentConfig, TaskConfig, TrialConfig, VerifierConfig
 from harbor.models.trial.result import TrialResult
 from harbor.trial.queue import TrialQueue
 from harbor.trial.hooks import TrialHookEvent
+from harbor.verifier.verifier import RewardFileEmptyError, Verifier, VerifierOutputParseError
 from verifiers.v1.cli.eval.runner import run_eval
 from verifiers.v1.configs.cli.eval import EvalConfig
 from verifiers.v1.env import RunSlot
@@ -35,7 +46,8 @@ from verifiers.v1.tasksets.harbor.taskset import (
 )
 from verifiers.v1.utils.trace_store import type_adapter
 
-from nudi.records import EpisodeConfig, EpisodeResult, ErrorRecord, ExecutionPath, InfrastructureAbort, NativeBehavior
+from nudi.records import (EpisodeConfig, EpisodeResult, ErrorRecord, ExecutionPath, InfrastructureAbort, NativeBehavior,
+                          private_dir, write_private)
 
 # task.toml fields the upstream contract tests exercise on both execution paths.
 VERIFIED_FIELDS = {
@@ -90,8 +102,99 @@ DIFFERENCES = {
 }
 
 
+# The Verifiers adapter's bound on a reward file.
+REWARD_LIMIT = 2**20
+
+
 class UnsupportedTask(ValueError):
     """The task uses a feature nudi has not verified, so it is not started."""
+
+
+def read_reward(path: Path) -> str:
+    """A container-written reward file's text, read on the host without following a link
+    or blocking on a FIFO, and bounded. Errors name the file, never its content."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as error:
+        raise VerifierOutputParseError(f"Reward file {path} is a link or cannot be opened: {error.strerror}") from None
+    with os.fdopen(descriptor, "rb") as file:
+        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+            raise VerifierOutputParseError(f"Reward file {path} is not a regular file")
+        data = file.read(REWARD_LIMIT + 1)
+    if len(data) > REWARD_LIMIT:
+        raise VerifierOutputParseError(f"Reward file {path} exceeds {REWARD_LIMIT} bytes")
+    if not data:
+        raise RewardFileEmptyError(f"Reward file is empty at {path}")
+    try:
+        return data.decode()
+    except UnicodeDecodeError:
+        raise VerifierOutputParseError(f"Reward file {path} is not UTF-8") from None
+
+
+class RewardVerifier(Verifier):
+    """Harbor's Verifier, parsing rewards through `read_reward` with Harbor's rules. Harbor
+    0.24.0 follows reward links on the host and puts invalid values in its errors.
+
+    Its import-path factory drops the bundled-tests flag Harbor resolves for a separate
+    verifier, so an unset `skip_tests_upload` is resolved here the same way."""
+
+    def __init__(self, *, task: Task, skip_tests_upload: bool | None = None, **kwargs):
+        if skip_tests_upload is None:
+            definition = resolve_verifier_environment_definition(task.config, task.paths)
+            skip_tests_upload = definition is not None and definition.bundled_tests
+        super().__init__(task=task, skip_tests_upload=skip_tests_upload, **kwargs)
+
+    def _parse_reward_text(self) -> dict[str, float | int]:
+        path = self.trial_paths.reward_text_path
+        try:
+            value = float(read_reward(path))
+        except ValueError:
+            raise VerifierOutputParseError(f"Failed to parse rewards from text file {path}") from None
+        if not math.isfinite(value):
+            raise VerifierOutputParseError(f"Non-finite reward in text file {path}")
+        return {"reward": value}
+
+    def _parse_reward_json(self) -> dict[str, float | int]:
+        path = self.trial_paths.reward_json_path
+        try:
+            rewards = json.loads(read_reward(path))
+        except ValueError:
+            raise VerifierOutputParseError(f"Failed to parse rewards from JSON file {path}") from None
+        if not isinstance(rewards, dict):
+            raise VerifierOutputParseError(f"Rewards in JSON file {path} are not an object")
+        for value in rewards.values():
+            if not isinstance(value, (int, float)) or isinstance(value, float) and not math.isfinite(value):
+                raise VerifierOutputParseError(f"Non-numeric or non-finite reward in JSON file {path}")
+        return rewards
+
+
+def snapshot(task_dir: Path, destination: Path, credentials: Path | None = None) -> None:
+    """Copy the task to a new `destination` as regular files and directories only. A link
+    inside the task is copied as its target. A link leaving the task or forming a directory
+    cycle, any other file type, and the run's credentials file are refused. Callers use only
+    the copy."""
+    root = task_dir.resolve()
+    secret = credentials.resolve() if credentials is not None else None
+
+    def copy(source: Path, target: Path, ancestors: frozenset[Path]) -> None:
+        path, name = source.resolve(), source.relative_to(task_dir)
+        if not path.is_relative_to(root):
+            raise UnsupportedTask(f"{name} points outside the task")
+        if path == secret:
+            raise UnsupportedTask(f"{name} is the run's credentials file")
+        if path.is_dir():
+            if path in ancestors:
+                raise UnsupportedTask(f"{name} forms a directory cycle")
+            target.mkdir()
+            for child in sorted(source.iterdir()):
+                copy(child, target / child.name, ancestors | {path})
+        elif path.is_file():
+            shutil.copyfile(path, target)
+        else:
+            raise UnsupportedTask(f"{name} is not a regular file")
+        shutil.copystat(path, target)
+
+    copy(task_dir, destination, frozenset())
 
 
 def unverified_fields(table: dict, prefix: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], object]]:
@@ -110,20 +213,45 @@ def label(path: tuple[str, ...]) -> str:
     return f"[{'.'.join(path[:-1])}].{path[-1]}" if len(path) > 1 else f"[{path[0]}]"
 
 
+def excluded_convention_artifact(entries: object) -> bool:
+    """A main-service convention directory with exclude is downloaded into its own mount."""
+    if not isinstance(entries, list):
+        return False
+    convention = EnvironmentPaths().artifacts_dir.as_posix()
+    root = Path("artifacts")
+    mount = source_host_path(root, convention)
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("exclude"):
+            continue
+        try:
+            artifact = ArtifactConfig.model_validate(entry)
+        except ValueError:
+            continue
+        if not is_convention_entry(artifact, convention):
+            continue
+        if artifact_host_path(root, artifact) == mount:
+            return True
+    return False
+
+
 def check_task(task_dir: Path) -> dict[tuple[str, ...], object]:
-    """Reject escaping file references and unverified task features.
+    """Reject escaping file references, special files and unverified task features.
 
     Returns the accepted declarations that only native Harbor may run."""
     root = task_dir.resolve()
     for path in sorted(task_dir.rglob("*")):
         if path.is_symlink() and not path.resolve().is_relative_to(root):
             raise UnsupportedTask(f"{path.relative_to(task_dir)} points outside the task")
+        if not (path.is_dir() or path.is_file()):
+            raise UnsupportedTask(f"{path.relative_to(task_dir)} is not a regular file")
     for name in ("docker-compose.yaml", "docker-compose.yml"):
         if (task_dir / "environment" / name).exists():
             raise UnsupportedTask(f"environment/{name} is not verified")
 
     # Raw fields: Harbor's parsed config silently drops keys it does not know.
     raw = tomllib.loads((task_dir / "task.toml").read_text())
+    if excluded_convention_artifact(raw.get("artifacts")):
+        raise UnsupportedTask("the conventional artifacts directory with exclude is not verified")
     # The legacy names Harbor renames before parsing (harbor/models/task/config.py).
     # It drops a non-string `memory` instead, so that stays unverified.
     if "version" in raw and "schema_version" not in raw:
@@ -243,7 +371,7 @@ def record_slots(slots: list[RunSlot], output_dir: Path, run_dir: Path, result: 
         elif slot.traces:
             # Upstream persists only finished episodes; keep the live traces, model calls included.
             lines = [type_adapter(type(trace)).dump_json(trace, exclude_none=True) for trace in slot.traces]
-            (output_dir / run_dir / "partial-traces.jsonl").write_bytes(b"\n".join(lines) + b"\n")
+            write_private(output_dir / run_dir / "partial-traces.jsonl", b"\n".join(lines) + b"\n")
         for trace in slot.traces:
             result.ids["trace_id"] = trace.id
             for name, reward in trace.rewards.items():
@@ -258,19 +386,36 @@ def record_slots(slots: list[RunSlot], output_dir: Path, run_dir: Path, result: 
             result.artifacts[name] = str(run_dir / relative)
 
 
+# Sibling of the trial's agent directory. Harbor bind-mounts agent/ into the container
+# and does not mount this directory.
+HOST_AGENT_LOGS = "agent-host"
+
+
+def trajectory_path(trial_dir: Path) -> Path | None:
+    """The ATIF file outside the mounted agent directory, or a regular file at the
+    mounted name. A link is not a trajectory."""
+    for relative in (f"{HOST_AGENT_LOGS}/trajectory.json", "agent/trajectory.json"):
+        path = trial_dir / relative
+        if not path.is_symlink() and path.is_file():
+            return path
+    return None
+
+
 def record_trial(trial: TrialResult, output_dir: Path, result: EpisodeResult) -> None:
     trial_dir = Path("harbor") / trial.trial_name
     result.ids.update(
         trial_id=str(trial.id), trial_name=trial.trial_name, task_checksum=trial.task_checksum
     )
+    root = output_dir / trial_dir
     for name, relative in (
         ("trial", ""),
         ("result", "result.json"),
-        ("trajectory", "agent/trajectory.json"),
         ("collected", "artifacts"),
     ):
-        if (output_dir / trial_dir / relative).exists():
+        if (root / relative).exists():
             result.artifacts[name] = str(trial_dir / relative)
+    if trajectory := trajectory_path(root):
+        result.artifacts["trajectory"] = str(trajectory.relative_to(output_dir))
     if trial.verifier_result is not None:
         result.rewards.update(trial.verifier_result.rewards or {})
     if info := trial.exception_info:
@@ -331,6 +476,24 @@ def episode_queue(n_concurrent: int) -> TrialQueue:
     return TrialQueue(n_concurrent, retry_config=RetryConfig(max_retries=0))
 
 
+class HostTerminus(Terminus2):
+    """Terminus 2 with host logs outside the directory Harbor mounts into the container.
+
+    Harbor 0.24.0 passes logs_dir as the trial agent directory and bind-mounts that
+    directory at /logs/agent. Terminus writes trajectory.json, trajectory.cont-N.json
+    and trajectory.summarization-N-*.json there with a plain open, so a link planted
+    in the mount is followed on the host. Those files are written in the sibling
+    directory agent-host, which is not mounted. Terminal recording is off because
+    Harbor would download recording.cast into the mounted directory.
+    """
+
+    def __init__(self, logs_dir: Path, *args, **kwargs):
+        kwargs["record_terminal_session"] = False
+        host_logs = Path(logs_dir).parent / HOST_AGENT_LOGS
+        host_logs.mkdir(parents=True, exist_ok=True)
+        super().__init__(host_logs, *args, **kwargs)
+
+
 async def run_harbor(config: EpisodeConfig, task_dir: Path, result: EpisodeResult, queue: TrialQueue, agent: AgentConfig | None = None) -> None:
     ensure_lifecycle_hooks(queue)
     kwargs = {"api_base": config.api_base, "reasoning_effort": config.reasoning_effort}
@@ -340,8 +503,9 @@ async def run_harbor(config: EpisodeConfig, task_dir: Path, result: EpisodeResul
     trial_config = TrialConfig(
         task=TaskConfig(path=task_dir),
         trials_dir=config.output_dir / "harbor",
+        verifier=VerifierConfig(import_path="nudi.runner:RewardVerifier"),
         agent=agent or AgentConfig(
-            name="terminus-2",
+            import_path="nudi.runner:HostTerminus",
             model_name=config.model,
             kwargs={key: value for key, value in kwargs.items() if value is not None},
         ),
@@ -355,6 +519,22 @@ async def run_harbor(config: EpisodeConfig, task_dir: Path, result: EpisodeResul
             record_trial(TrialResult.model_validate_json(path.read_text()), config.output_dir, result)
 
 
+def restrict(directory: Path) -> None:
+    """Make a retained tree owner-only once its containers have stopped. Harbor and Verifiers
+    create it with default modes, and Harbor opens bind-mounted directories to the container's
+    users. Links are left alone; an entry the host user does not own keeps its mode."""
+    if directory.is_symlink() or not directory.is_dir():
+        return
+    os.chmod(directory, 0o700)
+    for parent, directories, files in os.walk(directory):
+        for names, mode in ((directories, 0o700), (files, 0o600)):
+            for name in names:
+                path = os.path.join(parent, name)
+                if not os.path.islink(path):
+                    with contextlib.suppress(PermissionError):
+                        os.chmod(path, mode)
+
+
 def check_output(output_dir: Path, task_dir: Path) -> None:
     """Reject an output directory equal to or inside the task, symlink aliases included."""
     if output_dir.resolve().is_relative_to(task_dir.resolve()):
@@ -362,10 +542,12 @@ def check_output(output_dir: Path, task_dir: Path) -> None:
 
 
 async def run_episode(config: EpisodeConfig, queue: TrialQueue | None = None, *, instruction: str | None = None,
-                      agent: AgentConfig | None = None, capture=None, on_agent_start=None, on_trial_end=None) -> EpisodeResult:
-    """Run one episode on a disposable task copy; the record is written even on failure.
+                      agent: AgentConfig | None = None, capture=None, on_agent_start=None, on_trial_end=None,
+                      credentials: Path | None = None) -> EpisodeResult:
+    """Run one episode on a disposable task snapshot; the record is written even on failure.
 
-    Native Harbor episodes run through `queue`, shared by a run, or a queue of their own."""
+    Native Harbor episodes run through `queue`, shared by a run, or a queue of their own.
+    `credentials` is the run's credentials file, which the snapshot refuses."""
     check_output(config.output_dir, config.task_dir)
     path, reasons = select_path(config.task_dir, config.native)
     result = EpisodeResult(
@@ -378,19 +560,17 @@ async def run_episode(config: EpisodeConfig, queue: TrialQueue | None = None, *,
         reasoning_effort=config.reasoning_effort,
         versions={name: importlib.metadata.version(name) for name in VERSIONED},
     )
-    config.output_dir.mkdir(parents=True, exist_ok=True)
+    private_dir(config.output_dir)
+    config.output_dir.chmod(0o700)
     token = verification_capture.set(capture)
     agent_token = agent_start_capture.set(on_agent_start)
     end_token = trial_end_capture.set(on_trial_end)
     try:
         with tempfile.TemporaryDirectory(prefix="nudi-task-") as temp:
             task_dir = Path(temp) / config.task_dir.name
-            # Symlinks are copied as files, so the copy never refers back to the original.
-            shutil.copytree(config.task_dir, task_dir)
+            snapshot(config.task_dir, task_dir, credentials)
             if instruction is not None:
-                evidence = config.output_dir / "nudi-evidence"
-                evidence.mkdir(exist_ok=True)
-                (evidence / "extension.md").write_text(instruction)
+                write_private(config.output_dir / "nudi-evidence" / "extension.md", instruction)
                 with (task_dir / "instruction.md").open("a") as file:
                     file.write("\n\n" + instruction)
             if path == "verifiers":
@@ -409,5 +589,7 @@ async def run_episode(config: EpisodeConfig, queue: TrialQueue | None = None, *,
         trial_end_capture.reset(end_token)
         if (config.output_dir / "nudi-evidence").is_dir():
             result.artifacts["nudi_evidence"] = "nudi-evidence"
-        (config.output_dir / "episode.json").write_text(result.model_dump_json(indent=2))
+        write_private(config.output_dir / "episode.json", result.model_dump_json(indent=2))
+        for tree in ("harbor", "verifiers"):
+            restrict(config.output_dir / tree)
     return result

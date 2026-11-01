@@ -5,6 +5,7 @@ the credentials file or the host environment only when a call is sent. Paths in
 `EpisodeResult.artifacts` are relative to the episode's output directory.
 """
 
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -16,6 +17,19 @@ Role = Literal["simulator", "inspector", "attacker"]
 ExecutionScope = Literal["native", "package"]
 """`native`: the original task harness of a native episode. `package`: an Inspector
 sandbox running a copy of the task package; it never establishes native accessibility."""
+
+
+def private_dir(path: Path) -> None:
+    """Create `path` and its missing parents owner-only."""
+    for directory in [*reversed([parent for parent in path.parents if not parent.exists()]), path]:
+        directory.mkdir(mode=0o700, exist_ok=True)
+
+
+def write_private(path: Path, data: str | bytes) -> None:
+    """Write `path`, created owner-only with its missing parents."""
+    private_dir(path.parent)
+    with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as file:
+        file.write(data.encode() if isinstance(data, str) else data)
 
 
 class InfrastructureAbort(Exception):
@@ -118,6 +132,9 @@ class Capacity(BaseModel):
     None in earlier records, whose workspaces inherited the task's limit."""
 
 
+PROVIDER_REPORTED = "provider-reported usage.cost"
+
+
 class CallRecord(BaseModel):
     """One model request sent during the run."""
 
@@ -127,7 +144,8 @@ class CallRecord(BaseModel):
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     cost: float | None
-    """Estimated US dollars; None when unknown, never zero by default."""
+    """US dollars, a LiteLLM estimate or, when LiteLLM has no price, the provider's
+    `usage.cost` (`cost_source` says which); None when unknown, never zero by default."""
     cost_source: str
     provider_cost: float | None = None
     """The provider's own `usage.cost`, when it reported one."""
@@ -460,7 +478,7 @@ class RunRecord(BaseModel):
 
 
 class Coverage(BaseModel):
-    """Inspector interpretation of an episode's complete applicable scoring outcome.
+    """Grader inspector interpretation of an episode's complete applicable scoring outcome.
 
     It cites the requirement and scoring sources, the checks of that episode that
     observed them, and explains why they justify its actual reward, partial credit
@@ -473,20 +491,24 @@ class Coverage(BaseModel):
 
 
 class DecisionRule(BaseModel):
-    """Inspector interpretation of how the native grader decides pass, citing its source.
+    """Grader inspector interpretation of how the native grader decides pass, citing its source.
 
     Exactly one encoding: explicit `pass_values`, or `comparison` with `threshold`.
-    Observed 0/1 rewards alone establish neither; nudi never supplies a threshold."""
+    `values` lists every value the cited source says this reward can return; grader
+    agreement needs each list given for one reward to name the same two values, and every
+    rule to pass the same one. Observed 0/1 rewards alone establish none of these; nudi
+    never supplies a threshold or values."""
 
     reward: str = "reward"
     source: Observation
     pass_values: list[float] = []
     comparison: Literal[">=", ">", "<=", "<", "=="] | None = None
     threshold: float | None = None
+    values: list[float] = []
 
 
 class Ordering(BaseModel):
-    """Inspector interpretation of which direction of a native score is toward completion."""
+    """Grader inspector interpretation of which direction of a native score is toward completion."""
 
     reward: str = "reward"
     source: Observation
@@ -494,7 +516,7 @@ class Ordering(BaseModel):
 
 
 class MetricBasis(BaseModel):
-    """Inspector interpretation of one ordinary episode's whole-task completion.
+    """Grader inspector interpretation of one ordinary episode's whole-task completion.
 
     Local validity, legitimate partial credit and complete-scoring coverage are not
     completion. `supported` needs every cited completion requirement observed satisfied
@@ -532,13 +554,16 @@ class Claim(BaseModel):
     scoring_support: Support | None = None
     """Absent in older records. New interactive interpretations supply both."""
     full_guidance: str | None = None
-    """Concrete steps that reproduce the suspected loophole, when the Inspector supplies them."""
+    """Concrete steps that reproduce the suspected loophole, when the hack inspector supplies them."""
     hint_location: str | None = None
     """Only a file, interface, or component to examine. It excludes the solution and the reproduction recipe."""
     derivation: Derivation | None = None
     unresolved: list[str] = []
     """Necessary conditions the Inspector could not establish. With any, the claim
     neither labels an ordinary episode nor counts as an evidenced issue."""
+    limits: list[str] = []
+    """Scope notes the derivation does not depend on, such as whether the task meant a stated
+    requirement to be graded. They are reported and do not block an evidenced issue."""
     coverage: Coverage | None = None
     """Required for an ordinary episode's legitimate label; see `Coverage`."""
     basis: MetricBasis | None = None

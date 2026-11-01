@@ -15,7 +15,6 @@ import hashlib
 import os
 import secrets
 import shlex
-import shutil
 import stat
 import tempfile
 from contextlib import asynccontextmanager
@@ -28,10 +27,9 @@ from harbor.models.task.config import TaskOS
 from harbor.models.task.task import Task
 from harbor.models.trial.config import ServiceVolumeBind, ServiceVolumeConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
-from harbor.verifier.verifier import Verifier
 
-from nudi.records import ErrorRecord, SandboxResult
-from nudi.runner import tree_digest
+from nudi.records import ErrorRecord, SandboxResult, private_dir, write_private
+from nudi.runner import RewardVerifier, snapshot, tree_digest
 
 PACKAGE = "/nudi/package"
 RUNNER = "/nudi/run.py"
@@ -134,7 +132,7 @@ class Sandbox:
         self.environment = None
 
     def save(self) -> None:
-        (self.directory / "sandbox.json").write_text(self.record.model_dump_json(indent=2))
+        write_private(self.directory / "sandbox.json", self.record.model_dump_json(indent=2))
 
     async def upload_dir(self, source: Path, target: str) -> None:
         self.record.files[target] = tree_digest(source)
@@ -178,15 +176,17 @@ class Sandbox:
 
     async def grade(self) -> None:
         """Run the copied grader through Harbor's Verifier, as its declared user and under
-        its own verifier limit. Harbor uploads the original host tests after setup and
-        capture, using its normal overlay and reward precedence; no actor timer applies."""
+        its own verifier limit. Harbor uploads the snapshot's tests after setup and
+        capture, using its normal overlay and reward precedence; no actor timer applies.
+        Rewards are read without following links."""
         verifier = self.task.config.verifier
-        self.record.grader = {"runner": "harbor.verifier.verifier.Verifier", "skip_tests_upload": False,
+        self.record.grader = {"runner": "nudi.runner.RewardVerifier", "skip_tests_upload": False,
                               "timeout_sec": verifier.timeout_sec, "user": verifier.user, "test_stdout": None}
         self.save()
         try:
             with self.environment.with_default_user(verifier.user):
-                grader = Verifier(task=self.task, trial_paths=self.paths, environment=self.environment)
+                grader = RewardVerifier(task=self.task, trial_paths=self.paths, environment=self.environment,
+                                        skip_tests_upload=False)
                 result = await asyncio.wait_for(grader.verify(), verifier.timeout_sec)
             self.record.rewards = dict(result.rewards or {})
         except TimeoutError:
@@ -224,9 +224,15 @@ async def sandbox(run, purpose: str):
     run.admit_container(purpose)
     name = f"sandbox-{len(run.record.sandboxes):04d}"
     session_id = f"nudi-{secrets.token_hex(4)}-{name}"
-    scratch = Path(tempfile.mkdtemp(prefix=f"nudi-{name}-"))
+    # Its cleanup also removes copied read-only directories.
+    temporary = tempfile.TemporaryDirectory(prefix=f"nudi-{name}-", ignore_cleanup_errors=True)
+    scratch = Path(temporary.name)
     copy = scratch / "package"
-    shutil.copytree(run.config.task_dir, copy)
+    try:
+        snapshot(run.config.task_dir, copy, run.config.credentials_file)
+    except BaseException:
+        temporary.cleanup()
+        raise
     task = Task(copy)
     paths = TrialPaths(scratch / "trial")
     paths.mkdir()
@@ -242,7 +248,8 @@ async def sandbox(run, purpose: str):
                      "docker_image": config.docker_image,
                      "network_mode": str(policy.network_mode), "allowed_hosts": policy.allowed_hosts})
     box = Sandbox(run, record, task, paths, scratch)
-    box.directory.mkdir(parents=True)
+    private_dir(box.directory.parent)
+    box.directory.mkdir(mode=0o700)
     run.record.sandboxes.append(name)
     run.save()
     box.save()
@@ -283,7 +290,7 @@ async def sandbox(run, purpose: str):
         try:
             await checks.finish_cleanup(asyncio.create_task(remove()))
         finally:
-            shutil.rmtree(scratch, ignore_errors=True)
+            temporary.cleanup()
             if record.cleanup.get("removed") is not True:
                 run.warn(f"{name}: sandbox containers may remain after removal of project {session_id}: {record.cleanup}")
             if tree_digest(run.config.task_dir) != record.task_digest:

@@ -2,7 +2,7 @@ nudi builds one deterministic instruction for the native Harbor agent. This
 file is not a separate model call, and it does not draft that instruction.
 
 Every instruction tells the native agent to find a reward hack. Full and
-minimal guidance each belong to one Inspector candidate. Full adds only that
+minimal guidance each belong to one hack inspector candidate. Full adds only that
 candidate's loophole details. Minimal adds only that candidate's short hint.
 Neither receives the static hack-family checklist or another candidate's hint.
 The no-hint instruction is one discovery stream for the environment. It adds

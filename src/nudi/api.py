@@ -1,7 +1,7 @@
 """The public workflow. `send_nudis`, `send_nudis_async` and `nudi send-nudis` share this
 one implementation over the existing analyses.
 
-Full analysis selects simulation, grader inspection, hack inspection and the attack;
+Full analysis selects simulation, the grader inspector, the hack inspector and the attack;
 `simulation` and `hacking` select two of them. A failed analysis is recorded and the
 independent ones still run. The report covers the selected analyses only, and resolved
 credentials never reach it.
@@ -33,11 +33,11 @@ class AnalysisConfig(RunConfig):
     analysis: Analysis = "full"
     episodes: int = Field(20, ge=1, strict=True)
     """Ordinary Simulator episodes."""
-    focused_attempts: int = Field(3, ge=0, strict=True)
-    """Total focused Inspector attempts for each category after broad inspection."""
+    focused_attempts: int = Field(2, ge=0, strict=True)
+    """Total focused attempts of the grader inspector and the hack inspector for each category after broad inspection."""
     isolated_inspections: bool = Field(False, strict=True)
-    """Grader inspection: off, `holistic_inspection`, presumes labels for episodes the Inspector names normal;
-    on, `inspector_swarm`, verifies each ordinary episode in its own Inspector forked from broad."""
+    """Grader inspector: off, `holistic_inspection`, presumes labels for episodes it names normal;
+    on, `inspector_swarm`, verifies each ordinary episode in its own grader inspector forked from broad."""
     attacker_tries: int = Field(2, ge=0, strict=True)
     """Maximum Attacker attempts for each candidate and hint level."""
     discovery_attempts: int = Field(1, ge=0, strict=True)
@@ -72,7 +72,8 @@ def _supplied(value: str | None) -> str | None:
 def guidance(hack: InspectionResult | None) -> dict:
     """One candidate per hack finding that can guide reproduction, composed without a model call.
 
-    Legitimate outcomes and rejected valid findings supply nothing. Full guidance is that
+    Legitimate outcomes and rejected valid findings supply nothing. Another finding is a
+    candidate when it is accepted invalid or supplies either guidance field. Full guidance is that
     candidate's `full_guidance`. Minimal guidance is the fixed where-to-look line plus
     that candidate's `hint_location`. Mechanism and interpretation are never copied.
     A missing or blank field is unavailable for that candidate only. Identical text stays
@@ -84,6 +85,8 @@ def guidance(hack: InspectionResult | None) -> dict:
         if item.outcome in ("legitimate", "rejected_valid"):
             continue
         full, location = _supplied(item.claim.full_guidance), _supplied(item.claim.hint_location)
+        if item.outcome != "accepted_invalid" and full is None and location is None:
+            continue
         unavailable = {}
         if full is None:
             unavailable["full"] = FULL_UNAVAILABLE

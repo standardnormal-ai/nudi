@@ -11,6 +11,7 @@ each call's usage and estimated cost.
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import subprocess
 import tomllib
@@ -28,6 +29,7 @@ from litellm.litellm_core_utils.get_model_cost_map import get_model_cost_map_sou
 
 from nudi.records import (
     DEFAULT_MODELS,
+    PROVIDER_REPORTED,
     CallRecord,
     CaptureFailure,
     Capacity,
@@ -42,6 +44,8 @@ from nudi.records import (
     RunRecord,
     SandboxResult,
     Simulation,
+    private_dir,
+    write_private,
 )
 from nudi.runner import UnsupportedTask, check_output, episode_queue, run_episode, select_path
 
@@ -148,7 +152,7 @@ class Run:
     """Native episodes started and not yet returned, queued or running."""
 
     def save(self) -> None:
-        (self.config.output_dir / "run.json").write_text(self.record.model_dump_json(indent=2))
+        write_private(self.config.output_dir / "run.json", self.record.model_dump_json(indent=2))
 
     def warn(self, message: str) -> None:
         if message not in self.record.warnings:
@@ -220,6 +224,8 @@ def resolve_credentials(config: RunConfig, models, roles) -> tuple[dict[Role, st
 def start_run(config: RunConfig, roles: frozenset[Role] = ROLES) -> Run:
     """Settle models, credentials, path and capacity for `roles` before any episode starts."""
     check_output(config.output_dir, config.task_dir)
+    if config.credentials_file and config.credentials_file.resolve().is_relative_to(config.task_dir.resolve()):
+        raise UnsupportedTask(f"the credentials file {config.credentials_file} is inside the task")
     # Copies, so a change to one run's models reaches no default or other run.
     models = {role: model.model_copy() for role, model in {**DEFAULT_MODELS, **config.models}.items()}
     keys, sources = resolve_credentials(config, models, roles)
@@ -257,7 +263,11 @@ def start_run(config: RunConfig, roles: frozenset[Role] = ROLES) -> Run:
         logger.warning(warning)
     if not any(isinstance(callback, RunCalls) for callback in litellm.callbacks):
         litellm.callbacks.append(RunCalls())
-    config.output_dir.mkdir(parents=True, exist_ok=True)
+    # The root becomes 0700 and nudi creates new directories 0700 and new files 0600 under it.
+    # Each episode restricts its Harbor or Verifiers tree once it ends; entries the host user does
+    # not own, and files that already existed, keep their modes under the private root.
+    private_dir(config.output_dir)
+    config.output_dir.chmod(0o700)
     run = Run(config, record, episode_queue(concurrency), keys)
     run.save()
     return run
@@ -310,6 +320,9 @@ def record_call(run: Run, role: Role, episode: str, request: dict, response=None
             cost, source = litellm.completion_cost(completion_response=response, model=model), "litellm.completion_cost"
         except Exception as failure:
             source = f"unknown: {type(failure).__name__}: {failure}"
+            provider = getattr(usage, "cost", None)
+            if isinstance(provider, (int, float)) and math.isfinite(provider):
+                cost, source = provider, PROVIDER_REPORTED
     run.record.calls.append(
         CallRecord(
             role=role,
@@ -429,17 +442,18 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
                             message = message.replace(secret, "[redacted]")
                         run.record.capture_errors.append(CaptureFailure(episode=name, location=location,
                             error=ErrorRecord(type=type(error).__name__, message=message)))
-                        run.warn(f"{name}: capture of {location} failed: {type(error).__name__}: {error}")
+                        run.warn(f"{name}: capture of {location} failed: {type(error).__name__}: {message}")
                         if isinstance(error, InfrastructureAbort):
                             raise
                     finally:
                         run.save()
         with model_calls(run, role, name):
             if instruction is None and agent is None and capture is None and on_agent_start is None and on_trial_end is None:
-                result = await run_episode(config, run.queue)
+                result = await run_episode(config, run.queue, credentials=run.config.credentials_file)
             else:
                 result = await run_episode(config, run.queue, instruction=instruction, agent=agent, capture=capture,
-                                           on_agent_start=on_agent_start, on_trial_end=on_trial_end)
+                                           on_agent_start=on_agent_start, on_trial_end=on_trial_end,
+                                           credentials=run.config.credentials_file)
         run.record.events.append(EpisodeEvent(episode=name, event="finished"))
         return result
     finally:
@@ -452,7 +466,8 @@ async def simulate(run: Run, episodes: int = 20) -> Simulation:
 
     Every count takes this path. As many workers as the run's queue runs at once admit
     an episode only while the spending cap allows; admitted episodes finish. Failed
-    episodes stay recorded and are not retried. The run's capture selection, made before
+    episodes stay recorded and are not retried; the pool is partial only when one has no
+    usable reward. The run's capture selection, made before
     the first episode, is captured at verification start for grader inspection, which
     reuses this pool."""
     from nudi.checks import capture_selection, redacted
@@ -462,6 +477,7 @@ async def simulate(run: Run, episodes: int = 20) -> Simulation:
     simulation = Simulation(requested=episodes)
     run.record.simulation = simulation
     run.save()
+    unusable = set()
 
     async def worker():
         while len(simulation.episodes) < episodes:
@@ -478,8 +494,11 @@ async def simulate(run: Run, episodes: int = 20) -> Simulation:
                 if result.errors:
                     simulation.failures[name] = [error.model_copy(update={"message": redacted(run, error.message)})
                                                  for error in result.errors]
+                if not any(value is not None and math.isfinite(value) for value in result.rewards.values()):
+                    unusable.add(name)
             except Exception as error:
                 simulation.failures[name] = [ErrorRecord(type=type(error).__name__, message=redacted(run, str(error)))]
+                unusable.add(name)
             finally:
                 if refusals := [signal for call in run.record.calls if call.episode == name for signal in call.refusals]:
                     simulation.refusals[name] = refusals
@@ -489,7 +508,7 @@ async def simulate(run: Run, episodes: int = 20) -> Simulation:
         locations = [item.source for item in (await capture_selection(run)).files if item.selected]
         await asyncio.gather(*(worker() for _ in range(min(episodes, run.record.capacity.concurrency))))
         if simulation.status == "running":
-            simulation.status = "partial" if simulation.failures else "complete"
+            simulation.status = "partial" if unusable else "complete"
     except asyncio.CancelledError:
         simulation.status = "cancelled"
         raise

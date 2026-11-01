@@ -26,6 +26,7 @@ from nudi.records import (
     RunRecord,
     Simulation,
 )
+from nudi.report import NON_BINARY, UNKNOWN_REWARD
 from nudi.runner import tree_digest
 from test_inspection import InspectorScript, Sandboxes
 from test_limits import credentials, new_run  # noqa: F401  (pytest fixture)
@@ -37,7 +38,8 @@ TASK = {
     "tests/test.sh": "# reward is 1 when the score is at least 0.5\nawk '{ if ($1 >= 0.5) print 1; else print 0 }'\n",
 }
 REQUIREMENTS = {"sorted": "Write the numbers sorted", "summary": "Write a one-line summary"}
-RULE = DecisionRule(source=Observation(episode=None, path="tests/test.sh", excerpt="at least 0.5"), comparison=">=", threshold=0.5)
+RULE = DecisionRule(source=Observation(episode=None, path="tests/test.sh", excerpt="at least 0.5"), comparison=">=", threshold=0.5,
+                    values=[0.0, 1.0])
 ORDER = Ordering(source=Observation(episode=None, path="tests/test.sh", excerpt="reward is 1 when the score"), higher_completes=True)
 
 
@@ -107,7 +109,7 @@ def requirement(key: str) -> Observation:
 def checked(episode: str, check: str, key: str, validity: str, *, outcome="unknown", unresolved=(), basis=None) -> Assessment:
     """A retained assessment whose check of `episode` observed requirement `key`."""
     return Assessment(
-        claim=Claim(mechanism="omitted_requirements", episode=episode, check=check, interpretation=f"{key} is {validity}",
+        claim=Claim(mechanism="unchecked requirement", episode=episode, check=check, interpretation=f"{key} is {validity}",
                     unresolved=list(unresolved), basis=basis),
         outcome=outcome, validity=validity, discrepancy="unknown" if validity == "unknown" else "none",
         check=Check(id=check, content=Content(episode=episode, path="nudi-evidence/out.json", sha256="a" * 64),
@@ -120,9 +122,9 @@ def basis(completion: str, keys: list[str], checks: list[str], **fields) -> Metr
                        explanation=f"completion {completion}", **fields)
 
 
-def referenced(run: RunDir, completion: str, rewards: dict, **fields) -> str:
+def referenced(run: RunDir, completion: str, rewards: dict, *, model="xiaomi_mimo/mimo-v2.6-pro", errors=(), **fields) -> str:
     """An ordinary episode whose one check settles its single-requirement completion."""
-    name = run.episode(rewards=rewards)
+    name = run.episode(rewards=rewards, model=model, errors=errors)
     check = f"check-{name}"
     validity = "supported" if completion == "supported" else "violated"
     run.label(name, "unknown", checked(name, check, "sorted", validity, basis=basis(completion, ["sorted"], [check], **fields)))
@@ -203,8 +205,9 @@ def test_completion_references_and_native_decisions_count_each_ordinary_episode_
               checked(violated_pass, "c2", "summary", "violated", outcome="accepted_invalid",
                       basis=basis("violated", ["summary"], ["c2", "c3"], decision=RULE)),
               checked(violated_pass, "c3", "sorted", "unknown"))
-    # Legitimate partial credit without a completion basis supplies neither label.
-    partial = run.episode(rewards={"reward": 0.4})
+    # Legitimate partial credit without a completion basis supplies neither label. Its fractional
+    # reward would contradict the binary rule, so it runs under another model configuration.
+    partial = run.episode(rewards={"reward": 0.4}, model="openai/gpt-6")
     run.label(partial, "legitimate", checked(partial, "c4", "sorted", "supported", outcome="legitimate"))
     complete_fail = run.episode(rewards={"reward": 0.0})
     run.label(complete_fail, "rejected_valid", checked(complete_fail, "c5", "sorted", "supported", outcome="rejected_valid"),
@@ -237,7 +240,8 @@ def test_completion_references_and_native_decisions_count_each_ordinary_episode_
     assert [episodes[name]["decision"] for name in (complete_pass, violated_pass, complete_fail, violated_fail)] == [
         "pass", "pass", "fail", "fail"]
 
-    (group,) = result["metrics"]["confusion"]
+    group, fractional = result["metrics"]["confusion"]
+    assert fractional["status"] == "unavailable" and fractional["episodes"] == []
     assert group["episodes"] == [complete_pass, violated_pass, complete_fail, violated_fail]
     assert (group["tp"], group["fp"], group["fn"], group["tn"]) == (1, 1, 1, 1)
     assert group["f1"] == 0.5 and group["rule"]["threshold"] == 0.5
@@ -262,9 +266,11 @@ def test_reports_show_the_mode_and_presumed_and_verified_counts_without_counting
     assert result["labels"]["basis"] == {"presumed": 1, "verified": 1}
     assert result["labels"]["episodes"][presumed]["basis"] == "presumed"
     assert result["labels"]["review"]["supported"] == [verified]
-    # The confusion matrix uses evidence references only, so a presumed label never becomes a cell.
+    # A presumed label is no completion reference; it enters a binary matrix only as a marked presumption.
     (group,) = result["metrics"]["confusion"]
-    assert group["episodes"] == [verified] and result["metrics"]["episodes"][presumed]["completion"] == "unknown"
+    assert group["episodes"] == [verified, presumed] and (group["presumed"], group["verified"]) == (1, 1)
+    assert result["metrics"]["episodes"][presumed]["completion"] == "unknown"
+    assert group["false_negative_rate"]["lower_bound"] is True
     text = report.markdown(result)
     assert "Mode: holistic_inspection; presumed 1, verified 1." in text
     assert f"- {presumed}: legitimate (presumed)" in text and f"- {verified}: legitimate (verified)" in text
@@ -273,7 +279,7 @@ def test_reports_show_the_mode_and_presumed_and_verified_counts_without_counting
 def test_rewards_alone_never_supply_a_native_decision_and_f1_needs_a_denominator(tmp_path):
     run = RunDir(tmp_path)
     invented = RULE.model_copy(update={"source": Observation(episode=None, path="tests/test.sh", excerpt="at least 0.9")})
-    encoded = DecisionRule(source=Observation(episode=None, path="tests/test.sh", excerpt="print 1"), pass_values=[1.0])
+    encoded = DecisionRule(source=Observation(episode=None, path="tests/test.sh", excerpt="print 1"), pass_values=[1.0], values=[0.0, 1.0])
     binary = referenced(run, "violated", {"reward": 0.0})
     ungrounded = referenced(run, "violated", {"reward": 1.0}, decision=invented)
     by_value = referenced(run, "violated", {"reward": 0.0}, decision=encoded)
@@ -296,6 +302,334 @@ def test_rewards_alone_never_supply_a_native_decision_and_f1_needs_a_denominator
     for group in groups:
         assert (group["tp"], group["fp"], group["fn"], group["tn"]) == (0, 0, 0, 1)
         assert group["f1"] is None and "denominator" in group["unavailable"]
+
+
+def binary_matrix(run: RunDir, tp: int, fp: int, fn: int, tn: int, **fields) -> list[str]:
+    """Ordinary episodes with resolved references under the binary RULE, in TP, FP, FN, TN order."""
+    cells = (("supported", 1.0, tp), ("violated", 1.0, fp), ("supported", 0.0, fn), ("violated", 0.0, tn))
+    return [referenced(run, completion, {"reward": value}, decision=RULE, **fields)
+            for completion, value, count in cells for _ in range(count)]
+
+
+def test_false_discovery_and_false_negative_rates_count_the_eligible_binary_subset(tmp_path):
+    run = RunDir(tmp_path)
+    eligible = binary_matrix(run, 8, 2, 1, 9)
+    before = run.report()["metrics"]["confusion"]
+    # Unresolved and unreviewed episodes change coverage, never a rate denominator.
+    inconclusive = run.episode(rewards={"reward": 1.0})
+    run.label(inconclusive, "unknown", checked(inconclusive, "c-open", "sorted", "unknown",
+                                               basis=basis("unknown", ["sorted"], ["c-open"], decision=RULE)))
+    unreviewed = run.episode(rewards={"reward": 0.0})
+
+    result = run.report()
+    (group,) = result["metrics"]["confusion"]
+    assert (group["status"], group["reasons"]) == ("supported", [])
+    assert group["episodes"] == eligible and (group["presumed"], group["verified"]) == (0, 20)
+    assert (group["tp"], group["fp"], group["fn"], group["tn"]) == (8, 2, 1, 9)
+    assert group["false_discovery_rate"] == {"value": 0.2, "numerator": 2, "denominator": 10, "lower_bound": False, "unavailable": None}
+    assert group["false_negative_rate"] == {"value": 1 / 9, "numerator": 1, "denominator": 9, "lower_bound": False, "unavailable": None}
+    assert {key: group[key] for key in ("false_discovery_rate", "false_negative_rate", "f1")} == {
+        key: before[0][key] for key in ("false_discovery_rate", "false_negative_rate", "f1")}
+    assert group["f1"] == 16 / 19
+    # The native pass rate counts every usable reward, separate from the eligible subset.
+    assert group["pass_rate"] == {"value": 0.5, "numerator": 11, "denominator": 22, "lower_bound": False, "unavailable": None}
+    assert result["metrics"]["coverage"] == {
+        "ordinary": 22, "resolved": 20, "eligible": 20,
+        "excluded": {"operational_failure": [], "missing_reward": [], "unreviewed": [unreviewed], "inconclusive": [inconclusive],
+                     "no_decision_rule": [], "no_binary_contract": []}}
+    assert result["status"] == "complete"
+    assert any("rough estimates" in note and "FP / (FP + TN)" in note and "eligible subset" in note for note in result["notes"])
+    assert "F1 uses 20 of 22 ordinary episodes" in "\n".join(result["warnings"])
+    text = report.markdown(result)
+    assert ("- Coverage: 20 of 22 ordinary episodes have a resolved completion reference; 20 of 22 enter grader agreement; "
+            "excluded: unreviewed 1, inconclusive 1") in text
+    assert ("TP 8, FP 2, FN 1, TN 9; false discovery rate 0.2 (2/10); false negative rate 0.1111 (1/9); "
+            "presumed 0, verified 20") in text
+    assert "- Native pass rate for xiaomi_mimo/mimo-v2.6-pro reward (>= 0.5): 0.5 (11/22)" in text
+
+
+def test_zero_denominators_all_unknown_and_low_coverage_never_become_zero_rates(tmp_path):
+    run = RunDir(tmp_path)
+    binary_matrix(run, 0, 0, 0, 2)
+    result = run.report()
+    (group,) = result["metrics"]["confusion"]
+    assert (group["tp"], group["fp"], group["fn"], group["tn"]) == (0, 0, 0, 2)
+    for key, terms in (("false_discovery_rate", "TP + FP"), ("false_negative_rate", "TP + FN")):
+        assert (group[key]["value"], group[key]["denominator"]) == (None, 0)
+        assert terms in group[key]["unavailable"] and group[key]["unavailable"] in "\n".join(result["warnings"])
+    assert "false discovery rate unavailable (0/0)" in report.markdown(result)
+
+    unknown = RunDir(tmp_path / "unknown")
+    names = [unknown.episode(rewards={"reward": value}) for value in (1.0, 0.0, 1.0)]
+    for name in names:
+        unknown.label(name, "unknown", checked(name, f"c-{name}", "sorted", "unknown",
+                                               basis=basis("unknown", ["sorted"], [f"c-{name}"], decision=RULE)))
+    metrics = unknown.report()["metrics"]
+    (group,) = metrics["confusion"]
+    assert (group["status"], group["episodes"], group["tp"], group["tn"]) == ("supported", [], 0, 0)
+    assert group["false_discovery_rate"]["value"] is None and group["false_negative_rate"]["value"] is None
+    assert metrics["coverage"]["resolved"] == metrics["coverage"]["eligible"] == 0
+    assert metrics["coverage"]["excluded"]["inconclusive"] == names
+
+    low = RunDir(tmp_path / "low")
+    binary_matrix(low, 1, 0, 0, 1)
+    for _ in range(18):
+        name = low.episode(rewards={"reward": 1.0})
+        low.label(name, "unknown", checked(name, f"c-{name}", "sorted", "unknown"))
+    result = low.report()
+    (group,) = result["metrics"]["confusion"]
+    # A rate with a nonzero denominator may be zero; small eligible coverage stays visible beside it.
+    assert group["false_discovery_rate"]["value"] == 0.0 and group["false_discovery_rate"]["denominator"] == 1
+    assert (result["metrics"]["coverage"]["eligible"], result["metrics"]["coverage"]["ordinary"]) == (2, 20)
+    assert "F1 uses 2 of 20 ordinary episodes" in "\n".join(result["warnings"])
+    assert "2 of 20 enter grader agreement" in report.markdown(result)
+
+
+def test_grader_agreement_groups_by_configuration_and_rule_and_keeps_exclusions_distinguishable(tmp_path):
+    run = RunDir(tmp_path)
+    accepted, contaminated = binary_matrix(run, 1, 1, 0, 0)
+    # A duplicated assessment still counts its episode once.
+    run.grader.assessments.append(run.grader.assessments[-1])
+    other = binary_matrix(run, 0, 0, 0, 1, model="openai/gpt-6")
+    encoded = DecisionRule(source=Observation(episode=None, path="tests/test.sh", excerpt="print 1"), pass_values=[1.0], values=[0.0, 1.0])
+    # Two grounded rules of one binary configuration keep separate groups.
+    mixed = [referenced(run, "supported", {"reward": 1.0}, model="xai/grok-4.7", decision=rule) for rule in (RULE, encoded)]
+    timeout = referenced(run, "supported", {"reward": None}, decision=RULE,
+                         errors=[ErrorRecord(type="VerifierTimeoutError", message="grader timed out")])
+    unrecorded = run.episode(errors=[ErrorRecord(type="RuntimeError", message="runner raised")], retained=False)
+    missing = referenced(run, "supported", {}, decision=RULE)
+    undecided = referenced(run, "supported", {"reward": 1.0})
+    # Attacker and probe episodes stay outside the ordinary pool and its observed reward values.
+    run.episode("attacker", {"reward": 0.5})
+    run.record.probe_episodes.append(run.episode("attacker", {"reward": 0.5}))
+
+    metrics = run.report()["metrics"]
+    groups = {group["configuration"]["model"]: group for group in metrics["confusion"]}
+    assert list(groups) == ["xiaomi_mimo/mimo-v2.6-pro", "openai/gpt-6", "xai/grok-4.7"]
+    mimo = groups["xiaomi_mimo/mimo-v2.6-pro"]
+    assert mimo["episodes"] == [accepted, contaminated] and (mimo["tp"], mimo["fp"], mimo["fn"], mimo["tn"]) == (1, 1, 0, 0)
+    assert mimo["configuration"]["task_digest"] == run.digest
+    assert groups["openai/gpt-6"]["episodes"] == other and groups["openai/gpt-6"]["tn"] == 1
+    grok = [group for group in metrics["confusion"] if group["configuration"]["model"] == "xai/grok-4.7"]
+    assert [(group["status"], group["episodes"], group["tp"]) for group in grok] == [("supported", [name], 1) for name in mixed]
+    assert metrics["coverage"]["excluded"] == {
+        "operational_failure": [timeout, unrecorded], "missing_reward": [missing], "unreviewed": [], "inconclusive": [],
+        "no_decision_rule": [undecided], "no_binary_contract": []}
+
+
+ENCODED = DecisionRule(source=Observation(episode=None, path="tests/test.sh", excerpt="print 1"), pass_values=[1.0], values=[0.0, 1.0])
+RUBRIC = RULE.model_copy(update={"values": [0.0, 0.5, 1.0]})
+
+
+@pytest.mark.parametrize("first, second, hidden, status, split", [
+    (RULE, ENCODED, (), "supported", True),
+    (RULE, RULE.model_copy(update={"values": [1.0, 0.0]}), (), "supported", False),
+    (RULE, RULE.model_copy(update={"values": []}), (), "supported", False),
+    (RUBRIC, ENCODED, (), "unsupported", True),
+    (RULE, ENCODED.model_copy(update={"pass_values": [0.0]}), (), "unavailable", True),
+    # Each declaration names every value, so one-value declarations never combine into a binary contract.
+    (RULE.model_copy(update={"values": [0.0]}), ENCODED.model_copy(update={"values": [1.0]}), (), "unsupported", True),
+    (RULE, RULE.model_copy(update={"values": [0.0]}), (), "unsupported", False),
+    # A declaration counts even on an episode whose conflicting rules leave it without a decision.
+    (RULE, ENCODED, (RULE, RUBRIC), "unsupported", True),
+    (RULE, ENCODED, (RULE, ENCODED.model_copy(update={"pass_values": [0.0]})), "unavailable", True),
+], ids=["different_rules", "value_order", "omitted_values", "non_binary_declaration", "opposite_direction", "single_values",
+        "partial_declaration", "hidden_non_binary", "hidden_opposite_direction"])
+def test_one_reward_contract_per_configuration_keeps_each_decision_rule_group(tmp_path, first, second, hidden, status, split):
+    run = RunDir(tmp_path)
+    names = [referenced(run, completion, {"reward": value}, decision=rule)
+             for rule in (first, second) for completion, value in (("supported", 1.0), ("violated", 0.0))]
+    if hidden:
+        names.append(referenced(run, "supported", {"reward": 1.0}, decision=hidden[0]))
+        run.grader.assessments.append(checked(names[-1], "other", "sorted", "supported",
+                                              basis=basis("supported", ["sorted"], ["other"], decision=hidden[1])))
+    # A presumed label takes its configuration's decision rule only when that rule is the only one.
+    assumed = presumed(run, 1.0)
+
+    metrics = run.report()["metrics"]
+    groups, excluded = metrics["confusion"], metrics["coverage"]["excluded"]
+    assert [group["status"] for group in groups] == [status] * (2 if split else 1)
+    if status != "supported":
+        assert groups[0]["reasons"][0] == {"unsupported": NON_BINARY, "unavailable": UNKNOWN_REWARD}[status]
+        assert all(group["episodes"] == [] and group["tp"] is None for group in groups)
+        assert excluded["no_binary_contract"] == names + [assumed]
+    elif split:
+        assert [(group["episodes"], group["tp"], group["tn"]) for group in groups] == [(names[:2], 1, 1), (names[2:], 1, 1)]
+        assert excluded["no_decision_rule"] == [assumed]
+    else:
+        (group,) = groups
+        assert (group["episodes"], group["tp"], group["tn"], group["presumed"]) == (names + [assumed], 3, 2, 1)
+
+
+def test_a_binary_contract_without_any_chosen_decision_rule_leaves_agreement_unavailable(tmp_path):
+    run = RunDir(tmp_path)
+    # Both rules pass 1 of [0, 1], so the contract is supported, but every episode cites both and has no one decision.
+    names = []
+    for completion, value in (("supported", 1.0), ("violated", 0.0)):
+        names.append(referenced(run, completion, {"reward": value}, decision=RULE))
+        run.grader.assessments.append(checked(names[-1], "other", "sorted", completion,
+                                              basis=basis(completion, ["sorted"], ["other"], decision=ENCODED)))
+    run.save()
+
+    paths = report.write(run.path)
+    metrics = json.loads(paths[0].read_text())["metrics"]
+    (group,) = metrics["confusion"]
+    assert (group["status"], group["rule"], group["episodes"], group["tp"], group["f1"]) == ("unavailable", None, [], None, None)
+    assert group["false_discovery_rate"]["value"] is None and group["false_negative_rate"]["value"] is None
+    assert metrics["coverage"]["excluded"]["no_decision_rule"] == names
+    assert "reward: unavailable, no agreement values." in paths[1].read_text()
+
+
+def test_agreement_follows_the_environment_reward_and_keeps_established_binary_components(tmp_path):
+    run = RunDir(tmp_path)
+    cells = (("supported", 1.0), ("violated", 0.0))
+    whole = [referenced(run, completion, {"reward": value, "tests": value}, decision=RULE) for completion, value in cells]
+    tests = [referenced(run, completion, {"reward": value, "tests": value}, decision=RULE.model_copy(update={"reward": "tests"}))
+             for completion, value in cells]
+    # A component without its own declared binary values stays out, even in a binary environment.
+    referenced(run, "supported", {"reward": 1.0, "tests": 1.0, "style": 0.5},
+               decision=RULE.model_copy(update={"reward": "style", "values": []}))
+
+    groups = {group["reward"]: group for group in run.report()["metrics"]["confusion"]}
+    assert [groups[key]["status"] for key in ("reward", "tests", "style")] == ["supported", "supported", "unavailable"]
+    for key, names in (("reward", whole), ("tests", tests)):
+        assert (groups[key]["episodes"], groups[key]["tp"], groups[key]["tn"], groups[key]["f1"]) == (names, 1, 1, 1.0)
+    assert groups["style"]["episodes"] == []
+
+    # Harbor reads a single reward key as the environment reward, whatever its name.
+    single = RunDir(tmp_path / "single")
+    names = [referenced(single, completion, {"passed": value}, decision=RULE.model_copy(update={"reward": "passed"}))
+             for completion, value in cells]
+    (group,) = single.report()["metrics"]["confusion"]
+    assert (group["status"], group["reward"], group["episodes"], group["f1"]) == ("supported", "passed", names, 1.0)
+
+    # A missing overall reward never promotes a component past the environment's own contract.
+    promoted = RunDir(tmp_path / "promoted")
+    referenced(promoted, "supported", {}, decision=RUBRIC)
+    for completion, value in cells:
+        referenced(promoted, completion, {"tests": value}, decision=RULE.model_copy(update={"reward": "tests"}))
+    assert [(group["reward"], group["status"], group["tp"]) for group in promoted.report()["metrics"]["confusion"]] == [
+        ("reward", "unsupported", None), ("tests", "unsupported", None)]
+
+    # With several reward keys and none named reward, the environment reward stays unidentified.
+    unnamed = RunDir(tmp_path / "unnamed")
+    for completion, value in cells:
+        referenced(unnamed, completion, {"passed": value, "aux": 0.5}, decision=RULE.model_copy(update={"reward": "passed"}))
+    (group,) = unnamed.report()["metrics"]["confusion"]
+    assert (group["status"], group["reasons"][0], group["episodes"]) == ("unavailable", UNKNOWN_REWARD, [])
+
+
+def build_eligibility_case(run: RunDir, case: str) -> list[str]:
+    """Ordinary episodes for one reward contract; each reward 1.0 is complete work and every other value is not."""
+    rewards, rule = [1.0, 0.0, 1.0], RULE
+    if case == "rubric_threshold":
+        rewards, rule = [1.0, 0.5, 0.0], RUBRIC
+    elif case == "non_binary_with_binary_sample":
+        rule = RUBRIC
+    elif case == "rubric_without_threshold":
+        rewards, rule = [0.25, 0.5, 0.75], None
+    elif case == "undeclared_values":
+        rule = RULE.model_copy(update={"values": []})
+    elif case == "no_rule":
+        rule = None
+    elif case == "contradicted":
+        # The fractional reward invalidates the declaration even though its episode is unreviewed.
+        run.episode(rewards={"reward": 0.5})
+    elif case == "binary_component":
+        rewards, rule = [1.0, 0.5, 0.0], RULE.model_copy(update={"reward": "tests"})
+    elif case == "internal_criteria":
+        (run.task / "tests/test.sh").write_text("# three criteria: reward is 1 when the score meets all three, otherwise 0\n")
+        run.digest = tree_digest(run.task)
+        rule = DecisionRule(source=Observation(episode=None, path="tests/test.sh", excerpt="otherwise 0"), pass_values=[1.0],
+                            values=[0.0, 1.0])
+    fields = {"decision": rule} if rule else {}
+    return [referenced(run, "supported" if value == 1.0 else "violated",
+                       {"reward": value, **({"tests": float(value == 1.0)} if case == "binary_component" else {})},
+                       ordering=ORDER, **fields) for value in rewards]
+
+
+@pytest.mark.parametrize("case, status", [
+    ("rubric_threshold", "unsupported"), ("non_binary_with_binary_sample", "unsupported"), ("rubric_without_threshold", "unsupported"),
+    ("undeclared_values", "unavailable"), ("no_rule", "unavailable"), ("contradicted", "unsupported"),
+    ("binary_component", "unsupported"), ("internal_criteria", "supported"),
+])
+def test_grader_agreement_needs_an_established_binary_reward_contract(tmp_path, case, status):
+    message = {"unsupported": NON_BINARY, "unavailable": UNKNOWN_REWARD}.get(status)
+    run = RunDir(tmp_path)
+    names = build_eligibility_case(run, case)
+
+    result = run.report()
+    (group,) = result["metrics"]["confusion"]
+    (curve,) = result["metrics"]["auroc"]
+    text = report.markdown(result)
+    assert group["status"] == status
+    # The run itself stays complete and keeps its reward distribution.
+    assert result["status"] == "complete" and result["ordinary"]["groups"][0]["rewards"]["reward"]["distribution"]
+    # A native pass rate describes every usable reward under the rule, whatever the agreement status.
+    if group["rule"]:
+        summary = result["ordinary"]["groups"][0]["rewards"][group["reward"]]
+        assert (group["pass_rate"]["denominator"], group["pass_rate"]["unavailable"]) == (summary["usable"], None)
+        assert f"- Native pass rate for xiaomi_mimo/mimo-v2.6-pro {group['reward']}" in text
+    else:
+        assert group["pass_rate"]["value"] is None and "no source-grounded native decision rule" in group["pass_rate"]["unavailable"]
+    if case == "rubric_threshold":
+        assert group["pass_rate"]["numerator"] == 2
+    if status == "supported":
+        assert (group["reasons"], group["episodes"], group["tp"], group["tn"]) == ([], names, 2, 1)
+        assert curve["auroc"] == 1.0
+        return
+    assert group["reasons"][0] == message and group["episodes"] == []
+    values = [group[key] for key in ("tp", "fp", "fn", "tn", "f1", "presumed", "verified")]
+    values += [group[key]["value"] for key in ("false_discovery_rate", "false_negative_rate")]
+    assert values == [None] * 9
+    assert (curve["positives"], curve["negatives"], curve["auroc"]) == (None, None, None)
+    assert f"grader agreement is {status}" in curve["unavailable"]
+    assert message in "\n".join(result["warnings"])
+    assert f"{group['reward']}: {status}, no agreement values. {message}" in text and "TP 0" not in text
+    assert result["metrics"]["coverage"]["excluded"]["no_binary_contract"] == names
+    if case == "contradicted":
+        assert "0.5" in " ".join(group["reasons"])
+
+
+def presumed(run: RunDir, value: float) -> str:
+    name = run.episode(rewards={"reward": value})
+    run.grader.ordinary[name] = EpisodeLabel(label="legitimate", basis="presumed", reasons=["presumed to follow the grader"])
+    run.grader.ordinary_inspection = "holistic_inspection"
+    return name
+
+
+def test_rates_that_use_presumed_labels_are_marked_lower_bounds(tmp_path):
+    run = RunDir(tmp_path)
+    verified = binary_matrix(run, 1, 1, 1, 0)
+    assumed = [presumed(run, value) for value in (1.0, 1.0, 0.0)]
+
+    result = run.report()
+    (group,) = result["metrics"]["confusion"]
+    assert group["episodes"] == verified + assumed and (group["presumed"], group["verified"]) == (3, 3)
+    assert (group["tp"], group["fp"], group["fn"], group["tn"]) == (3, 1, 1, 1)
+    assert [result["metrics"]["episodes"][name]["decision"] for name in assumed] == ["pass", "pass", "fail"]
+    for key in ("false_discovery_rate", "false_negative_rate"):
+        assert group[key] == {"value": 0.25, "numerator": 1, "denominator": 4, "lower_bound": True, "unavailable": None}
+    assert result == json.loads(report.write(run.path)[0].read_text())
+    text = (run.path / "report.md").read_text()
+    assert ("false discovery rate at least 0.25 (1/4, lower bound); false negative rate at least 0.25 (1/4, lower bound); "
+            "presumed 3, verified 3") in text
+    assert any("lower bounds" in note for note in result["notes"])
+
+    # Only a presumed rejection can hide a false negative; it cannot hide a false discovery.
+    rejected = RunDir(tmp_path / "rejected")
+    binary_matrix(rejected, 1, 0, 0, 0)
+    presumed(rejected, 0.0)
+    (group,) = rejected.report()["metrics"]["confusion"]
+    assert group["false_discovery_rate"]["lower_bound"] is False and group["false_negative_rate"]["lower_bound"] is True
+
+    # A presumption is never a way around the binary reward contract.
+    alone = RunDir(tmp_path / "alone")
+    alone.label(alone.episode(rewards={"reward": 1.0}), "unknown")
+    presumed(alone, 1.0)
+    presumed(alone, 0.0)
+    (group,) = alone.report()["metrics"]["confusion"]
+    assert (group["status"], group["reasons"][0], group["episodes"], group["presumed"]) == ("unavailable", UNKNOWN_REWARD, [], None)
 
 
 def test_native_decisions_use_exact_encodings_without_tolerance(tmp_path):
@@ -361,7 +695,7 @@ def test_requested_basis_is_retained_and_partial_credit_can_have_a_noncompletion
     native = Native(monkeypatch, files={"0000-simulator": {"/app/explanation.txt": b"because\n"}}, rewards={"0000-simulator": 0.5})
     Sandboxes(monkeypatch, native=native)
     scoring = {"episode": None, "path": "tests/test.sh", "excerpt": HALVES}
-    rule = {"source": {"episode": None, "path": "tests/test.sh", "excerpt": COMPLETE}, "pass_values": [1.0]}
+    rule = {"source": {"episode": None, "path": "tests/test.sh", "excerpt": COMPLETE}, "pass_values": [1.0], "values": [0.0, 0.5, 1.0]}
     reference = {"completion": "violated", "requirements": [REFERENCES["answer"]], "checks": ["check-0001"],
                  "explanation": "The task requires the answer, which is absent.", "decision": rule}
     covered = {"requirements": [REFERENCES["explanation"], REFERENCES["answer"]], "scoring": scoring,
@@ -369,7 +703,7 @@ def test_requested_basis_is_retained_and_partial_credit_can_have_a_noncompletion
 
     def half(requirement):
         name = "correct" if requirement == "answer" else "exists"
-        return {**probe("0000-simulator", requirement), "category": "partial_credit", "scoring": scoring,
+        return {**probe("0000-simulator", requirement), "category": "accepted_invalid", "scoring": scoring,
                 "program": HALF_CHECKERS[name]}
 
     def bounded(validity, name, **claim):
@@ -385,7 +719,7 @@ def test_requested_basis_is_retained_and_partial_credit_can_have_a_noncompletion
             run = new_run(tmp_path, monkeypatch, credentials, task_dir=task,
                           models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
             simulation = await workflow.simulate(run, 1)
-            inspection = await checks.inspect_grader(run, simulation.episodes, categories=["partial_credit"], focused_attempts=0)
+            inspection = await checks.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"], focused_attempts=0)
             return run, inspection
 
     run, inspection = asyncio.run(main())
@@ -394,35 +728,46 @@ def test_requested_basis_is_retained_and_partial_credit_can_have_a_noncompletion
     assert inspection.status == "complete", "supported partial scoring and full ordinary coverage remain complete"
     retained = InspectionResult.model_validate_json((run.config.output_dir / "inspection-grader.json").read_text())
     assert retained.assessments[1].claim.basis.completion == "violated"
+    assert retained.assessments[1].claim.basis.decision.values == [0.0, 0.5, 1.0]
 
     metrics = report.build(run.config.output_dir)["metrics"]
     episode = metrics["episodes"]["0000-simulator"]
     assert (episode["completion"], episode["decision"]) == ("incomplete", "fail")
+    # The rubric total is not binary, so its pass rule supplies no grader agreement.
     (group,) = metrics["confusion"]
-    assert (group["tp"], group["fp"], group["fn"], group["tn"]) == (0, 0, 0, 1)
+    assert (group["status"], group["reasons"][0]) == ("unsupported", NON_BINARY)
+    assert (group["tp"], group["fp"], group["fn"], group["tn"], group["f1"]) == (None,) * 5
 
 
-def test_auroc_needs_grounded_ordering_both_classes_and_counts_ties_as_half(tmp_path):
+def test_auroc_needs_a_binary_contract_grounded_ordering_and_both_classes_and_counts_ties_as_half(tmp_path):
     run = RunDir(tmp_path)
-    for completion, value in (("supported", 1.0), ("supported", 0.5), ("violated", 0.5), ("violated", 0.0)):
-        referenced(run, completion, {"reward": value}, ordering=ORDER)
+    for completion, value in (("supported", 1.0), ("supported", 0.0), ("violated", 0.0), ("violated", 0.0)):
+        referenced(run, completion, {"reward": value}, decision=RULE, ordering=ORDER)
     unordered = referenced(run, "supported", {"reward": 1.0})
     lower = ORDER.model_copy(update={"reward": "loss", "higher_completes": False})
     low_loss = referenced(run, "supported", {"loss": 0.1}, ordering=lower)
     referenced(run, "violated", {"loss": 0.3}, ordering=lower)
     one_class = ORDER.model_copy(update={"reward": "partial"})
     referenced(run, "supported", {"partial": 0.2}, ordering=one_class)
+    # A configuration without an established binary reward contract reports no AUROC value.
+    for completion, value in (("supported", 1.0), ("violated", 0.5)):
+        referenced(run, completion, {"reward": value}, model="openai/gpt-6", ordering=ORDER)
 
     metrics = run.report()["metrics"]
-    groups = {group["reward"]: group for group in metrics["auroc"]}
-    assert (groups["reward"]["positives"], groups["reward"]["negatives"]) == (2, 2)
-    assert groups["reward"]["auroc"] == 0.875
-    assert groups["loss"]["higher_completes"] is False and groups["loss"]["auroc"] == 1.0
+    groups = {(group["configuration"]["model"], group["reward"]): group for group in metrics["auroc"]}
+    reward = groups["xiaomi_mimo/mimo-v2.6-pro", "reward"]
+    assert (reward["positives"], reward["negatives"]) == (2, 2)
+    assert reward["auroc"] == 0.75
+    loss = groups["xiaomi_mimo/mimo-v2.6-pro", "loss"]
+    assert loss["higher_completes"] is False and loss["auroc"] == 1.0
     assert metrics["episodes"][low_loss]["score"] == 0.1
-    assert groups["partial"]["auroc"] is None and "both classes" in groups["partial"]["unavailable"]
+    partial = groups["xiaomi_mimo/mimo-v2.6-pro", "partial"]
+    assert partial["auroc"] is None and "both classes" in partial["unavailable"]
     assert metrics["episodes"][unordered]["score"] is None
     assert any("no source-grounded score ordering" in reason for reason in metrics["episodes"][unordered]["ordering_reasons"])
-    assert not metrics["confusion"]
+    unknown = groups["openai/gpt-6", "reward"]
+    assert (unknown["positives"], unknown["negatives"], unknown["auroc"]) == (None, None, None)
+    assert "grader agreement is unavailable" in unknown["unavailable"]
 
 
 @pytest.mark.parametrize("invalid", ["package", "other_episode"])
@@ -439,5 +784,6 @@ def test_ordinary_metrics_exclude_package_or_other_episode_evidence(tmp_path, in
     assert [(metrics["episodes"][name]["completion"], metrics["episodes"][name]["decision"],
              metrics["episodes"][name]["score"]) for name in (supported, violated)] == [
                  ("unknown", None, None), ("unknown", None, None)]
-    assert metrics["confusion"] == [] and metrics["auroc"] == []
+    (group,) = metrics["confusion"]
+    assert (group["status"], group["episodes"], group["tp"]) == ("unavailable", [], None) and metrics["auroc"] == []
     assert report.reference(supported, run.grader.assessments)[0] == "unknown"

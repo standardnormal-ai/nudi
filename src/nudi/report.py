@@ -15,7 +15,7 @@ from pathlib import Path
 
 from nudi.assessment import Evidence, Ungrounded, classify_probe, conclusions
 from nudi.checks import SELECTION_SESSION, AttackResult, InspectionResult, evidenced
-from nudi.records import Assessment, EpisodeResult, MetricBasis, Observation, RunRecord
+from nudi.records import PROVIDER_REPORTED, Assessment, EpisodeResult, MetricBasis, Observation, RunRecord
 
 ANALYSES = ("simulation", "grader", "hack", "attack")
 FILES = {"grader": "inspection-grader.json", "hack": "inspection-hack.json", "attack": "attack.json"}
@@ -28,9 +28,23 @@ LOCAL_LIMIT = (
     "They are not binary FP/FN labels, and legitimate partial credit is not a false pass."
 )
 METRIC_LIMIT = (
-    "F1 and AUROC compare native decisions and scores with evidence-grounded Inspector references. nudi checks "
-    "their retained provenance and consistency, not semantic correctness or calibrated accuracy."
+    "F1, AUROC and the false discovery and false negative rates compare native decisions and scores with "
+    "evidence-grounded grader inspector references. nudi checks their retained provenance and consistency, not semantic "
+    "correctness or calibrated accuracy. Whether a reference's requirements match the grader's acceptance rule is "
+    "the grader inspector's interpretation, not independently validated."
 )
+NON_BINARY = ("Non-binary rewards are currently not supported in grader agreement analysis. "
+              "Wrong partial scores were not searched; that search is not supported yet.")
+UNKNOWN_REWARD = "Reward type could not be established; grader agreement analysis currently supports binary rewards only."
+AGREEMENT_LIMIT = (
+    "Grader agreement covers binary rewards only. False discovery rate is FP / (TP + FP) and false negative rate is "
+    "FN / (TP + FN); both are observed proportions of the eligible episodes, not multiple-testing guarantees, and the "
+    "false positive rate FP / (FP + TN) is a different quantity. The default 20 ordinary runs give rough estimates. "
+    "Unresolved episodes may be systematically harder, so the rates describe the eligible subset, not the whole pool. "
+    "A presumed label stands in for the grader's own verdict, so rates that use one are lower bounds and F1 is then an upper bound."
+)
+# Why an ordinary episode stays out of grader agreement, in the order they are checked.
+EXCLUDED = ("operational_failure", "missing_reward", "unreviewed", "inconclusive", "no_binary_contract", "no_decision_rule")
 PACKAGE_LIMIT = (
     "Package evidence: an Inspector sandbox ran a copy of the task package, so this finding establishes what the "
     "copied package did, not native accessibility to a task agent. Setup privileges include copied tests, helpers "
@@ -41,6 +55,24 @@ NO_RATE = (
     "Each candidate, hint level, and no-hint discovery stops at its first independently evidenced exploit, "
     "so attempt counts give no unbiased success-rate estimate. Not found means not found within the actual attempts. "
     "An unrelated or unattributed exploit does not confirm the candidate under test."
+)
+FINDINGS_NOTE = (
+    "An evidenced finding is accepted_invalid (violating work received more than its deserved maximum) or rejected_valid "
+    "(valid work received less than it deserved) with no necessary condition unresolved. A suspected finding has one of "
+    "those outcomes with unresolved conditions. A legitimate finding has a reward within its checked bounds, which does "
+    "not judge the work. An inconclusive finding established no outcome. Package findings come from an Inspector sandbox "
+    "running a copy of the task package, native findings from a task episode. An earlier reading of a check stays listed, "
+    "marked with the later reading that superseded it. Category settlement reads the latest reading of each check; local "
+    "labels and metrics read every reading."
+)
+CATEGORY_RULE = (
+    "A category is evidenced_issue once one of its cases is evidenced (for the hack inspector, an accepted_invalid case), and a "
+    "later reading does not withdraw it. It is no_evidenced_issue only when its attempts completed after any failure, its "
+    "applicability evidence is applicable, and the latest reading of each case measured before the episode sessions is "
+    "consistent with its reward or evidenced; otherwise it stays unknown. A case belongs to the category of its experiment, "
+    "and an open case without an inspected category keeps every category open. A repair, which interprets an ordinary "
+    "check again in a later session, evidences the category of that session. The Inspector's applicability text is in "
+    "the JSON report."
 )
 
 
@@ -83,7 +115,7 @@ def build(run_dir: Path, secrets=(), selected=None) -> dict:
         },
         "labels": None,
         "metrics": None,
-        "inspections": {mode: inspection(mode, loaded[mode], warnings) for mode in ("grader", "hack") if mode in loaded},
+        "inspections": {f"{mode}_inspector": inspection(mode, loaded[mode], warnings) for mode in ("grader", "hack") if mode in loaded},
         "attack": attack(loaded["attack"], record, warnings) if "attack" in loaded else None,
         "persistence": persistence(record, warnings),
         "warnings": warnings,
@@ -92,9 +124,13 @@ def build(run_dir: Path, secrets=(), selected=None) -> dict:
     if "grader" in loaded:
         report["labels"] = labels(pool, loaded["grader"], warnings)
         report["metrics"] = metrics(run_dir, pool, results, loaded["grader"], warnings)
-        notes += [LOCAL_LIMIT, METRIC_LIMIT]
+        notes += [LOCAL_LIMIT, METRIC_LIMIT, AGREEMENT_LIMIT]
     if "attack" in loaded:
         notes.append(NO_RATE)
+    if loaded:
+        notes.append(FINDINGS_NOTE)
+    if report["inspections"]:
+        notes.append(CATEGORY_RULE)
     return scrub(report, [secret for secret in secrets if secret])
 
 
@@ -129,7 +165,7 @@ def collection(record: RunRecord) -> dict | None:
     return {"status": selection.status, "files": [item.model_dump(mode="json") for item in selection.files],
             "selected": [item.source for item in selection.files if item.selected], "limits": selection.limits,
             "calls": len(calls), "known_cost": sum(call.cost or 0.0 for call in calls),
-            "unknown_cost_calls": sum(call.cost is None for call in calls),
+            "provider_reported_cost": reported(calls), "unknown_cost_calls": sum(call.cost is None for call in calls),
             "capture_failures": [failure.model_dump(mode="json") for failure in record.capture_errors]}
 
 
@@ -153,13 +189,14 @@ def configuration_section(record: RunRecord, results: dict) -> dict:
     for name, result in results.items():
         if result is not None:
             provenance.setdefault(json.dumps(configuration(result), sort_keys=True), []).append(name)
-    return {"task_dir": record.task_dir, "path": record.path, "path_reasons": record.path_reasons,
+    # The task directory's name only; its host path stays in run.json, out of a report that may be shared.
+    return {"task_dir": Path(record.task_dir).name, "path": record.path, "path_reasons": record.path_reasons,
             "provenance": [{"configuration": json.loads(key), "episodes": names} for key, names in provenance.items()],
             "provenance_unavailable": {name: "no retained episode record, so its task digest and version pins are unavailable"
                                        for name, result in results.items() if result is None},
             "models": {role: model.model_dump(mode="json") for role, model in record.models.items()},
             "credential_sources": record.credential_sources, "spending_cap": record.spending_cap,
-            "known_cost": record.known_cost, "unknown_cost_calls": record.unknown_cost_calls,
+            "known_cost": record.known_cost, "provider_reported_cost": reported(record.calls), "unknown_cost_calls": record.unknown_cost_calls,
             "refused_calls": record.refused_calls, "capacity": record.capacity.model_dump(mode="json"),
             "cost_map": record.cost_map, "limitations": record.limitations}
 
@@ -227,7 +264,7 @@ def ordinary(record: RunRecord, results: dict, warnings: list[str], notes: list[
 
 def labels(pool: list[str], result: InspectionResult, warnings: list[str]) -> dict:
     """Local grader labels of the ordinary pool, separate from binary metrics."""
-    unreviewed = {"label": "unreviewed", "basis": None, "reasons": ["grader inspection retained no label for this episode"]}
+    unreviewed = {"label": "unreviewed", "basis": None, "reasons": ["the grader inspector retained no label for this episode"]}
     episodes = {name: result.ordinary[name].model_dump(mode="json", include={"label", "basis", "reasons"})
                 if name in result.ordinary else unreviewed for name in pool}
     counts = dict(sorted(Counter(item["label"] for item in episodes.values()).items()))
@@ -255,9 +292,9 @@ def labels(pool: list[str], result: InspectionResult, warnings: list[str]) -> di
 def completion_gaps(basis: MetricBasis, own: list[Assessment]) -> list[str]:
     """Why a basis does not establish completion; empty when it does. `own` are the
     episode's own checked assessments, each with one conclusion per requirement it read.
-    Semantic completeness stays the Inspector's interpretation."""
+    Semantic completeness stays the grader inspector's interpretation."""
     if basis.completion == "unknown":
-        return [f"the Inspector left completion unknown: {basis.explanation}"]
+        return [f"the grader inspector left completion unknown: {basis.explanation}"]
     gaps = [f"unresolved: {item}" for item in basis.unresolved]
     if not basis.explanation.strip():
         gaps.append("its basis explains nothing")
@@ -331,7 +368,7 @@ def grounded(run_dir: Path, name: str, source: Observation) -> str | None:
 def rule_gap(rule) -> str | None:
     if (rule.comparison is None) != (rule.threshold is None) or bool(rule.pass_values) == (rule.threshold is not None):
         return "it needs exactly one encoding: pass_values, or a comparison with a threshold"
-    if not all(math.isfinite(value) for value in rule.pass_values + ([rule.threshold] if rule.threshold is not None else [])):
+    if not all(math.isfinite(value) for value in rule.pass_values + rule.values + ([rule.threshold] if rule.threshold is not None else [])):
         return "its encoding is not finite"
     return None
 
@@ -343,20 +380,60 @@ def passes(rule, value: float) -> bool:
     return COMPARISONS[rule.comparison](value, rule.threshold)
 
 
+def identity(item, *exclude: str) -> str:
+    """An interpretation without its source; the order of a list of values never distinguishes two."""
+    dump = item.model_dump(mode="json", exclude={"source", *exclude})
+    return json.dumps({key: sorted(set(value)) if isinstance(value, list) else value for key, value in dump.items()}, sort_keys=True)
+
+
 def chosen(items: list, kind: str, run_dir: Path, name: str, gap=lambda item: None):
-    """The episode's one grounded `kind`, with every reason others are not used."""
+    """The episode's one grounded `kind`, every reason others are not used, and every valid `kind`."""
     valid, reasons = {}, []
     for item in items:
         problem = gap(item) or grounded(run_dir, name, item.source)
         if problem:
             reasons.append(f"{kind} not used: {problem}")
         else:
-            valid.setdefault(json.dumps(item.model_dump(mode="json", exclude={"source"}), sort_keys=True), item)
+            valid.setdefault(identity(item), item)
     if not valid:
         reasons.append(f"no source-grounded {kind}; observed reward values alone establish none")
     elif len(valid) > 1:
         reasons.append(f"incompatible {kind}s: {'; '.join(valid)}")
-    return (next(iter(valid.values())) if len(valid) == 1 else None), reasons
+    return (next(iter(valid.values())) if len(valid) == 1 else None), reasons, list(valid.values())
+
+
+def contract(key: str, rules: list, names: list[str], results: dict) -> tuple[str, list[str]]:
+    """The binary contract of reward `key` in one configuration, `supported`, `unsupported` or
+    `unavailable` with reasons. Every grounded rule's declaration must name the same two values;
+    observed rewards can contradict a declaration but never establish one."""
+    rules = [rule for rule in rules if rule.reward == key]
+    declarations = sorted({tuple(sorted(set(rule.values))) for rule in rules if rule.values})
+    observed = {value for name in names if (value := native_value(results[name], key)[0]) is not None}
+    if not declarations:
+        if len(observed) > 2:
+            return "unsupported", [NON_BINARY, f"The ordinary pool returned {len(observed)} distinct {key!r} values."]
+        return "unavailable", [UNKNOWN_REWARD] + ([f"Its native decision rules declare no {key!r} values."] if rules else [])
+    if len(declarations) != 1 or len(declarations[0]) != 2:
+        listed = " and ".join(str(list(values)) for values in declarations)
+        return "unsupported", [NON_BINARY, f"Its native decision rules declare the {key!r} values {listed}."]
+    declared = list(declarations[0])
+    if outside := sorted(observed - set(declared)):
+        return "unsupported", [NON_BINARY, f"Observed {key!r} values {outside} contradict the declared binary values {declared}."]
+    passing = {tuple(value for value in declared if passes(rule, value)) for rule in rules}
+    if len(passing) != 1 or len(passing.pop()) != 1:
+        return "unavailable", [UNKNOWN_REWARD, f"Its native decision rules do not pass the same one of {declared}."]
+    return "supported", []
+
+
+def rate(label: str, terms: str, numerator: int, denominator: int, lower: bool = False, missing: str | None = None) -> dict:
+    """An observed proportion beside its counts. A zero denominator gives null, never zero;
+    `missing` says why nothing is counted."""
+    if missing:
+        return {"value": None, "numerator": None, "denominator": None, "lower_bound": False,
+                "unavailable": f"{label} is unavailable: {missing}"}
+    return {"value": numerator / denominator if denominator else None, "numerator": numerator, "denominator": denominator,
+            "lower_bound": lower and denominator > 0,
+            "unavailable": None if denominator else f"{label} is unavailable: its denominator {terms} is zero"}
 
 
 def native_value(result: EpisodeResult | None, key: str) -> tuple[float | None, list[str]]:
@@ -369,25 +446,29 @@ def native_value(result: EpisodeResult | None, key: str) -> tuple[float | None, 
 
 
 def metrics(run_dir: Path, pool: list[str], results: dict, result: InspectionResult, warnings: list[str]) -> dict:
-    """Confusion counts/F1 and AUROC against eligible references, each ordinary episode
-    counted once. Local discrepancy labels never become matrix cells."""
-    episodes, confusion, auroc = {}, {}, {}
+    """Grader agreement per configuration and native decision rule under an established binary
+    reward contract: TP/FP/FN/TN, false discovery and false negative rates and F1 over the same
+    eligible episodes, each counted once, beside the rule's native pass rate; plus AUROC and
+    coverage of the ordinary pool. Local discrepancy labels never become matrix cells. A
+    presumed label enters as the grader's own verdict and marks the rates it changes as lower bounds."""
+    episodes, configs, rules, valid, auroc = {}, {}, {}, {}, {}
     for name in pool:
         own = ordinary_assessments(name, result.assessments)
         bases = [assessment.claim.basis for assessment in own if assessment.claim.basis is not None]
         completion, completion_reasons = reference(name, own)
         entry = episodes[name] = {"completion": completion, "completion_reasons": completion_reasons, "decision": None, "score": None}
         config = json.dumps(configuration(results[name]), sort_keys=True) if results.get(name) else ""
-        rule, entry["decision_reasons"] = chosen([basis.decision for basis in bases if basis.decision], "native decision rule",
-                                                 run_dir, name, rule_gap)
+        if config:
+            configs.setdefault(config, []).append(name)
+        rule, entry["decision_reasons"], valid[name] = chosen([basis.decision for basis in bases if basis.decision],
+                                                              "native decision rule", run_dir, name, rule_gap)
         if rule is not None:
+            rules[name] = rule
             value, missing = native_value(results.get(name), rule.reward)
             entry["decision_reasons"] += missing
             if value is not None:
                 entry["decision"] = "pass" if passes(rule, value) else "fail"
-                if completion != "unknown":
-                    confusion.setdefault((config, json.dumps(rule.model_dump(mode="json", exclude={"source"}), sort_keys=True)), []).append(name)
-        ordering, entry["ordering_reasons"] = chosen([basis.ordering for basis in bases if basis.ordering], "score ordering",
+        ordering, entry["ordering_reasons"], _ = chosen([basis.ordering for basis in bases if basis.ordering], "score ordering",
                                                      run_dir, name)
         if ordering is not None:
             value, missing = native_value(results.get(name), ordering.reward)
@@ -396,17 +477,77 @@ def metrics(run_dir: Path, pool: list[str], results: dict, result: InspectionRes
             if value is not None and completion != "unknown":
                 auroc.setdefault((config, ordering.reward, ordering.higher_completes), []).append(name)
 
-    matrices = []
-    for (config, rule), names in confusion.items():
-        cells = Counter((episodes[name]["completion"], episodes[name]["decision"]) for name in names)
-        tp, fp, fn, tn = cells["complete", "pass"], cells["incomplete", "pass"], cells["complete", "fail"], cells["incomplete", "fail"]
-        denominator = 2 * tp + fp + fn
-        rule = json.loads(rule)
-        matrices.append({"configuration": json.loads(config), "reward": rule["reward"], "rule": rule, "episodes": names,
-                         "tp": tp, "fp": fp, "fn": fn, "tn": tn, "f1": 2 * tp / denominator if denominator else None,
-                         "unavailable": None if denominator else "F1 is unavailable: its denominator 2TP + FP + FN is zero"})
+    kinds = {name: "operational_failure" for name in pool if results.get(name) is None}
+    matrices, statuses = [], {}
+    for config, names in configs.items():
+        # The contract uses every grounded rule, also on episodes left without a decision or a reward.
+        found = [rule for name in names for rule in valid[name]]
+        keys = {rule.reward for rule in found} | {key for name in names for key in results[name].rewards}
+        # Harbor reads a single reward key as the reward, whatever its name.
+        environment = next(iter(keys)) if len(keys) == 1 else "reward"
+        statuses[config] = contract(environment, found, names, results)
+        # One group per chosen native decision rule; a configuration without any keeps one group for its status.
+        groups = {identity(rule, "values"): rule for name in names if (rule := rules.get(name))} or {None: None}
+        # Without a chosen rule a supported reward still gives no decision to compare.
+        contracts = {key: statuses[config] if statuses[config][0] != "supported" else contract(rule.reward, found, names, results)
+                     if rule else ("unavailable", ["No episode of this configuration has one grounded native decision rule."])
+                     for key, rule in groups.items()}
+        # A presumed episode's reference follows its native decision.
+        members, presumed = {key: [] for key in groups}, {}
+        for name in names:
+            entry, label, rule = episodes[name], result.ordinary.get(name), rules.get(name)
+            assumed = label is not None and label.basis == "presumed" and entry["completion"] == "unknown"
+            if assumed and rule is None and len(groups) == 1:
+                rule = next(iter(groups.values()))
+            key = identity(rule, "values") if rule else None
+            if native_value(results[name], environment)[0] is None:
+                kinds[name] = "operational_failure" if results[name].errors else "missing_reward"
+            elif label is None or name in result.unreviewed:
+                kinds[name] = "unreviewed"
+            elif entry["completion"] == "unknown" and not assumed:
+                kinds[name] = "inconclusive"
+            elif (contracts[key] if rule else statuses[config])[0] != "supported":
+                kinds[name] = "no_binary_contract"
+            elif assumed and rule and (value := native_value(results[name], rule.reward)[0]) is not None:
+                if name not in rules:
+                    entry["decision_reasons"].append("its presumed label takes this configuration's one native decision rule")
+                entry["decision"] = "pass" if passes(rule, value) else "fail"
+                presumed[name] = "complete" if passes(rule, value) else "incomplete"
+            elif entry["decision"] is None or assumed:
+                kinds[name] = "no_decision_rule"
+            if name not in kinds:
+                members[key].append(name)
+        for key, rule in groups.items():
+            (status, reasons), group = contracts[key], members[key]
+            cells = Counter((presumed.get(name, episodes[name]["completion"]), episodes[name]["decision"]) for name in group)
+            tp, fp, fn, tn = cells["complete", "pass"], cells["incomplete", "pass"], cells["complete", "fail"], cells["incomplete", "fail"]
+            presumptions = [name for name in group if name in presumed]
+            supported, denominator = status == "supported", 2 * tp + fp + fn
+            counts = {"tp": tp, "fp": fp, "fn": fn, "tn": tn, "presumed": len(presumptions), "verified": len(group) - len(presumptions)}
+            suppressed = None if supported else f"grader agreement is {status}"
+            f1_reason = suppressed or (None if denominator else "its denominator 2TP + FP + FN is zero")
+            reward = rule.reward if rule else environment
+            # The native pass rate describes the reward distribution, apart from agreement and its references.
+            usable = [value for name in names if (value := native_value(results[name], reward)[0]) is not None]
+            passed = sum(passes(rule, value) for value in usable) if rule else 0
+            matrices.append({
+                "configuration": json.loads(config), "reward": reward, "status": status, "reasons": reasons,
+                "rule": json.loads(key) if rule else None, "episodes": group,
+                **{name: value if supported else None for name, value in counts.items()},
+                "false_discovery_rate": rate("false discovery rate", "TP + FP", fp, tp + fp,
+                                             any(presumed[name] == "complete" for name in presumptions), suppressed),
+                "false_negative_rate": rate("false negative rate", "TP + FN", fn, tp + fn, bool(presumptions), suppressed),
+                "pass_rate": rate("native pass rate", f"usable {reward!r} rewards", passed, len(usable),
+                                  missing=None if rule else "no source-grounded native decision rule"),
+                "f1": None if f1_reason else 2 * tp / denominator, "unavailable": f"F1 is unavailable: {f1_reason}" if f1_reason else None})
+
     curves = []
     for (config, reward, higher), names in auroc.items():
+        if statuses[config][0] != "supported":
+            curves.append({"configuration": json.loads(config), "reward": reward, "higher_completes": higher, "episodes": [],
+                           "positives": None, "negatives": None, "auroc": None,
+                           "unavailable": f"AUROC is unavailable: grader agreement is {statuses[config][0]}"})
+            continue
         sign = 1 if higher else -1
         positives = [sign * episodes[name]["score"] for name in names if episodes[name]["completion"] == "complete"]
         negatives = [sign * episodes[name]["score"] for name in names if episodes[name]["completion"] == "incomplete"]
@@ -416,28 +557,40 @@ def metrics(run_dir: Path, pool: list[str], results: dict, result: InspectionRes
                        "auroc": sum(pairs) / len(pairs) if pairs else None,
                        "unavailable": None if pairs else "AUROC is unavailable: it needs both classes"})
 
+    for group in matrices:
+        model = group["configuration"]["model"]
+        if group["status"] != "supported":
+            warnings.append(f"grader agreement for {model} {group['reward']} is {group['status']}: {' '.join(group['reasons'])}")
+            continue
+        warnings += [f"{model}: {group[key]['unavailable']}" for key in ("false_discovery_rate", "false_negative_rate")
+                     if group[key]["unavailable"]]
     for metric, groups, needs in (("F1", matrices, "native decision"), ("AUROC", curves, "score ordering")):
         if not groups:
             warnings.append(f"{metric} is unavailable: no ordinary episode has both an eligible completion reference "
                             f"and a source-grounded {needs}")
         warnings += [f"{group['unavailable']} for {group['reward']}" for group in groups if group["unavailable"]]
-        used = sum(len(group["episodes"]) for group in groups)
-        if groups and used < len(pool):
+        # An unavailable metric uses no episode.
+        used = sum(len(group["episodes"]) for group in groups if not group["unavailable"])
+        if used and used < len(pool):
             warnings.append(f"{metric} uses {used} of {len(pool)} ordinary episodes; the rest are excluded with retained reasons")
-    return {"episodes": episodes, "confusion": matrices, "auroc": curves}
+    coverage = {"ordinary": len(pool), "resolved": sum(episodes[name]["completion"] != "unknown" for name in pool),
+                "eligible": sum(len(group["episodes"]) for group in matrices),
+                "excluded": {kind: [name for name in pool if kinds.get(name) == kind] for kind in EXCLUDED}}
+    return {"episodes": episodes, "confusion": matrices, "auroc": curves, "coverage": coverage}
 
 
 def dump(item) -> dict | None:
     return item.model_dump(mode="json") if item is not None else None
 
 
-def finding(assessment: Assessment) -> dict:
+def finding(assessment: Assessment, category: str | None = None, experiment: str | None = None) -> dict:
     """The claim, nudi's captured facts, the Inspector's interpretation and nudi's assessment, kept apart."""
     claim, check = assessment.claim, assessment.check
     limits = assessment.limits + [PACKAGE_LIMIT] * (assessment.execution_scope == "package")
     return {
-        "execution_scope": assessment.execution_scope,
-        "claim": {"mechanism": claim.mechanism, "episode": claim.episode, "reward": claim.reward, "unresolved": claim.unresolved},
+        "execution_scope": assessment.execution_scope, "category": category, "experiment": experiment,
+        "claim": {"mechanism": claim.mechanism, "episode": claim.episode, "reward": claim.reward, "unresolved": claim.unresolved,
+                  "limits": claim.limits},
         "captured": {
             "copied_grader_reward" if assessment.execution_scope == "package" else "native_reward": assessment.reward,
             "ids": assessment.ids,
@@ -460,27 +613,57 @@ def finding(assessment: Assessment) -> dict:
     }
 
 
-def findings(assessments: list[Assessment]) -> dict:
-    """Native findings by kind; every package-sandbox finding stays apart in `package`."""
-    groups = {"evidenced": [], "suspected": [], "legitimate": [], "package": []}
-    for assessment in assessments:
-        kind = "package" if assessment.execution_scope == "package" else "evidenced" if evidenced(assessment) else "legitimate" if (
-            assessment.outcome == "legitimate" and not assessment.claim.unresolved) else "suspected"
-        groups[kind].append(finding(assessment))
+def result_of(assessment: Assessment) -> str:
+    if evidenced(assessment):
+        return "evidenced"
+    if assessment.outcome in ("accepted_invalid", "rejected_valid"):
+        return "suspected"
+    return "legitimate" if assessment.outcome == "legitimate" and not assessment.claim.unresolved else "inconclusive"
+
+
+def findings(assessments: list[Assessment], links: dict[int, dict] | None = None) -> dict:
+    """Every finding by nudi's result, with its index into the inspection's assessments.
+
+    Category settlement reads a check's latest reading, so an earlier one names that reading as superseding it
+    and stays listed, since its evidence and open conditions can still explain a label, metric or category.
+    A claim without a check is never superseded. Each finding keeps its execution scope, so package evidence
+    stays distinct from native accessibility, and the category and experiment `links` give it."""
+    latest = {item.claim.check: index for index, item in enumerate(assessments) if item.claim.check}
+    groups = {"evidenced": [], "suspected": [], "legitimate": [], "inconclusive": []}
+    for index, assessment in enumerate(assessments):
+        later = latest.get(assessment.claim.check, index)
+        superseded = None if later == index else {"index": later, "result": result_of(assessments[later])}
+        groups[result_of(assessment)].append({"index": index, "superseded_by": superseded,
+                                              **finding(assessment, **(links or {}).get(index, {}))})
     return groups
 
 
 def inspection(mode: str, result: InspectionResult, warnings: list[str]) -> dict:
     for category, status in result.categories.items():
         if status not in SETTLED:
-            reason = result.applicability.get(category)
-            warnings.append(f"{mode} category {category} is {status}" + (f": {reason}" if reason else ""))
-    warnings += [f"{mode} {item.phase} attempt {item.number} ({item.category or item.episode or 'all categories'}) {item.status}: {item.error}"
+            # A restriction keeps its grounded reason. Other applicability text is the Inspector's and stays in the JSON.
+            reason = result.applicability.get(category) if status == "restricted" else None
+            warnings.append(f"{mode} inspector category {category} is {status}" + (f": {reason}" if reason else ""))
+    warnings += [f"{mode} inspector {item.phase} attempt {item.number} ({item.category or item.episode or 'all categories'}) {item.status}"
+                 + (f": {item.error}" if item.error else ", no error message recorded")
                  for item in result.attempts if item.status in ("refused", "model_inability", "model_output_failure", "unobservable", "inference_failure", "tool_failure")]
+    measured = {}
+    for item in result.experiments:
+        # Older records name an experiment's check only through its assessment.
+        index = item.get("assessment")
+        if check := item.get("check") or (index is not None and result.assessments[index].claim.check):
+            measured[check] = item
+    links = {index: {"category": measured[item.claim.check].get("category"), "experiment": measured[item.claim.check]["id"]}
+             for index, item in enumerate(result.assessments) if item.claim.check in measured}
+    for review in result.reviews:
+        # A repair evidences the category of the session that made it; its experiment stays as provenance.
+        category = result.attempts[review.attempt].category
+        if review.reinterprets and review.assessment is not None and category:
+            links.setdefault(review.assessment, {})["category"] = category
     return {"status": result.status, "categories": result.categories, "applicability": result.applicability,
             "applicability_evidence": result.applicability_evidence,
             "artifacts": result.artifacts, "limits": result.limits, "experiments": result.experiments,
-            "attempts": [item.model_dump(mode="json") for item in result.attempts], "findings": findings(result.assessments)}
+            "attempts": [item.model_dump(mode="json") for item in result.attempts], "findings": findings(result.assessments, links)}
 
 
 def _condition_view(status, guidance, unavailable, entries, record: RunRecord) -> dict:
@@ -581,16 +764,72 @@ def number(value) -> str:
     return "unavailable" if value is None else f"{value:.4g}"
 
 
+def ratio(label: str, item: dict) -> str:
+    """A rate beside its numerator and denominator, marked when presumed labels make it a lower bound."""
+    if item["lower_bound"]:
+        return f"{label} at least {number(item['value'])} ({item['numerator']}/{item['denominator']}, lower bound)"
+    return f"{label} {number(item['value'])} ({item['numerator']}/{item['denominator']})"
+
+
+def reported(calls) -> float:
+    """The part of the known cost that providers reported, not LiteLLM estimates."""
+    return sum(call.cost for call in calls if call.cost_source == PROVIDER_REPORTED)
+
+
+def cost(known: float, provider: float, unknown: int) -> str:
+    return (f"known cost ${known:.6f}" + (f", ${provider:.6f} of it provider-reported" if provider else "")
+            + (f", excluding {unknown} calls with unknown prices" if unknown else ""))
+
+
+def check_id(item: dict) -> str:
+    return item["captured"]["check"]["id"] if item["captured"]["check"] else "none"
+
+
+def category_line(mode: str, item: dict, category: str, status: str) -> str:
+    """A category's status beside what nudi retained about it: its evidencing checks, or why it is
+    not settled, and the broad and focused attempts that covered it."""
+    cases = [(kind, found) for kind, group in item["findings"].items() for found in group if found["category"] == category]
+    parts = [f"- {mode} {category}: {status}"]
+    if status == "evidenced_issue":
+        evidence = [check_id(found) + (f" (superseded by a later {found['superseded_by']['result']} reading)" if found["superseded_by"] else "")
+                    for kind, found in cases if kind == "evidenced"
+                    and (mode == "grader_inspector" or found["assessment"]["outcome"] == "accepted_invalid")]
+        parts.append("evidenced by " + (", ".join(evidence) or "a finding the report cannot link to this category"))
+    elif status != "no_evidenced_issue":
+        applicability = item["applicability_evidence"].get(category, {}).get("status")
+        if status == "restricted":
+            parts.append(item["applicability"].get(category) or "no restriction reason retained")
+        elif applicability != "applicable":
+            parts.append(f"applicability evidence {applicability or 'missing'}")
+        unresolved = [f"{check_id(found)} {kind}" for kind, found in cases
+                      if kind in ("suspected", "inconclusive") and not found["superseded_by"]]
+        if unresolved:
+            parts.append("unresolved cases " + ", ".join(unresolved))
+    attempts = [f"{entry['phase']} {entry['number']} {entry['status']}" for entry in item["attempts"]
+                if entry["category"] in (category, None) and entry["episode"] is None]
+    return "; ".join(parts + ["attempts " + (", ".join(attempts) or "none")])
+
+
+def unassessed(mode: str, item: dict) -> list[str]:
+    """Each experiment with no assessment, once, whatever its category's status."""
+    read = {check_id(found) for group in item["findings"].values() for found in group}
+    entries = [f"{entry['id']} {entry['status']} ({entry.get('category') or 'no category'}"
+               + "".join(f", {entry[key]}" for key in ("check", "episode") if entry.get(key))
+               + (", with a reading in Findings" if entry.get("check") in read else "") + ")"
+               for entry in item["experiments"] if entry.get("status") != "assessed"]
+    return [f"- {mode} experiments without an assessment: " + ", ".join(entries)] if entries else []
+
+
 def markdown(report: dict) -> str:
     """A readable rendering of `build`'s report; the JSON keeps every field."""
     config = report["configuration"]
     lines = ["# nudi report", "", f"Status: {report['status']}, relative to the selected analyses.", "", "## Configuration", ""]
-    lines += [f"- {role}: {model['model']}, reasoning effort {model['reasoning_effort']}, "
-              f"credential from {config['credential_sources'].get(role, 'nowhere: not resolved')}"
-              for role, model in config["models"].items()]
+    for role, model in config["models"].items():
+        source = config["credential_sources"].get(role)
+        lines.append(f"- {role}: {model['model']}, reasoning effort {model['reasoning_effort']}, "
+                     + (f"credential from {source}" if source else "no credential resolved; the selected analyses do not run this role"))
     lines += [f"- Task: {config['task_dir']}; execution path {config['path']}: {'; '.join(config['path_reasons'])}",
-              f"- Spending cap: {config['spending_cap']}; known cost ${config['known_cost']:.6f}; "
-              f"calls with unknown prices: {config['unknown_cost_calls']}"]
+              f"- Spending cap: {config['spending_cap']}; {cost(config['known_cost'], config['provider_reported_cost'], config['unknown_cost_calls'])}"]
     for item in config["provenance"]:
         setup = item["configuration"]
         versions = ", ".join(f"{name} {version}" for name, version in setup["versions"].items())
@@ -601,13 +840,18 @@ def markdown(report: dict) -> str:
         lines.append("- Task digest and version pins: unavailable, no retained episode record")
     lines += ["", "## Analyses", ""] + [f"- {name}: {status}" for name, status in report["analyses"].items()]
 
+    lines += ["", "## Inspection categories", ""]
+    lines += [line for mode, item in report["inspections"].items() for line in
+              [category_line(mode, item, category, status) for category, status in item["categories"].items()]
+              + unassessed(mode, item)] or ["Neither the grader inspector nor the hack inspector was selected or run."]
+
     lines += ["", "## Evidence collection", ""]
     selection = report["collection"]
     if selection is None:
         lines.append("No capture selection was recorded.")
     else:
-        lines.append(f"Selection {selection['status']} in {selection['calls']} Inspector calls; known cost "
-                     f"${selection['known_cost']:.6f}; calls with unknown prices: {selection['unknown_cost_calls']}.")
+        lines.append(f"Selection {selection['status']} in {selection['calls']} Inspector calls; "
+                     f"{cost(selection['known_cost'], selection['provider_reported_cost'], selection['unknown_cost_calls'])}.")
         lines.append(f"- Captured files: {', '.join(selection['selected']) or 'none'}")
         lines += [f"- Limit: {limit}" for limit in selection["limits"]]
         lines += [f"- {failure['episode']}: capture of {failure['location']} failed: {failure['error']['type']}: "
@@ -620,6 +864,8 @@ def markdown(report: dict) -> str:
     else:
         lines.append(f"{pool['attempted']} of {pool['requested']} requested episodes attempted; status {pool['status']}.")
         lines += [f"- {name}: no retained record; {'; '.join(errors) or 'cause unknown'}" for name, errors in pool["unrecorded"].items()]
+        lines += [f"- {name} recorded {'; '.join(errors)}; its retained reward is summarized below"
+                  for name, errors in pool["failures"].items() if errors and name not in pool["unrecorded"]]
         for group in pool["groups"]:
             setup = group["configuration"]
             versions = ", ".join(f"{name} {version}" for name, version in setup["versions"].items())
@@ -632,57 +878,83 @@ def markdown(report: dict) -> str:
                              f"distribution {distribution}")
     other = report["other_episodes"]
     earlier = f"{len(other['inspector'])} native Inspector episodes from an earlier version, " if other["inspector"] else ""
-    lines += ["", f"Outside the ordinary pool: {len(other['sandboxes'])} Inspector package sandboxes, {earlier}"
-                  f"{len(other['probes'])} persistence probe and {len(other['attacker'])} attacker episodes."]
+    lines += ["", f"Outside the ordinary pool: {len(other['sandboxes'])} Inspector sandboxes (session workspaces and package "
+                  f"experiments), {earlier}{len(other['probes'])} persistence probes and {len(other['attacker'])} attacker episodes."]
 
     lines += ["", "## Local grader labels", ""]
     if report["labels"] is None:
-        lines.append("Grader inspection was not selected or not run.")
+        lines.append("The grader inspector was not selected or not run.")
     else:
         labeled = report["labels"]
         lines.append(f"Mode: {labeled['mode']}; presumed {labeled['basis']['presumed']}, verified {labeled['basis']['verified']}.")
         lines.append(", ".join(f"{label} {count}" for label, count in labeled["counts"].items()) or "No ordinary episode.")
         review = labeled["review"]
-        lines.append(f"Review attempted for {len(review['attempted'])} (attempted but unresolved {len(review['unresolved'])}), "
-                     f"unreviewed {len(review['unreviewed'])}, supported label for {len(review['supported'])}.")
+        skipped = [name for name in labeled["episodes"] if name not in review["attempted"]]
+        presumed = sum(labeled["episodes"][name]["basis"] == "presumed" for name in skipped)
+        lines.append(f"Review attempted for {len(review['attempted'])} (attempted but unresolved {len(review['unresolved'])}); "
+                     f"not reviewed {len(skipped)}, of which presumed {presumed}; supported label for {len(review['supported'])}.")
         lines += [f"- {name}: {item['label']}" + (f" ({item['basis']})" if item["basis"] else "") for name, item in labeled["episodes"].items()]
 
     lines += ["", "## Metrics", ""]
     metric = report["metrics"]
     if metric is None:
-        lines.append("Grader inspection was not selected or not run, so no metric reference exists.")
+        lines.append("The grader inspector was not selected or not run, so no metric reference exists.")
     else:
         lines += [f"- {name}: completion {item['completion']}; native decision {item['decision'] or 'unavailable'}; "
                   f"score {number(item['score'])}" for name, item in metric["episodes"].items()]
+        coverage = metric["coverage"]
+        excluded = ", ".join(f"{kind.replace('_', ' ')} {len(names)}" for kind, names in coverage["excluded"].items() if names)
+        lines.append(f"- Coverage: {coverage['resolved']} of {coverage['ordinary']} ordinary episodes have a resolved completion "
+                     f"reference; {coverage['eligible']} of {coverage['ordinary']} enter grader agreement; excluded: {excluded or 'none'}")
         for group in metric["confusion"]:
-            rule = group["rule"]
-            encoding = f"pass values {rule['pass_values']}" if rule["pass_values"] else f"{rule['comparison']} {rule['threshold']}"
-            lines.append(f"- F1 for {group['reward']} ({encoding}): TP {group['tp']}, FP {group['fp']}, FN {group['fn']}, "
-                         f"TN {group['tn']}; F1 {number(group['f1'])}")
+            subject, rule, encoding = f"{group['configuration']['model']} {group['reward']}", group["rule"], ""
+            if rule:
+                encoding = f" (pass values {rule['pass_values']})" if rule["pass_values"] else f" ({rule['comparison']} {rule['threshold']})"
+                lines.append(f"- {ratio(f'Native pass rate for {subject}{encoding}:', group['pass_rate'])}")
+            heading = f"- Grader agreement for {subject}"
+            if group["status"] != "supported":
+                lines.append(f"{heading}: {group['status']}, no agreement values. {' '.join(group['reasons'])}")
+                continue
+            rates = "; ".join(ratio(label, group[key]) for label, key in (
+                ("false discovery rate", "false_discovery_rate"), ("false negative rate", "false_negative_rate")))
+            lines.append(f"{heading}{encoding}: TP {group['tp']}, FP {group['fp']}, "
+                         f"FN {group['fn']}, TN {group['tn']}; {rates}; presumed {group['presumed']}, verified {group['verified']}; "
+                         f"F1 {number(group['f1'])}")
         for group in metric["auroc"]:
+            if group["positives"] is None:
+                lines.append(f"- {group['unavailable']} for {group['reward']}")
+                continue
             direction = "higher" if group["higher_completes"] else "lower"
             lines.append(f"- AUROC for {group['reward']}, {direction} toward completion: {group['positives']} complete, "
                          f"{group['negatives']} incomplete; AUROC {number(group['auroc'])}")
 
     lines += ["", "## Findings", ""]
-    sections = [(mode, item["findings"]) for mode, item in report["inspections"].items()]
-    sections += [("attack", report["attack"]["findings"])] if report["attack"] else []
-    entries = []
-    for source, groups in sections:
-        for kind, items in groups.items():
+    sections = list(report["inspections"].items()) + ([("attack", report["attack"])] if report["attack"] else [])
+    entries, limits = [], []
+    for source, section in sections:
+        measured = {entry["id"]: entry.get("category") for entry in section.get("experiments", [])}
+        for kind, items in section["findings"].items():
             for item in items:
-                claim, outcome, check = item["claim"], item["assessment"], item["captured"]["check"]
+                claim, outcome, later = item["claim"], item["assessment"], item["superseded_by"]
                 package = item["execution_scope"] == "package"
                 reward_name, reward_key = ("copied grader reward", "copied_grader_reward") if package else ("native reward", "native_reward")
                 readings = "".join(f"; requirement {found['requirement']['excerpt']!r} {found['validity']}"
                                    for found in outcome["conclusions"])
-                entries.append(f"- {source} {kind}: {claim['mechanism']} in {claim['episode']}; {reward_name} "
-                               f"{number(item['captured'][reward_key])}; check {check['id'] if check else 'none'}; "
+                category = f"; category {item['category']}" if item["category"] else ""
+                if item["experiment"] and measured.get(item["experiment"]) != item["category"]:
+                    category += f"; reinterprets {item['experiment']}, measured for {measured[item['experiment']] or 'no category'}"
+                replaced = f", superseded by the later {later['result']} reading of {check_id(item)}" if later else ""
+                entries.append(f"- {source} {kind}{' (package)' if package else ''}{replaced}: {claim['mechanism']} in {claim['episode']}; "
+                               f"{reward_name} {number(item['captured'][reward_key])}; check {check_id(item)}{category}; "
                                f"validity {outcome['validity']}; discrepancy {outcome['discrepancy']}{readings}; "
-                               f"{outcome['outcome']}: {'; '.join(outcome['reasons'] + outcome['missing'])}")
-                if package:
-                    entries[-1] += " Limits: " + "; ".join(outcome["limits"])
+                               f"{outcome['outcome']}: {'; '.join(outcome['reasons']) or 'no reason recorded'}")
+                for label, values in (("Missing", outcome["missing"]), ("Unresolved", claim["unresolved"]), ("Scope notes", claim["limits"])):
+                    if values:
+                        entries[-1] += f". {label}: " + "; ".join(values)
+                limits += [limit for limit in outcome["limits"] if limit not in limits]
     lines += entries or ["None retained."]
+    # Limits that many findings share are stated once; the JSON keeps each finding's own list.
+    lines += [f"- Finding limit: {limit}" for limit in limits]
 
     for mode, item in report["inspections"].items():
         for session, artifacts in item["artifacts"].items():

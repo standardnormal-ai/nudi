@@ -135,6 +135,8 @@ def files_with_secret(directory: Path) -> list[Path]:
 @pytest.fixture
 def docker_env(tmp_path, monkeypatch):
     """Host provider key and result sentinel; checks Docker and temporary-file cleanup."""
+    if shutil.which("docker") is None or subprocess.run(["docker", "info"], capture_output=True).returncode:
+        pytest.skip("Docker is not available")
     monkeypatch.setenv("XAI_API_KEY", PROVIDER_KEY)
     temp = tmp_path / "temp"
     temp.mkdir()
@@ -543,7 +545,7 @@ def test_supported_fixtures_are_accepted(source):
 
 
 # Synthetic declarations in the shape of a published Harbor task.toml.
-RETAINED_DECLARATIONS = """\
+HARBOR_DECLARATIONS = """\
 version = "1.0"
 
 [metadata]
@@ -623,7 +625,7 @@ def harbor_reads(task: Path) -> tuple:
 
 
 def test_retained_real_task_declarations_run_on_native_harbor(tmp_path):
-    task = task_with(tmp_path, DOCKERFILE_TASK, RETAINED_DECLARATIONS)
+    task = task_with(tmp_path, DOCKERFILE_TASK, HARBOR_DECLARATIONS)
 
     path, reasons = select_path(task, frozenset({"shared_grading", "host_harness", "atif"}))
 

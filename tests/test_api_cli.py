@@ -6,18 +6,22 @@ or model calls. The analyses themselves have their own suites.
 """
 
 import asyncio
+import inspect
 import json
 import subprocess
+from collections import Counter
 from pathlib import Path
 
 import litellm
 import pytest
 from pydantic import ValidationError
 
-from nudi import api, cli, send_nudis, send_nudis_async
-from nudi.checks import AttackResult, InspectionResult
-from nudi.records import DEFAULT_MODELS, Assessment, Capacity, Claim, RunRecord, Simulation
+from nudi import api, checks, cli, report, send_nudis, send_nudis_async
+from nudi.checks import AttackResult, EpisodeLabel, InspectionResult
+from nudi.records import DEFAULT_MODELS, Assessment, Capacity, Claim, EpisodeResult, RunRecord, Simulation
+from nudi.runner import tree_digest
 from nudi.workflow import Run
+from test_metrics import RULE, TASK, basis, checked
 
 SECRET = "sk-live-api-0123456789"
 ALL_ROLES = ["attacker", "inspector", "simulator"]
@@ -26,8 +30,9 @@ ALL_ROLES = ["attacker", "inspector", "simulator"]
 class Analyses:
     """Stands in for start_run and the four existing analyses, recording each call."""
 
-    def __init__(self, monkeypatch, *, candidates=(), fail=None):
-        self.calls, self.candidates, self.fail = [], list(candidates), fail or {}
+    def __init__(self, monkeypatch, *, candidates=(), fail=None, rewards=(), assessments=(), ordinary=None):
+        self.calls, self.candidates, self.fail, self.rewards = [], list(candidates), fail or {}, list(rewards)
+        self.assessments, self.ordinary = list(assessments), ordinary or {}
         for name in ("start_run", "simulate", "inspect_grader", "inspect_hacks", "attack"):
             monkeypatch.setattr(api, name, getattr(self, name))
 
@@ -51,18 +56,28 @@ class Analyses:
         self.calls.append(("simulate", episodes))
         self.raise_if("simulation")
         run.record.simulation = Simulation(requested=episodes, status="complete")
+        for index, value in enumerate(self.rewards):
+            name = f"{index:04d}-simulator"
+            run.record.episodes.append(name)
+            run.record.simulation.episodes.append(name)
+            result = EpisodeResult(path="harbor", path_reasons=["original grading and harness"], task_name="sort",
+                                   task_dir=str(run.config.task_dir), task_digest=tree_digest(run.config.task_dir), model="openai/gpt-test",
+                                   reasoning_effort="high", versions={"harbor": "0.24.0"}, rewards={"reward": value})
+            (run.config.output_dir / "episodes" / name).mkdir(parents=True)
+            (run.config.output_dir / "episodes" / name / "episode.json").write_text(result.model_dump_json())
         run.save()
         return run.record.simulation
 
-    def inspection(self, run, mode, assessments=()):
-        result = InspectionResult(mode=mode, status="complete", categories={}, applicability={}, assessments=list(assessments))
+    def inspection(self, run, mode, assessments=(), ordinary=None):
+        result = InspectionResult(mode=mode, status="complete", categories={}, applicability={}, assessments=list(assessments),
+                                  ordinary=ordinary or {}, ordinary_inspection="holistic_inspection" if ordinary else None)
         (run.config.output_dir / f"inspection-{mode}.json").write_text(result.model_dump_json())
         return result
 
     async def inspect_grader(self, run, ordinary_pool, *, focused_attempts, isolated_inspections):
         self.calls.append(("inspect_grader", ordinary_pool, focused_attempts, isolated_inspections))
         self.raise_if("grader")
-        return self.inspection(run, "grader")
+        return self.inspection(run, "grader", self.assessments, self.ordinary)
 
     async def inspect_hacks(self, run, *, focused_attempts):
         self.calls.append(("inspect_hacks", focused_attempts))
@@ -98,14 +113,24 @@ FULL_UNAVAILABLE = "candidate exists but generated full guidance unavailable"
 MINIMAL_UNAVAILABLE = "candidate exists but generated minimal guidance unavailable"
 
 
-def test_default_is_full_analysis_with_default_counts(tmp_path, monkeypatch):
+def test_default_is_full_analysis_with_default_counts(tmp_path, monkeypatch, capsys):
+    """Two focused attempts per category by default, one try and one retry."""
+    assert api.AnalysisConfig.model_fields["focused_attempts"].default == 2
+    assert {inspect.signature(function).parameters["focused_attempts"].default
+            for function in (checks.inspect_grader, checks.inspect_hacks)} == {2}
+    with pytest.raises(SystemExit):
+        cli.main(["send-nudis", "--help"])
+    help = " ".join(capsys.readouterr().out.split())
+    assert "total focused attempts per grader inspector or hack inspector category, default 2" in help
+    assert "runs one grader inspector per ordinary episode (inspector_swarm)" in help
     analyses = Analyses(monkeypatch)
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
 
-    assert analyses.calls == [("start_run", ALL_ROLES), ("simulate", 20), ("inspect_grader", [], 3, False), ("inspect_hacks", 3),
+    assert analyses.calls == [("start_run", ALL_ROLES), ("simulate", 20), ("inspect_grader", [], 2, False), ("inspect_hacks", 2),
                               ("attack", 2, 1, 0)]
     assert report["analyses"] == {"simulation": "complete", "grader": "complete", "hack": "complete", "attack": "complete"}
     assert report["status"] == "complete"
+    assert sorted(report["inspections"]) == ["grader_inspector", "hack_inspector"]
     assert report == json.loads((tmp_path / "run" / "report.json").read_text())
     assert (tmp_path / "run" / "report.md").read_text().startswith("# nudi report")
 
@@ -170,6 +195,51 @@ def test_python_async_and_cli_share_configuration_and_report(tmp_path, monkeypat
     assert reports[0]["configuration"]["models"]["simulator"]["api_key_var"] == "TEST_KEY"
 
 
+@pytest.mark.parametrize("rewards, status, message", [
+    ([0.0, 0.5, 1.0], "unsupported", report.NON_BINARY),
+    ([0.0, 1.0], "unavailable", report.UNKNOWN_REWARD),
+    ([1.0, 0.0, 1.0], "supported", None),
+], ids=["non-binary", "unknown", "presumed"])
+def test_grader_agreement_availability_is_the_same_in_api_cli_json_and_markdown(tmp_path, monkeypatch, capsys, rewards, status, message):
+    task = tmp_path / "task"
+    for name, text in TASK.items():
+        (task / name).parent.mkdir(parents=True, exist_ok=True)
+        (task / name).write_text(text)
+    grader = {}
+    if status == "supported":
+        # One verified reference grounds the binary rule; the other two episodes take it with presumed labels.
+        grader = {"assessments": [checked("0000-simulator", "c0", "sorted", "supported",
+                                          basis=basis("supported", ["sorted"], ["c0"], decision=RULE))],
+                  "ordinary": {"0000-simulator": EpisodeLabel(label="legitimate", basis="verified", assessments=[0]),
+                               **{f"000{index}-simulator": EpisodeLabel(label="legitimate", basis="presumed") for index in (1, 2)}}}
+    Analyses(monkeypatch, rewards=rewards, **grader)
+    result = send_nudis(task, output_dir=tmp_path / "api", episodes=len(rewards), analysis="simulation")
+    Analyses(monkeypatch, rewards=rewards, **grader)
+    code = cli.main(["send-nudis", str(task), "--output", str(tmp_path / "cli"), "--episodes", str(len(rewards)),
+                     "--analysis", "simulation"])
+
+    # Unsupported agreement alone neither fails the run nor hides its other results.
+    assert code == 0 and result["status"] == "complete"
+    assert result == json.loads((tmp_path / "cli" / "report.json").read_text())
+    assert result["ordinary"]["groups"][0]["rewards"]["reward"]["distribution"] == [[value, count] for value, count in
+                                                                                 sorted(Counter(rewards).items())]
+    (group,) = result["metrics"]["confusion"]
+    text = capsys.readouterr().out
+    assert text == (tmp_path / "cli" / "report.md").read_text() == (tmp_path / "api" / "report.md").read_text()
+    if status == "supported":
+        assert (group["tp"], group["fp"], group["fn"], group["tn"], group["presumed"], group["verified"]) == (2, 0, 0, 1, 2, 1)
+        for key in ("false_discovery_rate", "false_negative_rate"):
+            assert group[key] == {"value": 0.0, "numerator": 0, "denominator": 2, "lower_bound": True, "unavailable": None}
+        assert ("false discovery rate at least 0 (0/2, lower bound); false negative rate at least 0 (0/2, lower bound); "
+                "presumed 2, verified 1") in text
+        return
+    assert (group["status"], group["reasons"][0], group["tp"], group["false_discovery_rate"]["value"]) == (status, message, None, None)
+    assert message in "\n".join(result["warnings"])
+    assert f"reward: {status}, no agreement values. {message}" in text
+    if status == "unsupported":
+        assert "Wrong partial scores were not searched; that search is not supported yet." in text
+
+
 INVALID = {
     "zero episodes": "episodes = 0\n",
     "unknown analysis": 'analysis = "hack"\n',
@@ -213,7 +283,7 @@ def test_isolated_inspections_switch_parses_from_cli_api_and_file(tmp_path, monk
         analyses = Analyses(monkeypatch)
         start(tmp_path / name)
         found[name] = [call for call in analyses.calls if call[0] in ("inspect_grader", "inspect_hacks")]
-    assert found == {name: [("inspect_grader", [], 3, name.endswith("on")), ("inspect_hacks", 3)] for name in runs}
+    assert found == {name: [("inspect_grader", [], 2, name.endswith("on")), ("inspect_hacks", 2)] for name in runs}
     with pytest.raises(ValidationError):
         send_nudis(task, output_dir=tmp_path / "invalid", isolated_inspections="yes")
     with pytest.raises(SystemExit) as error:
@@ -304,7 +374,7 @@ def test_known_false_negative_findings_never_supply_exploit_guidance(tmp_path, m
     else:
         (sent,) = analyses.candidates_sent
         assert sent.id == "hack-1" and sent.guidance["full"] == REPRODUCTION
-    retained = result["inspections"]["hack"]["findings"]["evidenced"]
+    retained = result["inspections"]["hack_inspector"]["findings"]["evidenced"]
     assert retained[0]["assessment"]["outcome"] == "rejected_valid"
 
 
@@ -313,9 +383,7 @@ def test_known_false_negative_findings_never_supply_exploit_guidance(tmp_path, m
     ("  ", LOCATION),
     (REPRODUCTION, None),
     (REPRODUCTION, "   "),
-    (None, None),
-    ("", ""),
-], ids=["full missing", "full blank", "location missing", "location blank", "both missing", "both blank"])
+], ids=["full missing", "full blank", "location missing", "location blank"])
 def test_missing_or_blank_guidance_field_leaves_that_condition_unavailable(tmp_path, monkeypatch, full_guidance, hint_location):
     analyses = Analyses(monkeypatch, candidates=[candidate(MECHANISM, INTERPRETATION, full_guidance=full_guidance, hint_location=hint_location)])
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
@@ -326,9 +394,9 @@ def test_missing_or_blank_guidance_field_leaves_that_condition_unavailable(tmp_p
     rendered = json.dumps(sent.guidance)
     assert MECHANISM not in rendered and INTERPRETATION not in rendered
     # The candidate and its interpretation stay in the inspection evidence.
-    suspected = report["inspections"]["hack"]["findings"]["suspected"]
-    assert suspected[0]["claim"]["mechanism"] == MECHANISM
-    assert suspected[0]["interpretation"]["interpretation"] == INTERPRETATION
+    inconclusive = report["inspections"]["hack_inspector"]["findings"]["inconclusive"]
+    assert inconclusive[0]["claim"]["mechanism"] == MECHANISM
+    assert inconclusive[0]["interpretation"]["interpretation"] == INTERPRETATION
     conditions = report["attack"]["candidates"][0]["conditions"]
     if isinstance(full_guidance, str) and full_guidance.strip():
         assert sent.guidance["full"] == REPRODUCTION and "full" not in sent.unavailable
@@ -344,6 +412,21 @@ def test_missing_or_blank_guidance_field_leaves_that_condition_unavailable(tmp_p
         assert sent.unavailable["minimal"] == conditions["minimal"]["unavailable"] == MINIMAL_UNAVAILABLE
     assert report["attack"]["discovery"]["status"] == "no_evidenced_issue"
     assert NO_CANDIDATE not in sent.unavailable.values()
+
+
+def test_only_accepted_invalid_or_guided_findings_become_candidates(tmp_path, monkeypatch):
+    analyses = Analyses(monkeypatch, candidates=[
+        candidate("found nothing", INTERPRETATION),
+        candidate("no measurement", INTERPRETATION, outcome="unavailable", full_guidance=" ", hint_location=""),
+        candidate(MECHANISM, INTERPRETATION, outcome="accepted_invalid"),
+    ])
+    report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
+
+    assert analyses.calls[-1] == ("attack", 2, 1, 1)
+    (sent,) = analyses.candidates_sent
+    assert sent.id == "hack-2" and sent.guidance == {"full": None, "minimal": None}
+    assert sent.unavailable == {"full": FULL_UNAVAILABLE, "minimal": MINIMAL_UNAVAILABLE}
+    assert [item["id"] for item in report["attack"]["candidates"]] == ["hack-2"]
 
 
 def test_no_candidate_leaves_guidance_unavailable_and_still_attacks(tmp_path, monkeypatch):

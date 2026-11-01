@@ -47,6 +47,7 @@ DOCKERFILE_TASK = FIXTURES / "dockerfile-task"
 SLOW_GRADER_TASK = FIXTURES / "slow-grader-task"
 PROVIDER_KEY = "nudi-contract-provider-key"
 HOST_SECRET = "nudi-host-secret-must-not-leak"
+DOCKER = shutil.which("docker") is not None and subprocess.run(["docker", "info"], capture_output=True).returncode == 0
 
 
 def masked(text: str) -> str:
@@ -210,6 +211,8 @@ def tree_digest(directory: Path) -> str:
 @pytest.fixture
 def episode_env(tmp_path, monkeypatch):
     """Controlled host variables; checks container cleanup and the global cache."""
+    if not DOCKER:
+        pytest.skip("Docker is not available")
     monkeypatch.setenv("NUDI_CONTRACT_PROVIDER_KEY", PROVIDER_KEY)
     monkeypatch.setenv("NUDI_CONTRACT_HOST_SECRET", HOST_SECRET)
     containers, cache = labelled_containers("verifiers.run"), cache_listing()
@@ -780,6 +783,7 @@ print(json.dumps({"before": before, "after": after}))
     assert offered["after"] == offered["before"]
 
 
+@pytest.mark.skipif(not DOCKER, reason="Docker is not available")
 def test_deep_agents_workspace_offers_only_file_search_and_shell_tools(tmp_path, monkeypatch):
     """The released SDK, as nudi assembles it over a Harbor Docker workspace, offers file,
     search and shell tools and the structured result only: no delegation `task`, todo list,
@@ -824,6 +828,7 @@ def test_deep_agents_workspace_offers_only_file_search_and_shell_tools(tmp_path,
     assert files_with_secrets(tmp_path / "run") == []
 
 
+@pytest.mark.skipif(not DOCKER, reason="Docker is not available")
 def test_workspace_memory_override_reaches_docker_beside_an_experiment_at_task_limits(tmp_path):
     """Docker enforces the recorded limits: Harbor's override sets the held workspace's memory,
     a fresh experiment beside it keeps the task's declaration, and both are removed."""

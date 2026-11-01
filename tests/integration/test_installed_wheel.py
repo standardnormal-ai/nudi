@@ -114,7 +114,7 @@ class Endpoint:
             keys = [0, 1] if self.case in ("partial", "ambiguity") else [1] if self.case == "permissive" else [0]
             for key in keys:
                 index = len(probes)
-                category = {"strict": "rejected_valid", "permissive": "omitted_requirements", "partial": "partial_credit"}.get(self.case, "accepted_invalid")
+                category = "rejected_valid" if self.case == "strict" else "accepted_invalid"
                 probes.append({"category": category, "case": f"{episode} requirement {key}", "episode": episode,
                                "location": "/app/answer.txt" if key == 0 else "/app/explanation.txt",
                                "capture_point": "verification_start", "timing": "The requirement explicitly applies at verification start.",
@@ -146,7 +146,8 @@ class Endpoint:
                     claim["unresolved"] = ["Suitable explanation has no sufficient criteria."]
                 claim["basis"] = {"completion": completion, "requirements": [source("instruction.md", self.requirements[key])],
                                   "checks": [f"check-{index:04d}"], "explanation": "Completion follows only from the cited measured requirement.",
-                                  "decision": {"source": source("tests/test.sh", SCORING), "pass_values": [1.0]},
+                                  "decision": {"source": source("tests/test.sh", SCORING), "pass_values": [1.0],
+                                               "values": [0.0, 0.5, 1.0] if self.case == "partial" else [0.0, 1.0]},
                                   "ordering": {"source": source("tests/test.sh", SCORING), "higher_completes": True}}
                 self.interpretations.append({"claim": claim})
         return {"probes": probes}
@@ -307,19 +308,25 @@ def verify_retained(case, retained, result=None):
         matrix, = metrics["confusion"]
         curve, = metrics["auroc"]
         assert (matrix["tp"], matrix["tn"], matrix["fp"], matrix["fn"], matrix["f1"], curve["auroc"]) == (1, 3, 0, 0, 1, 1)
-        assert result["inspections"]["grader"]["findings"]["evidenced"] == []
-    elif case in ("strict", "permissive", "partial"):
+        assert (matrix["false_discovery_rate"]["value"], matrix["false_negative_rate"]["value"]) == (0.0, 0.0)
+        assert result["inspections"]["grader_inspector"]["findings"]["evidenced"] == []
+    elif case in ("strict", "permissive"):
         matrix, = metrics["confusion"]
-        assert (matrix["tp"], matrix["fp"], matrix["fn"], matrix["tn"]) == {"strict": (0, 0, 1, 0), "permissive": (0, 1, 0, 0), "partial": (0, 0, 0, 1)}[case]
+        assert (matrix["tp"], matrix["fp"], matrix["fn"], matrix["tn"]) == {"strict": (0, 0, 1, 0), "permissive": (0, 1, 0, 0)}[case]
+        assert metrics["auroc"][0]["auroc"] is None
+    elif case == "partial":
+        # The 0.5 rubric total is not binary, so grader agreement reports no counts.
+        matrix, = metrics["confusion"]
+        assert (matrix["status"], matrix["reasons"][0], matrix["tp"]) == ("unsupported", report.NON_BINARY, None)
         assert metrics["auroc"][0]["auroc"] is None
     else:
-        assert metrics["confusion"] == [] and metrics["auroc"] == []
+        assert all(group["episodes"] == [] for group in metrics["confusion"]) and metrics["auroc"] == []
         assert metrics["episodes"]["0000-simulator"]["completion"] == ("complete" if case == "infrastructure" else "unknown")
     if case == "infrastructure":
         assert summary["usable"] == 0 and summary["missing"] == ["0000-simulator"]
         episode = json.loads((output / "episodes/0000-simulator/episode.json").read_text())
         assert episode["rewards"].get("reward") is None and episode["errors"]
-        assert result["inspections"]["grader"]["findings"]["evidenced"] == []
+        assert result["inspections"]["grader_inspector"]["findings"]["evidenced"] == []
     if case == "ambiguity":
         assert "Suitable explanation" in " ".join(result["labels"]["episodes"]["0000-simulator"]["reasons"])
     record = json.loads((output / "run.json").read_text())
