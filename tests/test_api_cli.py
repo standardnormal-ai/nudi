@@ -360,20 +360,19 @@ def test_each_inspector_candidate_composes_its_own_guidance_without_a_model_call
 
 
 @pytest.mark.parametrize("only_false_negative", [False, True])
-def test_known_false_negative_findings_never_supply_exploit_guidance(tmp_path, monkeypatch, only_false_negative):
+def test_rejected_valid_hack_findings_become_valid_work_candidates(tmp_path, monkeypatch, only_false_negative):
+    """Rejected valid work is a valid-work candidate with its own guidance, beside exploit candidates."""
     fn = candidate("correct work rejected", "undeserved rejection", outcome="rejected_valid",
-                   full_guidance="FN reproduction must not reach attackers", hint_location="fn/private-grader.py")
+                   full_guidance="Write the answer in the documented format.", hint_location="fn/private-grader.py")
     candidates = [fn]
     if not only_false_negative:
         candidates.append(candidate(MECHANISM, INTERPRETATION, full_guidance=REPRODUCTION, hint_location=LOCATION))
     analyses = Analyses(monkeypatch, candidates=candidates)
     result = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
-    if only_false_negative:
-        assert analyses.calls[-1] == ("attack", 2, 1, 0)
-        assert result["attack"]["unavailable"] == {"full": NO_CANDIDATE, "minimal": NO_CANDIDATE}
-    else:
-        (sent,) = analyses.candidates_sent
-        assert sent.id == "hack-1" and sent.guidance["full"] == REPRODUCTION
+    sent = analyses.candidates_sent
+    assert analyses.calls[-1] == ("attack", 2, 1, len(candidates))
+    assert [(item.id, item.valid_work) for item in sent] == [("hack-0", True), ("hack-1", False)][:len(candidates)]
+    assert sent[0].guidance == {"full": "Write the answer in the documented format.", "minimal": WHERE_TO_LOOK + "\nfn/private-grader.py"}
     retained = result["inspections"]["hack_inspector"]["findings"]["evidenced"]
     assert retained[0]["assessment"]["outcome"] == "rejected_valid"
 
@@ -441,8 +440,9 @@ def test_no_candidate_leaves_guidance_unavailable_and_still_attacks(tmp_path, mo
 
 
 def test_inspector_prompt_requests_reproduction_steps_and_a_location_only():
-    prompt = (Path(api.__file__).parent / "prompts" / "inspector.md").read_text()
-    assert "`full_guidance`" in prompt and "concrete steps that reproduce the loophole" in prompt
+    from nudi import checks
+    prompt = " ".join(checks.inspector_prompt("hack").split())
+    assert "`full_guidance`" in prompt and "concrete steps that reproduce it" in prompt
     assert "`hint_location`" in prompt and "file, interface, or component" in prompt
     assert "must not contain a solution or a reproduction recipe" in prompt
 

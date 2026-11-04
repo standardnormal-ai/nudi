@@ -53,14 +53,15 @@ def source(path, excerpt):
     return {"episode": None, "path": path, "excerpt": excerpt}
 
 
-def checker(expected=None, *, half=False):
-    test = "state['exists']" if expected is None else f"state['exists'] and int(base64.b64decode(state['base64']).strip()) == {expected}"
-    bounds = "{'minimum': 0.5 * met, 'maximum': 0.5 * met + 0.5}" if half else "{'minimum': met, 'maximum': met}"
-    return f'''import base64, hashlib, json, sys
-inputs = json.load(sys.stdin)
-state = json.loads(inputs['submission'])
+def checker(location, expected=None, *, half=False):
+    """A check that reads `location` in place in the state copy's container."""
+    test = "os.path.isfile(path)" if expected is None else f"os.path.isfile(path) and int(open(path).read().strip()) == {expected}"
+    # A check of one half's file cannot compute the whole deserved score, so it omits it.
+    results = "{}" if half else "{'deserved': met}"
+    return f'''import json, os
+path = {location!r}
 met = int({test})
-print(json.dumps({{'input_sha256': {{k: hashlib.sha256(v.encode()).hexdigest() for k,v in inputs.items()}}, 'observations': {{'met': met}}, 'results': {bounds}}}))
+print(json.dumps({{'observations': {{'met': met}}, 'results': {results}}}))
 '''
 
 
@@ -115,22 +116,18 @@ class Endpoint:
             for key in keys:
                 index = len(probes)
                 category = "rejected_valid" if self.case == "strict" else "accepted_invalid"
-                probes.append({"category": category, "case": f"{episode} requirement {key}", "episode": episode,
-                               "location": "/app/answer.txt" if key == 0 else "/app/explanation.txt",
+                location = "/app/answer.txt" if key == 0 else "/app/explanation.txt"
+                probes.append({"category": category, "case": f"{episode} requirement {key}", "episode": episode, "location": location,
                                "capture_point": "verification_start", "timing": "The requirement explicitly applies at verification start.",
-                               "program": checker(990 if self.case == "clean" else 42 if key == 0 else None, half=self.case == "partial"),
+                               "program": checker(location, 990 if self.case == "clean" else 42 if key == 0 else None, half=self.case == "partial"),
                                "requirement": source("instruction.md", self.requirements[key]), "scoring": source("tests/test.sh", SCORING)})
                 reward = item["rewards"].get("reward")
                 met = reward == 1 if self.case == "clean" else key == 0
                 validity = "supported" if met else "violated"
                 if self.case == "ambiguity" and key == 1:
                     validity = "unknown"
-                claim = {"mechanism": "required work", "interpretation": "The retained capture checks the cited requirement and stated credit.",
-                         "derivation": {"observations": ["met"], "minimum": "minimum", "maximum": "maximum", "validity": validity}}
-                claim["requirement_support"] = {"basis": "explicit", "sources": [probes[-1]["requirement"]],
-                                                 "rationale": "The instruction states this requirement.", "uncertainty": []}
-                claim["scoring_support"] = {"basis": "inferred", "sources": [probes[-1]["scoring"]],
-                                             "rationale": "The cited rule connects the measured requirement to credit.", "uncertainty": []}
+                claim = {"mechanism": "required work", "interpretation": "The check of the state copy measures the cited requirement and stated credit.",
+                         "derivation": {"observations": ["met"], "validity": validity}}
                 if self.case in ("clean", "strict"):
                     claim["coverage"] = {"requirements": [source("instruction.md", self.requirements[0])], "scoring": source("tests/test.sh", SCORING),
                                          "checks": [f"check-{index:04d}"], "explanation": "This checks the complete single requirement and its stated score."}
@@ -191,10 +188,7 @@ class Endpoint:
             context = json.loads(body["messages"][-1]["content"])
         except (ValueError, TypeError):
             context = {}
-        if context.get("phase") == "capture_selection":
-            # The declared artifacts already cover each case's requirements.
-            response = {"locations": []}
-        elif "phase" in context:
+        if "phase" in context:
             response = self.proposal(context)
             response["applicability"] = {category: {"scope": "package", "status": "applicable", "facts": {"package_copy": True}, "reason": "The Inspector can check the copied package and retained submissions."} for category in context["categories"]}
         elif "check" in context:
@@ -275,11 +269,17 @@ def test_native_cases_from_installed_wheel(case, tmp_path, monkeypatch):
     (retained / "requests.json").write_text(json.dumps(endpoint.requests, indent=2))
     assert helpers.docker_resources() == before
     assert helpers.tree_digest(task) == digest and helpers.tree_digest(helpers.CONTRACT_TASK) == original
-    selections = [body for body in endpoint.requests if isinstance(body["messages"][-1].get("content"), str)
-                  and '"phase": "capture_selection"' in body["messages"][-1]["content"]]
+    # Every check ran in a container made from a state copy, cites that copy's receipt, and
+    # every copy was deleted at run end; the one-file capture selection no longer exists.
     record = json.loads((output / "run.json").read_text())
-    assert len(selections) == 1 and record["capture_selection"]["status"] == "complete", record["capture_selection"]
-    assert not any("capture selection" in warning for warning in record["warnings"])
+    assert not any('"phase": "capture_selection"' in str(body["messages"][-1].get("content")) for body in endpoint.requests)
+    assert record["capture_selection"] is None and record["submissions"] == []
+    copies = {copy["id"]: copy for copy in record["copies"]}
+    assert copies and all(copy["deleted"] is True and copy["tag"] for copy in copies.values())
+    for check in record["checks"]:
+        copy = copies[check["state_copy"]]
+        assert check["submission"] is None and copy["error"] is None
+        assert check["content"] == copy["receipt"] and copy["point"] == "verification_start"
     verify_retained(case, retained, result)
 
 
@@ -296,9 +296,9 @@ def verify_retained(case, retained, result=None):
     assert result == json.loads((output / "report.json").read_text())
     assert (output / "report.md").read_text() == report.markdown(result)
     assert result["analyses"] == {"simulation": "partial" if case == "infrastructure" else "complete",
-                                   "grader": "partial" if case in ("ambiguity", "infrastructure") else "complete"}
+                                   "grader": "partial" if case in ("partial", "ambiguity", "infrastructure") else "complete"}
     expected = {"clean": {"legitimate": 4}, "strict": {"rejected_valid": 1}, "permissive": {"accepted_invalid": 1},
-                "partial": {"legitimate": 1}, "ambiguity": {"unknown": 1}, "infrastructure": {"unavailable": 1}}
+                "partial": {"unknown": 1}, "ambiguity": {"unknown": 1}, "infrastructure": {"unavailable": 1}}
     assert result["labels"]["counts"] == expected[case], result["labels"]
     group, = result["ordinary"]["groups"]
     summary = group["rewards"]["reward"]

@@ -14,6 +14,8 @@ from pydantic import BaseModel, ConfigDict, Field
 NativeBehavior = Literal["shared_grading", "host_harness", "atif"]
 ExecutionPath = Literal["verifiers", "harbor"]
 Role = Literal["simulator", "inspector", "attacker"]
+Backend = Literal["docker", "modal"]
+"""Where native episodes and Inspector sandboxes run: the local Docker daemon or Modal."""
 ExecutionScope = Literal["native", "package"]
 """`native`: the original task harness of a native episode. `package`: an Inspector
 sandbox running a copy of the task package; it never establishes native accessibility."""
@@ -76,6 +78,9 @@ class RunConfig(BaseModel):
     workspace_memory_mb: int | None = Field(None, gt=0, strict=True)
     """Memory limit in MiB of a held Inspector workspace; by default the smaller of 512 and
     the task's declared memory_mb. Experiments and native episodes keep the task's limits."""
+    backend: Backend = "docker"
+    concurrency: int = Field(8, ge=1, strict=True)
+    """Containers at once: the limit on Modal, and on Docker a cap on what Docker's capacity allows."""
 
 
 class EpisodeConfig(BaseModel):
@@ -90,6 +95,7 @@ class EpisodeConfig(BaseModel):
     reasoning_effort: str | None = None
     native: frozenset[NativeBehavior] = frozenset()
     """Native Harbor behaviors the episode must keep; any the adapter changes select native Harbor."""
+    backend: Backend = "docker"
 
 
 class ErrorRecord(BaseModel):
@@ -120,13 +126,16 @@ class EpisodeResult(BaseModel):
 
 
 class Capacity(BaseModel):
-    docker_cpus: int
-    docker_memory_mb: int
+    docker_cpus: int | None
+    """None on Modal, where Docker is not used."""
+    docker_memory_mb: int | None
     episode_cpus: int | None
     """Declared CPUs of one episode's largest container; None when undeclared."""
     episode_memory_mb: int | None
     concurrency: int
     """Episodes the run's Harbor TrialQueue runs at once."""
+    concurrency_setting: int | None = None
+    """The run's `concurrency` setting, which also caps its containers; None in earlier records."""
     workspace_memory_mb: int | None = None
     """Memory limit in MiB that Harbor's override enforces on a held Inspector workspace.
     None in earlier records, whose workspaces inherited the task's limit."""
@@ -213,6 +222,8 @@ class Submission(BaseModel):
 
 
 class CaptureFailure(BaseModel):
+    """Read only from older records; no current code writes one."""
+
     episode: str
     location: str
     error: ErrorRecord
@@ -243,8 +254,8 @@ class ArtifactSelection(BaseModel):
 
 
 class CaptureSelection(BaseModel):
-    """The files every ordinary and Attacker episode of a run captures, chosen once
-    from the original task before the first of them."""
+    """The files every ordinary and Attacker episode of a run captured, chosen once
+    from the original task before the first of them. Read only from older records."""
 
     files: list[ArtifactSelection]
     status: Literal["not_requested", "complete", "failed", "refused", "model_inability", "malformed", "spending_exhausted",
@@ -277,10 +288,11 @@ class Check(BaseModel):
     host records, and capture completion, stdout and status independently. Only exit 0
     is successful execution; it says nothing about task validity.
 
-    The last stdout line is JSON with `input_sha256`, `observations` and `results`.
-    Observations are measured facts; results are computations from them and the input
-    rule. Inspector interpretation references those fields. A printed bound without
-    the program, inputs, observations and submission link remains provisional.
+    The last stdout line is JSON with `observations` and `results`; a check without a
+    `sandbox` receipt also prints `input_sha256`. Observations are measured facts; results
+    are computations from them and the input rule, with `deserved` the score a grader
+    checking every stated requirement would give. A printed score without the program,
+    inputs, observations and submission link remains provisional.
     """
 
     id: str
@@ -296,6 +308,9 @@ class Check(BaseModel):
     environment: str | None = None
     inputs: dict[str, Content] = {}
     submission: Submission | None = None
+    """One-file capture of older records; current checks read a state copy instead."""
+    state_copy: str | None = None
+    """The `StateCopy` the check sandbox started from; `content` is its receipt."""
     sandbox: str | None = None
     """The Inspector sandbox that ran `program` on the uploaded inputs; `command` then names
     the uploaded files instead of including the program."""
@@ -305,19 +320,6 @@ class Check(BaseModel):
 
 
 Validity = Literal["supported", "violated", "unknown"]
-
-
-class Support(BaseModel):
-    """The Inspector's support for meaning, separate from measured computation.
-
-    Inference is permitted when cited context and an explanation support it. An
-    assumption, artifact declaration or unresolved condition cannot establish a rule.
-    """
-
-    basis: Literal["explicit", "inferred", "assumed", "artifact_metadata", "unknown"]
-    sources: list[Observation] = []
-    rationale: str = ""
-    uncertainty: list[str] = []
 
 
 class Reading(BaseModel):
@@ -330,23 +332,19 @@ class Reading(BaseModel):
     observations: list[str]
     validity: Validity
     interpretation: str
-    support: Support | None = None
 
 
 class Derivation(BaseModel):
     """Inspector interpretation, not an independent verdict or validation language.
 
-    Observation names refer to the check's measured `observations`; minimum/maximum
-    name computed `results` fields, never Inspector-supplied numbers. The Inspector's
-    explanation in `Claim.interpretation` connects the requirement and applicable
-    scoring source to these observations and computations. `validity` concerns the
-    check's own requirement and needs no bound; `requirements` reads others from the
-    same execution. This record cannot prove arbitrary checker semantics.
+    Observation names refer to the check's measured `observations`. The deserved score
+    is the check's computed `results.deserved`, never an Inspector-supplied number.
+    `Claim.interpretation` connects the requirement and scoring source to these facts.
+    `validity` concerns the check's own requirement; `requirements` reads others from
+    the same execution. This record cannot prove arbitrary checker semantics.
     """
 
     observations: list[str]
-    minimum: str | None = None
-    maximum: str | None = None
     validity: Validity
     requirements: list[Reading] = []
 
@@ -373,11 +371,12 @@ class EpisodeEvent(BaseModel):
 
 class SandboxResult(BaseModel):
     """Host record of one Inspector sandbox: a copy of the task package in Harbor's Docker
-    environment, with no native actor, Trial, agent or actor timer.
+    or Modal environment, with no native actor, Trial, agent or actor timer.
 
     It establishes only what the copied package did. `ids` identify the sandbox; there are
     no native trial IDs. Probe/check command output is bounded; workspace tools use SDK
-    eviction and source capture. `cleanup` records the containers observed after removal."""
+    eviction and source capture. `cleanup` records the containers observed after removal on
+    Docker, or whether Modal reported the sandbox ended."""
 
     name: str
     purpose: Literal["probe", "check", "workspace"]
@@ -390,8 +389,9 @@ class SandboxResult(BaseModel):
     """SHA256 over the original task files when the sandbox started."""
     copy_digest: str
     environment: dict
-    """The enforced resources, network policy and image: the copied package's declaration,
-    except a workspace's memory limit, which is the run's `workspace_memory_mb`."""
+    """The backend, the enforced resources and their enforcement, network policy and image: the
+    copied package's declaration, except a workspace's memory limit, which is the run's
+    `workspace_memory_mb`."""
     files: dict[str, str] = {}
     """SHA256 of each uploaded file, or tree digest of each uploaded directory, by target path."""
     commands: list[dict] = []
@@ -403,6 +403,46 @@ class SandboxResult(BaseModel):
     verifier_timeout: bool = False
     cleanup: dict = {}
     artifacts: dict[str, str] = {"nudi_evidence": "nudi-evidence"}
+    state_copy: str | None = None
+    """The `StateCopy` this sandbox started from, if any."""
+    image: str | None = None
+    """The image it started from: on Docker the running container's image id, checked against
+    the copy's; on Modal the object id of the snapshot nudi passed."""
+    setup: str | None = None
+    """For a separate verifier's probe: the sandbox that ran the setup program in the main image."""
+    artifact_manifest: list[dict] | None = None
+    """For a separate verifier's probe: Harbor's manifest of the declared artifacts collected from
+    `setup`, `failed` and `empty` entries included. An entry Harbor did not collect is not uploaded."""
+
+
+class StateCopy(BaseModel):
+    """nudi's copy of the filesystem of the container that grades an episode or a package
+    sandbox, taken at the start of grading or after the grader returned. It has no processes
+    and omits the `excluded` paths: `/logs`, `/proc`, `/sys`, `/dev` and the runtime's
+    `/etc` files on both backends and, on Docker, the container's mount destinations, tmpfs
+    paths and image volumes. A Docker commit pauses the container's processes for its
+    duration. The same data, written before `finished_at`, is the `receipt` file a check cites."""
+
+    id: str
+    episode: str
+    point: Literal["verification_start", "grading_end"]
+    environment: Literal["agent", "verifier"]
+    """The grader's environment: the agent's in shared mode, the separate verifier's otherwise."""
+    backend: Backend
+    ids: dict[str, str]
+    """Native identifiers of the episode, or the sandbox's identifiers."""
+    tag: str | None = None
+    """Docker tag `nudi-copy-<run id>-<n>`; none on Modal."""
+    image: str | None = None
+    """Docker image id, or the Modal image object id."""
+    excluded: list[str] = []
+    started_at: str
+    finished_at: str | None = None
+    seconds: float | None = None
+    error: str | None = None
+    receipt: Content | None = None
+    deleted: bool | None = None
+    """Set at run end: whether the image or snapshot was deleted."""
 
 
 class PersistenceProbe(BaseModel):
@@ -441,6 +481,21 @@ class PersistenceProbe(BaseModel):
     episodes: list[str] = []
 
 
+class ModalSandbox(BaseModel):
+    """One Modal sandbox of the run, recorded when it was stopped, for the cost estimate."""
+
+    session_id: str
+    sandbox_id: str
+    cpus: int | None
+    """The hard CPU limit; None when the task declares none."""
+    memory_mb: int | None
+    started_at: str
+    """When nudi created the environment, at or before the sandbox's start."""
+    stopped_at: str
+    removed: bool
+    """Modal reported the sandbox ended after stop, or after one more terminate."""
+
+
 class RunRecord(BaseModel):
     task_dir: str
     path: ExecutionPath
@@ -465,16 +520,22 @@ class RunRecord(BaseModel):
     """Episode lifecycle in the order nudi observed it."""
     checks: list[Check] = []
     submissions: list[Submission] = []
-    """Host observations collected at the explicitly requested native boundary."""
+    """One-file captures of older records; no current code writes them."""
     capture_errors: list[CaptureFailure] = []
     replays: list[Replay] = []
     capture_selection: CaptureSelection | None = None
+    """Older records only."""
+    run_id: str = ""
+    """Names this run's copy images, `nudi-copy-<run id>-<n>`."""
+    copies: list[StateCopy] = []
     simulation: Simulation | None = None
     probe_episodes: list[str] = []
     """Planting and fresh-instance reads. They are not ordinary episodes and not attack successes."""
     persistence_probes: list[PersistenceProbe] = []
     sandboxes: list[str] = []
     """Inspector package sandboxes in start order, recorded under `sandboxes/`; not episodes."""
+    backend: Backend = "docker"
+    modal: list[ModalSandbox] = []
 
 
 class Coverage(BaseModel):
@@ -550,17 +611,17 @@ class Claim(BaseModel):
     persisted: Content | None = None
     """The same state, retained by the graded episode after the normal reset."""
     interpretation: str = ""
-    requirement_support: Support | None = None
-    scoring_support: Support | None = None
-    """Absent in older records. New interactive interpretations supply both."""
+    """What happened, in the job's own words. Each judging job's schema requires it non-empty; empty, the claim stays provisional."""
+    citations: list[Observation] = []
+    """Further retained text, only when the check's requirement and scoring citations do not suffice."""
     full_guidance: str | None = None
     """Concrete steps that reproduce the suspected loophole, when the hack inspector supplies them."""
     hint_location: str | None = None
     """Only a file, interface, or component to examine. It excludes the solution and the reproduction recipe."""
     derivation: Derivation | None = None
     unresolved: list[str] = []
-    """Necessary conditions the Inspector could not establish. With any, the claim
-    neither labels an ordinary episode nor counts as an evidenced issue."""
+    """Facts that could change the verdict and stay open. An issue still counts and is
+    reported with them; a legitimate result with any is not clean."""
     limits: list[str] = []
     """Scope notes the derivation does not depend on, such as whether the task meant a stated
     requirement to be graded. They are reported and do not block an evidenced issue."""
@@ -568,6 +629,9 @@ class Claim(BaseModel):
     """Required for an ordinary episode's legitimate label; see `Coverage`."""
     basis: MetricBasis | None = None
     """For an ordinary episode: the reference that grader metrics use; see `MetricBasis`."""
+    attribution: dict | None = None
+    """The attack inspector's link of an Attacker exploit to its target candidate: `relation`
+    `target` or `other`, the `check` it cites and a `rationale`. Other jobs never write it."""
 
 
 Discrepancy = Literal["over", "under", "none", "unknown"]

@@ -19,8 +19,8 @@ from pathlib import Path
 from harbor.models.trajectories import Trajectory
 from pydantic import ValidationError
 
-from nudi.records import (Assessment, Check, Claim, Conclusion, Content, Derivation, EpisodeResult, Observation,
-                          PersistenceProbe, Reading, RunRecord, SandboxResult)
+from nudi.records import (Assessment, Check, Claim, Conclusion, Content, EpisodeResult, Observation,
+                          PersistenceProbe, Reading, RunRecord, SandboxResult, StateCopy)
 from nudi.runner import tree_digest
 from nudi.sandbox import CHECK_INPUTS, CHECK_PROGRAM, OUTPUT_LIMIT
 
@@ -29,6 +29,7 @@ CHECK_LIMIT = (
     "interpretation; nudi checks provenance and consistency, not arbitrary program or "
     "task semantics, and an Inspector-written checker can misread the requirement or scoring"
 )
+COPY_INTERPRETER = "the check ran with the episode's own interpreter, so code the episode planted could change its output"
 PERSISTENCE_ORDER = "equal content, a disclosed marker and episode return order do not establish persistence"
 PERSISTENCE_GAP = (
     "producer-recorded planting and protected readback at the same location after a known successful normal reset, "
@@ -119,10 +120,6 @@ class Evidence:
         self.content(check.content)
         for content in check.inputs.values():
             self.content(content)
-        if check.submission is not None:
-            self.content(check.submission.content)
-            if check.submission.execution_scope != self.scope(check.content.episode):
-                raise Ungrounded(f"check {check.id} names a {check.submission.execution_scope} capture of {check.content.episode}")
         self.excerpt(check.requirement)
         if check.scoring is not None:
             self.excerpt(check.scoring)
@@ -138,6 +135,9 @@ class Evidence:
                 or record.files.get(CHECK_PROGRAM) != hashlib.sha256(check.program.encode()).hexdigest()
                 or record.files.get(CHECK_INPUTS) != hashlib.sha256(inputs.encode()).hexdigest()):
             raise Ungrounded(f"check {check.id} differs from the program and inputs sandbox {check.sandbox} executed")
+        copy = self.copy(check)
+        if check.state_copy is not None and (copy is None or record.state_copy != copy.id or record.image != copy.image):
+            raise Ungrounded(f"check {check.id}'s sandbox {check.sandbox} did not start from {check.state_copy}'s image")
         if check.exit_code is None:
             return
         commands = [command for command in record.commands if command.get("argv") == check.command
@@ -148,6 +148,9 @@ class Evidence:
         if (not receipt.get("finished_at") or receipt.get("error") or record.cancelled
                 or check.exit_code != expected_code or check.output != expected_output):
             raise Ungrounded(f"check {check.id} differs from sandbox {check.sandbox}'s completed command receipt")
+
+    def copy(self, check: Check) -> StateCopy | None:
+        return next((copy for copy in self.run.copies if copy.id == check.state_copy), None)
 
     def input_contains(self, check: Check, source: Observation) -> bool:
         file = self.file(source.episode, source.path)
@@ -184,28 +187,6 @@ class Evidence:
         return any(source.excerpt in block for block in blocks + ["\n".join(current)])
 
 
-def support_gaps(support, kind: str, evidence: Evidence) -> list[str]:
-    """Check references and stated uncertainty, without claiming semantic validation."""
-    if support is None:  # Retained records from before interactive inspection remain readable.
-        return []
-    gaps = []
-    if support.basis not in ("explicit", "inferred"):
-        gaps.append(f"{kind} support is {support.basis}")
-    if not support.sources or not support.rationale.strip():
-        gaps.append(f"{kind} support lacks cited context or an explanation")
-    metadata = []
-    for source in support.sources:
-        try:
-            evidence.excerpt(source)
-            metadata.append(evidence.artifact_metadata(source))
-        except Ungrounded as error:
-            gaps.append(f"{kind} support: {error}")
-    if metadata and all(metadata):
-        gaps.append(f"{kind} support cites only artifact metadata; collection declarations establish no requirement or score")
-    gaps += [f"{kind} support unresolved: {item}" for item in support.uncertainty]
-    return gaps
-
-
 def tool_output(trajectory: Path, step_id: int, result: int) -> bytes:
     try:
         steps = Trajectory.model_validate_json(trajectory.read_text()).steps
@@ -228,24 +209,20 @@ def captured_object(output: str) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def linked_submission(check: Check) -> bool:
-    """Check an independent observation linked to the episode's native outcome.
+def linked_submission(check: Check, evidence: Evidence) -> StateCopy | None:
+    """The state copy that links the checked state to the episode's native outcome, or None.
 
-    Submission/task state includes absence or omitted work relevant to that outcome;
-    the grader need not literally read every disputed byte. The producer must capture
-    the location, time/point and episode linkage. Receipt consistency cannot certify a
-    native hook, make a model-written manifest independent, or exclude state changes.
+    nudi took the copy without error, the check's content is its receipt, it names the
+    check's episode and native IDs, and a sandbox started from it ran the check
+    (`Evidence.executed`). Submission/task state includes absence or omitted work; the
+    grader need not literally read every disputed byte. A copy cannot exclude state
+    changes outside its point or under its excluded paths.
     """
-    submission = check.submission
-    if submission is None or submission.exit_code != 0 or submission.content != check.content or check.content.step is not None:
-        return False
-    receipt = captured_object(submission.output)
-    return bool(
-        check.ids and submission.ids == check.ids and submission.location and submission.capture_point
-        and submission.program and submission.program in submission.command and receipt
-        and receipt.get("sha256") == check.content.sha256
-        and receipt.get("location") == submission.location and receipt.get("ids") == check.ids
-    )
+    copy = evidence.copy(check)
+    if (copy is None or copy.error is not None or copy.receipt != check.content or copy.episode != check.content.episode
+            or not check.ids or copy.ids != check.ids or check.sandbox is None):
+        return None
+    return copy
 
 
 def measured(names: list[str], observations: dict, results: dict) -> list[str]:
@@ -269,26 +246,11 @@ def measured(names: list[str], observations: dict, results: dict) -> list[str]:
     return problems
 
 
-def bounds(derivation: Derivation, observations: dict, results: dict) -> tuple[float | None, float | None]:
-    """Resolve Inspector references to captured computation results; accept no new scalar.
-
-    Raises ValueError naming every bound reference defect."""
-    problems = []
-    names = {"minimum": derivation.minimum, "maximum": derivation.maximum}
-    if all(name is None for name in names.values()):
-        problems.append("derivation names neither minimum nor maximum, so no `results` bound is referenced")
-    for field, name in names.items():
-        if name is not None and name not in results:
-            problems.append(f"derivation.{field} {name!r} is " + ("a key of `observations`, not `results`" if name in observations
-                                                                  else "absent from `results`"))
-    if problems:
-        raise ValueError("; ".join(problems))
-    low, high = [results[name] if name is not None else None for name in names.values()]
-    if not all(value is None or (type(value) in (int, float) and -sys.float_info.max <= value <= sys.float_info.max) for value in (low, high)):
-        raise ValueError("a referenced `results` bound is not a finite number")
-    if low is not None and high is not None and low > high:
-        raise ValueError("the referenced minimum exceeds the maximum")
-    return low, high
+def deserved(results: dict) -> float | None:
+    """The check's computed `results.deserved` when it is a finite number; never a default."""
+    value = results.get("deserved")
+    finite = type(value) in (int, float) and -sys.float_info.max <= value <= sys.float_info.max
+    return value if finite else None
 
 
 def conclude(reading: Reading, check: Check, evidence: Evidence, observations: dict, results: dict) -> Conclusion:
@@ -303,8 +265,7 @@ def conclude(reading: Reading, check: Check, evidence: Evidence, observations: d
         conclusion.reasons.append(str(error))
     if not reading.interpretation.strip():
         conclusion.reasons.append("the reading lacks an interpretation")
-    conclusion.reasons += support_gaps(reading.support, "requirement", evidence)
-    if reading.support is None and not conclusion.reasons and evidence.artifact_metadata(reading.requirement):
+    if not conclusion.reasons and evidence.artifact_metadata(reading.requirement):
         conclusion.reasons.append("artifact metadata alone establishes no requirement")
     conclusion.reasons += measured(reading.observations, observations, results)
     if not conclusion.reasons:
@@ -455,30 +416,45 @@ def judge(assessment: Assessment, evidence: Evidence) -> None:
             f"the check tested {source}; a command replay can produce other output and does not establish {claim.episode}'s validity",
             f"a check of {claim.episode}'s immutable evaluated submission; assess a new replay on its own reward",
         )
-    if not linked_submission(check):
+    copy = linked_submission(check, evidence)
+    if copy is None:
         return provisional(
-            "the retained content has no independent observation linking submission/task state to the native outcome; collected files and writable ATIF alone do not establish that link",
-            "independently captured submission/task state, including relevant absence, with native IDs, observed location, time/capture point and actual capture program/command/result",
+            "the retained content has no state copy linking submission/task state to the native outcome; collected files and writable ATIF alone do not establish that link",
+            "a state copy nudi took of the episode, with its native IDs and point, checked in a sandbox started from it",
         )
+    assessment.limits.append(COPY_INTERPRETER)
+    assessment.limits.append(f"the copy omits {', '.join(copy.excluded)}; nothing under them was checked")
+    if copy.backend == "docker" and copy.point == "verification_start":
+        assessment.limits.append(f"processes were paused for {copy.seconds:.1f} s before grading")
     if check.exit_code != 0:
         return provisional("the check did not complete successfully; printed output cannot establish validity", "a successful isolated check, with exit code 0")
-    # A sandbox check's program and inputs are uploaded files whose hashes Evidence.check matched.
-    if not check.program or (check.program not in check.command and check.sandbox is None) or not check.environment or not check.inputs:
+    # The check sandbox's program and inputs are uploaded files whose hashes Evidence.check matched.
+    if not check.program or not check.environment or not check.inputs:
         return provisional("the check lacks its executed program, isolation context or immutable inputs", "the actual isolated program/command and hashed input mapping")
     if check.content not in check.inputs.values() or not evidence.input_contains(check, check.requirement):
         return provisional("the check did not record the submission and requirement as inputs", "the evaluated submission and requirement among the check's immutable inputs")
     result = captured_object(check.output)
-    if result is None or result.get("input_sha256") != {name: content.sha256 for name, content in check.inputs.items()}:
-        return provisional("the check's structured output is malformed or names other input bytes", "structured observations and computations from the recorded input bytes")
+    # The sandbox receipt binds the output to the uploaded program and input bytes.
+    if result is None:
+        return provisional("the check's structured output is malformed", "structured observations and computations from the recorded input bytes")
     observations, results, derivation = result.get("observations"), result.get("results"), claim.derivation
     if not isinstance(observations, dict) or not isinstance(results, dict):
         return provisional("the check output lacks an `observations` or `results` object", "structured observations and computations from the recorded input bytes")
     if derivation is None or not claim.interpretation.strip():
         return provisional("the claim lacks an interpretation or derivation", "an Inspector derivation naming measured observations")
-    requirement_gaps = support_gaps(claim.requirement_support, "requirement", evidence)
-    if claim.requirement_support is None and evidence.artifact_metadata(check.requirement):
-        requirement_gaps.append("requirement support consists only of artifact metadata")
-    problems = measured(derivation.observations, observations, results) + requirement_gaps
+    citation_gaps = []
+    for citation in claim.citations:
+        try:
+            evidence.excerpt(citation)
+        except Ungrounded as error:
+            citation_gaps.append(f"citation: {error}")
+
+    def metadata_alone(source: Observation) -> bool:
+        return all(evidence.artifact_metadata(item) for item in [source, *claim.citations])
+
+    problems = measured(derivation.observations, observations, results) + citation_gaps
+    if not citation_gaps and metadata_alone(check.requirement):
+        problems.append("artifact metadata alone establishes no requirement")
     if problems:
         provisional(f"no measured observation supports the claimed validity: {'; '.join(problems)}",
                     "derivation.observations naming measured facts of the check output")
@@ -487,37 +463,33 @@ def judge(assessment: Assessment, evidence: Evidence) -> None:
     assessment.conclusions = [conclude(item, check, evidence, observations, results) for item in derivation.requirements]
     if reward is None:
         return
-    scoring_gaps = support_gaps(claim.scoring_support, "scoring", evidence)
-    if scoring_gaps:
-        return provisional("; ".join(scoring_gaps), "supported scoring context and resolved assumptions")
     if check.scoring is None or not evidence.input_contains(check, check.scoring):
         return provisional("the check lacks an applicable scoring input", "the cited scoring rule among the check's immutable inputs")
-    try:
-        low, high = bounds(derivation, observations, results)
-    except ValueError as error:
-        return provisional(f"no consistent measured scoring derivation supports the claimed bounds: {error}",
-                           "Inspector references connecting the applicable rule to captured finite computation results")
+    if not citation_gaps and metadata_alone(check.scoring):
+        return provisional("artifact metadata alone establishes no score", "a scoring rule in task text or grader code")
+    score = deserved(results)
+    if score is None:
+        return provisional("the check output has no finite `results.deserved`, so the score comparison is unknown",
+                           "a check computing the deserved score as a finite `results.deserved`")
     if problems:
         return
-    if high is not None and reward > high and not math.isclose(reward, high):
-        assessment.discrepancy = "over"
-    elif low is not None and reward < low and not math.isclose(reward, low):
-        assessment.discrepancy = "under"
-    else:
+    if math.isclose(reward, score):
         assessment.discrepancy = "none"
+    else:
+        assessment.discrepancy = "over" if reward > score else "under"
 
     match assessment.validity, assessment.discrepancy:
         case "violated", "over":
             assessment.outcome = "accepted_invalid"
-            assessment.reasons.append(f"violating content received {reward}, above the deserved maximum {high}")
+            assessment.reasons.append(f"violating content received {reward}, above the deserved score {score}")
         case "supported", "under":
             assessment.outcome = "rejected_valid"
-            assessment.reasons.append(f"satisfying content received {reward}, below the deserved minimum {low}")
-        case "supported" | "violated", "none" if low is not None and low == high:
+            assessment.reasons.append(f"satisfying content received {reward}, below the deserved score {score}")
+        case "supported" | "violated", "none":
             assessment.outcome = "legitimate"
-            assessment.reasons.append(f"native reward {reward} matches the supported computed reward {low}")
+            assessment.reasons.append(f"native reward {reward} matches the deserved score {score}")
         case validity, discrepancy:
             provisional(
                 f"validity {validity} with discrepancy {discrepancy} shows neither accepted invalid nor rejected valid work",
-                "a check whose result and bounds agree on the content's validity",
+                "a check whose result and deserved score agree on the content's validity",
             )

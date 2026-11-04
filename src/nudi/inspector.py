@@ -319,8 +319,9 @@ class Investigation:
 
 
 @asynccontextmanager
-async def investigation(run, name: str, prompt: str, evidence: dict[str, Path], fork: Investigation | None = None):
+async def investigation(run, name: str, prompt: str, evidence: dict[str, Path], fork: Investigation | None = None, copy=None):
     """Own one sandbox until all turns and fresh experiments finish, then retain and remove it.
+    With `copy`, a `StateCopy`, the workspace starts from that copy, with the package at /nudi/package.
 
     Evidence is an explicit selection of files already retained within this run, mapped to
     relative names under `/nudi/evidence`. No host directory or credential file is mounted.
@@ -339,7 +340,7 @@ async def investigation(run, name: str, prompt: str, evidence: dict[str, Path], 
         selected[relative] = path
     backend = None
     try:
-        async with sandbox.sandbox(run, "workspace") as box:
+        async with sandbox.sandbox(run, "workspace", copy=copy) as box:
             runtime, _ = await checks.python3_runtime(box)
             if runtime != "python3":
                 raise RuntimeError("unsupported_runtime: Deep Agents file tools require the python3 executable")

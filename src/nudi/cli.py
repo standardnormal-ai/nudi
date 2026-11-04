@@ -1,7 +1,8 @@
 """`nudi send-nudis TASK`: a thin command over `nudi.api.send_nudis`.
 
 It prints the Markdown report and exits 0 when every selected analysis is complete,
-1 when the report is partial, and 2 when configuration or startup fails before execution.
+1 when the report is partial, and 2 when configuration or startup fails before execution,
+an unreachable Docker daemon or a failed Modal preflight included.
 """
 
 import argparse
@@ -12,7 +13,8 @@ from pathlib import Path
 from typing import get_args
 
 from nudi import api, report
-from nudi.workflow import CapacityError
+from nudi.records import Backend
+from nudi.workflow import BackendUnavailable, CapacityError
 
 
 def main(argv=None) -> int:
@@ -34,12 +36,16 @@ def main(argv=None) -> int:
     send.add_argument("--credentials-file", type=Path, help="dotenv file of credentials")
     send.add_argument("--workspace-memory-mb", type=int,
                       help="Inspector workspace memory limit in MiB; default the smaller of 512 and the task's")
+    send.add_argument("--backend", choices=get_args(Backend),
+                      help="where episodes and sandboxes run, default docker; modal needs a Modal credential")
+    send.add_argument("--concurrency", type=int,
+                      help="containers at once, default 8: the limit on Modal, a cap on Docker's capacity")
     options = vars(parser.parse_args(argv))
     del options["command"]
     task, config = options.pop("task"), options.pop("config")
     try:
         result = api.send_nudis(task, config, **{key: value for key, value in options.items() if value is not None})
-    except (ValueError, OSError, CapacityError) as error:
+    except (ValueError, OSError, CapacityError, BackendUnavailable) as error:
         print(f"nudi: {error}", file=sys.stderr)
         return 2
     except subprocess.CalledProcessError as error:

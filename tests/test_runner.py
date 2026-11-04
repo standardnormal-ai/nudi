@@ -9,6 +9,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -24,7 +25,7 @@ from harbor.models.task.task import Task
 from verifiers.v1.cli.eval import runner as verifiers_runner
 
 from nudi.records import EpisodeResult, EpisodeConfig
-from nudi.runner import DOCKERFILE, UnsupportedTask, run_episode, select_path
+from nudi.runner import DOCKERFILE, UnsupportedTask, compose_services, run_episode, select_path
 
 FIXTURES = Path(__file__).parent / "integration" / "fixtures"
 CONTRACT_TASK = FIXTURES / "contract-task"
@@ -145,9 +146,18 @@ def docker_env(tmp_path, monkeypatch):
     output.mkdir()
     (output / SENTINEL).write_text("A host result file that task tools must not see.\n")
     before = docker_resources()
+    copies_before = copy_images()
     yield output
+    # A run deletes its copies at run end; a test that calls a probe directly leaves them.
+    if left := copy_images() - copies_before:
+        subprocess.run(["docker", "rmi", "--force", *left], capture_output=True)
     assert docker_resources() == before, "episode containers or networks remain"
     assert list(temp.iterdir()) == [], "temporary task copies remain"
+
+
+def copy_images() -> set[str]:
+    listed = subprocess.run(["docker", "images", "--format", "{{.Repository}}", "nudi-copy-*"], capture_output=True, text=True)
+    return set(listed.stdout.split())
 
 
 def episode(output: Path, task_dir: Path, command: str, *, native=frozenset(), duration=2.0):
@@ -255,12 +265,54 @@ def test_rejects_task_without_declared_environment(tmp_path):
         select_path(task, frozenset())
 
 
-def test_rejects_compose_environment(tmp_path):
-    task = task_variant(tmp_path, CONTRACT_TASK)
-    (task / "environment").mkdir()
-    (task / "environment" / "docker-compose.yaml").write_text("services:\n  main: {}\n")
+# Harbor builds an environment from each of these directories, merging a compose file found there,
+# and compose reads .env from it as its project directory, on the native path too.
+# environment/docker-compose.yaml, the file Harbor's Docker environment merges, is checked instead.
+@pytest.mark.parametrize(("directory", "name"), [
+    ("environment", "docker-compose.yml"), ("tests", "docker-compose.yaml"), ("tests", "docker-compose.yml"),
+    ("steps/one/tests", "docker-compose.yaml"), ("steps/one/tests", "docker-compose.yml"),
+    ("environment", ".env"), ("environment", ".ENV"), ("tests", ".env"), ("steps/one/tests", ".Env")])
+def test_rejects_compose_file_in_any_environment_definition(tmp_path, directory, name):
+    from nudi.workflow import ORIGINAL_BEHAVIOR
 
-    with pytest.raises(UnsupportedTask, match="docker-compose.yaml is not verified"):
+    task = task_variant(tmp_path, SEPARATE_TASK)
+    (task / directory).mkdir(parents=True, exist_ok=True)
+    (task / directory / name).write_text("DOCKER_HOST=tcp://task.example:2375\n" if "env" in name.casefold() else
+                                         "# nudi sentinel, not a compose definition\n")
+
+    for native in (frozenset(), ORIGINAL_BEHAVIOR):
+        with pytest.raises(UnsupportedTask, match=f"^{directory}/{name} is not verified$"):
+            select_path(task, native)
+
+
+@pytest.fixture
+def exact_names(monkeypatch, tmp_path):
+    """Lookups under tmp_path match exact names only, as on a case-sensitive source volume.
+    The snapshot's case-insensitive volume would then find these names as compose files."""
+    exists = Path.exists
+
+    def exact(path, **kwargs):
+        inside = [p for p in (path, *path.parents) if p.is_relative_to(tmp_path) and p != tmp_path]
+        return exists(path, **kwargs) and all(p.name in os.listdir(p.parent) for p in inside)
+
+    monkeypatch.setattr(Path, "exists", exact)
+
+
+# One name at a time: a case-insensitive test volume cannot hold two names that differ only in case.
+# U+212A (Kelvin sign) and U+017F (long s) casefold to k and s.
+@pytest.mark.parametrize(
+    ("directory", "name"),
+    [("tests", "Docker-Compose.YAML"), ("tests", "docKer-compose.yaml"), ("tests", "docker-compoſe.yml"),
+     ("Tests", "docker-compose.yaml"), ("steps/one/TESTS", "docker-compose.yml")],
+)
+def test_rejects_compose_names_a_case_insensitive_copy_would_find(tmp_path, exact_names, directory, name):
+    task = task_variant(tmp_path, SEPARATE_TASK)
+    if directory == "Tests":
+        (task / "tests").rename(task / "Tests")
+    (task / directory).mkdir(parents=True, exist_ok=True)
+    (task / directory / name).write_text("# nudi sentinel, not a compose definition\n")
+
+    with pytest.raises(UnsupportedTask, match=f"^{re.escape(f'{directory}/{name}')} is not verified$"):
         select_path(task, frozenset())
 
 
@@ -683,22 +735,36 @@ def test_native_storage_declaration_is_kept_and_disclosed_as_unenforced(tmp_path
     assert Task(task).config.environment.storage_mb == 4096
 
 
+@pytest.mark.parametrize("timeout", ["900.0", "1800", "0.5"])
+def test_native_path_admits_and_uses_any_finite_positive_build_timeout(tmp_path, timeout):
+    task = task_with(tmp_path, DOCKERFILE_TASK, f'schema_version = "1.4"\n[environment]\nbuild_timeout_sec = {timeout}\n')
+
+    assert select_path(task, frozenset()) == ("harbor", [DOCKERFILE])
+    assert harbor_reads(task)[1] == float(timeout)
+
+
 @pytest.mark.parametrize(
     ("tables", "environment", "reason"),
     [
-        ('[verifier.env]\nTOKEN = "literal"\n', "", r"\[verifier\]\.env"),
+        ('[verifier.env]\nTOKEN = "${HOST_TOKEN}"\n', "", r"\[verifier\]\.env"),
+        ('[verifier.env]\nTOKEN = "${HOST_TOKEN:-x}"\n', "", r"\[verifier\]\.env"),
+        ("[verifier.env]\nTOKEN = 1\n", "", r"\[verifier\]\.env"),
         ("[verifier.env.nested]\n", "", r"\[verifier\]\.env"),
         ('[solution.env]\nTOKEN = "${HOST_TOKEN}"\n', "", r"\[solution\]\.env"),
         ("[solution]\nother = 1\n", "", r"\[solution\]\.other"),
-        ("", "gpus = 1\n", r"\[environment\]\.gpus"),
+        ("", "gpus = -1\n", r"\[environment\]\.gpus"),
         ("", "gpus = false\n", r"\[environment\]\.gpus"),
         ("", "gpus = 0.0\n", r"\[environment\]\.gpus"),
         ("", 'gpus = "0"\n', r"\[environment\]\.gpus"),
         ("", "allow_internet = false\n", r"\[environment\]\.allow_internet"),
         ("", "allow_internet = 1\n", r"\[environment\]\.allow_internet"),
         ("", 'allow_internet = "true"\n', r"\[environment\]\.allow_internet"),
-        ("", "build_timeout_sec = 900.0\n", r"\[environment\]\.build_timeout_sec"),
         ("", 'build_timeout_sec = "600"\n', r"\[environment\]\.build_timeout_sec"),
+        ("", "build_timeout_sec = true\n", r"\[environment\]\.build_timeout_sec"),
+        ("", "build_timeout_sec = 0\n", r"\[environment\]\.build_timeout_sec"),
+        ("", "build_timeout_sec = -600.0\n", r"\[environment\]\.build_timeout_sec"),
+        ("", "build_timeout_sec = inf\n", r"\[environment\]\.build_timeout_sec"),
+        ("", "build_timeout_sec = nan\n", r"\[environment\]\.build_timeout_sec"),
         ("", "storage_mb = 0\n", r"\[environment\]\.storage_mb"),
         ("", "storage_mb = -1024\n", r"\[environment\]\.storage_mb"),
         ("", "storage_mb = 1024.0\n", r"\[environment\]\.storage_mb"),
@@ -708,10 +774,11 @@ def test_native_storage_declaration_is_kept_and_disclosed_as_unenforced(tmp_path
         ('[environment.env]\nTOKEN = "literal"\n', "", r"\[environment\]\.env"),
         ("[environment.env.nested]\n", "", r"\[environment\]\.env"),
         ("", "env = []\n", r"\[environment\]\.env"),
-        ("", 'mcp_servers = [{ name = "tools", transport = "stdio", command = "true" }]\n', r"\[environment\]\.mcp_servers"),
         ("", "mcp_servers = {}\n", r"\[environment\]\.mcp_servers"),
+        ("", "gpu_types = [1]\n", r"\[environment\]\.gpu_types"),
+        ("", "skills_dir = 1\n", r"\[environment\]\.skills_dir"),
+        ('[verifier]\ncollect = "true"\n', "", r"\[verifier\]\.collect"),
         # Only the approved empty collections are accepted.
-        ("", "gpu_types = []\n", r"\[environment\]\.gpu_types"),
         ("", "allowed_hosts = []\n", r"\[environment\]\.allowed_hosts"),
         ("[environment.healthcheck]\n", "", r"\[environment\]\.healthcheck"),
     ],
@@ -725,7 +792,7 @@ def test_native_path_still_rejects_unverified_values_and_types(tmp_path, tables,
 
 @pytest.mark.parametrize(
     "declaration",
-    ["gpus = 0", "allow_internet = true", "build_timeout_sec = 600.0", "storage_mb = 1024", "env = {}", "mcp_servers = []"],
+    ["gpus = 0", "allow_internet = true", "build_timeout_sec = 600.0", "build_timeout_sec = 1800", "storage_mb = 1024", "env = {}", "mcp_servers = []"],
 )
 def test_adapter_rejects_declarations_verified_only_on_native_harbor(tmp_path, declaration):
     task = task_with(
@@ -738,3 +805,254 @@ def test_adapter_rejects_declarations_verified_only_on_native_harbor(tmp_path, d
     # A requested native behavior keeps its existing fallback reason.
     path, reasons = select_path(task, frozenset({"host_harness"}))
     assert path == "harbor" and reasons[0].startswith("host-side Terminus 2 requested")
+
+
+# A separate grader's own environment, in the shape of the terminal-bench 4 tasks that declare one.
+VERIFIER_ENVIRONMENT = """\
+schema_version = "1.4"
+artifacts = ["/app/answer.txt"]
+
+[verifier]
+timeout_sec = 60.0
+
+[environment]
+docker_image = "python:3.12-slim"
+cpus = 1
+memory_mb = 512
+
+[verifier.environment]
+docker_image = "python:3.13-slim"
+cpus = 2
+memory_mb = 4096
+storage_mb = 10240
+gpus = 0
+allow_internet = true
+mcp_servers = []
+"""
+
+
+def test_a_verifier_environment_is_admitted_natively_with_harbors_definition(tmp_path):
+    from harbor.models.task.verifier_mode import resolve_verifier_environment_definition
+
+    from nudi.workflow import ORIGINAL_BEHAVIOR, declared_requirements
+
+    task = task_with(tmp_path, SEPARATE_TASK, VERIFIER_ENVIRONMENT)
+    path, reasons = select_path(task, ORIGINAL_BEHAVIOR)
+    assert path == "harbor"
+    assert "[verifier.environment].storage_mb = 10240 is recorded but not enforced" in reasons[-1]
+    with pytest.raises(UnsupportedTask, match=r"\[verifier\.environment\]\.\w+ is not verified on the Verifiers adapter"):
+        select_path(task, frozenset())
+    # Harbor's trial grades in the declared image, from the tests directory, with the tests in that image.
+    definition = resolve_verifier_environment_definition(Task(task).config, Task(task).paths)
+    assert (definition.config.docker_image, definition.config.cpus, definition.config.memory_mb) == ("python:3.13-slim", 2, 4096)
+    assert (definition.directory, definition.bundled_tests) == (Task(task).paths.tests_dir, True)
+    # Admission control counts the larger of the two containers.
+    assert declared_requirements(task) == (2, 4096)
+
+
+@pytest.mark.parametrize(
+    ("declaration", "reason"),
+    [
+        # Harbor's separate verifier enforces no internet through its egress-control sidecar, a
+        # startup path nudi's Docker sandboxes do not apply.
+        ("allow_internet = false", "allow_internet"),
+        ('os = "windows"', "os"),
+        ('network_mode = "no-network"', "network_mode"),
+        ("storage_mb = 0", "storage_mb"),
+        ("cpus = 0", "cpus"),
+        ('docker_image = ""', "docker_image"),
+        ('env = { TOKEN = "literal" }', "env"),
+        ("[verifier.environment.healthcheck]", "healthcheck"),
+        ("build_timeout_sec = 900.0", "build_timeout_sec"),  # native Harbor waits the main environment's bound
+    ],
+)
+def test_verifier_environment_fields_nudi_cannot_honor_stay_refused_by_name(tmp_path, declaration, reason):
+    key = declaration.split(" = ")[0]
+    kept = "".join(line + "\n" for line in VERIFIER_ENVIRONMENT.splitlines() if not line.startswith(key + " = "))
+    task = task_with(tmp_path, SEPARATE_TASK, kept + declaration + "\n")
+
+    with pytest.raises(UnsupportedTask, match=rf"\[verifier\.environment\]\.{reason} is not verified"):
+        select_path(task, frozenset({"shared_grading", "host_harness", "atif"}))
+
+
+@pytest.mark.parametrize("key", ["cpus", "memory_mb"])
+def test_a_verifier_environment_without_both_resources_is_refused_by_name(tmp_path, key):
+    """Native Harbor gives the verifier the main environment's limit policies, which fail without a value."""
+    kept = "".join(line + "\n" for line in VERIFIER_ENVIRONMENT.splitlines() if not line.startswith(key + " = "))
+    task = task_with(tmp_path, SEPARATE_TASK, kept)
+    with pytest.raises(UnsupportedTask, match=rf"\[verifier\.environment\]\.{key} is not declared"):
+        select_path(task, frozenset({"shared_grading", "host_harness", "atif"}))
+
+
+# Admission part 2: the fields native Harbor 0.24.0 handles itself and nudi's package path honors or does not reach.
+NATIVE_FIELDS = [
+    ('[verifier.env]\nMODE = "strict"\n', ""),
+    ("", 'gpus = 1\ngpu_types = ["H100"]\n'),
+    ("", 'skills_dir = "/skills"\n'),
+    ("", 'mcp_servers = [{ name = "tools", transport = "stdio", command = "true" }]\n'),
+    ("[[verifier.collect]]\ncommand = \"true\"\n", ""),
+]
+
+
+@pytest.mark.parametrize(("tables", "environment"), [*NATIVE_FIELDS, ("", '[environment.healthcheck]\ncommand = "true"\n')])
+def test_native_harbor_admits_the_fields_it_handles_itself(tmp_path, tables, environment):
+    from nudi.workflow import ORIGINAL_BEHAVIOR
+
+    image = 'docker_image = "python:3.12-slim"\ncpus = 1\n'
+    if environment.startswith("["):
+        image, environment = image + environment, ""
+    task = task_with(tmp_path, CONTRACT_TASK, f'schema_version = "1.4"\n{tables}[environment]\n{image}{environment}')
+
+    assert select_path(task, ORIGINAL_BEHAVIOR)[0] == "harbor"
+    with pytest.raises(UnsupportedTask, match="is not verified on the Verifiers adapter"):
+        select_path(task, frozenset())
+
+
+def test_a_verifier_build_timeout_equal_to_the_main_one_is_admitted(tmp_path):
+    from nudi.workflow import ORIGINAL_BEHAVIOR
+
+    declared = VERIFIER_ENVIRONMENT.replace("memory_mb = 512\n", "memory_mb = 512\nbuild_timeout_sec = 900\n") + "build_timeout_sec = 900.0\n"
+    task = task_with(tmp_path, SEPARATE_TASK, declared)
+    assert select_path(task, ORIGINAL_BEHAVIOR)[0] == "harbor"
+    assert Task(task).config.verifier.environment.build_timeout_sec == Task(task).config.environment.build_timeout_sec == 900
+
+
+# environment/docker-compose.yaml in the shape of the Terminal-Bench 4 tasks that declare helper services.
+COMPOSE = """\
+services:
+  main:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      helper:
+        condition: service_healthy
+    cap_add: [SYS_PTRACE]
+  helper:
+    build: ./helper
+    command: ["sh", "-c", "echo $$PATH && sleep infinity"]
+    environment:
+      - MODE=strict
+    expose: ["8080"]
+    shm_size: 1gb
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 1s
+  cache:
+    image: redis:7-alpine
+    pull_policy: missing
+    network_mode: service:helper
+    environment:
+      LEVEL: "1"
+"""
+
+
+def compose_task(tmp_path: Path, compose: str = COMPOSE) -> Path:
+    task = task_variant(tmp_path, DOCKERFILE_TASK)
+    (task / "environment" / "helper").mkdir()
+    (task / "environment" / "helper" / "Dockerfile").write_text("FROM python:3.12-slim\n")
+    (task / "environment" / "docker-compose.yaml").write_text(compose)
+    return task
+
+
+def test_a_compose_file_with_helper_services_is_admitted_natively_on_docker_only(tmp_path):
+    from nudi.runner import check_backend, compose_services
+    from nudi.workflow import ORIGINAL_BEHAVIOR, declared_requirements
+
+    task = compose_task(tmp_path)
+    assert compose_services(task) == ["cache", "helper", "main"]
+    assert select_path(task, ORIGINAL_BEHAVIOR)[0] == "harbor"
+    with pytest.raises(UnsupportedTask, match=r"docker-compose\.yaml is not verified on the Verifiers adapter"):
+        select_path(task, frozenset())
+    check_backend(task, "docker")
+    with pytest.raises(UnsupportedTask, match=r"^environment/docker-compose\.yaml is not verified on Modal$"):
+        check_backend(task, "modal")
+    # Harbor gives the declared limits to the main service only, so the helpers' needs are undeclared.
+    assert declared_requirements(task) == (None, None)
+
+
+@pytest.mark.parametrize(("change", "reason"), [
+    (("  cache:\n", "  cache:\n    volumes: [\"/:/host\"]\n"), r"services\.cache\.volumes"),
+    (("  cache:\n", "  cache:\n    env_file: .env\n"), r"services\.cache\.env_file"),
+    (("  cache:\n", "  cache:\n    privileged: true\n"), r"services\.cache\.privileged"),
+    (("services:\n", "volumes: {}\nservices:\n"), "a top level other than one services table"),
+    (("- MODE=strict", "- MODE=${HOST_TOKEN}"), "variable interpolation"),
+    (("- MODE=strict", "- MODE=$HOST_TOKEN"), "variable interpolation"),
+    (("- MODE=strict", '- "MODE=\\u0024{HOST_TOKEN}"'), "variable interpolation"),
+    (('LEVEL: "1"', '"\\u0024{HOST_TOKEN}": "1"'), "variable interpolation"),
+    (("  cache:\n", '  cache:\n    healthcheck: {test: ["CMD", "\\x24HOST_TOKEN"]}\n'), "variable interpolation"),
+    # PyYAML decodes these tags to bytes and a set, which compose-go reads as text.
+    (('LEVEL: "1"', "LEVEL: !!binary JHtIT1NUX1RPS0VOfQ=="), "a YAML bytes value"),
+    (('LEVEL: "1"', 'LEVEL: !!set {"\\u0024{HOST_TOKEN}": null}'), "a YAML set value"),
+    (("- MODE=strict", "- HOST_TOKEN"), r"services\.helper\.environment entry without a value"),
+    (('LEVEL: "1"', "LEVEL:"), r"services\.cache\.environment entry without a value"),
+    (("build: ./helper", "build: .."), r"services\.helper\.build outside environment/"),
+    (("dockerfile: Dockerfile", "dockerfile: ../task.toml"), r"services\.main\.build outside environment/"),
+    (("build: ./helper", "build: { context: ./helper, args: { A: b } }"), r"services\.helper\.build other than"),
+    (("network_mode: service:helper", "network_mode: host"), r"services\.cache\.network_mode other than"),
+    (("cap_add: [SYS_PTRACE]", "cap_add: [SYS_ADMIN]"), r"services\.main\.cap_add other than SYS_PTRACE"),
+    (("services:\n", "services: [\n"), "a file that does not parse as YAML"),
+    (("cap_add: [SYS_PTRACE]", "cap_add: [SYS_PTRACE]\n    cpus: 4.0"), r"services\.main\.cpus"),
+    (("cap_add: [SYS_PTRACE]", "cap_add: [SYS_PTRACE]\n    image: ubuntu:24.04"), r"services\.main\.image"),
+])
+def test_a_compose_file_reaching_the_host_is_refused_by_name(tmp_path, change, reason):
+    """Harbor runs compose with nudi's own environment, which contains the run's credentials."""
+    task = compose_task(tmp_path, COMPOSE.replace(*change))
+    with pytest.raises(UnsupportedTask, match=rf"^environment/docker-compose\.yaml: {reason}.* is not verified$"):
+        select_path(task, frozenset({"shared_grading", "host_harness", "atif"}))
+
+
+def test_an_escaped_dollar_stays_literal_after_yaml_decoding(tmp_path):
+    """Compose reads $$ as a literal $, also when YAML decodes it from an escape."""
+    task = compose_task(tmp_path, COMPOSE.replace("- MODE=strict", '- "MODE=\\u0024\\u0024{LITERAL}"'))
+    assert compose_services(task) == ["cache", "helper", "main"]
+
+
+@pytest.mark.parametrize(("toml", "service"), [
+    ('\n[[verifier.collect]]\nservice = "helper"\ncommand = "true"\n', "helper"),
+    ('\n[[verifier.collect]]\nservice = "db"\ncommand = "true"\n', "db"),
+    ('artifacts = [{ source = "/data/out.json", service = "db" }]\n', "db"),
+])
+def test_a_helper_service_named_outside_the_compose_file_is_refused_by_name(tmp_path, toml, service):
+    """Native Harbor refuses it before the trial starts; without compose, only main exists."""
+    from nudi.workflow import ORIGINAL_BEHAVIOR
+
+    plain = task_variant(tmp_path / "plain", DOCKERFILE_TASK)
+    (plain / "task.toml").write_text(toml + (plain / "task.toml").read_text() if toml.startswith("artifacts") else
+                                     (plain / "task.toml").read_text() + toml)
+    with pytest.raises(UnsupportedTask, match=rf"^service '{service}', named by an artifact or a \[verifier\]\.collect hook, is not a service"):
+        select_path(plain, ORIGINAL_BEHAVIOR)
+    composed = compose_task(tmp_path)
+    (composed / "task.toml").write_text(toml + (composed / "task.toml").read_text() if toml.startswith("artifacts") else
+                                        (composed / "task.toml").read_text() + toml)
+    if service == "helper":
+        assert select_path(composed, ORIGINAL_BEHAVIOR)[0] == "harbor"
+    else:
+        with pytest.raises(UnsupportedTask, match=f"service '{service}'"):
+            select_path(composed, ORIGINAL_BEHAVIOR)
+
+
+@pytest.mark.parametrize("table", ["environment", "verifier.environment"])
+def test_gpus_are_admitted_on_modal_and_refused_on_docker_by_name(tmp_path, table):
+    from nudi.runner import check_backend
+
+    declared = VERIFIER_ENVIRONMENT.replace("gpus = 0\n", "") + "gpus = 1\n" if table == "verifier.environment" else (
+        VERIFIER_ENVIRONMENT.replace("memory_mb = 512\n", "memory_mb = 512\ngpus = 1\n"))
+    task = task_with(tmp_path, SEPARATE_TASK, declared)
+    check_backend(task, "modal")
+    with pytest.raises(UnsupportedTask, match=rf"^\[{re.escape(table)}\]\.gpus = 1 is not verified on Docker$"):
+        check_backend(task, "docker")
+
+
+@pytest.mark.parametrize("artifact", ['"/manifest.json"', '"/"', '"/manifest.json/inner"',
+                                      '{ source = "/app/answer.txt", destination = "./manifest.json" }'])
+def test_an_artifact_collected_onto_the_manifest_or_the_collection_directory_is_refused(tmp_path, artifact):
+    """Harbor writes manifest.json in the collection directory after downloading, through any link left there."""
+    declared = VERIFIER_ENVIRONMENT.replace('artifacts = ["/app/answer.txt"]', f"artifacts = [{artifact}]")
+    task = task_with(tmp_path, SEPARATE_TASK, declared)
+    with pytest.raises(UnsupportedTask, match=r"artifacts\[0\] .* artifacts directory or its manifest\.json"):
+        select_path(task, frozenset({"shared_grading", "host_harness", "atif"}))
+    # Admission itself refuses it, before either path is chosen.
+    with pytest.raises(UnsupportedTask, match=r"artifacts\[0\]"):
+        select_path(task, frozenset())

@@ -1,0 +1,24 @@
+---
+config:
+  look: handDrawn
+  theme: neutral
+  fontFamily: Virgil
+  htmlLabels: false
+  flowchart:
+    wrappingWidth: 260
+---
+flowchart TD
+    S["Run simulations"] --> T["Save trajectories,<br/>outputs and rewards"]
+    T --> G["grader_inspector<br/>Check the work against task requirements"]
+    T --> R["Grader's verdict<br/>Pass or fail"]
+    G --> C["Compare inspector judgment<br/>with grader verdict"]
+    R --> C
+    C --> TP["TP<br/>Correct work passed"]
+    C --> FP["FP<br/>Incorrect work passed"]
+    C --> FN["FN<br/>Correct work failed"]
+    C --> TN["TN<br/>Incorrect work failed"]
+    C --> U["Unresolved<br/>Report separately"]
+    TP --> FDR["FDR = FP / (TP + FP)<br/>Of accepted work, how much was incorrect?"]
+    FP --> FDR
+    TP --> FNR["FNR = FN / (TP + FN)<br/>Of correct work, how much was rejected?"]
+    FN --> FNR

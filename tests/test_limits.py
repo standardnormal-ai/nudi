@@ -150,9 +150,14 @@ def test_missing_declarations_run_one_episode_with_exhaustion_warning(declared):
 
 
 @pytest.mark.parametrize("declared", [(0, 512), (-1, 512), (1, 0), (1, -512), (0, None), (None, -1)])
-def test_nonpositive_declarations_are_rejected(declared):
+def test_nonpositive_declarations_are_rejected(tmp_path, declared):
+    """On either backend: the check reads the task, not Docker's capacity."""
+    task = task_variant(tmp_path, CONTRACT_TASK)
+    lines = [f"{key} = {value}" for key, value in zip(("cpus", "memory_mb"), declared) if value is not None]
+    (task / "task.toml").write_text('schema_version = "1.4"\n[environment]\ndocker_image = "python:3.12-slim"\n'
+                                    + "\n".join(lines) + "\n")
     with pytest.raises(ValueError, match="must be positive"):
-        plan_concurrency(10, 10000, *declared)
+        declared_requirements(task)
 
 
 @pytest.mark.parametrize("environment", ["cpus = 0\nmemory_mb = 512", "cpus = 1\nmemory_mb = -512"])

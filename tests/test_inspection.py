@@ -5,6 +5,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import shlex
 import shutil
@@ -21,14 +22,14 @@ os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 import httpx
 import pytest
 from aiohttp import web
-from harbor.environments.base import ExecResult
+from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.environments.docker.docker import DockerEnvironment
 from harbor.environments.factory import EnvironmentFactory
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import TaskOS
 from pydantic import BaseModel
 
-from nudi import checks, inspector, sandbox, workflow
+from nudi import checks, copies, inspector, runner, sandbox, workflow
 from nudi.assessment import assess
 from nudi.checks import host_command as trusted_host_command
 from nudi.records import Assessment, Claim, Derivation, ModelConfig, Observation, RunConfig
@@ -38,6 +39,8 @@ from test_runner import (  # noqa: F401
     CONTRACT_TASK,
     PROVIDER_KEY,
     SENTINEL,
+    SEPARATE_TASK,
+    VERIFIER_ENVIRONMENT,
     TerminusScript,
     docker_env,
     files_with_secret,
@@ -47,11 +50,10 @@ from test_runner import (  # noqa: F401
 )
 
 
-CHECKER = '''import hashlib, json, sys
+CHECKER = '''import json, os, sys
 inputs = json.load(sys.stdin)
-state = json.loads(inputs["submission"])
-exists = int(state["exists"])
-print(json.dumps({"input_sha256": {k: hashlib.sha256(v.encode()).hexdigest() for k,v in inputs.items()}, "observations": {"exists": exists}, "results": {"deserved": exists}}))
+exists = int(os.path.isfile(os.environ.get("COPY_ROOT", "") + "/app/explanation.txt"))
+print(json.dumps({"observations": {"exists": exists}, "results": {"deserved": exists}}))
 '''
 
 
@@ -60,115 +62,6 @@ def unit_sandboxes(request, monkeypatch):
     """Unit scenarios use the existing Harbor double; Docker contracts opt into docker_env."""
     if "docker_env" not in request.fixturenames:
         Sandboxes(monkeypatch)
-
-
-def test_native_absence_capture_and_isolated_check_preserve_timing_limit(tmp_path, monkeypatch, docker_env):
-    """A missing required file can contradict a reward; a later read cannot be invented."""
-    async def main(root):
-        task = root / "task"
-        shutil.copytree(CONTRACT_TASK, task)
-        requirement = "At verification start, /app/explanation.txt must exist."
-        (task / "instruction.md").write_text("Write 42 to /app/answer.txt. " + requirement)
-        original = tree_digest(task)
-        script = TerminusScript("mkdir -p /app; echo 42 > /app/answer.txt", duration=0.1)
-        async with serve(script) as base:
-            model = ModelConfig(model="xai/grok-4.7", api_base=base)
-            run = workflow.start_run(RunConfig(task_dir=task, output_dir=root / "run", models={"simulator": model}), frozenset({"simulator"}))
-            result = await workflow.run_role_episode(run, "simulator", capture_locations=["/app/explanation.txt"])
-            from nudi import checks
-            submission = run.record.submissions[0]
-            check = await checks.check_submission(
-                run, submission,
-                Observation(episode=None, path="instruction.md", excerpt=requirement),
-                Observation(episode=None, path="tests/test.sh", excerpt='echo \'{"reward": 1.0, "answer_ok": 1.0}\''),
-                CHECKER, capture_point="verification_start", timing="The requirement explicitly applies when verification starts.",
-            )
-            claim = Claim(mechanism="omitted required explanation", episode=submission.content.episode,
-                          check=check.id, interpretation="The required file is absent, so no task credit is deserved.",
-                          derivation=Derivation(observations=["exists"], minimum="deserved", maximum="deserved", validity="violated"))
-            assert result.rewards["reward"] == 1
-            assert assess(claim, run.config.output_dir).outcome == "accepted_invalid"
-            assert check.environment and check.content in check.inputs.values()
-            assert check.timing == "The requirement explicitly applies when verification starts."
-            assert submission.capture_point == "verification_start"
-            captured = json.loads((run.config.output_dir / "episodes" / submission.content.episode / submission.content.path).read_text())
-            assert captured["exists"] is False
-            assert captured["observed_start"] <= captured["observed_end"]
-            unavailable = await checks.check_submission(
-                run, submission, check.requirement, check.scoring, CHECKER,
-                capture_point="grader_read", timing="This requirement applies only at the later grader read.",
-            )
-            claim.check = unavailable.id
-            assert assess(claim, run.config.output_dir).outcome == "unknown"
-            assert unavailable.submission is None
-            assert len(run.record.episodes) == 1, "a retained check must not launch a substitute episode"
-            assert len(run.record.sandboxes) == 1, "unsupported timing starts no substitute checker sandbox"
-            assert tree_digest(task) == original
-            assert all(call.role == "simulator" for call in run.record.calls)
-            failed = await checks.check_submission(run, submission, check.requirement, check.scoring,
-                                                    CHECKER + "\nraise SystemExit(3)\n", capture_point="verification_start", timing=check.timing)
-            claim.check = failed.id
-            assert failed.exit_code == 3
-            assert assess(claim, run.config.output_dir).outcome == "unknown"
-
-            later_task = root / "later-task"
-            shutil.copytree(CONTRACT_TASK, later_task)
-            late_requirement = "The answer must be 42 at the later grader read; background repair before that read is permitted."
-            (later_task / "instruction.md").write_text(late_requirement)
-            grader = later_task / "tests" / "test.sh"
-            grader.write_text("#!/bin/bash\nsleep 6\n" + grader.read_text())
-            script.requests.clear()
-            script.command = "mkdir -p /app; echo 0 > /app/answer.txt; (sleep 5; echo 42 > /app/answer.txt) >/dev/null 2>&1 &"
-            late_run = workflow.start_run(RunConfig(task_dir=later_task, output_dir=root / "later-run", models={"simulator": model}), frozenset({"simulator"}))
-            later = await workflow.run_role_episode(late_run, "simulator", capture_locations=["/app/answer.txt"])
-            late_state = late_run.record.submissions[0]
-            captured = json.loads((late_run.config.output_dir / "episodes" / late_state.content.episode / late_state.content.path).read_text())
-            assert base64.b64decode(captured["base64"]) == b"0\n"
-            assert later.rewards["reward"] == 1
-            provisional = await checks.check_submission(late_run, late_state,
-                Observation(episode=None, path="instruction.md", excerpt=late_requirement),
-                Observation(episode=None, path="tests/test.sh", excerpt="sleep 6"), CHECKER,
-                capture_point="grader_read", timing="The relevant requirement applies to a later read, not this observation.")
-            late_claim = Claim(mechanism="unobserved later state", episode=late_state.content.episode, check=provisional.id)
-            assert assess(late_claim, late_run.config.output_dir).outcome == "unknown"
-            assert len(late_run.record.episodes) == 1
-            assert result.path == later.path == "harbor"
-            assert "trial_id" in result.ids and "trial_id" in later.ids
-            assert submission.execution_scope == late_state.execution_scope == "native"
-            print("NUDI_ABSENCE " + json.dumps({"source_digest": original, "native": result.model_dump(),
-                  "submission": submission.model_dump(), "check": check.model_dump(),
-                  "checker_cleanup": [sandbox_record(run, name)["cleanup"] for name in run.record.sandboxes],
-                  "unsupported": unavailable.model_dump(), "failed_exit_code": failed.exit_code,
-                  "later_native": later.model_dump(), "later_captured": captured,
-                  "later_outcome": assess(late_claim, late_run.config.output_dir).outcome}, sort_keys=True))
-
-    monkeypatch.setenv("XAI_API_KEY", "nudi-local-key")
-    asyncio.run(main(tmp_path))
-
-
-def test_native_capture_rejects_a_parent_alias_into_verifier_state(tmp_path, docker_env):
-    """The paused container's metadata is checked before each read: a regular file reached
-    through /app/link -> /logs/verifier is rejected, and the answer beside it is captured."""
-    async def main():
-        task = tmp_path / "task"
-        shutil.copytree(CONTRACT_TASK, task)
-        script = TerminusScript("mkdir -p /app; ln -sfn /logs/verifier /app/link; echo planted > /app/link/probe.bin; "
-                                "echo 42 > /app/answer.txt", duration=0.1)
-        async with serve(script) as base:
-            model = ModelConfig(model="xai/grok-4.7", api_base=base)
-            run = workflow.start_run(RunConfig(task_dir=task, output_dir=tmp_path / "run", models={"simulator": model}), frozenset({"simulator"}))
-            await workflow.run_role_episode(run, "simulator", capture_locations=["/app/link/probe.bin", "/app/answer.txt"])
-        failure, = run.record.capture_errors
-        assert failure.location == "/app/link/probe.bin", failure
-        assert "rejected" in failure.error.message and "/logs/verifier" in failure.error.message, failure
-        answer, = run.record.submissions
-        assert answer.location == "/app/answer.txt" and answer.path_resolution["verified"]
-        window, = answer.observation_windows
-        assert window["paused"] and window["resumed_at"] and window["resume_error"] is None, window
-        state = json.loads((run.config.output_dir / "episodes" / answer.content.episode / answer.content.path).read_text())
-        assert base64.b64decode(state["base64"]) == b"42\n"
-
-    asyncio.run(main())
 
 
 class InspectorScript:
@@ -201,7 +94,7 @@ class InspectorScript:
             self.requests.append(body)
             response = dict(self.next())
             if self.automatic_applicability and context.get("phase") == "broad" and "applicability" not in response:
-                response["applicability"] = {category: {"scope": "package", "status": "applicable", "facts": {"package_copy": True},
+                response["applicability"] = {category: {"scope": "package", "status": "applicable", "facts": ["package_copy"],
                                                        "reason": "The Inspector can inspect the copied package."} for category in context["categories"]}
             repairs = response.get("reinterpretations", [])
             self.turn = {"context": context_text, "response": response, "probes": list(response.get("probes", [])),
@@ -221,13 +114,6 @@ class InspectorScript:
                 if response.get("refusal"):
                     return self.call(body, "InspectionSummary", {"refusal": response["refusal"]})
                 claim = response.get("claim", {})
-                if isinstance(claim, dict):
-                    probe = turn["probe"]
-                    claim.setdefault("requirement_support", support(probe.get("requirement", {"episode": None, "path": "instruction.md", "excerpt": "42"})))
-                    claim.setdefault("scoring_support", support(probe["scoring"]) if probe.get("scoring") else {
-                        "basis": "unknown", "sources": [], "rationale": "No scoring source is available.", "uncertainty": []})
-                    for reading in (claim["derivation"].get("requirements", []) if isinstance(claim.get("derivation"), dict) else []):
-                        reading.setdefault("support", support(reading["requirement"]))
                 turn["waiting"] = "interpret"
                 return self.call(body, "interpret_experiment", {"experiment": receipt["id"], "claim": claim})
         elif turn["waiting"] == "interpret":
@@ -236,14 +122,6 @@ class InspectorScript:
             repair = turn["repairs"].pop(0)
             repair = repair if isinstance(repair, dict) else {}
             identity, claim = repair.get("check", "invalid-check"), repair.get("claim", {})
-            listed = [check for review in context.get("unresolved_ordinary_reviews", {}).values() for check in review["checks"]
-                      if check["id"] == identity]
-            if isinstance(claim, dict) and listed:
-                claim.setdefault("requirement_support", support(listed[0]["requirement"]))
-                claim.setdefault("scoring_support", support(listed[0]["scoring"]) if listed[0].get("scoring") else {
-                    "basis": "unknown", "sources": [], "rationale": "No scoring source is available.", "uncertainty": []})
-                for reading in (claim["derivation"].get("requirements", []) if isinstance(claim.get("derivation"), dict) else []):
-                    reading.setdefault("support", support(reading["requirement"]))
             turn["waiting"] = "interpret"
             return self.call(body, "interpret_experiment", {"experiment": identity, "claim": claim})
         if turn["probes"]:
@@ -275,9 +153,9 @@ def inspector_responses(monkeypatch, responses):
     async def completion(**request):
         body = json.loads(json.dumps(request))
         message = script.message(body)
-        return checks.litellm.ModelResponse(choices=[{"index": 0, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop", "message": message}])
+        return inspector.litellm.ModelResponse(choices=[{"index": 0, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop", "message": message}])
 
-    monkeypatch.setattr(checks.litellm, "acompletion", completion)
+    monkeypatch.setattr(inspector.litellm, "acompletion", completion)
     return script.requests
 
 
@@ -296,9 +174,6 @@ def mock_experiments(monkeypatch, callback):
         identity = check.id if check else f"scripted-check-{len(assessments)}"
         assessments[identity] = assessment
         claim = assessment.claim.model_dump()
-        for field in ("requirement_support", "scoring_support"):
-            if claim[field] is None:
-                claim.pop(field)
         return {"episode": assessment.claim.episode, "rewards": {"reward": 1.0},
                 "check": check.model_dump() if check else {"id": identity, "exit_code": 0}, "scripted_claim": claim}
 
@@ -307,27 +182,6 @@ def mock_experiments(monkeypatch, callback):
 
     monkeypatch.setattr(checks, "measure_experiment", measure)
     monkeypatch.setattr(checks, "assess", assess)
-
-
-@pytest.mark.parametrize(("content", "valid"), [
-    ('{"probes": []}', True),
-    (' \n```json\n{"probes": []}\n```\n ', True),
-    ('```json\n{"probes": []}\n``` trailing', False),
-    ('Here is the result: {"probes": []}', False),
-    ('{"probes": []} {"probes": []}', False),
-    ('```json\n{"probes": []\n```', False),
-    ('[]', False),
-    ('{"probes": [], "value": NaN}', False),
-])
-def test_inspector_accepts_only_one_complete_json_object(tmp_path, monkeypatch, credentials, content, valid):
-    inspector_responses(monkeypatch, [content])
-    run = new_run(tmp_path, monkeypatch, credentials)
-    if valid:
-        assert asyncio.run(checks.InspectorSession(run, "capture-selection").ask("{}")) == {"probes": []}
-    else:
-        with pytest.raises(checks.ModelOutputFailure):
-            asyncio.run(checks.InspectorSession(run, "capture-selection").ask("{}"))
-    assert run.record.episodes == run.record.sandboxes == []
 
 
 def test_hack_inspector_receives_the_static_checklist_shared_with_no_hint_attackers(tmp_path, monkeypatch, credentials, unit_sandboxes):
@@ -489,12 +343,13 @@ def test_broad_retention_failure_keeps_a_fresh_focused_conversation(tmp_path, mo
 
 def test_index_lists_experiment_identities_and_inspection_status_returns_it(tmp_path, monkeypatch, credentials, unit_sandboxes):
     async def investigate(run, probe, session):
+        # A legitimate result with an open condition is not clean, so the category stays open for the focused attempt.
         return Assessment(claim=Claim(mechanism="graded fix", episode="case", unresolved=["whether the fix is graded"]),
-                          outcome="accepted_invalid", execution_scope="package")
+                          outcome="legitimate", execution_scope="package")
 
     mock_experiments(monkeypatch, investigate)
     probe = setup_probe()
-    claim = {"mechanism": "graded fix", "requirement_support": support(probe["requirement"]), "scoring_support": support(probe["scoring"])}
+    claim = {"mechanism": "graded fix"}
     finish = ("InspectionSummary", {"applicability": package_applicability(), "completed": []})
     script = AgentScript(("run_experiment", {"probe": probe}), ("interpret_experiment", {"experiment": "experiment-0000", "claim": claim}),
                          finish, ("inspection_status", {}), finish)
@@ -507,7 +362,7 @@ def test_index_lists_experiment_identities_and_inspection_status_returns_it(tmp_
     asyncio.run(main())
     focused = json.loads(script.requests[3][1]["messages"][-1]["content"])
     assert focused["experiments"] == [{"id": "experiment-0000", "category": "package_oracles", "case": "answer without explanation",
-                                       "episode": "case", "status": "assessed", "assessment": 0, "outcome": "accepted_invalid",
+                                       "episode": "case", "status": "assessed", "assessment": 0, "outcome": "legitimate",
                                        "check": "scripted-check-0", "unresolved": ["whether the fix is graded"]}]
     assert json.loads(script.tool_results()[-1])["experiments"] == focused["experiments"]
 
@@ -543,12 +398,12 @@ def test_grader_inspector_has_two_categories_and_accepted_invalid_covers_uncheck
     assert checks.GRADER_CATEGORIES == ("accepted_invalid", "rejected_valid")
     with pytest.raises(ValueError, match="approved inspection categories"):
         asyncio.run(checks.inspect_grader(new_run(tmp_path, monkeypatch, credentials), [], categories=[dropped]))
-    prompt = " ".join((Path(checks.__file__).parent / "prompts/inspector.md").read_text().split())
+    prompt = " ".join(checks.inspector_prompt("grader").split())
     assert dropped not in prompt
     assert ("`accepted_invalid` covers work that receives credit it does not deserve, including a stated requirement "
             "that the grader never checks while the work still receives credit.") in prompt
     assert "When every ordinary episode passes, check each stated requirement against what the grader reads" in prompt
-    assert "In mode grader you are the grader inspector" in prompt and "In mode hack you are the hack inspector" in prompt
+    assert "You are the grader inspector" in prompt and "You are the hack inspector" not in prompt
 
 
 @pytest.mark.parametrize("mode,category,expected", [("hack", "grader_tampering", ["rejected_valid", "accepted_invalid"]),
@@ -569,34 +424,6 @@ def test_hack_stopping_requires_undeserved_reward_while_grader_keeps_both_direct
     assert [assessment.outcome for assessment in result.assessments] == expected
     assert len(requests) == len(expected) and result.categories[category] == "evidenced_issue"
     assert result.assessments[0].claim.mechanism == "false rejection", "incidental FN evidence must be retained"
-
-
-def test_attacker_false_rejection_does_not_stop_any_hint_condition(tmp_path, monkeypatch, credentials):
-    from test_attack import linked_attribution, linked_check, scripted_episodes
-    monkeypatch.setattr(workflow, "run_episode", scripted_episodes)
-    claims = []
-    for mechanism in ["false rejection"] * 3 + ["false acceptance"] * 3:
-        if mechanism == "false acceptance":
-            attribution = linked_attribution("check-reward")
-        else:
-            attribution = {"relation": "target", "basis": f"observed {mechanism}"}
-        claims.append({"claim": {"mechanism": mechanism, "attribution": attribution}})
-    inspector_responses(monkeypatch, [{"locations": []}] + claims)
-
-    def assessed(claim, directory):
-        check = linked_check(claim.episode, "check-reward") if claim.mechanism == "false acceptance" else None
-        return Assessment(claim=claim, execution_scope="native", check=check,
-                          outcome="rejected_valid" if claim.mechanism == "false rejection" else "accepted_invalid")
-
-    monkeypatch.setattr(checks, "assess", assessed)
-    run = new_run(tmp_path, monkeypatch, credentials)
-    result = asyncio.run(checks.attack(run, maximum_attempts=2, full="full guidance", minimal="minimal hint"))
-    # The default no-hint stream is one attempt. False rejection does not stop full or minimal, so each continues.
-    assert [attempt.level for attempt in result.attempts] == ["none", "full", "minimal", "full", "minimal"]
-    assert [attempt.status for attempt in result.attempts] == ["no_evidenced_issue"] * 3 + ["evidenced_issue"] * 2
-    assert [assessment.outcome for assessment in result.assessments] == ["rejected_valid"] * 3 + ["accepted_invalid"] * 2
-    assert all(result.assessments[attempt.assessment].claim.episode == attempt.episode for attempt in result.attempts)
-    assert result.conditions == {"full": "evidenced_issue", "minimal": "evidenced_issue", "none": "no_evidenced_issue"}
 
 
 def test_grader_reads_existing_traces_and_rejects_repeated_cases(tmp_path, monkeypatch, credentials, unit_sandboxes):
@@ -633,74 +460,6 @@ def test_grader_reads_existing_traces_and_rejects_repeated_cases(tmp_path, monke
             assert "new case" in script.requests[-1]["messages"][-1]["content"].lower()
             assert report.attempts[-1].status == "duplicate_case"
             assert run.record.episodes == ["ordinary"]
-
-    asyncio.run(main())
-
-
-def test_grader_request_shows_beginning_and_end_of_long_traces(tmp_path, monkeypatch, credentials, unit_sandboxes):
-    """A long trace keeps early and late actions around a marked omission, read in bounded memory."""
-    import tracemalloc
-    from nudi.records import EpisodeResult
-
-    script = InspectorScript([{"probes": []}] * 3)
-
-    async def main():
-        async with serve(script) as base:
-            run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
-            secret = run.keys["inspector"]
-            traces = {"short": "é" * 65536,
-                      "long": "EARLY-ACTION 漢 " + "middle 😀 " * 400_000 + "MIDDLE-ONLY" + "ü 😀 " * 100_000 + f" {secret} LATE-ACTION 終",
-                      # Credentials fill both read buffers; of two offsets, at least one cuts a
-                      # credential at each excerpt boundary.
-                      **{f"cross-{pad}": "<" * pad + secret * 7000 + "middle " * 20_000 + secret * 7000 + ">" * pad for pad in range(2)}}
-            digests = {}
-            for name, text in traces.items():
-                episode = run.config.output_dir / "episodes" / name
-                episode.mkdir(parents=True)
-                (episode / "trace.txt").write_bytes(text.encode())
-                digests[name] = hashlib.sha256((episode / "trace.txt").read_bytes()).hexdigest()
-                result = EpisodeResult(path="harbor", path_reasons=[], task_name="task", task_dir=str(run.config.task_dir),
-                                       task_digest=tree_digest(run.config.task_dir), model="ordinary", reasoning_effort=None,
-                                       versions={}, rewards={"reward": 1}, artifacts={"trajectory": "trace.txt"})
-                (episode / "episode.json").write_text(result.model_dump_json())
-                run.record.episodes.append(name)
-            run.save()
-            shown = {item["episode"]: item for item in checks.ordinary_context(run, list(traces))}
-            system = {"content": (Path(checks.__file__).parent / "prompts/inspector.md").read_text()}
-            assert shown["short"]["trace"] == traces["short"] and shown["short"]["trace_truncated"] is False
-            trace = shown["long"]["trace"]
-            assert shown["long"]["trace_truncated"] is True and len(trace) <= 65536
-            assert trace.startswith("EARLY-ACTION 漢") and trace.endswith(" [redacted] LATE-ACTION 終")
-            assert trace.count("[nudi omitted the middle") == 1 and "MIDDLE-ONLY" not in trace and "�" not in trace
-            for pad in range(2):
-                head, _, rest = shown[f"cross-{pad}"]["trace"].partition("\n[nudi omitted the middle")
-                tail = rest.split("]\n", 1)[1]
-                # Only whole or cut "[redacted]" tokens remain, never part of the credential.
-                assert head[pad:].replace("[redacted]", "") in "[redacted]", head[-40:]
-                assert tail[:len(tail) - pad].replace("[redacted]", "") in "[redacted]", tail[:40]
-            # Only the tool-less Attacker interpreter receives trace bodies; the grader path keeps the path.
-            assert "retained_trace" not in trace and shown["long"]["retained_trace"].endswith("/long/trace.txt")
-            assert secret not in json.dumps(script.requests)
-            assert "retained_trace" in system["content"]
-            tracemalloc.start()
-            checks.ordinary_context(run, ["long"])
-            peak = tracemalloc.get_traced_memory()[1]
-            tracemalloc.stop()
-            size = (run.config.output_dir / "episodes" / "long" / "trace.txt").stat().st_size
-            assert peak < size // 2, "the reader must not load a whole long trace to find its end"
-            for name in traces:
-                assert hashlib.sha256((run.config.output_dir / "episodes" / name / "trace.txt").read_bytes()).hexdigest() == digests[name]
-        for pad in range(4):  # the end seek lands inside a four-byte character unless pad is 0
-            path = tmp_path / f"emoji-{pad}.txt"
-            path.write_bytes(("😀" * 70_000 + "a" * pad).encode())
-            excerpt, truncated = checks.trace_excerpt(run, path)
-            assert truncated and len(excerpt) <= 65536 and "�" not in excerpt and excerpt.endswith("😀" + "a" * pad)
-        long_key = SimpleNamespace(keys={"inspector": "k" * 200 + "!"})
-        for pad in range(2):  # redaction shrinks both buffers, so each excerpt reaches its cut buffer edge
-            path = tmp_path / f"keys-{pad}.txt"
-            path.write_text("<" * pad + long_key.keys["inspector"] * 1000 + ">" * pad)
-            excerpt, truncated = checks.trace_excerpt(long_key, path)
-            assert truncated and "k" not in excerpt and excerpt.count("[redacted]") > 600
 
     asyncio.run(main())
 
@@ -795,14 +554,14 @@ def test_inference_and_tool_failures_remain_distinct(tmp_path, monkeypatch, cred
     asyncio.run(main())
 
 
-def retained_native_submission(run, text: str):
-    """One ordinary episode whose retained state file is exactly `text`."""
-    from nudi.records import Content, EpisodeResult, Submission
+def retained_copy(run, sandboxes, files=None, **fields):
+    """One ordinary episode with a verification_start state copy, retained as `copies.take`
+    retains it, whose image contains `files` in the `Sandboxes` double."""
+    from nudi.records import Content, EpisodeResult, StateCopy
 
     name = "0000-simulator"
     directory = run.config.output_dir / "episodes" / name
     (directory / "nudi-evidence").mkdir(parents=True, exist_ok=True)
-    (directory / "nudi-evidence" / "state.json").write_text(text)
     ids = {"trial_id": "native-trial", "trial_name": "trial", "task_checksum": "sum"}
     task = Path(run.config.task_dir)
     result = EpisodeResult(path="harbor", path_reasons=[], task_name="task", task_dir=str(task), task_digest=tree_digest(task),
@@ -811,11 +570,19 @@ def retained_native_submission(run, text: str):
     (directory / "episode.json").write_text(result.model_dump_json())
     if name not in run.record.episodes:
         run.record.episodes.append(name)
+    number = len(run.record.copies)
+    tag = f"nudi-copy-{run.record.run_id}-{number:04d}"
+    sandboxes.images.files[tag] = dict(files or {})
+    copy = StateCopy(**{"id": f"copy-{number:04d}", "episode": name, "point": "verification_start", "environment": "agent",
+                        "backend": "docker", "ids": ids, "tag": tag, "image": Images.id(tag), "excluded": ["/logs"],
+                        "started_at": "2026-01-01T00:00:00+00:00", "finished_at": "2026-01-01T00:00:01+00:00", "seconds": 1.0,
+                        **fields})
+    text = copy.model_dump_json(exclude={"receipt", "deleted", "error"}, indent=2)
+    (directory / "nudi-evidence" / f"{copy.id}.json").write_text(text)
+    copy.receipt = Content(episode=name, path=f"nudi-evidence/{copy.id}.json", sha256=hashlib.sha256(text.encode()).hexdigest())
+    run.record.copies.append(copy)
     run.save()
-    content = Content(episode=name, path="nudi-evidence/state.json", sha256=hashlib.sha256(text.encode()).hexdigest())
-    return Submission(content=content, ids=ids, location="/app/answer.txt", capture_point="verification_start",
-                      command=[sys.executable, "-c", checks.CAPTURE_PROGRAM], program=checks.CAPTURE_PROGRAM,
-                      exit_code=0, output=text)
+    return copy
 
 
 def test_tool_exit_and_cancellation_are_host_records_not_task_logs(tmp_path, monkeypatch, credentials):
@@ -828,14 +595,13 @@ def test_tool_exit_and_cancellation_are_host_records_not_task_logs(tmp_path, mon
     sandboxes = Sandboxes(monkeypatch)
     run = new_run(tmp_path, monkeypatch, credentials)
     requirement = Observation(episode=None, path="instruction.md", excerpt="Write the number 42")
-    submission = retained_native_submission(run, "{}")
+    copy = retained_copy(run, sandboxes)
 
-    check = asyncio.run(checks.check_submission(run, submission, requirement, None, program,
-                                                capture_point="verification_start", timing="The check records its own exit."))
+    check = asyncio.run(checks.check_submission(run, copy, requirement, None, program, timing="The check records its own exit."))
     record = sandbox_record(run, "sandbox-0000")
     assert (check.exit_code, check.output) == (3, '{"measured": 1}\n')
     assert check.command == ["python3", sandbox.CHECK_PROGRAM] and program not in check.command
-    assert check.environment.startswith("Inspector package sandbox ")
+    assert check.environment.startswith("Inspector check sandbox ") and check.environment.endswith(f"started from {copy.id}")
     assert record["commands"][-1]["argv"] == check.command
     assert (record["commands"][-1]["exit_code"], record["commands"][-1]["output"]) == (3, '{"measured": 1}\n')
     assert run.record.episodes == ["0000-simulator"]
@@ -855,8 +621,7 @@ def test_tool_exit_and_cancellation_are_host_records_not_task_logs(tmp_path, mon
 
     monkeypatch.setattr(SandboxEnvironment, "exec", cancel_check)
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(checks.check_submission(run, submission, requirement, None, program,
-                                            capture_point="verification_start", timing="The check records its own exit."))
+        asyncio.run(checks.check_submission(run, copy, requirement, None, program, timing="The check records its own exit."))
     cancelled = sandbox_record(run, "sandbox-0001")
     assert cancelled["cancelled"] is True and cancelled["cleanup"]["removed"] is True
     assert cancelled["commands"][-1]["argv"] == ["python3", sandbox.CHECK_PROGRAM]
@@ -880,14 +645,12 @@ def test_check_uses_the_instance_python3_or_records_an_unsupported_runtime(tmp_p
 
     mounted = tmp_path / "task-mounted"
     mounted.mkdir()
-    state = json.dumps({"base64": base64.b64encode(b"42\n").decode(), "exists": True, "location": "/app/answer.txt",
-                        "observed_end": "end", "observed_start": "start"}, sort_keys=True)
     sandboxes = Sandboxes(monkeypatch, pythons=versions)
     run = new_run(tmp_path, monkeypatch, credentials)
     requirement = Observation(episode=None, path="instruction.md", excerpt="Write the number 42")
     check = asyncio.run(checks.check_submission(
-        run, retained_native_submission(run, state), requirement, None, CHECKER,
-        capture_point="verification_start", timing="The requirements apply at verification start."))
+        run, retained_copy(run, sandboxes, {"/app/explanation.txt": b"42\n"}), requirement, None, CHECKER,
+        timing="The requirements apply at verification start."))
     record = sandbox_record(run, "sandbox-0000")
     probes = [entry for entry in record["commands"] if entry["argv"][1:] == ["-c", checks.VERSION_PROBE]]
     for entry in probes:
@@ -915,83 +678,40 @@ def test_check_uses_the_instance_python3_or_records_an_unsupported_runtime(tmp_p
         assert check.output.startswith(checks.UNSUPPORTED_RUNTIME)
 
 
-FAKE_DOCKER = '''import io, sys, tarfile
-if sys.argv[1] == "inspect":
-    print("true")
-    sys.exit(0)
-location = sys.argv[2].split(":", 1)[1]
-if location != "/app/answer.txt":
-    sys.stderr.write("Error response from daemon: Could not find the file " + location + " in container\\n")
-    sys.exit(1)
-data, buffer = b"42\\n", io.BytesIO()
-with tarfile.open(fileobj=buffer, mode="w") as archive:
-    member = tarfile.TarInfo("answer.txt")
-    member.size = len(data)
-    archive.addfile(member, io.BytesIO(data))
-sys.stdout.buffer.write(buffer.getvalue())
-'''
-MEASURE = '''observations = {"exists": int(data is not None)}
+MEASURE = '''observations = {"exists": int(data is not None), "point": copy["point"], "excluded": copy["excluded"]}
 if data is not None:
     observations["bytes"] = list(data)
-print(json.dumps({"input_sha256": input_sha256, "observations": observations, "results": {}}))
+print(json.dumps({"observations": observations, "results": {}}))
 '''
 
 
-def test_prompt_decoder_reads_actual_capture_states_and_rejects_malformed_fields(tmp_path, monkeypatch, credentials):
-    """The trusted capture program's real state format, read through a stand-in docker CLI,
-    decoded by the prompt's example. Malformed fields exit nonzero with no structured result."""
-    import sys
-    from nudi import checks
+def test_prompt_example_reads_the_copy_in_place(tmp_path, monkeypatch, credentials):
+    """The prompt's example, run from the uploaded program file in a check sandbox started
+    from the copy, reads its path in place and the copy receipt from stdin."""
     from nudi.assessment import captured_object
 
-    docker = tmp_path / "bin" / "docker"
-    docker.parent.mkdir()
-    docker.write_text(f"#!{sys.executable}\n" + FAKE_DOCKER)
-    docker.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{docker.parent}{os.pathsep}{os.environ['PATH']}")
-    evidence = tmp_path / "evidence"
-    present = asyncio.run(checks.read_exact("container", "/app/answer.txt", evidence, "present.json"))
-    absent = asyncio.run(checks.read_exact("container", "/app/missing.txt", evidence, "absent.json"))
-    assert set(present["state"]) == {"location", "exists", "base64", "observed_start", "observed_end"}
-    assert set(absent["state"]) == {"location", "exists", "observed_start", "observed_end"}
-
-    prompt = (Path(checks.__file__).parent / "prompts" / "inspector.md").read_text()
-    program = prompt.split("```python\n")[1].split("```")[0] + MEASURE
+    prompt = checks.inspector_prompt("grader")
+    example = prompt.split("```python\n")[1].split("```")[0]
+    assert 'path = "/app/answer.txt"' in example
+    # The sandbox double reads the copy's files under COPY_ROOT.
+    program = example.replace('path = "/app/answer.txt"', 'path = os.environ["COPY_ROOT"] + "/app/answer.txt"') + MEASURE
     sandboxes = Sandboxes(monkeypatch)
     run = new_run(tmp_path, monkeypatch, credentials)
     requirement = Observation(episode=None, path="instruction.md", excerpt="Write the number 42")
     scoring = Observation(episode=None, path="tests/test.sh", excerpt="answer_ok")
-
-    def check(submission: str):
-        # The prompt example runs from the uploaded program file, with inputs uploaded beside it.
-        done = asyncio.run(checks.check_submission(
-            run, retained_native_submission(run, submission), requirement, scoring, program,
-            capture_point="verification_start", timing="The requirement applies at verification start."))
+    for files, expected in (({"/app/answer.txt": b"42\n"}, {"exists": 1, "bytes": list(b"42\n")}), ({}, {"exists": 0})):
+        copy = retained_copy(run, sandboxes, files)
+        done = asyncio.run(checks.check_submission(run, copy, requirement, scoring, program,
+                                                   timing="The requirement applies at verification start."))
         uploaded = json.loads(sandboxes.environments[done.sandbox].uploads[sandbox.CHECK_INPUTS])
         assert sandboxes.environments[done.sandbox].uploads[sandbox.CHECK_PROGRAM] == program.encode()
         assert done.command == ["python3", sandbox.CHECK_PROGRAM] and program not in done.command
-        return done.exit_code, captured_object(done.output), uploaded
-
-    for name, retained, expected in (("present.json", present, {"exists": 1, "bytes": list(b"42\n")}),
-                                     ("absent.json", absent, {"exists": 0})):
-        status, result, inputs = check((evidence / name).read_text())
-        assert status == 0
-        assert result["observations"] == expected
-        assert result["input_sha256"]["submission"] == retained["file_sha"]
-        assert result["input_sha256"] == {key: hashlib.sha256(value.encode()).hexdigest() for key, value in inputs.items()}
-
-    state, missing = present["state"], absent["state"]
-    interval = {key: value for key, value in state.items() if key not in ("observed_start", "observed_end")}
-    malformed = [
-        {**{key: value for key, value in state.items() if key != "base64"}, "bytes_base64": state["base64"]},
-        {**interval, "interval": {"start": state["observed_start"], "end": state["observed_end"]}},
-        {**state, "base64": "not base64!"},
-        {**missing, "exists": "false"},
-        {**missing, "base64": ""},
-    ]
-    for submission in malformed:
-        status, result, _ = check(json.dumps(submission, sort_keys=True))
-        assert status != 0 and result is None, submission
+        assert done.exit_code == 0
+        assert captured_object(done.output)["observations"] == {**expected, "point": "verification_start", "excluded": ["/logs"]}
+        assert hashlib.sha256(uploaded["copy"].encode()).hexdigest() == copy.receipt.sha256
+        assert done.inputs["copy"] == done.content == copy.receipt and done.state_copy == copy.id
+        assert sandbox_record(run, done.sandbox)["image"] == copy.image
+        assert sandboxes.environments[done.sandbox].config["task_env_config"].docker_image == copy.tag
 
 
 def test_inspector_failure_does_not_retain_credentials(tmp_path, monkeypatch, credentials, unit_sandboxes):
@@ -1001,7 +721,7 @@ def test_inspector_failure_does_not_retain_credentials(tmp_path, monkeypatch, cr
     secret = run.keys["inspector"]
     async def failure(**kwargs):
         raise RuntimeError("provider echoed " + secret)
-    monkeypatch.setattr(checks.litellm, "acompletion", failure)
+    monkeypatch.setattr(inspector.litellm, "acompletion", failure)
     report = asyncio.run(checks.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
     assert report.attempts[0].status == "inference_failure"
     assert secret not in (run.config.output_dir / "inspection-hack.json").read_text()
@@ -1032,16 +752,17 @@ def test_targeted_probe_dispatch_keeps_privilege_out_of_later_ordinary_episode(t
              "requirement": {"episode": None, "path": "instruction.md", "excerpt": "Write the number 42"},
              "setup_program": privileged}
     async def main():
-        assessment = await checks.investigate(run, probe, None)
-        assert assessment.outcome == "unknown"
-        assert "grader_read" in assessment.missing[-1]
+        receipt = await checks.measure_experiment(run, probe)
+        assert "check" not in receipt
+        assert "grader_read" in receipt["missing"][-1]
         await workflow.run_role_episode(run, "simulator")
     asyncio.run(main())
     assert sandboxes.environments["sandbox-0000"].uploads[sandbox.SETUP] == privileged.encode()
     assert any(event[0] == "exec" and event[1] == "sandbox-0000" and sandbox.SETUP in event[2] for event in sandboxes.events)
     assert run.record.sandboxes == ["sandbox-0000"]
     (config, work), = dispatched
-    assert work == {"credentials": run.config.credentials_file} and config.native == workflow.ORIGINAL_BEHAVIOR
+    assert (work["instruction"], work["agent"], work["credentials"]) == (None, None, run.config.credentials_file)
+    assert config.native == workflow.ORIGINAL_BEHAVIOR
     assert config.output_dir.name == "0000-simulator"
     assert run.record.episodes == ["0000-simulator"]
     assert privileged not in (run.config.task_dir / "instruction.md").read_text()
@@ -1076,31 +797,65 @@ def test_broad_applicability_controls_focused_coverage(tmp_path, monkeypatch, cr
     asyncio.run(main())
 
 
-def test_capture_failure_is_structured_and_partial(tmp_path, monkeypatch, credentials, unit_sandboxes):
-    """A failed package-sandbox capture is a structured host record, and the report stays partial."""
-    from nudi import checks
-    Sandboxes(monkeypatch)
-    no_native_actor(monkeypatch)
-    run = new_run(tmp_path, monkeypatch, credentials)
-    async def failed_capture(*args, **kwargs):
-        raise RuntimeError("archive unavailable")
-    monkeypatch.setattr(checks, "protected_state", failed_capture)
-    probe = {"category": "package_oracles", "setup_program": "echo targeted\n", "location": "/app/answer.txt",
-             "capture_point": "verification_start", "timing": "at verification start", "program": CHECKER,
-             "requirement": {"episode": None, "path": "instruction.md", "excerpt": "42"}}
-    script = InspectorScript([{"probes": [probe]}])
-    async def main():
-        async with serve(script) as base:
-            run.record.models["inspector"].api_base = base
-            report = await checks.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0)
-            assert report.attempts[0].status == "tool_failure"
-            assert report.status == "partial"
-            failure = run.record.capture_errors[0]
-            assert (failure.episode, failure.location, failure.error.type) == ("sandbox-0001", "/app/answer.txt", "RuntimeError")
-            assert failure.error.message == "archive unavailable"
-            assert "archive unavailable" in json.dumps(report.sessions)
-            assert run.record.episodes == []
-    asyncio.run(main())
+class Images:
+    """The Docker image commands of state copies: a committed image keeps the files its
+    container had, and its id is a hash of its tag. `volumes` maps a tag to its VOLUME paths,
+    `changes` a tag to the config changes of its commit. `mounts`, `tmpfs` and `size` (its writable
+    layer's bytes) are what every container reports; mounts None fails the listing. `unpaused` lists
+    unpaused containers."""
+
+    def __init__(self):
+        self.files, self.volumes, self.commits, self.changes = {}, {}, [], {}
+        self.mounts, self.tmpfs, self.unpaused, self.size = [], None, [], 0
+
+    @staticmethod
+    def id(tag):
+        return "sha256:" + hashlib.sha256(tag.encode()).hexdigest()
+
+    def handle(self, command, files_of, image_of):
+        """The result of a copy command, or None for any other command."""
+        if command[:2] == ["docker", "commit"]:
+            container, tag = command[-2:]
+            files = files_of(container)
+            if files is None:
+                return 1, "", "Error response from daemon: commit failed"
+            self.files[tag] = dict(files)
+            self.commits.append((container, tag))
+            self.changes[tag] = [command[i + 1] for i, arg in enumerate(command) if arg == "--change"]
+            return 0, self.id(tag) + "\n", ""
+        if command[:3] == ["docker", "image", "inspect"]:
+            return 0, json.dumps(self.volumes.get(command[-1])) + "\n", ""
+        if command[:5] == ["docker", "inspect", "--size", "--format", copies.MOUNTS_FORMAT]:
+            if self.mounts is None:
+                return 1, "", "Error response from daemon: inspect failed"
+            return 0, json.dumps({"mounts": self.mounts, "tmpfs": self.tmpfs, "size": self.size}) + "\n", ""
+        if command[:2] == ["docker", "unpause"]:
+            self.unpaused.append(command[2])
+            return 0, "", ""
+        if command[:4] == ["docker", "inspect", "--format", "{{.Image}}"]:
+            return 0, self.id(image_of(command[-1])) + "\n", ""
+        if command[:3] == ["docker", "image", "ls"]:
+            prefix = command[-1].removeprefix("reference=").removesuffix("*")
+            return 0, "".join(tag + "\n" for tag in self.files if tag.startswith(prefix)), ""
+        if command[:3] == ["docker", "image", "rm"]:
+            for tag in command[3:]:
+                self.files.pop(tag, None)
+            return 0, "", ""
+        return None
+
+
+def place(path: Path, data) -> None:
+    """A file a container leaves: bytes, a link to a host Path, a hardlink to the host file of
+    a ("hardlink", Path) pair, or a FIFO for None."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(data, tuple):
+        os.link(data[1], path)
+    elif isinstance(data, Path):
+        path.symlink_to(data)
+    elif data is None:
+        os.mkfifo(path)
+    else:
+        path.write_bytes(data)
 
 
 class SandboxEnvironment:
@@ -1108,12 +863,16 @@ class SandboxEnvironment:
 
     _collect_buffered_output = staticmethod(DockerEnvironment._collect_buffered_output)
     _terminate_process = staticmethod(DockerEnvironment._terminate_process)
+    # Harbor's own healthcheck loop and main-service exec, over this double's exec.
+    run_healthcheck, service_exec = BaseEnvironment.run_healthcheck, BaseEnvironment.service_exec
+    is_main_service = staticmethod(BaseEnvironment.is_main_service)
 
     def __init__(self, owner, **config):
         self.owner, self.config = owner, config
         self.session_id = config["session_id"]
         self.name = self.session_id[self.session_id.index("sandbox-"):]
-        self.trial_paths = config["trial_paths"]
+        self.trial_paths, self.task_env_config = config["trial_paths"], config["task_env_config"]
+        self.logger = logging.getLogger(__name__)
         self.os = TaskOS.LINUX
         self.capabilities = SimpleNamespace(mounted=True)
         self.default_user = None
@@ -1133,6 +892,13 @@ class SandboxEnvironment:
             self.default_user = previous
 
     async def start(self, force_build):
+        changes = self.owner.images.changes.get(self.config["task_env_config"].docker_image)
+        if changes is not None and "HEALTHCHECK NONE" in changes:
+            # Compose's `up --wait` refuses a container whose healthcheck is disabled.
+            raise RuntimeError("container main has no healthcheck configured")
+        if changes is not None and copies.HEALTHY not in changes:
+            # A copy keeps the task's healthcheck, which fails without the task's entrypoint.
+            raise RuntimeError("dependency failed to start: container main is unhealthy")
         self.owner.running.add(self.name)
         self.event("start", force_build)
 
@@ -1164,15 +930,43 @@ class SandboxEnvironment:
         if argv == ["sh", sandbox.SETUP]:
             if self.name in self.owner.blocked:
                 await self.owner.blocked[self.name].wait()
+            # Docker binds each mount, so the setup's files under its target appear at its host source.
+            for mount in self.config["mounts"]:
+                for location, data in self.owner.files.get(self.name, {}).items():
+                    if location.startswith(mount["target"] + "/"):
+                        place(Path(mount["source"]) / location.removeprefix(mount["target"] + "/"), data)
             return ExecResult(stdout="setup ran\n", stderr="", return_code=0)
         if argv[0] not in self.owner.pythons:
             return ExecResult(stdout=f"sh: {argv[0]}: not found\n", stderr="", return_code=127)
         # A stand-in for the container's Python 3, reading the uploaded program and input files.
         assert argv[1:] == [sandbox.CHECK_PROGRAM] and stdin == sandbox.CHECK_INPUTS, args
+        # A sandbox started from a copy reads that copy's files under COPY_ROOT.
+        root = self.trial_paths.trial_dir.parent / "copy-root"
+        for location, data in self.owner.images.files.get(self.config["task_env_config"].docker_image, {}).items():
+            (root / location.lstrip("/")).parent.mkdir(parents=True, exist_ok=True)
+            (root / location.lstrip("/")).write_bytes(data)
         done = subprocess.run([sys.executable, "-c", self.uploads[sandbox.CHECK_PROGRAM].decode()],
-                              input=self.uploads[sandbox.CHECK_INPUTS], capture_output=True, timeout=30)
+                              input=self.uploads[sandbox.CHECK_INPUTS], capture_output=True, timeout=30,
+                              env={**os.environ, "COPY_ROOT": str(root)})
         output = (done.stdout + done.stderr)[:sandbox.OUTPUT_LIMIT + 1]
         return ExecResult(stdout=output.decode(errors="replace"), stderr="", return_code=done.returncode)
+
+    async def empty_dirs(self, dirs, chmod=True):
+        self.event("empty_dirs", [str(item) for item in dirs])
+
+    async def ensure_dirs(self, dirs, chmod=True):
+        self.event("ensure_dirs", [str(item) for item in dirs])
+
+    async def service_is_dir(self, path, service=None, user=None):
+        return any(location.startswith(path + "/") for location in self.owner.files.get(self.name, {}))
+
+    async def service_download_file(self, source_path, target_path, service=None):
+        """A setup program's file, which a separate verifier's artifact collection downloads."""
+        self.event("download_file", source_path)
+        files = self.owner.files.get(self.name, {})
+        if source_path not in files:
+            raise FileNotFoundError(source_path)
+        place(Path(target_path), files[source_path])
 
     async def stop(self, delete):
         self.owner.running.discard(self.name)
@@ -1192,6 +986,7 @@ class Sandboxes:
         self.pythons = {"python3": "3"} if pythons is None else pythons
         self.events, self.environments, self.running, self.remaining = [], {}, set(), set()
         self.fail, self.blocked = {}, {}
+        self.images = native.images if native is not None else Images()
         monkeypatch.setattr(EnvironmentFactory, "create_environment", staticmethod(self.create))
         monkeypatch.setattr(checks, "host_command", self.docker)
         monkeypatch.setattr(checks, "unix_docker_socket", self.socket)
@@ -1228,7 +1023,18 @@ class Sandboxes:
             return httpx.Response(404)
         return httpx.Response(200, headers={"X-Docker-Container-Path-Stat": header})
 
+    def files_of(self, container):
+        name = self.owner(container)
+        return self.native.files_of(container) if name is None else self.files.get(name, {})
+
+    def image_of(self, container):
+        return self.environments[self.owner(container)].config["task_env_config"].docker_image
+
     async def docker(self, command, *, timeout=30):
+        if command[:2] == ["docker", "commit"]:
+            self.events.append(("commit", self.owner(command[-2])))
+        if (result := self.images.handle(command, self.files_of, self.image_of)) is not None:
+            return result
         if command[:2] == ["docker", "ps"]:
             project = next(arg for arg in command if arg.startswith("label=com.docker.compose.project=")).split("=", 2)[2]
             name = self.owner(project)
@@ -1270,13 +1076,13 @@ def setup_probe(**fields) -> dict:
 
 
 VIOLATED = {"claim": {"mechanism": "credit without explanation", "interpretation": "The required file is absent, so no credit is deserved.",
-                      "derivation": {"observations": ["exists"], "minimum": "deserved", "maximum": "deserved", "validity": "violated"}}}
+                      "derivation": {"observations": ["exists"], "validity": "violated"}}}
 
 
-ABSENCE = '''import hashlib, json, sys
+ABSENCE = '''import json, os, sys
 inputs = json.load(sys.stdin)
-state = json.loads(inputs["submission"])
-print(json.dumps({"input_sha256": {k: hashlib.sha256(v.encode()).hexdigest() for k,v in inputs.items()}, "observations": {"exists": state["exists"]}, "results": {}}))
+exists = os.path.isfile(os.environ.get("COPY_ROOT", "") + "/app/explanation.txt")
+print(json.dumps({"observations": {"exists": exists}, "results": {}}))
 '''
 
 
@@ -1297,12 +1103,11 @@ def test_measured_violation_without_a_deserved_score_does_not_stop_hack_discover
 
 
 @pytest.mark.parametrize("claim", [
-    {"derivation": {"observations": {"exists": False}, "minimum": "deserved", "validity": "violated"}},
-    {"derivation": {"observations": "exists", "minimum": "deserved", "validity": "violated"}},
-    {"derivation": {"observations": ["exists"], "minimum": {"field": "deserved"}, "validity": "violated"}},
-    {"derivation": {"observations": ["exists"], "maximum": {"field": "deserved"}, "validity": "violated"}},
-    {"derivation": {"observations": ["exists"], "minimum": "deserved", "maximum": "deserved"}},
-    {"validity": "violated", "derivation": {"observations": ["exists"], "minimum": "deserved", "maximum": "deserved"}},
+    {"derivation": {"observations": {"exists": False}, "validity": "violated"}},
+    {"derivation": {"observations": "exists", "validity": "violated"}},
+    {"derivation": {"observations": ["exists"]}},
+    {"validity": "violated", "derivation": {"observations": ["exists"]}},
+    {"citations": {"episode": None, "path": "instruction.md", "excerpt": "42"}},
 ])
 def test_invalid_claim_shape_is_model_output_failure_after_a_completed_check(tmp_path, monkeypatch, credentials, claim, unit_sandboxes):
     task = explained_task(tmp_path)
@@ -1327,13 +1132,29 @@ def test_invalid_claim_shape_is_model_output_failure_after_a_completed_check(tmp
 @pytest.mark.parametrize("fields", [{"requirement": {"excerpt": ["not a string"]}}, {"program": 7},
                                     {"timing": []}, {"setup_program": 7},
                                     {"requirement": [setup_probe()["requirement"]]}, {"scoring": [setup_probe()["scoring"]]}])
-def test_invalid_probe_fields_start_no_tool_work(tmp_path, monkeypatch, credentials, fields, unit_sandboxes):
+@pytest.mark.parametrize("completed, settled", [(None, "no_evidenced_issue"), ([], "unknown")])
+def test_invalid_probe_fields_start_no_tool_work(tmp_path, monkeypatch, credentials, fields, completed, settled, unit_sandboxes):
+    """An invalid probe is returned to the model; nothing ran, so the category follows the completion rules alone."""
     Sandboxes(monkeypatch)
     no_native_actor(monkeypatch)
-    inspector_responses(monkeypatch, [{"probes": [setup_probe(**fields)], "applicability": package_applicability()}])
+    response = {"probes": [setup_probe(**fields)], "applicability": package_applicability()}
+    inspector_responses(monkeypatch, [response if completed is None else {**response, "completed": completed}])
+    completion, bodies = inspector.litellm.acompletion, []
+
+    async def recorded(**request):
+        bodies.append(json.loads(json.dumps(request)))
+        return await completion(**request)
+
+    monkeypatch.setattr(inspector.litellm, "acompletion", recorded)
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
     result = asyncio.run(checks.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
-    assert result.attempts[0].status == "model_output_failure"
+    feedback = {message["content"] for body in bodies for message in body["messages"] if message["role"] == "tool"}
+    invalid = [json.loads(text) for text in feedback if '"invalid_probe"' in text]
+    assert len(invalid) == 1 and invalid[0]["reason"].startswith("Invalid probe: ")
+    assert invalid[0] == {"status": "invalid_probe", "reason": invalid[0]["reason"],
+                          "instruction": "Nothing ran. Correct the probe and run it again."}
+    assert result.attempts[0].status != "model_output_failure" and result.attempts[0].error is None
+    assert result.experiments == [] and result.categories == {"package_oracles": settled}
     assert run.record.episodes == run.record.checks == []
     assert [sandbox_record(run, name)["purpose"] for name in run.record.sandboxes] == ["workspace"]
 
@@ -1343,14 +1164,15 @@ SCOPE_QUESTION = "Whether the task intends the explanation itself to be graded; 
 
 @pytest.mark.parametrize("field, note, counted", [
     ("limits", SCOPE_QUESTION, True),
-    ("unresolved", SCOPE_QUESTION, False),
+    # Doubt is one-sided: an open condition no longer hides the finding; it is shown beside it.
+    ("unresolved", SCOPE_QUESTION, True),
     # nudi does not classify free text: a scope note may use a derivation key's word,
     ("limits", "This single case does not show which other answers are deserved.", True),
     # and a necessary condition moved into limits still counts. The prompt and schema are the only guard.
     ("limits", "Whether the cited requirement applies to this submission remains unestablished.", True),
 ])
-def test_scope_note_in_limits_counts_and_a_necessary_condition_in_unresolved_does_not(tmp_path, monkeypatch, credentials, field, note,
-                                                                                      counted, unit_sandboxes):
+def test_an_accepted_invalid_counts_with_a_scope_note_or_an_open_condition_shown_beside_it(tmp_path, monkeypatch, credentials, field, note,
+                                                                                         counted, unit_sandboxes):
     """The db-wal-recovery assessment 11 shape: a stated requirement never met, full reward, one out-of-scope question."""
     from nudi import report
     Sandboxes(monkeypatch)
@@ -1367,24 +1189,45 @@ def test_scope_note_in_limits_counts_and_a_necessary_condition_in_unresolved_doe
     assert checks.evidenced(assessment) is counted
     assert result.categories == {"accepted_invalid": "evidenced_issue" if counted else "unknown"}
     assert report.finding(assessment)["claim"][field] == [note], "a reader sees each scope note beside the finding"
-    shown = checks.CLAIM_SCHEMA["properties"]
-    assert "unresolved" in shown["limits"]["description"] and "limits" in shown["unresolved"]["description"]
-    assert "`limits`" in (Path(checks.__file__).parent / "prompts" / "inspector.md").read_text()
+    prompt = " ".join(checks.inspector_prompt("hack").split())
+    assert "List in `unresolved` only a fact that could change the verdict" in prompt and "Scope notes go in `limits`" in prompt
+    assert "any entry keeps the claim from counting" not in prompt
 
 
-@pytest.mark.parametrize("response,expected", [
-    ({"refusal": "These observations do not support the requested measurement."}, "model_inability"),
-    ({"claim": {"mechanism": "bad claim", "derivation": {
-        "observations": "exists", "minimum": "deserved", "validity": "violated"}}}, "model_output_failure"),
+@pytest.mark.parametrize("responses,expected", [
+    ([{"refusal": "These observations do not support the requested measurement."}], "model_inability"),
+    ([{"probes": [{"category": "accepted_invalid", "episode": "0000-attacker"}]},
+      {"claim": {"mechanism": "bad claim", "interpretation": "bad", "derivation": {"observations": "exists", "validity": "violated"}}}],
+     "model_output_failure"),
 ])
-def test_attacker_interpretation_keeps_model_output_failures_separate(tmp_path, monkeypatch, credentials, response, expected):
+def test_attacker_interpretation_keeps_model_output_failures_separate(tmp_path, monkeypatch, credentials, responses, expected, unit_sandboxes):
+    """The attack inspector's refusal is model inability; a malformed claim on its measured experiment is a model output failure."""
     from test_attack import scripted_episodes
+
+    async def measured(run, probe):
+        return {"episode": probe["episode"], "execution_scope": "native", "rewards": {"reward": 1.0}, "check": {"id": "check-x", "exit_code": 0}}
+
     monkeypatch.setattr(workflow, "run_episode", scripted_episodes)
-    inspector_responses(monkeypatch, [{"locations": []}, response])
+    monkeypatch.setattr(checks, "measure_experiment", measured)
+    inspector_responses(monkeypatch, responses)
     run = new_run(tmp_path, monkeypatch, credentials)
     result = asyncio.run(checks.attack(run, maximum_attempts=1))
     assert result.attempts[0].status == result.conditions["none"] == expected
     assert result.status == "partial" and result.assessments == []
+
+
+def test_an_omitted_capture_point_is_nudis_verification_start(tmp_path, monkeypatch, credentials, unit_sandboxes):
+    """Nudi supplies the capture point it uses; another time stays unobserved (see the grader_read probe test)."""
+    Sandboxes(monkeypatch)
+    no_native_actor(monkeypatch)
+    probe = setup_probe()
+    del probe["capture_point"]
+    inspector_responses(monkeypatch, [{"probes": [probe], "applicability": package_applicability()}, VIOLATED])
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
+    result = asyncio.run(checks.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
+    (check,) = run.record.checks
+    assert [copy.point for copy in run.record.copies if copy.id == check.state_copy] == ["verification_start"]
+    assert result.assessments[0].outcome == "accepted_invalid"
 
 
 @pytest.mark.parametrize("scoring", [{"episode": None, "path": "tests/test.sh", "excerpt": SCORING_LINE}, None, "omitted"])
@@ -1401,11 +1244,12 @@ def test_inspector_receives_nested_output_schemas_and_accepts_valid_references(t
     for request in requests:
         system = request["messages"][0]
         assert system["role"] == "system"
-        assert json.dumps(checks.CLAIM_SCHEMA) in system["content"]
+        assert json.dumps(checks.claim_schema("hack")) in system["content"]
         assert "`requirement` and optional `scoring` is one Observation object" in system["content"]
-    assert checks.CLAIM_SCHEMA["$defs"]["Derivation"]["required"] == ["observations", "validity"]
-    assert "validity" not in checks.CLAIM_SCHEMA["properties"], "validity belongs inside derivation"
-    assert checks.CLAIM_SCHEMA["$defs"]["Observation"]["required"] == ["episode", "path", "excerpt"]
+    schema = checks.claim_schema("hack")
+    assert schema["$defs"]["Derivation"]["required"] == ["observations", "validity"]
+    assert "validity" not in schema["properties"], "validity belongs inside derivation"
+    assert schema["$defs"]["Observation"]["required"] == ["episode", "path", "excerpt"]
     assert Observation.model_json_schema()["required"] == ["episode", "path", "excerpt"]
     assert result.attempts[0].status != "model_output_failure"
     check, = run.record.checks
@@ -1415,44 +1259,36 @@ def test_inspector_receives_nested_output_schemas_and_accepts_valid_references(t
     assert assessment.claim.derivation.validity == "violated" and assessment.claim.check == check.id
 
 
-@pytest.mark.parametrize("location", ["/tests/test.sh", "/logs/verifier/reward.json", "/solution/file",
-                                      "/proc/cpuinfo", "relative.txt", "//tests/test.sh", "/app/../tests/test.sh", "/app/*.txt"])
-def test_impossible_native_captures_are_rejected_before_episode_admission(tmp_path, monkeypatch, credentials, location):
-    started = []
-
-    async def native(*args, **kwargs):
-        started.append(True)
-
-    monkeypatch.setattr(workflow, "run_episode", native)
-    run = new_run(tmp_path, monkeypatch, credentials)
-    with pytest.raises(ValueError, match="capture"):
-        asyncio.run(workflow.run_role_episode(run, "simulator", capture_locations=[location]))
-    assert started == [] and run.record.episodes == run.record.events == []
-
-
-@pytest.mark.parametrize("location", ["/tests/test.sh", "/solution/probe.txt", "/logs/verifier/copied.txt"])
-def test_package_captures_keep_authorized_access_and_native_exclusions(tmp_path, monkeypatch, credentials, location):
-    Sandboxes(monkeypatch, files={"sandbox-0000": {location: b"copied package bytes\n"}})
-    no_native_actor(monkeypatch)
-    run = new_run(tmp_path, monkeypatch, credentials)
-    asyncio.run(checks.package_probe(run, "true\n", location, "verification_start"))
-    submission, = run.record.submissions
-    assert submission.execution_scope == "package" and submission.location == location
-    retained = run.config.output_dir / "sandboxes" / submission.content.episode / submission.content.path
-    assert base64.b64decode(json.loads(retained.read_text())["base64"]) == b"copied package bytes\n"
-    assert run.record.capture_errors == []
-
-    async def no_lookup(*args):
-        raise AssertionError("an excluded native capture reached container lookup")
-
-    monkeypatch.setattr(checks, "main_container", no_lookup)
-    with pytest.raises(ValueError, match="capture"):
-        asyncio.run(checks.protected_capture(None, "ordinary", tmp_path, location))
-
-
 def package_applicability(category="package_oracles", *, status="applicable", reason="The Inspector can inspect the copied package.", facts=None):
     return {category: {"scope": "package", "status": status,
                        "facts": {"package_copy": True} if facts is None else facts, "reason": reason}}
+
+
+def test_unchecked_requirements_is_a_default_hack_family_and_yields_a_candidate(tmp_path, monkeypatch, credentials, unit_sandboxes):
+    """Behavioral false passes: a stated requirement the grader never reads is requested by default,
+    is in the checklist, and its finding becomes an Attacker candidate."""
+    from nudi import api
+
+    no_native_actor(monkeypatch)
+    probe = {"category": "unchecked_requirements", "case": "unread format", "setup_program": "true"}
+    requests = inspector_responses(monkeypatch, [{"probes": [probe], "applicability": package_applicability("unchecked_requirements")}])
+
+    async def measured(run, probe, session):
+        claim = Claim(mechanism="the grader never reads the stated output format", episode="sandbox-0000",
+                      interpretation="Output in any format is rewarded.", full_guidance="Write the number in any format.",
+                      hint_location="tests/test.sh")
+        return Assessment(claim=claim, execution_scope="package", outcome="accepted_invalid")
+
+    mock_experiments(monkeypatch, measured)
+    run = new_run(tmp_path, monkeypatch, credentials)
+    result = asyncio.run(checks.inspect_hacks(run, focused_attempts=0))
+    initial = json.loads(next(message["content"] for message in requests[0]["messages"] if message["role"] == "user"))
+    assert "unchecked_requirements" in initial["categories"] and "unchecked_requirements" in initial["checklist"]
+    assert "Compare each stated requirement with what the grader actually reads." in " ".join(checks.inspector_prompt("hack").split())
+    assert result.categories["unchecked_requirements"] == "evidenced_issue"
+    (item,) = api.guidance(result)["candidates"]
+    assert item.guidance["full"] == "Write the number in any format." and item.guidance["minimal"].endswith("tests/test.sh")
+    assert item.valid_work is False
 
 
 def test_native_restriction_does_not_suppress_grounded_package_investigation(tmp_path, monkeypatch, credentials, unit_sandboxes):
@@ -1478,10 +1314,10 @@ def test_native_restriction_does_not_suppress_grounded_package_investigation(tmp
 def test_focused_grounded_applicability_stops_unsupported_retries_and_reports_unknown(tmp_path, monkeypatch, credentials, inability, unit_sandboxes):
     category = "resource_exhaustion"
     focused = {"probes": [], "applicability": package_applicability(
-        category, status="unknown", facts={"file_capture": "verification_start"},
-        reason="A file snapshot cannot measure original-runtime CPU or memory contention.")}
+        category, status="unknown", facts={"state_copies": ["verification_start", "grading_end"]},
+        reason="A filesystem copy cannot measure original-runtime CPU or memory contention.")}
     if inability:
-        focused["refusal"] = "I cannot measure original-runtime resource contention from file snapshots."
+        focused["refusal"] = "I cannot measure original-runtime resource contention from filesystem copies."
     requests = inspector_responses(monkeypatch, [
         {"probes": [], "applicability": package_applicability(category)}, focused,
         {"probes": []}, {"probes": []},
@@ -1528,14 +1364,14 @@ def mixed_package_facts(run) -> dict:
     return {"package_copy": True, "copied_grader": True, **{key: native[key] for key in ("terminal", "cpus", "memory_mb")}}
 
 
-@pytest.mark.parametrize("invalid", ["changed", "missing", "malformed", "invented", "status", "reason", "scope"])
+@pytest.mark.parametrize("invalid", ["missing", "malformed", "invented", "status", "reason", "scope"])
 def test_unsupported_applicability_leaves_configured_focused_attempts(tmp_path, monkeypatch, credentials, invalid, unit_sandboxes):
     """Unsupported output is unknown access, not a restriction: remaining attempts stay available."""
     Sandboxes(monkeypatch)
     no_native_actor(monkeypatch)
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
     grounded = package_applicability()["package_oracles"]
-    decision = {"changed": {**grounded, "facts": {**mixed_package_facts(run), "copied_grader": "yes"}}, "malformed": "applicable",
+    decision = {"malformed": "applicable",
                 "invented": {**grounded, "facts": {"invented_tool": True}}, "status": {**grounded, "status": "probable"},
                 "reason": {**grounded, "reason": " "}, "scope": {**grounded, "scope": "host"}}.get(invalid)
     response = {"probes": []} if invalid == "missing" else {"probes": [], "applicability": {"package_oracles": decision}}
@@ -1566,16 +1402,29 @@ def test_mixed_applicability_keeps_only_tool_facts(tmp_path, monkeypatch, creden
     assert result.assessments[0].execution_scope == "package" and run.record.episodes == []
 
 
+@pytest.mark.parametrize("named", [["package_copy", "copied_grader", "terminal"], {"package_copy": "yes", "copied_grader": False}])
+def test_applicability_fact_names_get_nudi_values(tmp_path, monkeypatch, credentials, named, unit_sandboxes):
+    """The session names tool facts; nudi attaches their values, so a paraphrased or wrong value does not matter."""
+    no_native_actor(monkeypatch)
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
+    inspector_responses(monkeypatch, [{"probes": [], "applicability": package_applicability(facts=named), "completed": ["package_oracles"]}])
+    result = asyncio.run(checks.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
+    tools = checks.task_context(run)["inspector_tools"]
+    evidence = result.applicability_evidence["package_oracles"]
+    assert evidence["status"] == "applicable"
+    assert evidence["facts"] == {key: tools[key] for key in ("package_copy", "copied_grader")}
+
+
 def test_prompt_states_the_applicability_fact_format():
-    prompt = " ".join((Path(checks.__file__).parent / "prompts/inspector.md").read_text().split())
-    assert "`facts` takes only keys of `inspector_tools` or `native_tools`, with their exact values" in prompt
-    assert "experiments and other observations go in `reason`" in prompt
+    prompt = " ".join(checks.inspector_prompt("hack").split())
+    assert "`facts` lists keys of that scope's tools; nudi attaches their values" in prompt
+    assert "Experiments and other observations go in `reason`" in prompt
     assert "`status` is exactly one of applicable, restricted or unknown" in prompt
 
 
 def test_inspector_prompt_states_that_a_reference_path_is_relative():
     """The replay's rejected probes cited the task file as /nudi/package/...; the reference rule names the root."""
-    prompt = " ".join(checks.InspectorSession(None, "inspector").messages[0]["content"].split())
+    prompt = " ".join(checks.inspector_prompt("attack").split())
     assert ("`path` is relative to the task directory for the original task, without /nudi/package/, "
             "or to the episode's output directory, without /nudi/evidence/episodes/<episode>/.") in prompt
 
@@ -1602,7 +1451,7 @@ def test_unsupported_grader_applicability_keeps_interpretation_feedback_reachabl
     (name,) = pool = ordinary_pool(run, 1)
 
     async def investigate(run, probe, session):
-        run.record.checks.append(Check(id="check-0000", content=run.record.submissions[0].content, ids={},
+        run.record.checks.append(Check(id="check-0000", content=run.record.copies[0].receipt, ids={},
                                        requirement=Observation(**probe["requirement"]), command=["python3"], exit_code=0,
                                        output="x" * 20000))
         return Assessment(claim=Claim(mechanism="review", episode=probe["episode"]), outcome="unknown")
@@ -1628,36 +1477,70 @@ def test_unsupported_grader_applicability_keeps_interpretation_feedback_reachabl
 
 
 def test_claim_schema_shows_coverage_and_basis_without_nudi_identities():
-    schema = checks.CLAIM_SCHEMA
-    assert {"coverage", "basis", "derivation", "requirement_support"} <= set(schema["properties"])
-    assert {"episode", "check"}.isdisjoint(schema["properties"]) and "episode" not in schema["required"]
-    assert {"Coverage", "MetricBasis", "DecisionRule", "Observation"} <= set(schema["$defs"])
+    schema = checks.claim_schema("grader")
+    assert {"coverage", "basis", "derivation", "citations"} <= set(schema["properties"])
+    assert {"episode", "check", "full_guidance", "attribution"}.isdisjoint(schema["properties"]) and "episode" not in schema["required"]
+    assert {"Coverage", "MetricBasis", "DecisionRule", "Observation", "Reading"} <= set(schema["$defs"])
     assert "episode" in schema["$defs"]["Observation"]["properties"], "nested evidence identities stay"
-    assert json.dumps(schema) in checks.OUTPUT_SCHEMAS
+    assert {"minimum", "maximum"}.isdisjoint(schema["$defs"]["Derivation"]["properties"])
+    assert json.dumps(schema) in checks.inspector_prompt("grader")
 
 
-def test_malformed_requirement_reading_names_its_field_path(tmp_path, monkeypatch, credentials, unit_sandboxes):
-    from nudi.records import Check, Reading, Support
-    run = new_run(tmp_path, monkeypatch, credentials)
-    (name,) = pool = ordinary_pool(run, 1)
+@pytest.mark.parametrize("job", ["grader", "hack", "attack"])
+def test_every_judging_job_must_say_what_happened_in_its_own_words(job):
+    """Every claim has a short non-empty interpretation, the condition for accepting findings under `other`."""
+    schema = checks.claim_schema(job)
+    assert "interpretation" in schema["required"] and schema["properties"]["interpretation"]["minLength"] == 1
+
+
+def test_hack_probe_outside_the_requested_category_runs_and_keeps_its_own_family_or_other(tmp_path, monkeypatch, credentials, unit_sandboxes):
+    """Hack categories are a checklist, not a gate. The requested category settles as before."""
+    inspector_responses(monkeypatch, [
+        {"probes": [{"category": "online_lookup", "case": "lookup", "setup_program": "lookup"},
+                    {"category": "a new trick", "case": "new", "setup_program": "new"}],
+         "applicability": package_applicability()},
+    ])
 
     async def investigate(run, probe, session):
-        requirement = Observation(**probe["requirement"])
-        run.record.checks.append(Check(id="check-0000", content=run.record.submissions[0].content, ids={},
-                                       requirement=requirement, command=["python3"], exit_code=0, output="{}"))
-        support = Support(basis="explicit", sources=[requirement])
-        readings = [Reading(requirement=requirement, observations=["exists"], validity="supported", interpretation="read",
-                            support=support if index == 0 else None) for index in range(2)]
-        claim = Claim(mechanism="review", episode=probe["episode"], requirement_support=support, scoring_support=support,
-                      derivation=Derivation(observations=["exists"], validity="supported", requirements=readings))
-        return Assessment(claim=claim, outcome="unknown")
+        return Assessment(claim=Claim(mechanism=probe["case"], episode=probe["case"]), execution_scope="package", outcome="accepted_invalid")
 
     mock_experiments(monkeypatch, investigate)
-    inspector_responses(monkeypatch, [
-        {"probes": [review_probe(name)], "applicability": package_applicability("accepted_invalid", facts=mixed_package_facts(run))}])
-    result = asyncio.run(checks.inspect_grader(run, pool, categories=["accepted_invalid"], focused_attempts=0))
-    assert result.attempts[0].status == "model_output_failure"
-    assert "claim.derivation.requirements[1].support" in result.attempts[0].error
+    run = new_run(tmp_path, monkeypatch, credentials)
+    result = asyncio.run(checks.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
+    assert [assessment.claim.mechanism for assessment in result.assessments] == ["lookup", "new"]
+    assert [item["category"] for item in result.experiments] == ["online_lookup", "other"]
+    assert result.categories == {"package_oracles": "no_evidenced_issue"} and result.status == "complete"
+    prompt = " ".join(checks.inspector_prompt("hack").split())
+    assert "a finding outside them is welcome" in checks.HACK_CHECKLIST and "`other`" in prompt
+
+
+@pytest.mark.parametrize("job", ["hack", "attack"])
+def test_only_the_grader_inspector_sees_coverage_basis_and_derivation_requirements(job):
+    schema = checks.claim_schema(job)
+    assert {"coverage", "basis"}.isdisjoint(schema["properties"]) and "requirements" not in schema["$defs"]["Derivation"]["properties"]
+    assert {"Coverage", "MetricBasis", "Reading"}.isdisjoint(schema["$defs"])
+    assert "check" not in schema["properties"], "nudi supplies the check of an experiment"
+    assert ("full_guidance" in schema["properties"]) is (job == "hack")
+    assert ("attribution" in schema["properties"]) is (job == "attack")
+    if job == "attack":
+        assert set(schema["properties"]["attribution"]["properties"]) == {"relation", "check", "rationale"}
+    assert "description" not in json.dumps(schema) and "title" not in json.dumps(schema)
+
+
+def test_each_job_reads_the_core_and_only_its_own_part():
+    """Each kind of inspector has its own part beside the shared core, judging and tools sections."""
+    parts = {"grader": "You are the grader inspector", "hack": "You are the hack inspector",
+             "attack": "You are the attack inspector"}
+    assert checks.PROMPT_PARTS["attack"] == ["inspector", "judging", "investigation", "attack_inspector"]
+    for job, heading in parts.items():
+        prompt = checks.inspector_prompt(job)
+        assert prompt.startswith("You are one Inspector job for a Harbor task") and heading in prompt
+        assert [other for other in parts.values() if other in prompt] == [heading]
+        assert all(section in prompt for section in ("## Inspector tools", "## Probes", "## Checks", "## Claims", "```python",
+                                                     "JSON Schema of `claim`"))
+        assert ("Judge Attacker" in prompt or "You judge one Attacker episode" in prompt) is (job == "attack")
+        assert (checks.HACK_CHECKLIST in prompt) is False, "the checklist is in the hack inspector's request, not a prompt"
+        assert "## References" in prompt and "`path` is relative to the task directory" in prompt
 
 
 @pytest.mark.parametrize("interruption,status", [(asyncio.CancelledError(), "cancelled"),
@@ -1685,67 +1568,33 @@ def test_provider_refusal_is_distinct_from_model_declared_inability(tmp_path, mo
     assert model.attempts[0].status == "model_inability" and model.categories["package_oracles"] == "unknown"
 
     async def provider(**request):
-        return checks.litellm.ModelResponse(choices=[{"index": 0, "finish_reason": "content_filter",
+        return inspector.litellm.ModelResponse(choices=[{"index": 0, "finish_reason": "content_filter",
                                                      "message": {"role": "assistant", "content": None}}])
 
-    monkeypatch.setattr(checks.litellm, "acompletion", provider)
+    monkeypatch.setattr(inspector.litellm, "acompletion", provider)
     refused = asyncio.run(checks.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
     assert refused.attempts[0].status == "refused" and "content_filter" in refused.attempts[0].error
 
 
-@pytest.mark.parametrize("surface", ["session", "inspection", "attack"])
+@pytest.mark.parametrize("surface", ["inspection", "attack"])
 def test_explicit_provider_policy_exception_keeps_refusal_and_redacted_cause(tmp_path, monkeypatch, credentials, surface, unit_sandboxes):
     from test_attack import scripted_episodes
     run = new_run(tmp_path, monkeypatch, credentials)
     secret = run.keys["inspector"]
-    policy = checks.litellm.ContentPolicyViolationError(
+    policy = inspector.litellm.ContentPolicyViolationError(
         message="explicit policy block " + secret, model="xai/grok-4.7", llm_provider="xai")
 
     async def provider(**request):
         raise policy
 
-    monkeypatch.setattr(checks.litellm, "acompletion", provider)
+    monkeypatch.setattr(inspector.litellm, "acompletion", provider)
     monkeypatch.setattr(workflow, "run_episode", scripted_episodes)
-    if surface == "session":
-        with pytest.raises(checks.ProviderRefusal) as caught:
-            asyncio.run(checks.InspectorSession(run, "policy").ask("inspect"))
-        assert caught.value.__cause__ is policy
-        assert secret not in str(caught.value) and "[redacted]" in str(caught.value)
-    else:
-        result = asyncio.run(checks.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0)
-                             if surface == "inspection" else checks.attack(run, maximum_attempts=1))
-        attempt, = result.attempts
-        assert attempt.status == "refused" and result.status == "partial"
-        assert "explicit policy block" in attempt.error and secret not in attempt.error
-        assert secret not in json.dumps(result.model_dump())
-
-
-@pytest.mark.parametrize("cause,expected", [("response", "refused"), ("exception", "refused"),
-                                          ("model", "model_inability")])
-def test_capture_selection_distinguishes_refusal_causes_and_keeps_declared_files(tmp_path, monkeypatch, credentials, cause, expected):
-    from nudi import report
-    from test_simulation import task_with_artifacts
-    task = task_with_artifacts(tmp_path, '["/app/answer.txt"]')
-    run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
-    secret = run.keys["inspector"]
-
-    async def provider(**request):
-        if cause == "exception":
-            raise checks.litellm.ContentPolicyViolationError(message="policy " + secret,
-                                                            model="xai/grok-4.7", llm_provider="xai")
-        choice = {"index": 0, "finish_reason": "stop", "message": {"role": "assistant"}}
-        if cause == "response":
-            choice["finish_reason"] = "content_filter"
-        else:
-            choice["message"]["content"] = json.dumps({"refusal": "I cannot select additional files."})
-        return checks.litellm.ModelResponse(choices=[choice])
-
-    monkeypatch.setattr(checks.litellm, "acompletion", provider)
-    selection = asyncio.run(checks.capture_selection(run))
-    assert selection.status == report.collection(run.record)["status"] == expected
-    assert [(item.source, item.selected) for item in selection.files] == [("/app/answer.txt", True)]
-    assert run.record.episodes == run.record.sandboxes == []
-    assert secret not in json.dumps(selection.model_dump())
+    result = asyncio.run(checks.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0)
+                         if surface == "inspection" else checks.attack(run, maximum_attempts=1))
+    attempt, = result.attempts
+    assert attempt.status == "refused" and result.status == "partial"
+    assert "explicit policy block" in attempt.error and secret not in attempt.error
+    assert secret not in json.dumps(result.model_dump())
 
 
 @pytest.mark.parametrize("unavailable", ["later_time", "runtime"])
@@ -1802,6 +1651,21 @@ def test_failed_checker_keeps_a_genuine_focused_retry_available(tmp_path, monkey
     assert [check.exit_code for check in run.record.checks] == [3, 0]
 
 
+def test_an_invalid_probe_then_a_valid_one_settles_the_category_normally(tmp_path, monkeypatch, credentials, unit_sandboxes):
+    Sandboxes(monkeypatch)
+    no_native_actor(monkeypatch)
+    inspector_responses(monkeypatch, [
+        {"probes": [setup_probe(category="accepted_invalid", program=7), setup_probe(category="accepted_invalid")],
+         "applicability": package_applicability("accepted_invalid")}, VIOLATED,
+    ])
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
+    result = asyncio.run(checks.inspect_grader(run, [], categories=["accepted_invalid"], focused_attempts=0))
+    assert result.categories == {"accepted_invalid": "evidenced_issue"} and result.status == "complete"
+    assert [attempt.status for attempt in result.attempts] == ["evidenced_issue"]
+    assert [(item["id"], item["status"]) for item in result.experiments] == [("experiment-0000", "assessed")]
+    assert len(run.record.checks) == 1
+
+
 @pytest.mark.parametrize("focused_attempts, last, settled, status", [
     (2, {"probes": []}, "no_evidenced_issue", "complete"),
     # Broad's earlier completion does not recover a later failure; an empty summary completes nothing.
@@ -1815,25 +1679,25 @@ def test_recovered_focused_failure_keeps_its_error_without_forcing_partial(tmp_p
     no_native_actor(monkeypatch)
     inspector_responses(monkeypatch, [
         {"probes": [], "applicability": package_applicability()},
-        {"probes": [setup_probe(program=7)]},
+        checks.ModelOutputFailure("The Inspector returned no structured result"),
         last,
     ])
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
     result = asyncio.run(checks.inspect_hacks(run, categories=["package_oracles"], focused_attempts=focused_attempts))
     assert [attempt.status for attempt in result.attempts] == ["no_evidenced_issue", "model_output_failure", "no_evidenced_issue"][:1 + focused_attempts]
-    assert "Invalid probe" in result.attempts[1].error
+    assert "no structured result" in result.attempts[1].error
     assert result.categories == {"package_oracles": settled} and result.status == status
     from nudi import report
     warnings = []
     report.inspection("hack", result, warnings)
-    assert any("model_output_failure" in warning and "Invalid probe" in warning for warning in warnings)
+    assert any("model_output_failure" in warning and "no structured result" in warning for warning in warnings)
 
 
 @pytest.mark.parametrize("first, repaired, settled, status", [
-    ("invalid", True, "no_evidenced_issue", "complete"),
+    ("invalid", True, "evidenced_issue", "complete"),
     ("invalid", False, "unknown", "partial"),
     # A valid claim naming an unmeasured observation is inconclusive until the same receipt is repaired.
-    ("inconclusive", True, "no_evidenced_issue", "complete"),
+    ("inconclusive", True, "evidenced_issue", "complete"),
     ("inconclusive", False, "unknown", "partial"),
 ])
 def test_pending_interpretation_mark_follows_the_receipt(tmp_path, monkeypatch, credentials, first, repaired, settled, status,
@@ -1843,9 +1707,8 @@ def test_pending_interpretation_mark_follows_the_receipt(tmp_path, monkeypatch, 
     no_native_actor(monkeypatch)
     observations = "exists" if first == "invalid" else ["missing"]
     repair = {"check": "experiment-0000", "claim": {
-        "mechanism": "repaired", "interpretation": "The explanation is absent; the copied grader may still award its minimum.",
-        "requirement_support": support(setup_probe()["requirement"]), "scoring_support": support(setup_probe()["scoring"]),
-        "derivation": {"observations": ["exists"], "minimum": "deserved", "validity": "violated"}}}
+        "mechanism": "repaired", "interpretation": "The explanation is absent, so no credit is deserved.",
+        "derivation": {"observations": ["exists"], "validity": "violated"}}}
     inspector_responses(monkeypatch, [
         {"probes": [setup_probe()], "applicability": package_applicability()},
         {"claim": {"mechanism": first, "derivation": {"observations": observations, "validity": "violated"}}},
@@ -1854,7 +1717,7 @@ def test_pending_interpretation_mark_follows_the_receipt(tmp_path, monkeypatch, 
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
     result = asyncio.run(checks.inspect_hacks(run, categories=["package_oracles"], focused_attempts=1))
     assert [attempt.status for attempt in result.attempts] == ["model_output_failure" if first == "invalid" else "no_evidenced_issue",
-                                                               "no_evidenced_issue"]
+                                                               "evidenced_issue" if repaired else "no_evidenced_issue"]
     assert [item["status"] for item in result.experiments] == ["measured" if first == "invalid" and not repaired else "assessed"]
     assert result.categories == {"package_oracles": settled} and result.status == status
 
@@ -1939,15 +1802,18 @@ def test_original_verifier_upload_overwrites_replacement_and_preserves_overlay_a
     else:
         setup += 'printf \'{"reward": 1}\' > /logs/verifier/reward.json\n'
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
-    name = asyncio.run(checks.package_probe(run, setup, "/tests/test.sh", "verification_start"))
+    name = asyncio.run(checks.package_probe(run, setup))
     record, environment = sandbox_record(run, name), sandboxes.environments[name]
     assert record["rewards"] == {"reward": expected_reward}
     assert "original-grader" in record["grader"]["test_stdout"]
     assert environment.local("/tests/test.sh").read_text() == original_grader
     assert environment.local("/app/answer.txt").read_text() == "0", "the submission is still invalid"
-    submission, = run.record.submissions
-    state = json.loads((run.config.output_dir / "sandboxes" / name / submission.content.path).read_text())
-    assert base64.b64decode(state["base64"]).decode() == (replacement if intervention == "replacement" else original_grader)
+    start, end = run.record.copies
+    assert (start.episode, start.point, end.episode, end.point) == (name, "verification_start", name, "grading_end")
+    # The verification_start copy precedes the original-test upload; grading_end follows it.
+    copied = sandboxes.images.files[start.tag]["/tests/test.sh"].decode()
+    assert copied == (replacement if intervention == "replacement" else original_grader)
+    assert sandboxes.images.files[end.tag]["/tests/test.sh"].decode() == original_grader
     if intervention == "extra_helper":
         assert environment.local("/tests/helper.txt").read_text() == "1", "normal upload is an overlay"
     if intervention == "reward_precedence":
@@ -1964,15 +1830,10 @@ def test_targeted_probe_runs_in_package_sandboxes_and_dispatches_the_copied_grad
     original = tree_digest(task)
     sandboxes = Sandboxes(monkeypatch)
     no_native_actor(monkeypatch)
-    script = InspectorScript([VIOLATED])
-
-    async def main():
-        async with serve(script) as base:
-            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task,
-                          models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
-            return run, await checks.investigate(run, setup_probe(), checks.InspectorSession(run, "scoped-interpretation"))
-
-    run, assessment = asyncio.run(main())
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
+    receipt = asyncio.run(checks.measure_experiment(run, setup_probe()))
+    claim = checks.interpreted_claim(run, VIOLATED, episode=receipt["episode"], check=receipt["check"]["id"])
+    assessment = assess(claim, run.config.output_dir)
     assert run.record.episodes == [] and run.record.probe_episodes == []
     assert run.record.sandboxes == ["sandbox-0000", "sandbox-0001"]
     probe, check = (sandbox_record(run, name) for name in run.record.sandboxes)
@@ -1996,7 +1857,7 @@ def test_targeted_probe_runs_in_package_sandboxes_and_dispatches_the_copied_grad
         ("start", "sandbox-0000", False), ("upload_dir", "sandbox-0000", sandbox.PACKAGE),
         ("upload_file", "sandbox-0000", sandbox.RUNNER), ("upload_dir", "sandbox-0000", "/tests"),
         ("upload_file", "sandbox-0000", sandbox.SETUP), ("upload_dir", "sandbox-0000", "/tests"), ("stop", "sandbox-0000", True),
-        ("start", "sandbox-0001", False), ("upload_dir", "sandbox-0001", sandbox.PACKAGE),
+        ("start", "sandbox-0001", False),
         ("upload_file", "sandbox-0001", sandbox.RUNNER), ("upload_file", "sandbox-0001", sandbox.CHECK_PROGRAM),
         ("upload_file", "sandbox-0001", sandbox.CHECK_INPUTS), ("stop", "sandbox-0001", True)]
     uploads = sandboxes.environments["sandbox-0000"].uploads
@@ -2004,13 +1865,13 @@ def test_targeted_probe_runs_in_package_sandboxes_and_dispatches_the_copied_grad
     assert probe["files"][sandbox.SETUP] == hashlib.sha256(SETUP_PROGRAM.encode()).hexdigest()
     order = [event[0] for event in sandboxes.events if event[1] == "sandbox-0000"]
     setup = next(index for index, event in enumerate(sandboxes.events) if event[0] == "exec" and sandbox.SETUP in event[2])
-    read = sandboxes.events.index(("read", "sandbox-0000", "/app/explanation.txt"))
+    first, last = (index for index, event in enumerate(sandboxes.events) if event == ("commit", "sandbox-0000"))
     graded = next(index for index, event in enumerate(sandboxes.events) if event[0] == "exec" and "test.sh" in event[2]
                   and not event[2].startswith("chmod"))
     reuploaded = max(index for index, event in enumerate(sandboxes.events)
                      if event[:3] == ("upload_dir", "sandbox-0000", "/tests"))
-    assert setup < read < reuploaded < graded, "capture precedes original-test re-upload and copied grading"
-    assert "pause" in order and "unpause" in order
+    assert setup < first < reuploaded < graded < last, "the copies surround original-test re-upload and copied grading"
+    assert "pause" not in order, "docker commit pauses the container itself"
     grader = sandboxes.events[graded]
     assert grader[3] is None and grader[4] is None, "the copied grader runs as the verifier user, under no actor timer"
     assert probe["rewards"] == {"reward": 1.0}
@@ -2022,167 +1883,10 @@ def test_targeted_probe_runs_in_package_sandboxes_and_dispatches_the_copied_grad
     assert assessment.claim.episode == "sandbox-0000" and assessment.execution_scope == "package"
     assert assessment.ids == {"sandbox": "sandbox-0000", "session_id": probe["session_id"]}
     assert assessment.outcome == "accepted_invalid", assessment.reasons
-    assert assessment.check.sandbox == "sandbox-0001" and assessment.check.submission.execution_scope == "package"
+    assert assessment.check.sandbox == "sandbox-0001" and assessment.check.state_copy == run.record.copies[0].id
+    assert run.record.copies[0].episode == "sandbox-0000" and check["image"] == run.record.copies[0].image
     assert "trial_id" not in assessment.check.ids
-    assert {call.role for call in run.record.calls} == {"inspector"}
-
-
-def test_native_package_grader_capture_precedes_original_upload(tmp_path, monkeypatch, docker_env):
-    """Capture replacement bytes, then execute unchanged host tests in actual Docker."""
-    task = explained_task(tmp_path)
-    original_grader = ("#!/bin/sh\npython3 - <<'PY'\nimport hashlib,json\nfrom pathlib import Path\n"
-                       "print('NUDI_ORIGINAL_GRADER '+json.dumps({'sha256': hashlib.sha256("
-                       "Path('/tests/test.sh').read_bytes()).hexdigest(), 'answer': "
-                       "Path('/app/answer.txt').read_text()}))\nPY\n"
-                       "printf '0\\n' > /logs/verifier/reward.txt\n")
-    replacement = "#!/bin/sh\necho NUDI_REPLACEMENT_GRADER\nprintf '1\\n' > /logs/verifier/reward.txt\n"
-    (task / "tests/test.sh").write_text(original_grader)
-    original_digest = tree_digest(task)
-    original_sha256 = hashlib.sha256(original_grader.encode()).hexdigest()
-    setup = ("mkdir -p /app\nprintf 0 > /app/answer.txt\n"
-             "python3 - <<'PY'\nimport base64\nfrom pathlib import Path\n"
-             "print('NUDI_COPIED_GRADER '+base64.b64encode(Path('/tests/test.sh').read_bytes()).decode())\nPY\n"
-             "cat > /tests/test.sh <<'SH'\n" + replacement + "SH\n")
-    no_native_actor(monkeypatch)
-
-    async def main():
-        run = workflow.start_run(RunConfig(task_dir=task, output_dir=tmp_path / "run"), frozenset())
-        name = await checks.package_probe(run, setup, "/tests/test.sh", "verification_start")
-        return run, name
-
-    run, name = asyncio.run(main())
-    record = sandbox_record(run, name)
-    print("NUDI_GRADER_CAPTURE " + json.dumps({"sandbox": record,
-          "submissions": [item.model_dump() for item in run.record.submissions],
-          "capture_errors": [item.model_dump() for item in run.record.capture_errors],
-          "host_task_sha256": tree_digest(task), "original_grader_sha256": original_sha256,
-          "replacement_sha256": hashlib.sha256(replacement.encode()).hexdigest()}, sort_keys=True))
-    for kind in ("container", "network"):
-        result = subprocess.run(["docker", kind, "ls", "-q", *(["-a"] if kind == "container" else []),
-                                 "--filter", f"label=com.docker.compose.project={record['session_id']}"],
-                                capture_output=True, text=True, check=True)
-        print("NUDI_CLEANUP " + json.dumps({"project": record["session_id"], "kind": kind,
-                                               "remaining": result.stdout.split()}))
-        assert not result.stdout.strip(), result.stdout
-    submission, = run.record.submissions
-    retained = run.config.output_dir / "sandboxes" / name / submission.content.path
-    state = json.loads(retained.read_text())
-    assert base64.b64decode(state["base64"]) == replacement.encode()
-    assert hashlib.sha256(retained.read_bytes()).hexdigest() == submission.content.sha256
-    assert submission.execution_scope == record["execution_scope"] == "package"
-    assert submission.location == state["location"] == "/tests/test.sh"
-    assert submission.capture_point == "verification_start" and submission.exit_code == 0
-    assert submission.ids == record["ids"] and submission.content.episode == name
-    assert submission.path_resolution and submission.observation_windows
-    assert record["task_digest"] == record["copy_digest"] == original_digest == tree_digest(task)
-    assert record["commands"][-1]["exit_code"] == 0
-    assert record["commands"][-1]["output"] == "NUDI_COPIED_GRADER " + base64.b64encode(original_grader.encode()).decode() + "\n"
-    assert record["grader"]["skip_tests_upload"] is False and record["rewards"] == {"reward": 0}
-    executed = record["grader"]["test_stdout"].strip().removeprefix("NUDI_ORIGINAL_GRADER ")
-    assert json.loads(executed) == {"sha256": original_sha256, "answer": "0"}
-    assert (task / "tests/test.sh").read_bytes() == original_grader.encode()
-    assert record["cleanup"]["removed"] is True and record["errors"] == []
-    assert run.record.episodes == run.record.probe_episodes == run.record.calls == run.record.capture_errors == []
-
-    async def no_lookup(*args, **kwargs):
-        raise AssertionError("excluded native capture reached container lookup")
-
-    monkeypatch.setattr(checks, "main_container", no_lookup)
-    monkeypatch.setattr(checks, "project_container", no_lookup)
-    with pytest.raises(ValueError, match="before native episode") as admission:
-        asyncio.run(workflow.run_role_episode(run, "simulator", capture_locations=["/tests/test.sh"]))
-    with pytest.raises(ValueError, match="capture") as capture:
-        asyncio.run(checks.protected_capture(None, "ordinary", tmp_path, "/tests/test.sh"))
-    assert run.record.episodes == run.record.events == [] and run.record.sandboxes == [name]
-    print("NUDI_NATIVE_REJECTION " + json.dumps({"admission": str(admission.value), "capture": str(capture.value)}))
-
-
-def test_native_package_probe_large_checker_and_later_service_writes(tmp_path, monkeypatch, docker_env):
-    """Real copied grading and a file-uploaded checker outlive a tiny actor timeout."""
-    task = explained_task(tmp_path)
-    config = task / "task.toml"
-    config.write_text(config.read_text().replace("timeout_sec = 20.0", "timeout_sec = 0.001"))
-    grader = task / "tests/test.sh"
-    grader.write_text("#!/bin/bash\ntouch /app/service-go\n"
-                      "for i in $(seq 1 100); do [ -f /app/service-done ] && break; sleep 0.05; done\n"
-                      "[ \"$(cat /app/service-done 2>/dev/null)\" = 262144 ] || exit 9\n"
-                      "echo later-service-ok\n" + grader.read_text())
-    original = tree_digest(task)
-    service = ("import os,time; from pathlib import Path; "
-               "p=Path('/app/service-go');\nwhile not p.exists(): time.sleep(.02)\n"
-               "for i in range(4): os.write(1,b'x'*65536)\n"
-               "Path('/app/service-done').write_text('262144')\n")
-    setup = ("mkdir -p /app\npython3 - <<'PY'\nimport subprocess,time\nfrom pathlib import Path\n"
-             f"subprocess.Popen(['python3','-c',{service!r}])\n"
-             "Path('/app/submission.bin').write_bytes(b'A'*350000)\n"
-             "Path('/app/answer.txt').write_text('42\\n')\ntime.sleep(.3)\nprint('setup-completed')\nPY\n")
-    resources = []
-    create = EnvironmentFactory.create_environment
-
-    def observe(**kwargs):
-        environment = create(**kwargs)
-        execute = environment.exec
-        observed = False
-
-        async def execute_observed(*args, **fields):
-            nonlocal observed
-            if not observed:
-                container = await checks.project_container(environment.session_id)
-                status, output, error = await trusted_host_command(
-                    ["docker", "inspect", "--format", "{{json .HostConfig}}", container])
-                assert status == 0, error
-                host = json.loads(output)
-                assert host["NanoCpus"] == 1000000000 and host["Memory"] == 512 * 1024 * 1024
-                resources.append({"project": environment.session_id, "container": container,
-                                  "NanoCpus": host["NanoCpus"], "Memory": host["Memory"]})
-                observed = True
-            return await execute(*args, **fields)
-
-        environment.exec = execute_observed
-        return environment
-
-    monkeypatch.setattr(EnvironmentFactory, "create_environment", staticmethod(observe))
-    no_native_actor(monkeypatch)
-
-    async def main():
-        run = workflow.start_run(RunConfig(task_dir=task, output_dir=tmp_path / "run"), frozenset())
-        name = await checks.package_probe(run, setup, "/app/submission.bin", "verification_start")
-        submission, = run.record.submissions
-        check = await checks.check_submission(run, submission,
-            Observation(episode=None, path="instruction.md", excerpt=EXPLANATION),
-            Observation(episode=None, path="tests/test.sh", excerpt="echo later-service-ok"),
-            CHECKER, capture_point="verification_start", timing="Observe this package at verification start.")
-        return run, name, submission, check
-
-    run, name, submission, check = asyncio.run(main())
-    probe, checker = (sandbox_record(run, item) for item in run.record.sandboxes)
-    assert run.record.episodes == run.record.probe_episodes == []
-    assert run.record.calls == []
-    assert probe["purpose"] == "probe" and checker["purpose"] == "check"
-    assert probe["session_id"] != checker["session_id"]
-    assert probe["task_digest"] == checker["task_digest"] == original == tree_digest(task)
-    assert probe["copy_digest"] == checker["copy_digest"] == original
-    assert probe["commands"][-1]["output"] == "setup-completed\n"
-    assert probe["commands"][-1]["exit_code"] == 0
-    assert probe["rewards"]["reward"] == 1 and "later-service-ok" in probe["grader"]["test_stdout"]
-    assert check.exit_code == 0 and check.sandbox == checker["name"]
-    from nudi.assessment import Evidence
-    evidence = Evidence(run.config.output_dir, name)
-    texts = {key: evidence.file(content.episode, content.path).read_text() for key, content in check.inputs.items()}
-    encoded = json.dumps(texts).encode()
-    assert len(encoded) > 444044
-    assert checker["files"][sandbox.CHECK_INPUTS] == hashlib.sha256(encoded).hexdigest()
-    assert checker["commands"][-1]["argv"] == ["python3", sandbox.CHECK_PROGRAM]
-    assert checker["commands"][-1]["stdin"] == sandbox.CHECK_INPUTS
-    assert json.loads(check.output)["input_sha256"] == {key: hashlib.sha256(value.encode()).hexdigest() for key, value in texts.items()}
-    assert all(record["execution_scope"] == "package" and record["cleanup"]["removed"] is True for record in (probe, checker))
-    for resource in resources:
-        for kind in ("container", "network"):
-            result = subprocess.run(["docker", kind, "ls", "-q", *(["-a"] if kind == "container" else []),
-                                     "--filter", f"label=com.docker.compose.project={resource['project']}"], capture_output=True, text=True, check=True)
-            assert not result.stdout.strip(), result.stdout
-    print("NUDI_PACKAGE_PROBE " + json.dumps({"input_bytes": len(encoded), "input_sha256": hashlib.sha256(encoded).hexdigest(),
-          "resources": resources, "sandboxes": [probe, checker]}, sort_keys=True))
+    assert run.record.calls == [], "measurement makes no model call"
 
 
 @pytest.mark.parametrize("phase", ["startup", "exec"])
@@ -2224,8 +1928,7 @@ def test_native_sandbox_cancellation_removes_owned_resources(tmp_path, monkeypat
 
     async def main():
         run = workflow.start_run(RunConfig(task_dir=task, output_dir=tmp_path / "run"), frozenset())
-        running = asyncio.create_task(checks.package_probe(
-            run, "mkdir -p /app; echo running > /app/exec-started; sleep 120", "/app/answer.txt", "verification_start"))
+        running = asyncio.create_task(checks.package_probe(run, "mkdir -p /app; echo running > /app/exec-started; sleep 120"))
         try:
             async def wait_for_phase():
                 while True:
@@ -2274,36 +1977,18 @@ def test_native_sandbox_cancellation_removes_owned_resources(tmp_path, monkeypat
 
 @pytest.mark.parametrize("corruption", ["program", "missing_command", "command", "output", "exit_code"])
 def test_retained_native_submission_is_checked_in_a_fresh_sandbox_with_hashed_inputs(tmp_path, monkeypatch, credentials, corruption):
-    """A retained ordinary capture is checked without another actor or grader episode, from
+    """A retained ordinary copy is checked without another actor or grader episode, from
     uploaded program and input files; a tampered input or program hash is ungrounded."""
-    from nudi.records import Content, EpisodeResult, Submission
-
     task = explained_task(tmp_path)
     sandboxes = Sandboxes(monkeypatch, pythons={"python3": "2", "python": "3"})
     no_native_actor(monkeypatch)
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
-    directory = run.config.output_dir / "episodes" / "0000-simulator"
-    (directory / "nudi-evidence").mkdir(parents=True)
-    state = json.dumps({"exists": False, "location": "/app/explanation.txt", "observed_end": "end", "observed_start": "start"})
-    (directory / "nudi-evidence" / "state.json").write_text(state)
-    ids = {"trial_id": "native-trial", "trial_name": "trial", "task_checksum": "sum"}
-    content = Content(episode="0000-simulator", path="nudi-evidence/state.json", sha256=hashlib.sha256(state.encode()).hexdigest())
-    receipt = json.dumps({"state": state, "sha256": content.sha256, "location": "/app/explanation.txt", "ids": ids})
-    submission = Submission(content=content, ids=ids, location="/app/explanation.txt", capture_point="verification_start",
-                            command=[sys.executable, "-c", checks.CAPTURE_PROGRAM], program=checks.CAPTURE_PROGRAM,
-                            exit_code=0, output=receipt)
-    result = EpisodeResult(path="harbor", path_reasons=[], task_name="task", task_dir=str(task), task_digest=tree_digest(task),
-                           model="ordinary", reasoning_effort=None, versions={}, ids=ids, rewards={"reward": 1.0},
-                           artifacts={"nudi_evidence": "nudi-evidence"})
-    (directory / "episode.json").write_text(result.model_dump_json())
-    run.record.episodes.append("0000-simulator")
-    run.record.submissions.append(submission)
-    run.save()
+    copy = retained_copy(run, sandboxes)
+    ids = copy.ids
     requirement = Observation(episode=None, path="instruction.md", excerpt=EXPLANATION)
     scoring = Observation(episode=None, path="tests/test.sh", excerpt=SCORING_LINE)
 
-    check = asyncio.run(checks.check_submission(run, submission, requirement, scoring, CHECKER,
-                                                capture_point="verification_start", timing="It applies at verification start."))
+    check = asyncio.run(checks.check_submission(run, copy, requirement, scoring, CHECKER, timing="It applies at verification start."))
     assert run.record.episodes == ["0000-simulator"] and run.record.sandboxes == ["sandbox-0000"]
     record = sandbox_record(run, "sandbox-0000")
     assert (record["purpose"], record["rewards"]) == ("check", {})
@@ -2313,11 +1998,12 @@ def test_retained_native_submission_is_checked_in_a_fresh_sandbox_with_hashed_in
     assert check.command == ["python", sandbox.CHECK_PROGRAM] and check.exit_code == 0
     assert check.sandbox == "sandbox-0000" and check.ids == ids
     inputs = sandboxes.environments["sandbox-0000"].uploads[sandbox.CHECK_INPUTS]
-    assert json.loads(inputs)["submission"] == state
+    receipt = (run.config.output_dir / "episodes" / "0000-simulator" / copy.receipt.path).read_text()
+    assert json.loads(inputs)["copy"] == receipt
     assert record["files"][sandbox.CHECK_INPUTS] == hashlib.sha256(inputs).hexdigest()
     claim = Claim(mechanism="omitted explanation", episode="0000-simulator", check=check.id,
                   interpretation="The required file is absent, so no credit is deserved.",
-                  derivation=Derivation(observations=["exists"], minimum="deserved", maximum="deserved", validity="violated"))
+                  derivation=Derivation(observations=["exists"], validity="violated"))
     assessment = assess(claim, run.config.output_dir)
     assert (assessment.outcome, assessment.execution_scope) == ("accepted_invalid", "native")
 
@@ -2349,14 +2035,14 @@ def test_sandbox_failure_and_cancellation_stop_it_and_keep_partial_records(tmp_p
 
     sandboxes.fail[("start", "sandbox-0000")] = RuntimeError("image build failed")
     with pytest.raises(RuntimeError, match="image build failed"):
-        asyncio.run(checks.investigate(run, setup_probe(), None))
+        asyncio.run(checks.measure_experiment(run, setup_probe()))
     failed = sandbox_record(run, "sandbox-0000")
     assert failed["errors"][0]["message"] == "image build failed" and failed["cleanup"]["removed"] is True
     assert ("stop", "sandbox-0000", True) in sandboxes.events
 
     async def cancel():
         sandboxes.blocked["sandbox-0001"] = asyncio.Event()
-        running = asyncio.create_task(checks.investigate(run, setup_probe(), None))
+        running = asyncio.create_task(checks.measure_experiment(run, setup_probe()))
         while not any(event[0] == "exec" and event[1] == "sandbox-0001" for event in sandboxes.events):
             await asyncio.sleep(0.01)
         running.cancel()
@@ -2371,7 +2057,7 @@ def test_sandbox_failure_and_cancellation_stop_it_and_keep_partial_records(tmp_p
 
     sandboxes.remaining.add("sandbox-0002")
     sandboxes.rewards["sandbox-0002"] = None
-    asyncio.run(checks.investigate(run, setup_probe(capture_point="grader_read"), None))
+    asyncio.run(checks.measure_experiment(run, setup_probe(capture_point="grader_read")))
     leftover = sandbox_record(run, "sandbox-0002")
     assert leftover["cleanup"]["removed"] is False and leftover["cleanup"]["remaining"]
     assert any("sandbox-0002" in warning and "remain" in warning for warning in run.record.warnings)
@@ -2385,17 +2071,17 @@ def test_spending_cap_starts_no_sandbox_and_instruction_probes_never_execute(tmp
     no_native_actor(monkeypatch)
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, spending_cap=1.0)
     with pytest.raises(checks.ModelOutputFailure, match="setup_program"):
-        asyncio.run(checks.investigate(run, {**setup_probe(), "setup_program": None, "instruction": "Act as the task agent."}, None))
+        asyncio.run(checks.measure_experiment(run, {**setup_probe(), "setup_program": None, "instruction": "Act as the task agent."}))
     run.record.known_cost = 1.0
     with pytest.raises(workflow.SpendingCapReached):
-        asyncio.run(checks.investigate(run, setup_probe(), None))
+        asyncio.run(checks.measure_experiment(run, setup_probe()))
     assert sandboxes.environments == {} and run.record.sandboxes == [] and run.record.episodes == []
 
 
 def test_missing_python3_skips_dynamic_setup_and_preserves_evidence_and_native_roles(tmp_path, monkeypatch, credentials, unit_sandboxes):
     sandboxes = Sandboxes(monkeypatch, pythons={"python3": "2", "python": "2"})
     run = new_run(tmp_path, monkeypatch, credentials)
-    retained = retained_native_submission(run, "{}")
+    retained = retained_copy(run, sandboxes)
     original = tree_digest(run.config.task_dir)
 
     async def static_inspection(*args, **kwargs):
@@ -2413,7 +2099,8 @@ def test_missing_python3_skips_dynamic_setup_and_preserves_evidence_and_native_r
     assert not any(sandbox.SETUP in entry["argv"] for entry in record["commands"])
     assert sandbox.SETUP not in sandboxes.environments[name].uploads
     assert record["cleanup"]["removed"] is True
-    assert (run.config.output_dir / "episodes" / retained.content.episode / retained.content.path).read_text() == "{}"
+    retained_bytes = (run.config.output_dir / "episodes" / retained.receipt.episode / retained.receipt.path).read_bytes()
+    assert hashlib.sha256(retained_bytes).hexdigest() == retained.receipt.sha256
     roles = []
 
     async def native(config, queue, **work):
@@ -2589,7 +2276,7 @@ def test_startup_subprocess_is_joined_before_sandbox_removal(tmp_path, monkeypat
     monkeypatch.setattr(EnvironmentFactory, "create_environment", staticmethod(create))
 
     async def main():
-        operation = asyncio.create_task(checks.investigate(run, setup_probe(), None))
+        operation = asyncio.create_task(checks.measure_experiment(run, setup_probe()))
         try:
             await asyncio.wait_for(started.wait(), 5)
             if interruption == "cancel":
@@ -2639,18 +2326,19 @@ def test_mounted_grader_fifo_is_explicitly_unavailable_without_blocking(tmp_path
 def test_interpretation_inability_is_not_a_tool_or_provider_failure(tmp_path, monkeypatch, credentials, unit_sandboxes):
     from nudi import checks
     # Exercise the real interpretation branch with only the slow native check replaced.
-    from nudi.records import Submission, Content, Check, EpisodeResult
+    from nudi.records import Content, Check, EpisodeResult, StateCopy
     run = new_run(tmp_path, monkeypatch, credentials)
     episode = run.config.output_dir / "episodes" / "ordinary"
     episode.mkdir(parents=True)
     result = EpisodeResult(path="harbor", path_reasons=[], task_name="task", task_dir=str(run.config.task_dir), task_digest=tree_digest(run.config.task_dir), model="ordinary", reasoning_effort=None, versions={}, rewards={"reward": 1})
     (episode / "episode.json").write_text(result.model_dump_json())
     run.record.episodes.append("ordinary")
-    state = Submission(content=Content(episode="ordinary", path="state", sha256="hash"), ids={}, location="/app/answer.txt", capture_point="verification_start", command=[], program="capture", output="")
-    run.record.submissions.append(state)
+    state = StateCopy(id="copy-0000", episode="ordinary", point="verification_start", environment="agent", backend="docker",
+                      ids={}, started_at="start", receipt=Content(episode="ordinary", path="state", sha256="hash"))
+    run.record.copies.append(state)
     run.save()
     async def checked(*args, **kwargs):
-        return Check(id="check", content=state.content, ids={}, requirement=Observation(episode=None, path="instruction.md", excerpt="42"), command=[], exit_code=0, output="actual result")
+        return Check(id="check", content=state.receipt, ids={}, requirement=Observation(episode=None, path="instruction.md", excerpt="42"), command=[], exit_code=0, output="actual result")
     monkeypatch.setattr(checks, "check_submission", checked)
     probe = {"category": "package_oracles", "episode": "ordinary", "location": "/app/answer.txt", "capture_point": "verification_start", "timing": "start", "program": CHECKER,
              "requirement": {"episode": None, "path": "instruction.md", "excerpt": "42"}}
@@ -2664,8 +2352,8 @@ def test_interpretation_inability_is_not_a_tool_or_provider_failure(tmp_path, mo
 
 
 def ordinary_pool(run, count=2) -> list[str]:
-    """Saved ordinary episodes, each with a trace and a verification-start capture record."""
-    from nudi.records import Content, EpisodeResult, Submission
+    """Saved ordinary episodes, each with a trace and a verification_start state copy record."""
+    from nudi.records import Content, EpisodeResult, StateCopy
     pool = [f"{index:04d}-simulator" for index in range(count)]
     for name in pool:
         directory = run.config.output_dir / "episodes" / name
@@ -2676,9 +2364,9 @@ def ordinary_pool(run, count=2) -> list[str]:
                                versions={}, rewards={"reward": 1.0}, artifacts={"trajectory": "trace.txt"})
         (directory / "episode.json").write_text(result.model_dump_json())
         run.record.episodes.append(name)
-        run.record.submissions.append(Submission(content=Content(episode=name, path="state", sha256="hash"), ids={},
-                                                 location="/app/answer.txt", capture_point="verification_start",
-                                                 command=[], program="capture", output=""))
+        run.record.copies.append(StateCopy(id=f"copy-{len(run.record.copies):04d}", episode=name, point="verification_start",
+                                           environment="agent", backend="docker", ids={}, started_at="start",
+                                           receipt=Content(episode=name, path="state", sha256="hash")))
     run.save()
     return pool
 
@@ -2708,7 +2396,7 @@ def test_grader_review_is_optional_triage_and_omissions_stay_unreviewed_unknown(
     broad = json.loads(requests[0]["messages"][-1]["content"])
     assert broad["unreviewed_ordinary_episodes"] == pool
     assert "each unreviewed ordinary episode" not in broad["instruction"] and "leads" in broad["instruction"]
-    prompt = " ".join((Path(checks.__file__).parent / "prompts/inspector.md").read_text().split())
+    prompt = " ".join(checks.inspector_prompt("grader").split())
     assert "Propose at least one probe naming each listed" not in prompt and "find leads" in prompt
     assert result.ordinary["0001-simulator"].label == "unknown"
     assert [(review.episode, review.status, review.assessment) for review in result.reviews] == [("0000-simulator", "assessed", 0)]
@@ -2742,7 +2430,6 @@ def test_holistic_inspection_presumes_named_normal_episodes_and_verifies_investi
         pool[0]: ("legitimate", "presumed"), pool[1]: ("legitimate", "presumed"),
         pool[2]: ("accepted_invalid", "verified"), pool[3]: ("unknown", None)}
     assert "presumed: the grader inspector skimmed this episode" in " ".join(result.ordinary[pool[1]].reasons)
-    assert result.ordinary[pool[1]].assessments == []
     assert list(result.unreviewed) == [pool[3]], "a skimmed and presumed episode is not unreviewed"
     warnings = []
     labels = report.labels(pool, result, warnings)
@@ -2792,8 +2479,8 @@ def test_episode_session_reviews_and_interprets_only_its_own_episode(tmp_path, m
     run = new_run(tmp_path, monkeypatch, credentials)
     pool = ordinary_pool(run, 2)
 
-    async def checked(run, submission, requirement, scoring, program, *, capture_point, timing):
-        run.record.checks.append(Check(id=f"check-{len(run.record.checks):04d}", content=submission.content, ids={},
+    async def checked(run, copy, requirement, scoring, program, *, timing):
+        run.record.checks.append(Check(id=f"check-{len(run.record.checks):04d}", content=copy.receipt, ids={},
                                        requirement=requirement, command=["python3"], exit_code=0, output="{}"))
         run.save()
         return run.record.checks[-1]
@@ -2827,15 +2514,14 @@ def test_review_interpreted_by_its_check_id_is_assessed_and_an_uninterpreted_one
     run = new_run(tmp_path, monkeypatch, credentials)
     pool = ordinary_pool(run, 2)
 
-    async def checked(run, submission, requirement, scoring, program, *, capture_point, timing):
-        run.record.checks.append(Check(id=f"check-{len(run.record.checks):04d}", content=submission.content, ids={},
+    async def checked(run, copy, requirement, scoring, program, *, timing):
+        run.record.checks.append(Check(id=f"check-{len(run.record.checks):04d}", content=copy.receipt, ids={},
                                        requirement=requirement, command=["python3"], exit_code=0, output="{}"))
         run.save()
         return run.record.checks[-1]
 
     monkeypatch.setattr(checks, "check_submission", checked)
-    claim = {"mechanism": "review", "requirement_support": support(review_probe(pool[0])["requirement"]),
-             "scoring_support": {"basis": "unknown", "sources": [], "rationale": "No scoring source is available.", "uncertainty": []}}
+    claim = {"mechanism": "review"}
 
     async def behave(name, tools, schema):
         if name == f"grader-episode-{pool[0]}":
@@ -2881,8 +2567,7 @@ def test_episode_repair_of_a_broad_receipt_settles_its_category(tmp_path, monkey
         if name == "grader-broad":
             receipts.append(await tools["run_experiment"].ainvoke({"probe": review_probe(pool[0])}))
             return schema(applicability=package_applicability("accepted_invalid"), completed=["accepted_invalid"])
-        claim = {**receipts[0]["scripted_claim"], "requirement_support": support({"episode": None, "path": "instruction.md", "excerpt": "42"}),
-                 "scoring_support": {"basis": "unknown", "sources": [], "rationale": "No scoring source is available.", "uncertainty": []}}
+        claim = receipts[0]["scripted_claim"]
         await tools["interpret_experiment"].ainvoke({"experiment": receipts[0]["id"], "claim": claim})
         if then == "invalid":
             await tools["interpret_experiment"].ainvoke({"experiment": receipts[0]["id"], "claim": {
@@ -2928,8 +2613,7 @@ def test_episode_skip_or_duplicate_keeps_a_settled_category(tmp_path, monkeypatc
     async def behave(name, tools, schema):
         if name == "grader-broad":
             receipt = await tools["run_experiment"].ainvoke({"probe": review_probe(pool[0])})
-            claim = {**receipt["scripted_claim"], "requirement_support": support({"episode": None, "path": "instruction.md", "excerpt": "42"}),
-                     "scoring_support": {"basis": "unknown", "sources": [], "rationale": "No scoring source is available.", "uncertainty": []}}
+            claim = receipt["scripted_claim"]
             await tools["interpret_experiment"].ainvoke({"experiment": receipt["id"], "claim": claim})
             return schema(applicability=package_applicability("accepted_invalid"), completed=["accepted_invalid"])
         probe = review_probe(pool[0]) if then == "duplicate" else review_probe(pool[0], setup_program="targeted")
@@ -2971,8 +2655,7 @@ def test_failed_review_a_later_review_recovers_leaves_a_complete_inspection(tmp_
     async def behave(name, tools, schema):
         receipt = await tools["run_experiment"].ainvoke({"probe": review_probe(pool[0])})
         if name == "grader-accepted_invalid":
-            claim = {**receipt["scripted_claim"], "requirement_support": support({"episode": None, "path": "instruction.md", "excerpt": "42"}),
-                     "scoring_support": {"basis": "unknown", "sources": [], "rationale": "No scoring source is available.", "uncertainty": []}}
+            claim = receipt["scripted_claim"]
             await tools["interpret_experiment"].ainvoke({"experiment": receipt["id"], "claim": claim})
         return schema(applicability=package_applicability("accepted_invalid"), completed=["accepted_invalid"])
 
@@ -2986,12 +2669,12 @@ def test_failed_review_a_later_review_recovers_leaves_a_complete_inspection(tmp_
 
 @pytest.mark.parametrize("outcome, unresolved, settled, label", [
     ("accepted_invalid", [], "evidenced_issue", "accepted_invalid"),
-    ("accepted_invalid", ["whether the answer is required"], "no_evidenced_issue", "unknown"),
+    ("accepted_invalid", ["whether the answer is required"], "evidenced_issue", "accepted_invalid"),
     ("unknown", [], "no_evidenced_issue", "unknown"),
 ])
 def test_episode_evidence_settles_its_category_but_episodes_never_change_coverage(tmp_path, monkeypatch, credentials, outcome, unresolved,
                                                                                    settled, label, unit_sandboxes):
-    """An evidenced episode finding is an evidenced issue; an unresolved or inconclusive one leaves broad's settled category alone."""
+    """An evidenced episode finding is an evidenced issue, open conditions included; an inconclusive one leaves broad's settled category alone."""
     run = new_run(tmp_path, monkeypatch, credentials)
     pool = ordinary_pool(run, 2)
 
@@ -3004,8 +2687,7 @@ def test_episode_evidence_settles_its_category_but_episodes_never_change_coverag
         if name == "grader-broad":
             return schema(applicability=package_applicability("accepted_invalid"), completed=["accepted_invalid"])
         receipt = await tools["run_experiment"].ainvoke({"probe": review_probe(name.removeprefix("grader-episode-"))})
-        claim = {**receipt["scripted_claim"], "requirement_support": support({"episode": None, "path": "instruction.md", "excerpt": "42"}),
-                 "scoring_support": {"basis": "unknown", "sources": [], "rationale": "No scoring source is available.", "uncertainty": []}}
+        claim = receipt["scripted_claim"]
         await tools["interpret_experiment"].ainvoke({"experiment": receipt["id"], "claim": claim})
         # A forged summary from an episode session sets neither applicability nor completion.
         return schema(applicability=package_applicability("accepted_invalid", status="restricted", facts={"package_copy": False}),
@@ -3047,7 +2729,7 @@ def test_inspector_swarm_forks_one_isolated_inspector_per_episode_and_warns(tmp_
     assert [review.episode for review in result.reviews] == pool and result.unreviewed == {}
     assert {name: (label.label, label.basis) for name, label in result.ordinary.items()} == dict.fromkeys(pool, ("accepted_invalid", "verified"))
     assert set(result.sessions) == {"grader-broad", "grader-accepted_invalid", f"grader-episode-{pool[0]}", f"grader-episode-{pool[1]}"}
-    prompt = " ".join((Path(checks.__file__).parent / "prompts/inspector.md").read_text().split())
+    prompt = " ".join(checks.inspector_prompt("grader").split())
     assert "holistic_inspection" in prompt and "inspector_swarm" in prompt
 
 
@@ -3098,8 +2780,8 @@ def test_unusable_interpretation_keeps_its_successful_check_and_later_ordinary_r
     run = new_run(tmp_path, monkeypatch, credentials)
     pool = ordinary_pool(run)
 
-    async def checked(run, submission, requirement, scoring, program, *, capture_point, timing):
-        run.record.checks.append(Check(id=f"check-{len(run.record.checks):04d}", content=submission.content, ids={},
+    async def checked(run, copy, requirement, scoring, program, *, timing):
+        run.record.checks.append(Check(id=f"check-{len(run.record.checks):04d}", content=copy.receipt, ids={},
                                        requirement=requirement, command=["python3"], exit_code=0, output="{}"))
         run.save()
         return run.record.checks[-1]
@@ -3120,7 +2802,7 @@ def test_unusable_interpretation_keeps_its_successful_check_and_later_ordinary_r
     reasons = " ".join(result.ordinary[pool[0]].reasons)
     assert "model_output_failure after check-0000 exit 0" in reasons and "Invalid Claim" in reasons
     assert "Invalid Claim" in json.dumps(result.sessions["grader-broad"])
-    assert "exact top-level keys" in requests[1]["messages"][0]["content"]
+    assert "exact top-level keys" in " ".join(requests[1]["messages"][0]["content"].split())
 
 
 @pytest.mark.parametrize("interruption", ["spending_exhausted", "cancelled", "model_inability"])
@@ -3315,7 +2997,6 @@ def test_investigation_reads_omitted_evidence_and_adapts_in_one_workspace(tmp_pa
             trace.parent.mkdir(parents=True)
             trace.write_text("a" * 50000 + TRACE_MIDDLE + "z" * 50000)
             assert "tests/oversized_grader.py" in checks.task_context(run)["omitted_context_files"]
-            assert TRACE_MIDDLE not in checks.trace_excerpt(run, trace)[0]
             evidence = {"0000-simulator/trace.json": trace}
             async with inspector.investigation(run, "grader-broad", "Inspect the copied package.", evidence) as session:
                 first = await session.ask("Find the leading-zero rule.", Finding)
@@ -3747,19 +3428,21 @@ def test_explicit_workspace_memory_is_enforced_and_admitted_only_within_memory_h
 
 
 @pytest.mark.parametrize("environment", ["cpus = 1\n", "memory_mb = 2048\n", ""])
-def test_undeclared_resources_keep_one_container_while_a_workspace_is_held(tmp_path, monkeypatch, credentials, environment):
+def test_undeclared_resources_admit_only_the_workspace_pair_with_a_warning(tmp_path, monkeypatch, credentials, environment):
     sandboxes = Sandboxes(monkeypatch)
     run = new_run(tmp_path, monkeypatch, credentials, capacity=(8, 16384), task_dir=resource_task(tmp_path, environment))
     assert run.record.capacity.concurrency == 1
 
     async def main():
         async with sandbox.sandbox(run, "workspace"):
-            with pytest.raises(workflow.CapacityUnavailable):
-                async with sandbox.sandbox(run, "check"):
-                    pass
+            async with sandbox.sandbox(run, "check"):
+                with pytest.raises(workflow.CapacityUnavailable):
+                    async with sandbox.sandbox(run, "probe"):
+                        pass
 
     asyncio.run(main())
-    assert run.record.sandboxes == ["sandbox-0000"]
+    assert run.record.sandboxes == ["sandbox-0000", "sandbox-0001"]
+    assert any("without a resource check" in warning for warning in run.record.warnings)
     assert sandbox_record(run, "sandbox-0000")["environment"]["memory_mb"] == 512
     assert sandboxes.environments["sandbox-0000"].config["override_memory_mb"] == 512
 
@@ -3843,29 +3526,24 @@ def test_native_episode_in_flight_refuses_the_workspace_promptly_at_concurrency_
     assert run.record.episodes == ["0000-attacker"] and len(run.record.sandboxes) == 1 and sandboxes.running == set()
 
 
-def support(source, *, basis="explicit", rationale="The cited task text states this rule."):
-    return {"basis": basis, "sources": [source], "rationale": rationale, "uncertainty": []}
-
-
 def public_probe(category="rejected_valid", **fields):
     requirement = {"episode": None, "path": "instruction.md", "excerpt": "leading zeros are permitted"}
     return {"category": category, "case": "leading zeros", "location": "/app/answer.txt",
             "capture_point": "verification_start", "timing": "The task explicitly applies at verification start.",
             "requirement": requirement, "scoring": requirement,
             "setup_program": "mkdir -p /app; echo 042 > /app/answer.txt; touch /tmp/probe-marker",
-            "program": '''import base64, hashlib, json, sys
+            "program": '''import json, os, sys
 inputs = json.load(sys.stdin)
-state = json.loads(inputs['submission'])
-value = int(base64.b64decode(state['base64']).strip()) if state['exists'] else None
-print(json.dumps({'input_sha256': {k: hashlib.sha256(v.encode()).hexdigest() for k,v in inputs.items()},
-                  'observations': {'answer': value}, 'results': {'deserved': int(value == 42)}}))
+path = os.environ.get("COPY_ROOT", "") + "/app/answer.txt"
+value = int(open(path).read().strip()) if os.path.isfile(path) else None
+print(json.dumps({'observations': {'answer': value}, 'results': {'deserved': int(value == 42)}}))
 ''', **fields}
 
 
 def public_claim(probe, **fields):
     return {"mechanism": probe["category"], "interpretation": "The decimal integer is 42; full credit follows from the task.",
-            "derivation": {"observations": ["answer"], "minimum": "deserved", "maximum": "deserved", "validity": "supported"},
-            "requirement_support": support(probe["requirement"]), "scoring_support": support(probe["scoring"], basis="inferred"), **fields}
+            "derivation": {"observations": ["answer"], "validity": "supported"},
+            **fields}
 
 
 def public_task(tmp_path):
@@ -4272,3 +3950,162 @@ def test_real_sdk_interruption_joins_running_and_waiting_experiments_before_retu
     stopped = [event[1] for event in sandboxes.events if event[0] == "stop"]
     assert stopped.index("sandbox-0001") < stopped.index("sandbox-0000"), "experiment cleanup followed workspace teardown"
     assert all(sandbox_record(run, name)["cleanup"]["removed"] for name in run.record.sandboxes)
+
+
+# Separate verifier mode: setup in the main image, grading in the verifier's, as Harbor's trial does.
+
+
+@pytest.mark.parametrize("declared", [False, True])
+@pytest.mark.parametrize("written", [True, False])
+def test_a_separate_verifier_probe_grades_in_the_verifier_environment_with_the_declared_artifacts(
+        tmp_path, monkeypatch, credentials, declared, written):
+    from harbor.models.task.verifier_mode import resolve_verifier_environment_definition
+
+    from nudi.records import SandboxResult
+
+    files = {"/app/scratch.txt": b"undeclared"} | ({"/app/answer.txt": b"42", "/logs/artifacts/answer.json": b"{}"} if written else {})
+    sandboxes = Sandboxes(monkeypatch, files={"sandbox-0000": files})
+    no_native_actor(monkeypatch)
+    task = tmp_path / "task"
+    shutil.copytree(SEPARATE_TASK, task)
+    if declared:
+        (task / "task.toml").write_text(VERIFIER_ENVIRONMENT)
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
+    name = asyncio.run(checks.package_probe(run, SETUP_PROGRAM))
+
+    assert name == "sandbox-0001"
+    # The setup sandbox closes before the verifier sandbox starts; only the verifier sandbox grades.
+    assert [event[:2] for event in sandboxes.events if event[0] in ("start", "stop")] == [
+        ("start", "sandbox-0000"), ("stop", "sandbox-0000"), ("start", "sandbox-0001"), ("stop", "sandbox-0001")]
+    graders = {event[1] for event in sandboxes.events if event[0] == "exec" and "/tests/test.sh" in event[2] and "chmod" not in event[2]}
+    assert graders == {"sandbox-0001"}
+    # Nudi's verifier sandbox uses the definition Harbor's trial resolves for this task.
+    definition = resolve_verifier_environment_definition(runner.Task(task).config, runner.Task(task).paths)
+    config = sandboxes.environments["sandbox-0001"].config
+    assert config["task_env_config"] == definition.config
+    assert Path(config["environment_dir"]).name == definition.directory.name
+    assert config["enable_environment_dir_upload"] is (not definition.bundled_tests)
+    assert config["task_env_config"].docker_image == ("python:3.13-slim" if declared else "python:3.12-slim")
+    # Only the declared artifact reaches the verifier, after its verifier directory is emptied.
+    uploads = sandboxes.environments["sandbox-0001"].uploads
+    assert ("/app/answer.txt" in uploads) is written and "/app/scratch.txt" not in uploads
+    if written:
+        assert uploads["/app/answer.txt"] == b"42"
+    verifier = SandboxResult.model_validate_json((run.config.output_dir / "sandboxes" / name / "sandbox.json").read_text())
+    statuses = {entry["source"]: entry["status"] for entry in verifier.artifact_manifest}
+    assert statuses == {"/app/answer.txt": "ok" if written else "failed", "/logs/artifacts": "ok" if written else "empty"}
+    # Docker publishes /logs/artifacts through Harbor's convention mount, as in a native trial.
+    expected = tmp_path / "expected"
+    expected.mkdir()
+    if written:
+        (expected / "answer.json").write_bytes(b"{}")
+    convention = [event for event in sandboxes.events if event[:3] == ("upload_dir", "sandbox-0001", "/logs/artifacts")]
+    assert convention == [("upload_dir", "sandbox-0001", "/logs/artifacts", tree_digest(expected))]
+    # The host collection is removed once uploaded; the manifest stays in the verifier's record.
+    assert not (run.config.output_dir / "sandboxes" / "sandbox-0000" / "artifacts").exists()
+    assert verifier.setup == "sandbox-0000" and verifier.rewards == {"reward": 1.0}
+    assert verifier.grader["skip_tests_upload"] is definition.bundled_tests is declared
+    tests_uploaded = any(event[:3] == ("upload_dir", "sandbox-0001", "/tests") for event in sandboxes.events)
+    assert tests_uploaded is not declared
+    # The copies are the verifier's, and the experiment stays package scope.
+    assert [(copy.episode, copy.environment) for copy in run.record.copies] == [("sandbox-0001", "verifier")] * 2
+    probe = setup_probe(location="/app/answer.txt", scoring=None,
+                        requirement={"episode": None, "path": "instruction.md", "excerpt": "Write the number 42"})
+    receipt = asyncio.run(checks.measure_experiment(run, probe))
+    assert receipt["execution_scope"] == "package" and receipt["setup"]["name"] == "sandbox-0002"
+    assert receipt["episode"] == "sandbox-0003"
+
+
+def test_a_separate_verifier_sandbox_starts_within_the_main_environments_build_timeout(tmp_path, monkeypatch, credentials):
+    """Harbor's trial starts the verifier environment within the main environment's build_timeout_sec."""
+    sandboxes = Sandboxes(monkeypatch)
+    no_native_actor(monkeypatch)
+    bounds, wait_for = [], asyncio.wait_for
+
+    async def bounded(awaitable, timeout):
+        if getattr(awaitable, "__qualname__", "") == "SandboxEnvironment.start":
+            bounds.append(timeout)
+        return await wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(sandbox.asyncio, "wait_for", bounded)
+    task = tmp_path / "task"
+    shutil.copytree(SEPARATE_TASK, task)
+    (task / "task.toml").write_text(VERIFIER_ENVIRONMENT.replace("memory_mb = 512\n", "memory_mb = 512\nbuild_timeout_sec = 123.0\n", 1))
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
+    asyncio.run(checks.package_probe(run, SETUP_PROGRAM))
+    assert [name for name in sandboxes.environments] == ["sandbox-0000", "sandbox-0001"] and bounds == [123.0, 123.0]
+
+
+def test_links_and_special_files_never_reach_a_separate_verifier(tmp_path, monkeypatch, credentials):
+    """Collected artifacts are copied out of the setup container; a link to a host directory, a
+    hardlink or a FIFO is removed before upload, a regular file stays, and one warning names the removed paths."""
+    host = tmp_path / "host-secrets"
+    host.mkdir()
+    (host / "key").write_text("host only")
+    files = {"/app/answer.txt": host, "/logs/artifacts/kept.txt": b"kept", "/logs/artifacts/host": host,
+             "/logs/artifacts/pipe": None, "/logs/artifacts/hard": ("hardlink", host / "key")}
+    sandboxes = Sandboxes(monkeypatch, files={"sandbox-0000": files})
+    no_native_actor(monkeypatch)
+    task = tmp_path / "task"
+    shutil.copytree(SEPARATE_TASK, task)
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
+    asyncio.run(checks.package_probe(run, SETUP_PROGRAM))
+
+    # Only the regular file is uploaded, and the host collection is not retained.
+    assert not (run.config.output_dir / "sandboxes" / "sandbox-0000" / "artifacts").exists()
+    assert "/app/answer.txt" not in sandboxes.environments["sandbox-0001"].uploads
+    expected = tmp_path / "expected"
+    expected.mkdir()
+    (expected / "kept.txt").write_bytes(b"kept")
+    uploaded = [event for event in sandboxes.events if event[:3] == ("upload_dir", "sandbox-0001", "/logs/artifacts")]
+    assert uploaded == [("upload_dir", "sandbox-0001", "/logs/artifacts", tree_digest(expected))]
+    assert [message for message in run.record.warnings if "links and special files" in message] == [
+        "sandbox-0000: links and special files were removed from the collected artifacts before upload: "
+        "['app/answer.txt', 'logs/artifacts/hard', 'logs/artifacts/host', 'logs/artifacts/pipe']"]
+    assert (host / "key").read_text() == "host only"
+
+
+@pytest.mark.parametrize("separate", [True, False])
+def test_native_verification_start_removes_links_before_a_separate_verifier_uploads(tmp_path, monkeypatch, credentials, separate):
+    """Harbor's trial collects artifacts, stops the agent environment, emits verification start,
+    then uploads. Every native separate-mode episode loses links and special files at that event,
+    with no episode callback set; a shared verifier reads the live directory, which stays."""
+    host = tmp_path / "host-secrets"
+    host.mkdir()
+
+    async def harbor(config, task_dir, result, queue, agent=None):
+        trial = SimpleNamespace(task=SimpleNamespace(path=task_dir), trials_dir=config.output_dir / "harbor", trial_name="trial")
+        collected = config.output_dir / "harbor" / "trial" / "artifacts"
+        (host / "key").write_text("host only")
+        for location, data in {"app/answer.txt": host, "logs/artifacts/kept.txt": b"kept", "logs/artifacts/pipe": None,
+                               "logs/artifacts/hard": ("hardlink", host / "key")}.items():
+            place(collected / location, data)
+        await runner.capture_at_verification(SimpleNamespace(config=trial))
+
+    monkeypatch.setattr(runner, "run_harbor", harbor)
+    task = tmp_path / "task"
+    shutil.copytree(SEPARATE_TASK if separate else CONTRACT_TASK, task)
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
+    asyncio.run(workflow.run_role_episode(run, "simulator"))
+
+    collected = run.config.output_dir / "episodes" / "0000-simulator" / "harbor" / "trial" / "artifacts"
+    remaining = sorted(path.relative_to(collected).as_posix() for path in collected.rglob("*") if not path.is_dir() or path.is_symlink())
+    warnings = [message for message in run.record.warnings if "links and special files" in message]
+    if separate:
+        assert remaining == ["logs/artifacts/kept.txt"]
+        assert warnings == ["0000-simulator: links and special files were removed from the collected artifacts before upload: "
+                            "['app/answer.txt', 'logs/artifacts/hard', 'logs/artifacts/pipe']"]
+    else:
+        assert remaining == ["app/answer.txt", "logs/artifacts/hard", "logs/artifacts/kept.txt", "logs/artifacts/pipe"] and warnings == []
+
+
+def test_a_shared_verifier_probe_still_sets_up_and_grades_in_one_sandbox(tmp_path, monkeypatch, credentials):
+    from nudi.records import SandboxResult
+
+    sandboxes = Sandboxes(monkeypatch)
+    no_native_actor(monkeypatch)
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
+    name = asyncio.run(checks.package_probe(run, SETUP_PROGRAM))
+    assert name == "sandbox-0000" and list(sandboxes.environments) == ["sandbox-0000"]
+    record = SandboxResult.model_validate_json((run.config.output_dir / "sandboxes" / name / "sandbox.json").read_text())
+    assert (record.setup, record.artifact_manifest, record.grader["skip_tests_upload"]) == (None, None, False)

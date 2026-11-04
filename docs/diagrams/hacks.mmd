@@ -1,0 +1,24 @@
+---
+config:
+  look: handDrawn
+  theme: neutral
+  fontFamily: Virgil
+  htmlLabels: false
+  flowchart:
+    wrappingWidth: 260
+---
+flowchart TD
+    E["Task, environment and grader"] --> I["hack_inspector<br/>Look for reward hacks"]
+    I --> S["●○○○○ suspected<br/>Inspector claims a loophole"]
+    S --> X["Inspector tests it<br/>in a sandbox"]
+    X -->|Reproduced| R["●●○○○ reproduced"]
+    X -->|Not reproduced| O["Keep the result and evidence<br/>Do not upgrade the claim"]
+    R --> F["Attacker receives<br/>full instructions"]
+    R --> H["Attacker receives<br/>only a hint"]
+    F --> VF["Inspector checks the result<br/>Did this exploit obtain reward?"]
+    H --> VH["Inspector checks the result<br/>Did this exploit obtain reward?"]
+    VF -->|Confirmed| SF["●●●○○ exploited with instructions"]
+    VH -->|Confirmed| SH["●●●●○ exploited with a hint"]
+    E --> N["Independent attacker<br/>No inspector findings or hints"]
+    N --> VN["Inspector checks the result<br/>Did an exploit obtain reward?"]
+    VN -->|Confirmed| SN["●●●●● exploited unaided"]

@@ -14,8 +14,9 @@ from typing import Literal
 
 from pydantic import ConfigDict, Field
 
-from nudi import report
-from nudi.checks import FULL_UNAVAILABLE, MINIMAL_UNAVAILABLE, Candidate, InspectionResult, attack, inspect_grader, inspect_hacks, redacted
+from nudi import copies, report
+from nudi.checks import (FULL_UNAVAILABLE, MINIMAL_UNAVAILABLE, Candidate, InspectionResult, attack, finish_cleanup, inspect_grader,
+                         inspect_hacks, redacted)
 from nudi.records import RunConfig
 from nudi.workflow import simulate, start_run
 
@@ -72,7 +73,8 @@ def _supplied(value: str | None) -> str | None:
 def guidance(hack: InspectionResult | None) -> dict:
     """One candidate per hack finding that can guide reproduction, composed without a model call.
 
-    Legitimate outcomes and rejected valid findings supply nothing. Another finding is a
+    Legitimate outcomes supply nothing. A rejected valid finding, work meeting every stated
+    requirement that got less than deserved, is a valid-work candidate. Another finding is a
     candidate when it is accepted invalid or supplies either guidance field. Full guidance is that
     candidate's `full_guidance`. Minimal guidance is the fixed where-to-look line plus
     that candidate's `hint_location`. Mechanism and interpretation are never copied.
@@ -82,10 +84,10 @@ def guidance(hack: InspectionResult | None) -> dict:
     """
     candidates = []
     for index, item in enumerate(hack.assessments if hack else []):
-        if item.outcome in ("legitimate", "rejected_valid"):
+        if item.outcome == "legitimate":
             continue
         full, location = _supplied(item.claim.full_guidance), _supplied(item.claim.hint_location)
-        if item.outcome != "accepted_invalid" and full is None and location is None:
+        if item.outcome not in ("accepted_invalid", "rejected_valid") and full is None and location is None:
             continue
         unavailable = {}
         if full is None:
@@ -95,7 +97,7 @@ def guidance(hack: InspectionResult | None) -> dict:
         candidates.append(Candidate(
             id=f"hack-{index}", mechanism=item.claim.mechanism,
             guidance={"full": full, "minimal": None if location is None else WHERE_TO_LOOK + "\n" + location},
-            unavailable=unavailable,
+            unavailable=unavailable, valid_work=item.outcome == "rejected_valid",
         ))
     return {"candidates": candidates}
 
@@ -108,7 +110,7 @@ async def send_nudis_async(task_dir, config=None, **options) -> dict:
     selected roles' credentials are validated before any episode starts, and the output
     directory must be new or empty. The report is
     also written as `report.json` and `report.md` in the output directory, after
-    cancellation too."""
+    cancellation too. Every state copy of the run is deleted first, also after a failure."""
     settings = configure(task_dir, config, options)
     # Earlier records there would otherwise be reported as this run's results.
     if settings.output_dir.exists() and any(settings.output_dir.iterdir()):
@@ -135,8 +137,11 @@ async def send_nudis_async(task_dir, config=None, **options) -> dict:
             except Exception as error:
                 run.warn(f"{name} failed: {type(error).__name__}: {redacted(run, str(error))}")
     finally:
-        run.save()
-        report.write(settings.output_dir, run.keys.values(), selected)
+        try:
+            await finish_cleanup(asyncio.create_task(copies.delete(run)))
+        finally:
+            run.save()
+            report.write(settings.output_dir, run.keys.values(), selected)
     return report.build(settings.output_dir, run.keys.values(), selected)
 
 

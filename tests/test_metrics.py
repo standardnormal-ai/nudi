@@ -86,10 +86,8 @@ class RunDir:
         if self.grader is None:
             self.grader = InspectionResult(mode="grader", status="complete", categories={"accepted_invalid": "no_evidenced_issue"},
                                            applicability={})
-        start = len(self.grader.assessments)
         self.grader.assessments.extend(assessments)
-        self.grader.ordinary[name] = EpisodeLabel(label=label, reasons=[f"{label} label"],
-                                                  assessments=list(range(start, len(self.grader.assessments))))
+        self.grader.ordinary[name] = EpisodeLabel(label=label, reasons=[f"{label} label"])
 
     def save(self) -> None:
         (self.path / "run.json").write_text(self.record.model_dump_json(indent=2))
@@ -248,6 +246,33 @@ def test_completion_references_and_native_decisions_count_each_ordinary_episode_
     # Local findings stay separate from binary labels.
     assert result["labels"]["counts"] == {"accepted_invalid": 2, "legitimate": 2, "rejected_valid": 1,
                                           "unavailable": 1, "unknown": 2}
+
+
+def test_an_evidenced_finding_with_an_open_claim_condition_still_counts_in_grader_error_rates(tmp_path):
+    """Doubt is one-sided: an open claim item keeps neither error direction out of the metrics,
+    while a legitimate check with one is still not a resolved completion reference."""
+    run = RunDir(tmp_path)
+    both, open_item = ["sorted", "summary"], ["whether the copied grader is the hosted one"]
+    false_positive = run.episode(rewards={"reward": 1.0})
+    run.label(false_positive, "accepted_invalid", checked(
+        false_positive, "c0", "summary", "violated", outcome="accepted_invalid", unresolved=open_item,
+        basis=basis("violated", ["summary"], ["c0"], decision=RULE)))
+    false_negative = run.episode(rewards={"reward": 0.0})
+    run.label(false_negative, "rejected_valid",
+              checked(false_negative, "c1", "sorted", "supported", outcome="rejected_valid", unresolved=open_item),
+              checked(false_negative, "c2", "summary", "supported", basis=basis("supported", both, ["c1", "c2"], decision=RULE)))
+    doubted_legitimate = run.episode(rewards={"reward": 1.0})
+    run.label(doubted_legitimate, "unknown", checked(
+        doubted_legitimate, "c3", "sorted", "supported", outcome="legitimate", unresolved=open_item,
+        basis=basis("supported", ["sorted"], ["c3"], decision=RULE)))
+
+    metrics = run.report()["metrics"]
+    episodes = metrics["episodes"]
+    assert [episodes[name]["completion"] for name in (false_positive, false_negative, doubted_legitimate)] == [
+        "incomplete", "complete", "unknown"]
+    assert any("c3 is not a resolved check" in reason for reason in episodes[doubted_legitimate]["completion_reasons"])
+    (group,) = metrics["confusion"]
+    assert (group["fp"], group["fn"]) == (1, 1)
 
 
 def test_reports_show_the_mode_and_presumed_and_verified_counts_without_counting_presumption_as_evidence(tmp_path):
@@ -708,10 +733,10 @@ def test_requested_basis_is_retained_and_partial_credit_can_have_a_noncompletion
 
     def bounded(validity, name, **claim):
         return {"claim": {"mechanism": "half credit", "interpretation": f"{name} earns 0.5 of the reward.",
-                          "derivation": {"observations": [name], "minimum": "minimum", "maximum": "maximum", "validity": validity},
+                          "derivation": {"observations": [name], "validity": validity},
                           **claim}}
 
-    script = InspectorScript([{"locations": []}, {"probes": [half("explanation"), half("answer")]}, bounded("supported", "exists"),
+    script = InspectorScript([{"probes": [half("explanation"), half("answer")]}, bounded("supported", "exists"),
                               bounded("violated", "correct", coverage=covered, basis=reference)])
 
     async def main():
@@ -724,8 +749,9 @@ def test_requested_basis_is_retained_and_partial_credit_can_have_a_noncompletion
 
     run, inspection = asyncio.run(main())
     assert "`basis`" in script.requests[0]["messages"][0]["content"]
-    assert inspection.ordinary["0000-simulator"].label == "legitimate"
-    assert inspection.status == "complete", "supported partial scoring and full ordinary coverage remain complete"
+    # Each half lives in its own file, so no check has the whole deserved score and the label stays unknown (a recorded limit).
+    assert inspection.ordinary["0000-simulator"].label == "unknown"
+    assert inspection.status == "partial", "an unresolved ordinary review keeps the grader inspection partial"
     retained = InspectionResult.model_validate_json((run.config.output_dir / "inspection-grader.json").read_text())
     assert retained.assessments[1].claim.basis.completion == "violated"
     assert retained.assessments[1].claim.basis.decision.values == [0.0, 0.5, 1.0]

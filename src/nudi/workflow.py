@@ -1,5 +1,5 @@
-"""Shared run state: models and credentials for each role, Docker capacity and the
-optional spending cap, applied to every episode and model call of one run.
+"""Shared run state: models and credentials for each role, the backend and its capacity,
+and the optional spending cap, applied to every episode and model call of one run.
 
 Episodes keep the original grading and harness, which selects native Harbor, and run
 through one Harbor TrialQueue sized by the capacity check. A LiteLLM callback,
@@ -13,6 +13,7 @@ import contextlib
 import logging
 import math
 import os
+import secrets
 import subprocess
 import tomllib
 from contextvars import ContextVar
@@ -22,6 +23,7 @@ from typing import get_args
 
 import litellm
 from dotenv import dotenv_values
+from harbor.environments.factory import EnvironmentFactory
 from harbor.models.task.task import Task
 from harbor.trial.queue import TrialQueue
 from litellm.integrations.custom_logger import CustomLogger
@@ -31,7 +33,6 @@ from nudi.records import (
     DEFAULT_MODELS,
     PROVIDER_REPORTED,
     CallRecord,
-    CaptureFailure,
     Capacity,
     EpisodeConfig,
     EpisodeEvent,
@@ -47,7 +48,8 @@ from nudi.records import (
     private_dir,
     write_private,
 )
-from nudi.runner import UnsupportedTask, check_output, episode_queue, run_episode, select_path
+from nudi.runner import (HELPER_STATE, MODAL_BOX, UnsupportedTask, check_backend, check_output, compose_services, dropped_links, episode_queue,
+                         run_episode, select_path)
 
 ROLES: frozenset[Role] = frozenset(DEFAULT_MODELS)
 # Requesting every behavior the adapter changes keeps the original grading and harness.
@@ -68,6 +70,14 @@ LIMITATIONS = [
     "Harbor's whole-episode retries are disabled, so every attempted episode stays recorded. "
     "Terminus 2 and Harbor's LiteLLM wrapper each retry a failed request up to 3 attempts; "
     "each sent attempt is a call.",
+]
+MODAL_LIMITATIONS = [
+    "On Modal, `concurrency` containers run at once. Each declared CPU and memory value is a hard limit "
+    "with a small request; an undeclared value has no limit. Hardware differs from a local Docker host, "
+    "so timing-sensitive grading can differ between backends.",
+    "On Modal, task files, episode files and the Attacker's work are uploaded to Modal. Modal compute is "
+    "outside the spending cap; the report estimates it as an upper bound from each sandbox's limits and "
+    "lifetime. A sandbox nudi fails to remove can run up to 24 h and is reported as a warning.",
 ]
 MIMO_LIMITATION = (
     "MiMo requests enable thinking explicitly and send the requested reasoning effort; "
@@ -92,6 +102,10 @@ class SpendingCapReached(RuntimeError):
     """Known cost reached the run's spending cap, so no new call or episode starts."""
 
 
+class BackendUnavailable(RuntimeError):
+    """The backend's preflight failed, so the run does not start."""
+
+
 class CapacityUnavailable(RuntimeError):
     """A held Inspector sandbox leaves no room under the run's concurrency, so another
     container does not start; it is refused at once rather than queued."""
@@ -110,15 +124,24 @@ def declared_requirements(task_dir: Path) -> tuple[int | None, int | None]:
     """Declared CPUs and memory_mb of one episode's largest container; None when undeclared.
 
     The raw TOML decides whether a value is declared; Harbor's parsed config supplies it,
-    converting the legacy `memory` string. A separate grader runs after the task
-    container with a copy of its environment (an explicit `[verifier.environment]` and
-    Compose helpers are rejected as unverified), so the larger requirement is the task's.
+    converting the legacy `memory` string. A separate grader runs after the task container,
+    in `[verifier.environment]` when declared, so the larger of the two is the requirement.
+    Helper services of a compose file run beside the task container without the declared
+    limits, Harbor applying them to the main service only, so their requirement is undeclared.
     """
-    raw = tomllib.loads((task_dir / "task.toml").read_text()).get("environment", {})
-    environment = Task(task_dir).config.environment
-    cpus = environment.cpus if "cpus" in raw else None
-    memory_mb = environment.memory_mb if {"memory_mb", "memory"} & raw.keys() else None
-    return cpus, memory_mb
+    if len(compose_services(task_dir)) > 1:
+        return None, None
+    raw = tomllib.loads((task_dir / "task.toml").read_text())
+    config = Task(task_dir).config
+    tables = [(raw.get("environment", {}), config.environment),
+              (raw.get("verifier", {}).get("environment", {}), config.verifier.environment)]
+    cpus = [parsed.cpus for table, parsed in tables if "cpus" in table]
+    memory_mb = [parsed.memory_mb for table, parsed in tables if {"memory_mb", "memory"} & table.keys()]
+    for name, needs in (("CPUs", cpus), ("MiB of memory", memory_mb)):
+        for need in needs:
+            if need <= 0:
+                raise ValueError(f"one episode declares {need} {name}; a declared value must be positive")
+    return max(cpus, default=None), max(memory_mb, default=None)
 
 
 def plan_concurrency(
@@ -126,14 +149,13 @@ def plan_concurrency(
 ) -> tuple[int, list[str]]:
     """Episodes to run at once within 90% of Docker's capacity, and the warnings."""
     for name, need, have in (("CPUs", cpus, docker_cpus), ("MiB of memory", memory_mb, docker_memory_mb)):
-        if need is not None and need <= 0:
-            raise ValueError(f"one episode declares {need} {name}; a declared value must be positive")
         if need is not None and need > have:
             raise CapacityError(f"one episode declares {need} {name}, which exceeds Docker's {have}")
     if cpus is None or memory_mb is None:
         return 1, [
-            "the task does not declare both cpus and memory_mb, so fit cannot be established: "
-            "episodes run one at a time and even one may exhaust Docker's memory"
+            "the task does not declare both cpus and memory_mb for every container, so fit cannot be established: "
+            "episodes run one at a time, a task's helper containers can exceed the concurrency setting, "
+            "and even one episode may exhaust Docker's memory"
         ]
     fits = min(9 * docker_cpus // (10 * cpus), 9 * docker_memory_mb // (10 * memory_mb))
     if fits == 0:
@@ -150,6 +172,8 @@ class Run:
     """Resolved credentials; held in memory only."""
     native_episodes: int = 0
     """Native episodes started and not yet returned, queued or running."""
+    images: dict = field(default_factory=dict)
+    """Modal snapshot images by copy id, for check sandboxes; held in memory only."""
 
     def save(self) -> None:
         write_private(self.config.output_dir / "run.json", self.record.model_dump_json(indent=2))
@@ -167,11 +191,15 @@ class Run:
     def admit_container(self, purpose: str) -> None:
         """Admit another container, a sandbox `purpose` or "native", only after every closed
         Inspector sandbox was removed. Native episodes alone keep waiting in the run's queue;
-        a held sandbox would make them wait on itself. Otherwise the recorded limits of held
-        sandboxes, the declaration of each native episode in flight and the new container
-        must fit 90% of Docker's CPUs and memory. Undeclared resources keep one container for
-        each slot of the run's concurrency. Only a held workspace and one fresh experiment
-        may use every CPU, still within the memory allowance, with a warning."""
+        a held sandbox would make them wait on itself. Otherwise held sandboxes and native
+        episodes in flight must leave room under the `concurrency` setting, except that a
+        held workspace always admits one fresh experiment. On Modal that count is all. On
+        Docker the recorded limits of held sandboxes, the declaration of each native episode
+        in flight and the new container must also fit 90% of Docker's CPUs and memory.
+        Undeclared resources keep one container for each slot of the run's concurrency, and a
+        held workspace still admits one fresh experiment, unchecked, with a warning. Only a held
+        workspace and one fresh experiment may use every CPU, still within the memory
+        allowance, with a warning."""
         held = []
         for name in self.record.sandboxes:
             path = self.config.output_dir / "sandboxes" / name / "sandbox.json"
@@ -183,10 +211,20 @@ class Run:
         if not held and (purpose == "native" or not self.native_episodes):
             return
         capacity = self.record.capacity
+        pair = [box.purpose for box in held] == ["workspace"] and not self.native_episodes and purpose in ("probe", "check")
+        setting = capacity.concurrency_setting
+        if setting is not None and len(held) + self.native_episodes >= setting and not pair:
+            raise CapacityUnavailable(f"{len(held)} held sandboxes and {self.native_episodes} native episodes fill the "
+                                      f"run's concurrency of {setting}; another container cannot start")
+        if self.record.backend == "modal":
+            return
         if capacity.episode_cpus is None or capacity.episode_memory_mb is None:
-            if len(held) + self.native_episodes >= capacity.concurrency:
+            if len(held) + self.native_episodes >= capacity.concurrency and not pair:
                 raise CapacityUnavailable(f"{len(held)} held sandboxes and {self.native_episodes} native episodes fill the "
                                           f"run's concurrency of {capacity.concurrency}; another container cannot start")
+            if pair:
+                self.warn("a held workspace and one fresh experiment run without a resource check: the task's resources "
+                          "are undeclared, helper services included")
             return
         memory_mb = capacity.workspace_memory_mb if purpose == "workspace" else capacity.episode_memory_mb
         limits = ([(box.environment["cpus"], box.environment["memory_mb"]) for box in held]
@@ -194,7 +232,6 @@ class Run:
                   + [(capacity.episode_cpus, memory_mb)])
         cpus, memory_mb = map(sum, zip(*limits))
         headroom = 10 * cpus <= 9 * capacity.docker_cpus
-        pair = [box.purpose for box in held] == ["workspace"] and not self.native_episodes and purpose in ("probe", "check")
         if 10 * memory_mb > 9 * capacity.docker_memory_mb or not (headroom or pair and cpus <= capacity.docker_cpus):
             raise CapacityUnavailable(f"{len(held)} held sandboxes and {self.native_episodes} native episodes leave no room "
                                       f"for another container within 90% of Docker's {capacity.docker_cpus} CPUs and "
@@ -222,7 +259,9 @@ def resolve_credentials(config: RunConfig, models, roles) -> tuple[dict[Role, st
 
 
 def start_run(config: RunConfig, roles: frozenset[Role] = ROLES) -> Run:
-    """Settle models, credentials, path and capacity for `roles` before any episode starts."""
+    """Settle models, credentials, path, backend and capacity for `roles` before any episode
+    starts. Docker's capacity comes from `docker info`; on Modal, Harbor's preflight
+    checks for a Modal credential instead, which nudi never reads."""
     check_output(config.output_dir, config.task_dir)
     if config.credentials_file and config.credentials_file.resolve().is_relative_to(config.task_dir.resolve()):
         raise UnsupportedTask(f"the credentials file {config.credentials_file} is inside the task")
@@ -232,11 +271,25 @@ def start_run(config: RunConfig, roles: frozenset[Role] = ROLES) -> Run:
     path, reasons = select_path(config.task_dir, ORIGINAL_BEHAVIOR)
     if path != "harbor":
         raise UnsupportedTask("run-level credentials and spending controls cover native Harbor only")
-    docker_cpus, docker_memory_mb = docker_capacity()
+    check_backend(config.task_dir, config.backend)
     cpus, memory_mb = declared_requirements(config.task_dir)
-    concurrency, warnings = plan_concurrency(docker_cpus, docker_memory_mb, cpus, memory_mb)
+    if config.backend == "modal":
+        try:
+            EnvironmentFactory.run_preflight(type=None, import_path=MODAL_BOX)
+        except (SystemExit, ImportError) as error:
+            # Harbor's login message and the missing-extra message are fixed texts.
+            raise BackendUnavailable(f"Modal is unavailable: {error}") from None
+        except Exception as error:
+            # Importing the Modal SDK reads the user's profile; its error text can quote that file.
+            raise BackendUnavailable(f"Modal is unavailable: loading or checking Modal raised {type(error).__name__}") from None
+        docker_cpus = docker_memory_mb = None
+        concurrency, warnings = config.concurrency, []
+    else:
+        docker_cpus, docker_memory_mb = docker_capacity()
+        concurrency, warnings = plan_concurrency(docker_cpus, docker_memory_mb, cpus, memory_mb)
+        concurrency = min(concurrency, config.concurrency)
     workspace_memory_mb = config.workspace_memory_mb or min(WORKSPACE_MEMORY_MB, memory_mb or WORKSPACE_MEMORY_MB)
-    if 10 * workspace_memory_mb > 9 * docker_memory_mb:
+    if docker_memory_mb is not None and 10 * workspace_memory_mb > 9 * docker_memory_mb:
         raise CapacityError(f"the Inspector workspace's {workspace_memory_mb} MiB of memory exceeds 90% of Docker's "
                             f"{docker_memory_mb} MiB")
     mimo = any(models[role].model.startswith("xiaomi_mimo/") for role in roles)
@@ -253,11 +306,15 @@ def start_run(config: RunConfig, roles: frozenset[Role] = ROLES) -> Run:
             episode_cpus=cpus,
             episode_memory_mb=memory_mb,
             concurrency=concurrency,
+            concurrency_setting=config.concurrency,
             workspace_memory_mb=workspace_memory_mb,
         ),
+        backend=config.backend,
+        run_id=secrets.token_hex(4),
         cost_map=get_model_cost_map_source_info(),
         warnings=warnings,
-        limitations=LIMITATIONS + [MIMO_LIMITATION] * mimo,
+        limitations=(LIMITATIONS if config.backend == "docker" else MODAL_LIMITATIONS + LIMITATIONS[1:])
+        + [MIMO_LIMITATION] * mimo + [HELPER_STATE.strip()] * (len(compose_services(config.task_dir)) > 1),
     )
     for warning in warnings:
         logger.warning(warning)
@@ -378,25 +435,21 @@ class RunCalls(CustomLogger):
             record_call(*scope, request_data, error=type(exception).__name__, refusals=refusals)
 
 
-async def run_role_episode(run: Run, role: Role, *, instruction: str | None = None,
-                           capture_locations: list[str] | None = None, agent=None,
+async def run_role_episode(run: Run, role: Role, *, instruction: str | None = None, agent=None,
                            on_agent_start=None, on_trial_end=None, on_verification=None,
                            probe: bool = False) -> EpisodeResult:
     """Run one episode of `role` through the run's queue, under its credential and cap.
 
-    Its lifecycle events record execution order. `finished` means the runner returned;
-    Harbor may return after a failed environment stop. Neither return nor ordering
-    establishes successful teardown or a normal reset.
+    The grader's environment is copied before grading and after the grader returns
+    (`nudi.copies`). Its lifecycle events record execution order. `finished` means the
+    runner returned; Harbor may return after a failed environment stop. Neither return nor
+    ordering establishes successful teardown or a normal reset.
 
     The Inspector is never a native task actor; it executes only in sandboxes of a package copy."""
+    from nudi import copies
+
     if role == "inspector":
         raise ValueError("the Inspector never runs as a native task actor; use an Inspector sandbox")
-    if capture_locations:
-        from nudi.checks import capture_location_problem
-
-        for location in capture_locations:
-            if problem := capture_location_problem(location):
-                raise ValueError(f"capture of {location!r} rejected before native episode: {problem}")
     run.check_cap()
     run.admit_container("native")
     model = run.record.models[role]
@@ -414,46 +467,39 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
         api_key_var=model.key_name(),
         reasoning_effort=model.reasoning_effort,
         native=ORIGINAL_BEHAVIOR,
+        backend=run.config.backend,
     )
     run.native_episodes += 1
     try:
-        capture = None
-        if capture_locations or on_verification is not None:
-            from nudi.checks import protected_capture
+        observe = None
+        if on_verification is not None:
+            async def observe(event):
+                try:
+                    await on_verification(event)
+                except InfrastructureAbort:
+                    raise
+                except Exception as error:
+                    message = str(error)
+                    for secret in run.keys.values():
+                        message = message.replace(secret, "[redacted]")
+                    run.warn(f"{name}: verification observation failed: {type(error).__name__}: {message}")
 
-            async def capture(event):
-                if on_verification is not None:
-                    try:
-                        await on_verification(event)
-                    except InfrastructureAbort:
-                        raise
-                    except Exception as error:
-                        message = str(error)
-                        for secret in run.keys.values():
-                            message = message.replace(secret, "[redacted]")
-                        run.warn(f"{name}: verification observation failed: {type(error).__name__}: {message}")
-                for location in capture_locations or []:
-                    try:
-                        submission = await protected_capture(event, name, config.output_dir, location)
-                        run.record.submissions.append(submission)
-                    except Exception as error:
-                        message = str(error)
-                        for secret in run.keys.values():
-                            message = message.replace(secret, "[redacted]")
-                        run.record.capture_errors.append(CaptureFailure(episode=name, location=location,
-                            error=ErrorRecord(type=type(error).__name__, message=message)))
-                        run.warn(f"{name}: capture of {location} failed: {type(error).__name__}: {message}")
-                        if isinstance(error, InfrastructureAbort):
-                            raise
-                    finally:
-                        run.save()
-        with model_calls(run, role, name):
-            if instruction is None and agent is None and capture is None and on_agent_start is None and on_trial_end is None:
-                result = await run_episode(config, run.queue, credentials=run.config.credentials_file)
-            else:
-                result = await run_episode(config, run.queue, instruction=instruction, agent=agent, capture=capture,
-                                           on_agent_start=on_agent_start, on_trial_end=on_trial_end,
+        async def copy(verifier, point):
+            ids = {"trial_id": str(verifier.environment.context_id), "trial_name": verifier.trial_paths.trial_dir.name,
+                   "task_checksum": verifier.task.checksum}
+            await copies.take(run, verifier, point, episode=name, owner=config.output_dir, ids=ids)
+
+        def dropped(paths):
+            run.warn(f"{name}: links and special files were removed from the collected artifacts before upload: {paths}")
+
+        token = dropped_links.set(dropped)
+        try:
+            with model_calls(run, role, name):
+                result = await run_episode(config, run.queue, instruction=instruction, agent=agent, copy=copy,
+                                           on_verification=observe, on_agent_start=on_agent_start, on_trial_end=on_trial_end,
                                            credentials=run.config.credentials_file)
+        finally:
+            dropped_links.reset(token)
         run.record.events.append(EpisodeEvent(episode=name, event="finished"))
         return result
     finally:
@@ -467,10 +513,8 @@ async def simulate(run: Run, episodes: int = 20) -> Simulation:
     Every count takes this path. As many workers as the run's queue runs at once admit
     an episode only while the spending cap allows; admitted episodes finish. Failed
     episodes stay recorded and are not retried; the pool is partial only when one has no
-    usable reward. The run's capture selection, made before
-    the first episode, is captured at verification start for grader inspection, which
-    reuses this pool."""
-    from nudi.checks import capture_selection, redacted
+    usable reward. Each episode's state copies serve grader inspection, which reuses this pool."""
+    from nudi.checks import redacted
 
     if type(episodes) is not int or episodes < 1:
         raise ValueError("episodes must be a positive integer")
@@ -490,7 +534,7 @@ async def simulate(run: Run, episodes: int = 20) -> Simulation:
             name = f"{len(run.record.episodes):04d}-simulator"
             simulation.episodes.append(name)
             try:
-                result = await run_role_episode(run, "simulator", capture_locations=locations)
+                result = await run_role_episode(run, "simulator")
                 if result.errors:
                     simulation.failures[name] = [error.model_copy(update={"message": redacted(run, error.message)})
                                                  for error in result.errors]
@@ -505,7 +549,6 @@ async def simulate(run: Run, episodes: int = 20) -> Simulation:
                 run.save()
 
     try:
-        locations = [item.source for item in (await capture_selection(run)).files if item.selected]
         await asyncio.gather(*(worker() for _ in range(min(episodes, run.record.capacity.concurrency))))
         if simulation.status == "running":
             simulation.status = "partial" if unusable else "complete"

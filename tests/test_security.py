@@ -4,7 +4,6 @@ local scripted Terminus 2 endpoint; no provider is called."""
 
 import asyncio
 import json
-import logging
 import os
 import signal
 import stat
@@ -69,7 +68,7 @@ def malicious_grader(monkeypatch, plant) -> Sandboxes:
 
 
 def probe(run) -> str:
-    return asyncio.run(checks.package_probe(run, "true\n", "/app/answer.txt", "verification_start"))
+    return asyncio.run(checks.package_probe(run, "true\n"))
 
 
 # Rewards: read without following links, bounded, invalid values kept out of errors.
@@ -338,24 +337,6 @@ def test_a_credentials_file_inside_the_task_is_refused_before_the_run(tmp_path, 
 
 
 # Redaction and owner-only raw evidence.
-
-
-def test_native_capture_failure_log_line_is_redacted(tmp_path, monkeypatch, credentials, caplog):
-    run = new_run(tmp_path, monkeypatch, credentials)
-
-    async def failing(event, episode, output_dir, location):
-        raise RuntimeError(f"daemon echoed {FILE_KEY}")
-
-    async def native(config, queue=None, *, capture=None, **work):
-        await capture(SimpleNamespace())
-        return SimpleNamespace()
-
-    monkeypatch.setattr(checks, "protected_capture", failing)
-    monkeypatch.setattr(workflow, "run_episode", native)
-    with caplog.at_level(logging.WARNING, logger="nudi"):
-        asyncio.run(workflow.run_role_episode(run, "simulator", capture_locations=["/app/answer.txt"]))
-    assert "[redacted]" in caplog.text and FILE_KEY not in caplog.text
-    assert FILE_KEY not in json.dumps(run.record.warnings)
 
 
 def mode(path: Path) -> int:

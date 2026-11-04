@@ -6,8 +6,8 @@ import pytest
 
 from nudi import report
 from nudi.assessment import CHECK_LIMIT
-from nudi.checks import CAPTURE_LIMIT, DISABLED_LIMIT, SAFETY_LIMIT, SELECTION_SESSION, TIMING_LIMIT, AttackAttempt, AttackResult, InspectionAttempt, InspectionResult, OrdinaryReview
-from nudi.records import Assessment, CallRecord, CaptureSelection, Claim, Derivation, ErrorRecord, PersistenceProbe, Submission
+from nudi.checks import DISABLED_LIMIT, SAFETY_LIMIT, TIMING_LIMIT, AttackAttempt, AttackResult, InspectionAttempt, InspectionResult, OrdinaryReview
+from nudi.records import Assessment, CallRecord, Claim, Derivation, ErrorRecord, PersistenceProbe
 from test_metrics import RunDir, basis, checked
 
 SECRET = "sk-live-0123456789abcdef"
@@ -16,11 +16,9 @@ SECRET = "sk-live-0123456789abcdef"
 def evidenced(episode: str, check: str) -> Assessment:
     assessment = checked(episode, check, "summary", "violated", outcome="accepted_invalid")
     assessment.discrepancy, assessment.reward, assessment.ids = "over", 1.0, {"trial_id": episode}
-    assessment.claim.derivation = Derivation(observations=["exists"], maximum="deserved", validity="violated")
-    assessment.check.submission = Submission(content=assessment.check.content, ids={"trial_id": episode}, location="/app/summary.txt",
-                                             capture_point="verification_start", command=["python", "-c", "capture"],
-                                             program="capture", exit_code=0, output="{}")
-    assessment.reasons, assessment.limits = ["violating content received 1.0, above the deserved maximum 0.0"], [CHECK_LIMIT]
+    assessment.claim.derivation = Derivation(observations=["exists"], validity="violated")
+    assessment.check.state_copy = "copy-0000"
+    assessment.reasons, assessment.limits = ["violating content received 1.0, above the deserved score 0.0"], [CHECK_LIMIT]
     return assessment
 
 
@@ -45,7 +43,7 @@ def attacked(run: RunDir) -> None:
                           error="InferenceFailure: RateLimitError"),
             AttackAttempt(level="none", number=2, context="attacker-none-2", status="spending_exhausted"),
         ],
-        assessments=[evidenced(full, "attack-check")], limits=[SAFETY_LIMIT, CAPTURE_LIMIT])
+        assessments=[evidenced(full, "attack-check")], limits=[SAFETY_LIMIT])
 
 
 def test_reports_are_deterministic_and_never_expose_resolved_credentials(tmp_path):
@@ -95,7 +93,7 @@ def test_attack_reports_actual_attempts_and_failure_kinds_without_a_success_rate
     assert result["status"] == "partial"
 
     disabled = RunDir(tmp_path / "disabled")
-    disabled.attack = AttackResult(status="complete", maximum_attempts=0, limits=[SAFETY_LIMIT, CAPTURE_LIMIT, DISABLED_LIMIT])
+    disabled.attack = AttackResult(status="complete", maximum_attempts=0, limits=[SAFETY_LIMIT, DISABLED_LIMIT])
     result = disabled.report()
     assert result["analyses"]["attack"] == "complete" and result["status"] == "complete"
     assert DISABLED_LIMIT in result["attack"]["limits"]
@@ -172,8 +170,7 @@ def test_findings_keep_claims_captured_facts_and_interpretations_apart(tmp_path)
     assert captured["native_reward"] == 1.0 and captured["ids"] == {"trial_id": graded}
     assert captured["check"]["id"] == "c0" and captured["check"]["exit_code"] == 0
     assert captured["check"]["content"]["sha256"] == "a" * 64
-    assert captured["check"]["submission"] == {"location": "/app/summary.txt", "capture_point": "verification_start",
-                                               "sha256": "a" * 64}
+    assert captured["check"]["state_copy"] == "copy-0000"
     assert issue["interpretation"]["interpretation"] == "summary is violated"
     assert issue["interpretation"]["derivation"]["validity"] == "violated"
     assert issue["assessment"]["outcome"] == "accepted_invalid" and CHECK_LIMIT in issue["assessment"]["limits"]
@@ -215,6 +212,48 @@ def test_records_before_requirement_conclusions_stay_readable_without_invented_e
     assert "native reward unavailable" in line and "validity violated" in line
 
 
+def test_a_record_saved_before_the_single_deserved_score_loads_and_reports_its_stored_outcomes(tmp_path):
+    """Old fields stay in the raw JSON and are not reassessed or converted: supports, min/max, the label's
+    assessment indices, the old attack session name and an attribution with a checks list."""
+    run = RunDir(tmp_path)
+    graded = run.episode(rewards={"reward": 1.0})
+    run.label(graded, "accepted_invalid", evidenced(graded, "c0"))
+    attacked = run.episode("attacker", {"reward": 1.0})
+    run.attack = AttackResult(status="complete", conditions={"none": "evidenced_issue"}, attempts=[
+        AttackAttempt(level="none", number=1, context="attacker-none-none-1", episode=attacked, rewards={"reward": 1.0},
+                      status="evidenced_issue", assessment=0)],
+        assessments=[evidenced(attacked, "c1")])
+    run.save()
+    support = {"basis": "explicit", "sources": [{"episode": None, "path": "instruction.md", "excerpt": "Write the numbers sorted"}],
+               "rationale": "stated", "uncertainty": []}
+    for name in ("inspection-grader.json", "attack.json"):
+        path = run.path / name
+        legacy = json.loads(path.read_text())
+        for item in legacy["assessments"]:
+            item["claim"].update(requirement_support=support, scoring_support=support)
+            item["claim"]["derivation"].update(minimum={"field": "minimum"}, maximum={"field": "maximum"},
+                                               requirements=[{"requirement": support["sources"][0], "observations": ["exists"],
+                                                              "validity": "violated", "interpretation": "old", "support": support}])
+        if name == "attack.json":
+            legacy["sessions"] = {"inspector-attacker-none-none-1": [{"role": "system", "content": "old prompt"}]}
+            legacy["findings"] = [{"kind": "discovery", "attempt": 0, "assessment": 0, "checks": ["c1"]}]
+        else:
+            legacy["ordinary"][graded]["assessments"] = [0]
+        path.write_text(json.dumps(legacy))
+
+    result = report.build(run.path)
+    grader = result["inspections"]["grader_inspector"]
+    (finding,) = grader["findings"]["evidenced"]
+    assert finding["assessment"]["outcome"] == "accepted_invalid" and finding["assessment"]["discrepancy"] == "over"
+    assert "above the deserved score 0.0" in " ".join(finding["assessment"]["reasons"])
+    assert finding["interpretation"]["citations"] == [] and "requirement_support" not in json.dumps(finding)
+    derivation = finding["interpretation"]["derivation"]
+    assert {"minimum", "maximum"}.isdisjoint(derivation) and "support" not in derivation["requirements"][0]
+    assert result["labels"]["episodes"][graded]["label"] == "accepted_invalid"
+    assert result["attack"]["attempts"][0]["status"] == "evidenced_issue"
+    assert report.markdown(result)
+
+
 def test_package_sandbox_evidence_stays_marked_apart_from_native_findings(tmp_path):
     run = RunDir(tmp_path)
     native = run.episode("attacker", {"reward": 1.0})
@@ -234,7 +273,7 @@ def test_package_sandbox_evidence_stays_marked_apart_from_native_findings(tmp_pa
 
     result = run.report()
     findings = result["inspections"]["hack_inspector"]["findings"]
-    assert findings["suspected"] == [] and findings["inconclusive"] == []
+    assert findings["inconclusive"] == []
     (copy,) = findings["evidenced"]
     assert copy["execution_scope"] == "package" and copy["claim"]["episode"] == "sandbox-0000"
     assert copy["captured"]["check"]["sandbox"] == "sandbox-0001"
@@ -250,7 +289,7 @@ def test_package_sandbox_evidence_stays_marked_apart_from_native_findings(tmp_pa
     assert "copied grader reward 1" in package_line and "native reward" not in package_line
     # The package limit is stated once for every package finding.
     assert markdown.count(report.PACKAGE_LIMIT) == 1
-    for part in ("not native accessibility", "copied tests", "after capture", "isolation parity"):
+    for part in ("not native accessibility", "copied tests", "after the verification_start copy", "isolation parity"):
         assert part in report.PACKAGE_LIMIT
     # A finding's scope notes stay visible beside it, native or package.
     assert "Scope notes: whether the copied grader matches the hosted one" in package_line
@@ -308,31 +347,33 @@ def experiment(number: int, category: str, check: str, status: str = "assessed")
 
 
 def test_findings_are_grouped_by_result_and_keep_their_scope_category_and_open_items(tmp_path):
-    """Package evidence behind an evidenced category is an evidenced finding marked package, not a separate list."""
+    """Doubt is one-sided: an issue with an open condition is a finding shown with it; a legitimate result with one is not clean."""
     run = RunDir(tmp_path)
     graded = run.episode(rewards={"reward": 1.0})
     run.record.sandboxes = ["sandbox-0000", "sandbox-0001"]
     unresolved = "whether the copied grader is the hosted grader"
     run.label(graded, "unknown", packaged("sandbox-0000", "check-0000"), packaged("sandbox-0001", "check-0001", unresolved),
-              checked(graded, "check-0002", "sorted", "unknown"))
+              checked(graded, "check-0002", "sorted", "unknown"),
+              checked(graded, "check-0003", "sorted", "supported", outcome="legitimate", unresolved=["whether sorting is graded"]))
     run.grader.categories = {"accepted_invalid": "evidenced_issue"}
     run.grader.experiments = [experiment(0, "accepted_invalid", "check-0000"), experiment(1, "accepted_invalid", "check-0001")]
 
     result = run.report()
     findings = result["inspections"]["grader_inspector"]["findings"]
-    assert set(findings) == {"evidenced", "suspected", "legitimate", "inconclusive"}
-    (issue,), (suspect,), (unknown,) = findings["evidenced"], findings["suspected"], findings["inconclusive"]
+    assert set(findings) == {"evidenced", "legitimate", "inconclusive"}
+    (issue, doubted), (unknown, doubted_legitimate) = findings["evidenced"], findings["inconclusive"]
     assert (issue["execution_scope"], issue["category"], issue["captured"]["check"]["id"]) == ("package", "accepted_invalid", "check-0000")
-    assert (suspect["claim"]["unresolved"], suspect["category"]) == ([unresolved], "accepted_invalid")
-    # An unknown outcome is inconclusive, not a suspected flaw.
+    assert (doubted["claim"]["unresolved"], doubted["category"]) == ([unresolved], "accepted_invalid")
     assert (unknown["execution_scope"], unknown["category"], unknown["assessment"]["outcome"]) == ("native", None, "unknown")
+    assert doubted_legitimate["assessment"]["outcome"] == "legitimate" and findings["legitimate"] == []
 
     lines = report.markdown(result).splitlines()
-    line = next(line for line in lines if line.startswith("- grader_inspector evidenced (package):"))
-    assert "check check-0000; category accepted_invalid" in line and "copied grader reward 1" in line
-    assert report.PACKAGE_LIMIT not in line and CHECK_LIMIT not in line
-    line = next(line for line in lines if line.startswith("- grader_inspector suspected (package):"))
-    assert f"Unresolved: {unresolved}" in line
+    assert lines[lines.index("## Findings") + 2] == "Evidenced findings: 2, 1 of them with open conditions."
+    first, second = [line for line in lines if line.startswith("- grader_inspector evidenced (package):")]
+    assert "check check-0000; category accepted_invalid" in first and "copied grader reward 1" in first
+    assert "Interpretation: summary is violated" in first and "Open conditions" not in first
+    assert report.PACKAGE_LIMIT not in first and CHECK_LIMIT not in first
+    assert f"Open conditions: {unresolved}" in second and "check check-0001" in second
     assert any(line.startswith("- grader_inspector inconclusive:") and "check check-0002;" in line for line in lines)
     # Limits shared by findings are listed once, apart from the finding lines.
     text = "\n".join(lines)
@@ -434,7 +475,7 @@ def test_markdown_reports_each_category_with_its_attempts_and_what_stays_open(tm
                                     error="Invalid probe: 'category'"),
                   InspectionAttempt(phase="focused", number=2, category="rejected_valid", status="no_evidenced_issue"),
                   InspectionAttempt(phase="episode", number=1, episode="0000-simulator", status="tool_failure")],
-        assessments=[packaged("sandbox-0000", "check-0000"), packaged("sandbox-0001", "check-0001", "whether it is graded")],
+        assessments=[packaged("sandbox-0000", "check-0000"), checked("sandbox-0001", "check-0001", "sorted", "unknown")],
         experiments=[experiment(0, "accepted_invalid", "check-0000"), experiment(1, "rejected_valid", "check-0001"),
                      experiment(2, "rejected_valid", "check-0002", "measured")])
 
@@ -450,7 +491,7 @@ def test_markdown_reports_each_category_with_its_attempts_and_what_stays_open(tm
     start = lines.index("## Inspection categories") + 2
     assert lines[start:start + 3] == [
         "- grader_inspector accepted_invalid: evidenced_issue; evidenced by check-0000; attempts broad 0 unobservable, focused 1 evidenced_issue",
-        "- grader_inspector rejected_valid: unknown; applicability evidence unknown; unresolved cases check-0001 suspected; "
+        "- grader_inspector rejected_valid: unknown; applicability evidence unknown; unresolved cases check-0001 inconclusive; "
         "attempts broad 0 unobservable, focused 1 model_output_failure, focused 2 no_evidenced_issue",
         "- grader_inspector experiments without an assessment: experiment-0002 measured (rejected_valid, check-0002)",
     ]
@@ -479,14 +520,13 @@ def test_configuration_names_the_task_without_its_host_path_and_states_what_cost
 def test_cost_lines_separate_provider_reported_cost_from_estimates(tmp_path):
     run = RunDir(tmp_path)
     run.episode(rewards={"reward": 1.0})
-    run.record.calls = [CallRecord(role="inspector", episode=SELECTION_SESSION, model="xai/grok-4.7", cost=0.05, cost_source="litellm.completion_cost"),
-                        CallRecord(role="inspector", episode=SELECTION_SESSION, model="openai/unpriced", cost=0.25,
+    run.record.calls = [CallRecord(role="inspector", episode="grader-inspector", model="xai/grok-4.7", cost=0.05, cost_source="litellm.completion_cost"),
+                        CallRecord(role="inspector", episode="grader-inspector", model="openai/unpriced", cost=0.25,
                                    cost_source="provider-reported usage.cost", provider_cost=0.25)]
-    run.record.known_cost, run.record.capture_selection = 0.3, CaptureSelection(files=[], status="complete")
+    run.record.known_cost = 0.3
 
     text = report.markdown(run.report())
     assert "- Spending cap: 5.0; known cost $0.300000, $0.250000 of it provider-reported" in text
-    assert "Selection complete in 2 Inspector calls; known cost $0.300000, $0.250000 of it provider-reported." in text
 
 
 def test_labels_failures_and_metric_coverage_state_their_counts_without_contradiction(tmp_path):

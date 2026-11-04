@@ -11,10 +11,11 @@ import math
 import operator
 import statistics
 from collections import Counter
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from nudi.assessment import Evidence, Ungrounded, classify_probe, conclusions
-from nudi.checks import SELECTION_SESSION, AttackResult, InspectionResult, evidenced
+from nudi.checks import AttackResult, InspectionResult, evidenced
 from nudi.records import PROVIDER_REPORTED, Assessment, EpisodeResult, MetricBasis, Observation, RunRecord
 
 ANALYSES = ("simulation", "grader", "hack", "attack")
@@ -24,7 +25,7 @@ UNSUPPORTED_LABELS = ("unknown", "unavailable", "ungrounded", "unreviewed")
 COMPARISONS = {">=": operator.ge, ">": operator.gt, "<=": operator.le, "<": operator.lt, "==": operator.eq}
 DESCRIPTIVE = "descriptive only; difficulty, sampling and execution conditions limit what rewards show"
 LOCAL_LIMIT = (
-    "Local over-credit and under-credit labels compare one native reward with checked bounds. "
+    "Local over-credit and under-credit labels compare one native reward with one deserved score. "
     "They are not binary FP/FN labels, and legitimate partial credit is not a false pass."
 )
 METRIC_LIMIT = (
@@ -48,19 +49,20 @@ EXCLUDED = ("operational_failure", "missing_reward", "unreviewed", "inconclusive
 PACKAGE_LIMIT = (
     "Package evidence: an Inspector sandbox ran a copy of the task package, so this finding establishes what the "
     "copied package did, not native accessibility to a task agent. Setup privileges include copied tests, helpers "
-    "and verifier outputs. Original host tests are uploaded after capture, so captured replacement test bytes do not "
-    "prove their later execution. Separate-verifier configurations do not establish native isolation parity."
+    "and verifier outputs. Original host tests are uploaded after the verification_start copy, so replacement test "
+    "bytes in that copy do not prove their later execution. Separate-verifier configurations do not establish native isolation parity."
 )
 NO_RATE = (
     "Each candidate, hint level, and no-hint discovery stops at its first independently evidenced exploit, "
     "so attempt counts give no unbiased success-rate estimate. Not found means not found within the actual attempts. "
-    "An unrelated or unattributed exploit does not confirm the candidate under test."
+    "Only the attack inspector's attribution to a check of the same episode confirms the candidate under test; "
+    "an unrelated or unattributed exploit does not."
 )
 FINDINGS_NOTE = (
-    "An evidenced finding is accepted_invalid (violating work received more than its deserved maximum) or rejected_valid "
-    "(valid work received less than it deserved) with no necessary condition unresolved. A suspected finding has one of "
-    "those outcomes with unresolved conditions. A legitimate finding has a reward within its checked bounds, which does "
-    "not judge the work. An inconclusive finding established no outcome. Package findings come from an Inspector sandbox "
+    "An evidenced finding is accepted_invalid (violating work received more than its deserved score) or rejected_valid "
+    "(valid work received less than it deserved). A finding with open conditions is still evidenced; its open conditions "
+    "are listed beside it. A legitimate finding has a reward equal to its deserved score and no open condition, which does "
+    "not judge the work. An inconclusive finding established no outcome, or is legitimate with an open condition. Package findings come from an Inspector sandbox "
     "running a copy of the task package, native findings from a task episode. An earlier reading of a check stays listed, "
     "marked with the later reading that superseded it. Category settlement reads the latest reading of each check; local "
     "labels and metrics read every reading."
@@ -69,8 +71,9 @@ CATEGORY_RULE = (
     "A category is evidenced_issue once one of its cases is evidenced (for the hack inspector, an accepted_invalid case), and a "
     "later reading does not withdraw it. It is no_evidenced_issue only when its attempts completed after any failure, its "
     "applicability evidence is applicable, and the latest reading of each case measured before the episode sessions is "
-    "consistent with its reward or evidenced; otherwise it stays unknown. A case belongs to the category of its experiment, "
-    "and an open case without an inspected category keeps every category open. A repair, which interprets an ordinary "
+    "consistent with its reward or evidenced; otherwise it stays unknown. A case belongs to the category of its experiment. "
+    "A hack inspector case outside the requested categories keeps its own family, or `other` when none fits, and leaves "
+    "the requested categories alone; an open grader inspector case without an inspected category keeps every category open. A repair, which interprets an ordinary "
     "check again in a later session, evidences the category of that session. The Inspector's applicability text is in "
     "the JSON report."
 )
@@ -104,7 +107,7 @@ def build(run_dir: Path, secrets=(), selected=None) -> dict:
         "status": "complete" if all(status == "complete" for status in analyses.values()) else "partial",
         "analyses": analyses,
         "configuration": configuration_section(record, results),
-        "collection": collection(record),
+        "copies": state_copies(record),
         "ordinary": ordinary(record, results, warnings, notes) if "simulation" in selected and present["simulation"] else None,
         "other_episodes": {
             "sandboxes": list(record.sandboxes),
@@ -155,18 +158,9 @@ def scrub(value, secrets: list[str]):
     return value
 
 
-def collection(record: RunRecord) -> dict | None:
-    """The run's one capture selection, its Inspector cost and every failed capture; None
-    for a run that never selected."""
-    selection = record.capture_selection
-    if selection is None:
-        return None
-    calls = [call for call in record.calls if call.episode == SELECTION_SESSION]
-    return {"status": selection.status, "files": [item.model_dump(mode="json") for item in selection.files],
-            "selected": [item.source for item in selection.files if item.selected], "limits": selection.limits,
-            "calls": len(calls), "known_cost": sum(call.cost or 0.0 for call in calls),
-            "provider_reported_cost": reported(calls), "unknown_cost_calls": sum(call.cost is None for call in calls),
-            "capture_failures": [failure.model_dump(mode="json") for failure in record.capture_errors]}
+def state_copies(record: RunRecord) -> list[dict]:
+    """The run's state copies, failed ones with their error."""
+    return [copy.model_dump(mode="json", exclude={"ids", "started_at", "finished_at", "receipt"}) for copy in record.copies]
 
 
 def episode(run_dir: Path, name: str) -> EpisodeResult | None:
@@ -178,6 +172,32 @@ def configuration(result: EpisodeResult) -> dict:
     """Task, model, harness and configuration: ordinary statistics never mix them."""
     return {"task_name": result.task_name, "task_digest": result.task_digest, "model": result.model,
             "reasoning_effort": result.reasoning_effort, "path": result.path, "versions": result.versions}
+
+
+# Modal's prices per core second and per GiB second (modal.com/pricing, read 2026-11-04).
+MODAL_CORE_SECOND, MODAL_GIB_SECOND = 0.00003942, 0.00000667
+# Harbor's default Modal sandbox lifetime, which nudi keeps.
+MODAL_LIFETIME = timedelta(hours=24)
+
+
+def modal_cost(record: RunRecord) -> dict | None:
+    """An upper-bound estimate of a Modal run's compute: each stopped sandbox's CPU and memory
+    limits over its lifetime. Modal bills the larger of request and use, and nudi's requests
+    stay below the limits. It is outside the spending cap. A sandbox without declared limits
+    is counted apart, and one that still runs after stop counts its whole 24 h lifetime."""
+    if record.backend != "modal":
+        return None
+    estimate, without_limits = 0.0, 0
+    for sandbox in record.modal:
+        if sandbox.cpus is None or sandbox.memory_mb is None:
+            without_limits += 1
+            continue
+        started = datetime.fromisoformat(sandbox.started_at)
+        stopped = datetime.fromisoformat(sandbox.stopped_at) if sandbox.removed else started + MODAL_LIFETIME
+        seconds = (stopped - started).total_seconds()
+        estimate += seconds * (sandbox.cpus * MODAL_CORE_SECOND + sandbox.memory_mb / 1024 * MODAL_GIB_SECOND)
+    return {"estimate": estimate, "sandboxes": len(record.modal), "without_limits": without_limits,
+            "still_running": sum(not sandbox.removed for sandbox in record.modal)}
 
 
 def configuration_section(record: RunRecord, results: dict) -> dict:
@@ -198,6 +218,7 @@ def configuration_section(record: RunRecord, results: dict) -> dict:
             "credential_sources": record.credential_sources, "spending_cap": record.spending_cap,
             "known_cost": record.known_cost, "provider_reported_cost": reported(record.calls), "unknown_cost_calls": record.unknown_cost_calls,
             "refused_calls": record.refused_calls, "capacity": record.capacity.model_dump(mode="json"),
+            "backend": record.backend, "modal_cost": modal_cost(record),
             "cost_map": record.cost_map, "limitations": record.limitations}
 
 
@@ -301,7 +322,8 @@ def completion_gaps(basis: MetricBasis, own: list[Assessment]) -> list[str]:
     if not basis.requirements:
         gaps.append("it cites no completion requirement")
     gaps += [f"requirement {item.path}: {item.excerpt!r} is not task context" for item in basis.requirements if item.episode is not None]
-    resolved = [item for item in own if not item.claim.unresolved
+    # Doubt is one-sided: an evidenced issue counts with its open claim items; any other assessment needs none.
+    resolved = [item for item in own if (evidenced(item) or not item.claim.unresolved)
                 and any(validity != "unknown" for _, validity in conclusions(item))]
     cited = [item for item in resolved if item.check.id in basis.checks]
     every = [found for item in resolved for found in conclusions(item) if found[1] != "unknown"]
@@ -600,13 +622,11 @@ def finding(assessment: Assessment, category: str | None = None, experiment: str
                 "content": dump(check.content),
                 "inputs": {key: dump(item) for key, item in check.inputs.items()},
                 "requirement": dump(check.requirement), "scoring": dump(check.scoring),
-                "submission": None if check.submission is None else {
-                    "location": check.submission.location, "capture_point": check.submission.capture_point,
-                    "sha256": check.submission.content.sha256}},
+                "state_copy": check.state_copy},
             "replay": dump(assessment.replay), "planted": dump(claim.planted), "persisted": dump(claim.persisted),
         },
         "interpretation": {"interpretation": claim.interpretation, "timing": check.timing if check else None,
-                           "requirement_support": dump(claim.requirement_support), "scoring_support": dump(claim.scoring_support),
+                           "citations": [dump(item) for item in claim.citations],
                            "derivation": dump(claim.derivation), "coverage": dump(claim.coverage), "basis": dump(claim.basis)},
         "assessment": {**assessment.model_dump(mode="json", include={"outcome", "validity", "discrepancy", "conclusions", "reasons",
                                                                      "missing", "persistence", "persistence_reasons"}), "limits": limits},
@@ -616,8 +636,6 @@ def finding(assessment: Assessment, category: str | None = None, experiment: str
 def result_of(assessment: Assessment) -> str:
     if evidenced(assessment):
         return "evidenced"
-    if assessment.outcome in ("accepted_invalid", "rejected_valid"):
-        return "suspected"
     return "legitimate" if assessment.outcome == "legitimate" and not assessment.claim.unresolved else "inconclusive"
 
 
@@ -629,7 +647,7 @@ def findings(assessments: list[Assessment], links: dict[int, dict] | None = None
     A claim without a check is never superseded. Each finding keeps its execution scope, so package evidence
     stays distinct from native accessibility, and the category and experiment `links` give it."""
     latest = {item.claim.check: index for index, item in enumerate(assessments) if item.claim.check}
-    groups = {"evidenced": [], "suspected": [], "legitimate": [], "inconclusive": []}
+    groups = {"evidenced": [], "legitimate": [], "inconclusive": []}
     for index, assessment in enumerate(assessments):
         later = latest.get(assessment.claim.check, index)
         superseded = None if later == index else {"index": later, "result": result_of(assessments[later])}
@@ -690,7 +708,7 @@ def _separated_attack(result: AttackResult, record: RunRecord, warnings: list[st
             conditions[level] = _condition_view(status, item.guidance.get(level), item.unavailable.get(level), entries, record)
             if status not in quiet:
                 warnings.append(f"attack candidate {item.id} {level} is {status}")
-        candidates.append({"id": item.id, "mechanism": item.mechanism, "conditions": conditions})
+        candidates.append({"id": item.id, "mechanism": item.mechanism, "valid_work": item.valid_work, "conditions": conditions})
     discovery_entries = [attempt for attempt in result.attempts if attempt.level == "none"]
     discovery_status = result.discovery.get("none", "unattempted")
     discovery = _condition_view(discovery_status, None, None, discovery_entries, record)
@@ -802,7 +820,7 @@ def category_line(mode: str, item: dict, category: str, status: str) -> str:
         elif applicability != "applicable":
             parts.append(f"applicability evidence {applicability or 'missing'}")
         unresolved = [f"{check_id(found)} {kind}" for kind, found in cases
-                      if kind in ("suspected", "inconclusive") and not found["superseded_by"]]
+                      if kind == "inconclusive" and not found["superseded_by"]]
         if unresolved:
             parts.append("unresolved cases " + ", ".join(unresolved))
     attempts = [f"{entry['phase']} {entry['number']} {entry['status']}" for entry in item["attempts"]
@@ -830,6 +848,12 @@ def markdown(report: dict) -> str:
                      + (f"credential from {source}" if source else "no credential resolved; the selected analyses do not run this role"))
     lines += [f"- Task: {config['task_dir']}; execution path {config['path']}: {'; '.join(config['path_reasons'])}",
               f"- Spending cap: {config['spending_cap']}; {cost(config['known_cost'], config['provider_reported_cost'], config['unknown_cost_calls'])}"]
+    if modal := config["modal_cost"]:
+        lines.append(f"- Modal compute: estimated at most ${modal['estimate']:.6f} for {modal['sandboxes']} sandboxes, an upper "
+                     "bound from their CPU and memory limits and lifetimes, outside the spending cap"
+                     + (f"; {modal['without_limits']} without declared limits are excluded" if modal["without_limits"] else "")
+                     + (f"; {modal['still_running']} still ran after stop and count their whole 24 h lifetime"
+                        if modal["still_running"] else ""))
     for item in config["provenance"]:
         setup = item["configuration"]
         versions = ", ".join(f"{name} {version}" for name, version in setup["versions"].items())
@@ -845,17 +869,17 @@ def markdown(report: dict) -> str:
               [category_line(mode, item, category, status) for category, status in item["categories"].items()]
               + unassessed(mode, item)] or ["Neither the grader inspector nor the hack inspector was selected or run."]
 
-    lines += ["", "## Evidence collection", ""]
-    selection = report["collection"]
-    if selection is None:
-        lines.append("No capture selection was recorded.")
-    else:
-        lines.append(f"Selection {selection['status']} in {selection['calls']} Inspector calls; "
-                     f"{cost(selection['known_cost'], selection['provider_reported_cost'], selection['unknown_cost_calls'])}.")
-        lines.append(f"- Captured files: {', '.join(selection['selected']) or 'none'}")
-        lines += [f"- Limit: {limit}" for limit in selection["limits"]]
-        lines += [f"- {failure['episode']}: capture of {failure['location']} failed: {failure['error']['type']}: "
-                  f"{failure['error']['message']}" for failure in selection["capture_failures"]]
+    lines += ["", "## State copies", ""]
+    for copy in report["copies"]:
+        if copy["error"] or copy["seconds"] is None:
+            state = f"failed: {copy['error'] or 'it never finished'}"
+        else:
+            state = f"took {copy['seconds']:.1f} s, omits {', '.join(copy['excluded'])}"
+        deleted = {True: "deleted", False: "not deleted", None: "deletion unconfirmed"}[copy["deleted"]]
+        lines.append(f"- {copy['id']}: {copy['episode']} at {copy['point']}, {copy['environment']} environment on "
+                     f"{copy['backend']}; {state}; {deleted}")
+    if not report["copies"]:
+        lines.append("No state copy was recorded.")
 
     lines += ["", "## Ordinary rewards", ""]
     pool = report["ordinary"]
@@ -930,7 +954,7 @@ def markdown(report: dict) -> str:
 
     lines += ["", "## Findings", ""]
     sections = list(report["inspections"].items()) + ([("attack", report["attack"])] if report["attack"] else [])
-    entries, limits = [], []
+    entries, limits, total, doubted = [], [], 0, 0
     for source, section in sections:
         measured = {entry["id"]: entry.get("category") for entry in section.get("experiments", [])}
         for kind, items in section["findings"].items():
@@ -948,10 +972,15 @@ def markdown(report: dict) -> str:
                                f"{reward_name} {number(item['captured'][reward_key])}; check {check_id(item)}{category}; "
                                f"validity {outcome['validity']}; discrepancy {outcome['discrepancy']}{readings}; "
                                f"{outcome['outcome']}: {'; '.join(outcome['reasons']) or 'no reason recorded'}")
-                for label, values in (("Missing", outcome["missing"]), ("Unresolved", claim["unresolved"]), ("Scope notes", claim["limits"])):
+                interpretation = item["interpretation"]["interpretation"].strip()
+                for label, values in (("Interpretation", [interpretation] * bool(interpretation)), ("Missing", outcome["missing"]),
+                                      ("Open conditions", claim["unresolved"]), ("Scope notes", claim["limits"])):
                     if values:
                         entries[-1] += f". {label}: " + "; ".join(values)
                 limits += [limit for limit in outcome["limits"] if limit not in limits]
+                total += kind == "evidenced"
+                doubted += kind == "evidenced" and bool(claim["unresolved"])
+    lines += [f"Evidenced findings: {total}, {doubted} of them with open conditions.", ""] * bool(entries)
     lines += entries or ["None retained."]
     # Limits that many findings share are stated once; the JSON keeps each finding's own list.
     lines += [f"- Finding limit: {limit}" for limit in limits]
@@ -972,7 +1001,8 @@ def markdown(report: dict) -> str:
         lines.append(f"No-hint discovery: {discovery['status']}; {discovery.get('attempts', 0)} started "
                      f"of at most {discovery.get('maximum_attempts', result.get('discovery_attempts', 0))}.")
         for candidate in result["candidates"]:
-            lines.append(f"- {candidate['id']}:")
+            # A valid-work candidate's reproduction is rejected valid work, not an exploit.
+            lines.append(f"- {candidate['id']}{' (valid work)' if candidate.get('valid_work') else ''}:")
             for level, item in candidate["conditions"].items():
                 outcomes = ", ".join(f"{status} {count}" for status, count in item["outcomes"].items()) or "none"
                 guidance = "supplied" if item["guidance"] else item["unavailable"] or "none"

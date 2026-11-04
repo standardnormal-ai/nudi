@@ -11,6 +11,7 @@ import importlib.metadata
 import json
 import math
 import os
+import re
 import shutil
 import stat
 import tempfile
@@ -20,18 +21,22 @@ from contextvars import ContextVar
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+import yaml
 from harbor.agents.terminus_2.terminus_2 import Terminus2
+from harbor.models.environment_type import EnvironmentType
 from harbor.models.job.config import RetryConfig
-from harbor.models.task.artifacts import is_convention_entry, source_host_path
+from harbor.constants import MAIN_SERVICE_NAME
+from harbor.models.task.artifacts import is_convention_entry, sidecar_services, source_host_path
 from harbor.models.task.config import ArtifactConfig
 from harbor.models.task.task import Task
-from harbor.models.trial.paths import EnvironmentPaths
+from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 from harbor.trial.artifact_handler import artifact_host_path
-from harbor.models.task.verifier_mode import resolve_verifier_environment_definition
-from harbor.models.trial.config import AgentConfig, TaskConfig, TrialConfig, VerifierConfig
+from harbor.models.task.verifier_mode import VerifierEnvironmentMode, resolve_task_verifier_mode, resolve_verifier_environment_definition
+from harbor.models.trial.config import AgentConfig, EnvironmentConfig, ResourceMode, TaskConfig, TrialConfig, VerifierConfig
 from harbor.models.trial.result import TrialResult
 from harbor.trial.queue import TrialQueue
 from harbor.trial.hooks import TrialHookEvent
+from harbor.utils.env import is_env_template
 from harbor.verifier.verifier import RewardFileEmptyError, Verifier, VerifierOutputParseError
 from verifiers.v1.cli.eval.runner import run_eval
 from verifiers.v1.configs.cli.eval import EvalConfig
@@ -46,7 +51,7 @@ from verifiers.v1.tasksets.harbor.taskset import (
 )
 from verifiers.v1.utils.trace_store import type_adapter
 
-from nudi.records import (EpisodeConfig, EpisodeResult, ErrorRecord, ExecutionPath, InfrastructureAbort, NativeBehavior,
+from nudi.records import (Backend, EpisodeConfig, EpisodeResult, ErrorRecord, ExecutionPath, InfrastructureAbort, NativeBehavior,
                           private_dir, write_private)
 
 # task.toml fields the upstream contract tests exercise on both execution paths.
@@ -67,18 +72,52 @@ OMITTED = {
     ("verifier", "env"): lambda value: value == {},
     ("solution", "env"): lambda value: value == {},
 }
-# Native Harbor 0.24.0 treats all but storage_mb as omitted, and its Docker environment never
-# reads storage_mb. The adapter is unchecked for them and turns storage into a disk request.
-NATIVE_ONLY = {
-    ("environment", "gpus"): lambda value: type(value) is int and value == 0,
-    ("environment", "allow_internet"): lambda value: value is True,
-    ("environment", "build_timeout_sec"): lambda value: type(value) in (int, float) and value == 600,
-    ("environment", "env"): lambda value: value == {},
-    ("environment", "mcp_servers"): lambda value: value == [],
-    ("environment", "storage_mb"): lambda value: type(value) is int and value > 0,
+# Native Harbor 0.24.0 treats these as omitted, except that it waits build_timeout_sec for an
+# environment to start, its Docker environment never reads storage_mb, and it requests declared
+# GPUs, which nudi admits on Modal only (`check_backend`). The adapter is unchecked for them and
+# turns storage into a disk request.
+ENVIRONMENT_RULES = {
+    "gpus": lambda value: type(value) is int and value >= 0,
+    "gpu_types": lambda value: isinstance(value, list) and all(isinstance(item, str) for item in value),
+    "allow_internet": lambda value: value is True,
+    "build_timeout_sec": lambda value: type(value) in (int, float) and 0 < value < math.inf,
+    "env": lambda value: value == {},
+    "mcp_servers": lambda value: value == [],
+    "storage_mb": lambda value: type(value) is int and value > 0,
 }
+# A `[verifier.environment]` table is the separate grader's environment, which native Harbor
+# resolves with resolve_verifier_environment_definition; its image and resources are honored
+# there and in a probe's verifier sandbox, the same way. The adapter is unchecked for it.
+NATIVE_ONLY = {
+    **{("environment", key): rule for key, rule in ENVIRONMENT_RULES.items()},
+    # Native Harbor starts the verifier within the main environment's build_timeout_sec, so check_task
+    # admits the verifier's own only when it is the same value.
+    **{("verifier", "environment", key): rule for key, rule in ENVIRONMENT_RULES.items()},
+    ("verifier", "environment", "docker_image"): lambda value: isinstance(value, str) and bool(value),
+    ("verifier", "environment", "cpus"): lambda value: type(value) is int and value > 0,
+    ("verifier", "environment", "memory_mb"): lambda value: type(value) is int and value > 0,
+    # Harbor's trial runs the healthcheck after the main environment starts, as nudi's sandboxes
+    # of the task environment do. skills_dir and mcp_servers reach only the agent (Terminus 2 lists
+    # them in its prompt), so they do not change package experiments.
+    ("environment", "healthcheck"): lambda value: isinstance(value, dict) and bool(value),
+    ("environment", "skills_dir"): lambda value: isinstance(value, str),
+    ("environment", "mcp_servers"): lambda value: isinstance(value, list),
+    # Harbor's Verifier gives these to the grader on both paths. A `${VAR}` value is refused: Harbor
+    # resolves it from nudi's own environment, which contains the run's credentials.
+    ("verifier", "env"): lambda value: isinstance(value, dict) and bool(value) and all(
+        isinstance(item, str) and not is_env_template(item) for item in value.values()),
+    # Harbor's trial runs these hooks before it collects artifacts; package_probe runs Harbor's own collection.
+    ("verifier", "collect"): lambda value: isinstance(value, list),
+}
+# environment/docker-compose.yaml: the service keys and build keys nudi admits, the ones Terminal-Bench 4
+# tasks use. Harbor runs compose with nudi's own environment, which contains the run's credentials, so no
+# variable is interpolated, and no service reaches a host path or passes a host variable through.
+COMPOSE_SERVICE_KEYS = {"build", "cap_add", "command", "cpus", "depends_on", "environment", "expose", "healthcheck",
+                        "image", "network_mode", "pull_policy", "shm_size"}
+COMPOSE_BUILD_KEYS = {"context", "dockerfile", "no_cache"}
+INTERPOLATION = re.compile(r"\$(\{|[A-Za-z_])")
 STORAGE = (
-    "[environment].storage_mb = {} is recorded but not enforced; Harbor's Docker environment "
+    "{} = {} is recorded but not enforced; Harbor's Docker environment "
     "sets no storage quota, so disk fit is not established"
 )
 VERSIONED = ("nudi", "verifiers", "harbor", "litellm")
@@ -131,18 +170,45 @@ def read_reward(path: Path) -> str:
         raise VerifierOutputParseError(f"Reward file {path} is not UTF-8") from None
 
 
+# Bounds one state copy operation; the margin covers cancellation and bookkeeping outside them.
+COPY_TIMEOUT = 120
+COPY_MARGIN = 30
+
+# Takes a state copy of a verifier's environment at a named point; set by nudi for each episode.
+state_copy: ContextVar[Callable[["RewardVerifier", str], Awaitable[None]] | None] = ContextVar("nudi_state_copy", default=None)
+
+
+def grading_bound(timeout_sec: float) -> float:
+    """The outer limit of `RewardVerifier.verify`: the grader's own limit plus two copies."""
+    return timeout_sec + 2 * COPY_TIMEOUT + COPY_MARGIN
+
+
 class RewardVerifier(Verifier):
     """Harbor's Verifier, parsing rewards through `read_reward` with Harbor's rules. Harbor
     0.24.0 follows reward links on the host and puts invalid values in its errors.
 
     Its import-path factory drops the bundled-tests flag Harbor resolves for a separate
-    verifier, so an unset `skip_tests_upload` is resolved here the same way."""
+    verifier, so an unset `skip_tests_upload` is resolved here the same way.
+
+    With a `state_copy` callback it copies the grading environment before grading and after
+    the grader returns. The grader keeps the task's own limit; its caller's limit is
+    `grading_bound`. A timeout or cancellation skips the second copy. The callback bounds
+    and records its own failures."""
 
     def __init__(self, *, task: Task, skip_tests_upload: bool | None = None, **kwargs):
         if skip_tests_upload is None:
             definition = resolve_verifier_environment_definition(task.config, task.paths)
             skip_tests_upload = definition is not None and definition.bundled_tests
         super().__init__(task=task, skip_tests_upload=skip_tests_upload, **kwargs)
+
+    async def verify(self):
+        take = state_copy.get()
+        if take is not None:
+            await take(self, "verification_start")
+        result = await asyncio.wait_for(super().verify(), self.task.config.verifier.timeout_sec)
+        if take is not None:
+            await take(self, "grading_end")
+        return result
 
     def _parse_reward_text(self) -> dict[str, float | int]:
         path = self.trial_paths.reward_text_path
@@ -234,6 +300,11 @@ def excluded_convention_artifact(entries: object) -> bool:
     return False
 
 
+def named(directory: Path, *names: str) -> list[Path]:
+    """The entries of `directory` whose casefolded name is one of `names`."""
+    return sorted(p for p in directory.iterdir() if p.name.casefold() in names) if directory.is_dir() else []
+
+
 def check_task(task_dir: Path) -> dict[tuple[str, ...], object]:
     """Reject escaping file references, special files and unverified task features.
 
@@ -244,9 +315,20 @@ def check_task(task_dir: Path) -> dict[tuple[str, ...], object]:
             raise UnsupportedTask(f"{path.relative_to(task_dir)} points outside the task")
         if not (path.is_dir() or path.is_file()):
             raise UnsupportedTask(f"{path.relative_to(task_dir)} is not a regular file")
-    for name in ("docker-compose.yaml", "docker-compose.yml"):
-        if (task_dir / "environment" / name).exists():
-            raise UnsupportedTask(f"environment/{name} is not verified")
+    # Harbor builds environments from these directories and merges a compose file found there
+    # (harbor/models/task/verifier_mode.py, resolve_verifier_environment_definition). Names are
+    # casefolded: a snapshot on a case-insensitive volume finds case variants under Harbor's names.
+    # Only environment/docker-compose.yaml is admitted, the file Harbor's Docker environment merges.
+    steps = [step for folder in named(task_dir, "steps") if folder.is_dir() for step in sorted(folder.iterdir())]
+    # Compose also reads .env from its project directory, which Harbor sets to the environment
+    # definition directory, and it can set Compose and Docker controls such as DOCKER_HOST. This
+    # also closes a path older than compose task admission: compose already ran with environment/ as its project
+    # directory.
+    for directory in [*named(task_dir, "environment", "tests"), *(t for step in steps for t in named(step, "tests"))]:
+        for path in named(directory, "docker-compose.yaml", "docker-compose.yml", ".env"):
+            if (directory.name.casefold(), path.name.casefold()) != ("environment", "docker-compose.yaml"):
+                raise UnsupportedTask(f"{path.relative_to(task_dir)} is not verified")
+    compose = compose_services(task_dir)
 
     # Raw fields: Harbor's parsed config silently drops keys it does not know.
     raw = tomllib.loads((task_dir / "task.toml").read_text())
@@ -266,11 +348,123 @@ def check_task(task_dir: Path) -> dict[tuple[str, ...], object]:
         elif not (path in OMITTED and OMITTED[path](value)):
             raise UnsupportedTask(f"{label(path)} is not verified")
 
+    # Native Harbor gives the verifier the main environment's limit policies, which need both values.
+    verifier = raw.get("verifier", {}).get("environment")
+    if isinstance(verifier, dict):
+        for key in ("cpus", "memory_mb"):
+            if key not in verifier:
+                raise UnsupportedTask(f"[verifier.environment].{key} is not declared, which native Harbor needs")
     config = Task(task_dir).config
+    if isinstance(verifier, dict) and "build_timeout_sec" in verifier and (
+            config.verifier.environment.build_timeout_sec != config.environment.build_timeout_sec):
+        raise UnsupportedTask("[verifier.environment].build_timeout_sec is not verified unless it equals "
+                              "[environment].build_timeout_sec, the bound native Harbor waits for the verifier")
+    if compose:
+        native_only[("environment", "docker-compose.yaml")] = compose
+    # Native Harbor refuses such a task before it starts (Trial._validate_artifact_configuration);
+    # a package probe would run the hook best-effort and grade without it.
+    hooks = {hook.service for hook in config.verifier.collect if hook.service != MAIN_SERVICE_NAME}
+    if missing := sorted((sidecar_services(config.artifacts) | hooks) - set(compose)):
+        raise UnsupportedTask(f"service {missing[0]!r}, named by an artifact or a [verifier].collect hook, "
+                              "is not a service of environment/docker-compose.yaml")
+    # Harbor reads and writes manifest.json in its collection directory after the downloads,
+    # through any link a download left there (harbor/trial/artifact_handler.py, _write_manifest).
+    collection = Path("artifacts")
+    for index, entry in enumerate(config.artifacts):
+        artifact = ArtifactConfig(source=entry) if isinstance(entry, str) else entry
+        host = artifact_host_path(collection, artifact)
+        if host == collection or host.is_relative_to(collection / "manifest.json"):
+            raise UnsupportedTask(f"artifacts[{index}] ({artifact.source}) is collected onto Harbor's artifacts directory or its manifest.json")
     dockerfile = task_dir / "environment" / "Dockerfile"
     if not config.environment.docker_image and not dockerfile.is_file():
         raise UnsupportedTask("the task declares no docker_image or environment/Dockerfile")
     return native_only
+
+
+def compose_services(task_dir: Path) -> list[str]:
+    """The services of the task's environment/docker-compose.yaml, main included, or [] without one.
+    A file using anything but `services` with COMPOSE_SERVICE_KEYS is refused, and so is a build
+    outside environment/, an environment entry without a value (compose would pass nudi's own),
+    network_mode other than another service's, a capability other than SYS_PTRACE, and cpus or
+    image on main, which would override the task's declared environment."""
+    files = [file for environment in named(task_dir, "environment") for file in named(environment, "docker-compose.yaml")]
+    services = {}
+    for file in files:
+        def refuse(what: str):
+            raise UnsupportedTask(f"{file.relative_to(task_dir)}: {what} is not verified")
+
+        try:
+            document = yaml.safe_load(file.read_text())
+        except yaml.YAMLError:
+            refuse("a file that does not parse as YAML")
+        # Compose interpolates the decoded strings, so an escape such as "\u0024{X}" is one too.
+        try:
+            texts = strings(document)
+        except TypeError as error:
+            refuse(f"a YAML {error} value")
+        if any(INTERPOLATION.search(text.replace("$$", "")) for text in texts):
+            refuse("variable interpolation")
+        if not isinstance(document, dict) or set(document) != {"services"} or not isinstance(document["services"], dict):
+            refuse("a top level other than one services table")
+        root = file.parent.resolve()
+        for name, service in document["services"].items():
+            service = {} if service is None else service
+            if not isinstance(service, dict):
+                refuse(f"services.{name} that is not a table")
+            for key in sorted(map(str, service.keys() - COMPOSE_SERVICE_KEYS)):
+                refuse(f"services.{name}.{key}")
+            if name == "main" and (overrides := sorted(service.keys() & {"cpus", "image"})):
+                refuse(f"services.main.{overrides[0]}")
+            build = service.get("build", {})
+            build = {"context": build} if isinstance(build, str) else build
+            if not isinstance(build, dict) or build.keys() - COMPOSE_BUILD_KEYS:
+                refuse(f"services.{name}.build other than {sorted(COMPOSE_BUILD_KEYS)}")
+            context = (root / str(build.get("context", "."))).resolve()
+            dockerfile = (context / str(build.get("dockerfile", "Dockerfile"))).resolve()
+            if not (context.is_dir() and context.is_relative_to(root) and dockerfile.is_relative_to(root)):
+                refuse(f"services.{name}.build outside environment/")
+            environment = service.get("environment", [])
+            entries = environment.values() if isinstance(environment, dict) else [
+                item if isinstance(item, str) and "=" in item else None for item in environment]
+            if any(item is None for item in entries):
+                refuse(f"services.{name}.environment entry without a value")
+            if not str(service.get("network_mode", "service:")).startswith("service:"):
+                refuse(f"services.{name}.network_mode other than service:<name>")
+            if set(service.get("cap_add", [])) - {"SYS_PTRACE"}:
+                refuse(f"services.{name}.cap_add other than SYS_PTRACE")
+            services[name] = service
+    return sorted({"main", *services}) if files else []
+
+
+def strings(node) -> list[str]:
+    """Every string in a decoded YAML document, keys included. Any value but a string, number,
+    boolean, null, table or list raises TypeError: PyYAML decodes tags such as !!binary and !!set
+    to other types, which compose-go reads as text."""
+    if isinstance(node, str):
+        return [node]
+    if isinstance(node, dict):
+        return [text for key, value in node.items() for text in strings(key) + strings(value)]
+    if isinstance(node, list):
+        return [text for item in node for text in strings(item)]
+    if node is None or isinstance(node, (bool, int, float)):
+        return []
+    raise TypeError(type(node).__name__)
+
+
+HELPER_STATE = (" Helper-service state is not copied: a copy is the grading container's filesystem only, so a helper's "
+                "files absent from it are unavailable evidence, never missing work.")
+
+
+def check_backend(task_dir: Path, backend: Backend) -> None:
+    """Refuse what nudi admits on one backend only: a compose file on Modal, where Harbor would select
+    Docker-in-Docker, and GPUs on Docker."""
+    if backend == "modal" and compose_services(task_dir):
+        raise UnsupportedTask("environment/docker-compose.yaml is not verified on Modal")
+    config = Task(task_dir).config
+    if backend == "docker":
+        for name, environment in (("environment", config.environment), ("verifier.environment", config.verifier.environment)):
+            if environment is not None and environment.gpus:
+                raise UnsupportedTask(f"[{name}].gpus = {environment.gpus} is not verified on Docker")
 
 
 def select_path(
@@ -278,8 +472,7 @@ def select_path(
 ) -> tuple[ExecutionPath, list[str]]:
     """The execution path and the reasons for it, decided before anything starts."""
     native_only = check_task(task_dir)
-    storage_mb = native_only.get(("environment", "storage_mb"))
-    storage = [STORAGE.format(storage_mb)] if storage_mb else []
+    storage = [STORAGE.format(label(path), value) for path, value in native_only.items() if path[-1] == "storage_mb"]
     try:
         data = parse_task(task_dir, 0, HarborConfig(ignore_timeouts=False))
     except ValueError as error:
@@ -424,7 +617,8 @@ def record_trial(trial: TrialResult, output_dir: Path, result: EpisodeResult) ->
         result.verifier_timeout = info.exception_type == "VerifierTimeoutError"
 
 
-verification_capture: ContextVar[Callable[[TrialHookEvent], Awaitable[None]] | None] = ContextVar("nudi_capture", default=None)
+verification_hook: ContextVar[Callable[[TrialHookEvent], Awaitable[None]] | None] = ContextVar("nudi_verification", default=None)
+dropped_links: ContextVar[Callable[[list[str]], None] | None] = ContextVar("nudi_dropped_links", default=None)
 agent_start_capture: ContextVar[Callable[[TrialHookEvent], Awaitable[None]] | None] = ContextVar("nudi_agent_start", default=None)
 trial_end_capture: ContextVar[Callable[[TrialHookEvent], Awaitable[None]] | None] = ContextVar("nudi_trial_end", default=None)
 
@@ -447,8 +641,30 @@ async def _run_hook(callback: Callable[[TrialHookEvent], Awaitable[None]] | None
         return
 
 
+def drop_links(directory: Path) -> list[str]:
+    """Remove every symlink, hardlinked file and entry that is neither a regular file nor a directory
+    under `directory`, without following links, and return their relative paths. Collected artifacts are
+    copied out of an untrusted container, and Harbor's upload follows links to host paths."""
+    removed = []
+    for root, directories, files in os.walk(directory):
+        for name in [*directories, *files]:
+            path = Path(root, name)
+            status = path.lstat()
+            # A hardlink looks regular, so its link count gives it away.
+            if not (stat.S_ISDIR(status.st_mode) or (stat.S_ISREG(status.st_mode) and status.st_nlink == 1)):
+                path.unlink()
+                removed.append(path.relative_to(directory).as_posix())
+        directories[:] = [name for name in directories if Path(root, name).is_dir()]
+    return sorted(removed)
+
+
 async def capture_at_verification(event: TrialHookEvent) -> None:
-    await _run_hook(verification_capture.get(), event)
+    # A separate verifier uploads the collected artifacts after this event; the agent environment has stopped.
+    if resolve_task_verifier_mode(Task(event.config.task.path).config) == VerifierEnvironmentMode.SEPARATE:
+        removed = drop_links(TrialPaths(event.config.trials_dir / event.config.trial_name).artifacts_dir)
+        if removed and (warn := dropped_links.get()):
+            warn(removed)
+    await _run_hook(verification_hook.get(), event)
 
 
 async def capture_at_agent_start(event: TrialHookEvent) -> None:
@@ -467,7 +683,6 @@ def ensure_lifecycle_hooks(queue: TrialQueue) -> None:
     queue.on_verification_started(capture_at_verification)
     queue.on_trial_ended(capture_at_trial_end)
     queue._nudi_lifecycle_registered = True
-    queue._nudi_capture_registered = True
 
 
 def episode_queue(n_concurrent: int) -> TrialQueue:
@@ -494,16 +709,35 @@ class HostTerminus(Terminus2):
         super().__init__(host_logs, *args, **kwargs)
 
 
+MODAL_BOX = "nudi.modal_box:ModalBox"
+
+
+def environment_config(backend: Backend, cpus: int | None, memory_mb: int | None) -> EnvironmentConfig:
+    """Harbor's environment for `backend`, Docker or nudi's `ModalBox`. Each declared CPU and
+    memory value is a hard limit on both: Harbor's Docker default, and on Modal a small
+    request under that limit. An undeclared value keeps Harbor's default, which on Modal is
+    no limit."""
+    def mode(declared: int | None) -> ResourceMode:
+        return ResourceMode.AUTO if declared is None else ResourceMode.LIMIT
+
+    where = {"type": EnvironmentType.DOCKER} if backend == "docker" else {"import_path": MODAL_BOX}
+    return EnvironmentConfig(**where, cpu_enforcement_policy=mode(cpus), memory_enforcement_policy=mode(memory_mb))
+
+
 async def run_harbor(config: EpisodeConfig, task_dir: Path, result: EpisodeResult, queue: TrialQueue, agent: AgentConfig | None = None) -> None:
     ensure_lifecycle_hooks(queue)
     kwargs = {"api_base": config.api_base, "reasoning_effort": config.reasoning_effort}
     if config.model.startswith("xiaomi_mimo/") and config.reasoning_effort not in (None, "none"):
         # MiMo Chat thinks only when asked through this field; the effort is still sent.
         kwargs["llm_call_kwargs"] = {"extra_body": {"thinking": {"type": "enabled"}}}
+    # Harbor builds a separate verifier environment from the same settings.
+    declared = Task(task_dir).config
     trial_config = TrialConfig(
         task=TaskConfig(path=task_dir),
         trials_dir=config.output_dir / "harbor",
-        verifier=VerifierConfig(import_path="nudi.runner:RewardVerifier"),
+        environment=environment_config(config.backend, declared.environment.cpus, declared.environment.memory_mb),
+        verifier=VerifierConfig(import_path="nudi.runner:RewardVerifier",
+                                override_timeout_sec=grading_bound(declared.verifier.timeout_sec)),
         agent=agent or AgentConfig(
             import_path="nudi.runner:HostTerminus",
             model_name=config.model,
@@ -542,14 +776,16 @@ def check_output(output_dir: Path, task_dir: Path) -> None:
 
 
 async def run_episode(config: EpisodeConfig, queue: TrialQueue | None = None, *, instruction: str | None = None,
-                      agent: AgentConfig | None = None, capture=None, on_agent_start=None, on_trial_end=None,
-                      credentials: Path | None = None) -> EpisodeResult:
+                      agent: AgentConfig | None = None, copy=None, on_verification=None, on_agent_start=None,
+                      on_trial_end=None, credentials: Path | None = None) -> EpisodeResult:
     """Run one episode on a disposable task snapshot; the record is written even on failure.
 
     Native Harbor episodes run through `queue`, shared by a run, or a queue of their own.
-    `credentials` is the run's credentials file, which the snapshot refuses."""
+    `copy` is the `state_copy` callback of a native episode; the hooks run at Harbor's
+    lifecycle events. `credentials` is the run's credentials file, which the snapshot refuses."""
     check_output(config.output_dir, config.task_dir)
     path, reasons = select_path(config.task_dir, config.native)
+    check_backend(config.task_dir, config.backend)
     result = EpisodeResult(
         path=path,
         path_reasons=reasons,
@@ -562,7 +798,8 @@ async def run_episode(config: EpisodeConfig, queue: TrialQueue | None = None, *,
     )
     private_dir(config.output_dir)
     config.output_dir.chmod(0o700)
-    token = verification_capture.set(capture)
+    copy_token = state_copy.set(copy)
+    token = verification_hook.set(on_verification)
     agent_token = agent_start_capture.set(on_agent_start)
     end_token = trial_end_capture.set(on_trial_end)
     try:
@@ -584,7 +821,8 @@ async def run_episode(config: EpisodeConfig, queue: TrialQueue | None = None, *,
         result.errors.append(ErrorRecord(type=type(error).__name__, message=str(error)))
         raise
     finally:
-        verification_capture.reset(token)
+        state_copy.reset(copy_token)
+        verification_hook.reset(token)
         agent_start_capture.reset(agent_token)
         trial_end_capture.reset(end_token)
         if (config.output_dir / "nudi-evidence").is_dir():

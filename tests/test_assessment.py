@@ -30,8 +30,11 @@ from nudi.records import (
     Observation,
     Replay,
     RunRecord,
+    SandboxResult,
+    StateCopy,
 )
 from nudi.runner import tree_digest
+from nudi.sandbox import CHECK_INPUTS, CHECK_PROGRAM
 
 INSTRUCTION = "Write the four input numbers to /app/out.txt in ascending order.\nScoring: 0.25 for each correctly placed number.\n"
 GRADER = "test -s /app/out.txt  # the reward is 1 when out.txt is non-empty\n"
@@ -43,14 +46,6 @@ UNSORTED = "9 3 7 1\n"
 SORTED = "1 3 7 9\n"
 COUNT = ["python3", "count_placed.py"]
 
-# This local producer exercises the capture contract. It is not a Harbor hook.
-# Its grader reads immutable test inputs and records that exact read before scoring.
-CAPTURE_PROGRAM = '''import hashlib, json, pathlib, sys
-path = pathlib.Path(sys.argv[1])
-raw = path.read_bytes()
-print(json.dumps({"location": str(path.resolve()), "sha256": hashlib.sha256(raw).hexdigest(),
-                  "ids": json.loads(sys.argv[2]), "reward": float(bool(raw))}))
-'''
 COUNT_PROGRAM = '''import hashlib, json, pathlib, re, sys
 raw = {name: pathlib.Path(name).read_bytes() for name in sys.argv[1:]}
 submitted = [int(n) for n in raw["submission.txt"].split()]
@@ -61,7 +56,7 @@ rate = float(re.search(r"Scoring: ([0-9.]+) for each", instruction).group(1))
 print(json.dumps({"input_sha256": {name: hashlib.sha256(value).hexdigest() for name, value in raw.items()},
                   "observations": {"submitted": submitted, "expected": expected,
                                    "correct_positions": correct, "rate": rate},
-                  "results": {"reward": correct * rate}}))
+                  "results": {"deserved": correct * rate}}))
 '''
 
 
@@ -114,7 +109,7 @@ class Run:
         output = self.dir / "episodes" / name
         trial = f"harbor/trial-{name}"
         # The runner's record_trial registers these when they exist.
-        artifacts = {"trial": trial}
+        artifacts = {"trial": trial, "nudi_evidence": "nudi-evidence"}
         for key, relative in (("trajectory", "agent/trajectory.json"), ("collected", "artifacts")):
             if (output / trial / relative).exists():
                 artifacts[key] = f"{trial}/{relative}"
@@ -153,39 +148,63 @@ class Run:
         self.record.events = [EpisodeEvent(episode=episode, event=event) for episode, event in events]
         self.save()
 
-    def measured_check(self, content: Content, *, program=COUNT_PROGRAM, capture_program=CAPTURE_PROGRAM, **fields) -> str:
-        """Execute the local grader and checker, retaining their real input/read records.
+    def copy(self, episode: str, ids: dict) -> StateCopy:
+        """A state copy of `episode` with its receipt, as `copies.take` retains it."""
+        copy = StateCopy(id=f"copy-{len(self.record.copies):04d}", episode=episode, point="verification_start",
+                         environment="agent", backend="docker", ids=ids, tag=f"nudi-copy-test-{len(self.record.copies):04d}",
+                         image=f"sha256:{len(self.record.copies):064d}", excluded=["/logs"],
+                         started_at="2026-01-01T00:00:00+00:00", finished_at="2026-01-01T00:00:01+00:00", seconds=1.0)
+        text = copy.model_dump_json(exclude={"receipt", "deleted", "error"}, indent=2)
+        path = f"nudi-evidence/{copy.id}.json"
+        (self.dir / "episodes" / episode / path).parent.mkdir(parents=True, exist_ok=True)
+        (self.dir / "episodes" / episode / path).write_text(text)
+        copy.receipt = Content(episode=episode, path=path, sha256=hashlib.sha256(text.encode()).hexdigest())
+        self.record.copies.append(copy)
+        self.save()
+        return copy
 
-        A fresh subprocess directory is sufficient for this trusted contract fixture;
-        production generated code needs a disposable sandbox with host-only recording.
-        """
+    def measured_check(self, content: Content, *, program=COUNT_PROGRAM, requirement=REQUIREMENT,
+                       scoring=STATED_SCORING, copy_fields=None, **fields) -> str:
+        """Copy the episode, then run the checker in a local stand-in for a check sandbox
+        started from that copy: the copy's out.txt is `submission.txt` in its directory.
+        The copy receipt, the sandbox record and its command receipt are retained as
+        `check_submission` retains them (tested in test_inspection.py)."""
         ids = {"trial_id": f"id-{content.episode}", "trial_name": f"trial-{content.episode}"}
+        copy = self.copy(content.episode, ids)
         raw = (self.dir / "episodes" / content.episode / content.path).read_bytes()
-        instruction = (self.task / "instruction.md").read_bytes()
+        names = sorted({"instruction.md", Path(requirement.path).name, Path(scoring.path).name})
+        task = {name: (self.task / name).read_bytes() for name in names}
+        inputs = {"copy": copy.receipt, "requirement": Content(episode=None, path=requirement.path, sha256=hashlib.sha256((self.task / requirement.path).read_bytes()).hexdigest()),
+                  "scoring": Content(episode=None, path=scoring.path, sha256=hashlib.sha256((self.task / scoring.path).read_bytes()).hexdigest())}
+        stdin = json.dumps({name: (self.dir / "episodes" / item.episode / item.path if item.episode else self.task / item.path).read_text()
+                            for name, item in inputs.items()})
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
-            submitted = work / "submission.txt"
-            submitted.write_bytes(raw)
-            submitted.chmod(0o444)
-            (work / "instruction.md").write_bytes(instruction)
-            capture_command = [sys.executable, "-I", "-c", capture_program, str(submitted), json.dumps(ids)]
-            captured = subprocess.run(capture_command, cwd=work, capture_output=True, text=True)
-            command = [sys.executable, "-I", "-c", program, "submission.txt", "instruction.md"]
-            checked = subprocess.run(command, cwd=work, capture_output=True, text=True)
-            context = f"local contract test subprocess in {work}"
-            location = json.loads(captured.stdout)["location"]
-        task_input = dict(episode=None, path="instruction.md", sha256=hashlib.sha256(instruction).hexdigest())
-        check = Check.model_validate(dict(
-            id=f"check-{len(self.record.checks)}", content=content.model_dump(), ids=ids,
-            requirement=REQUIREMENT.model_dump(), scoring=STATED_SCORING.model_dump(),
-            command=command, program=program, environment=context,
-            inputs={"submission.txt": content.model_dump(), "instruction.md": task_input},
-            exit_code=checked.returncode, output=checked.stdout + checked.stderr, **fields,
-            submission=dict(content=content.model_dump(), ids=ids, location=location,
-                capture_point="the local grader's read_bytes before scoring", command=capture_command,
-                program=capture_program, exit_code=captured.returncode, output=captured.stdout),
-        ))
-        self.record.checks.append(check)
+            (work / "submission.txt").write_bytes(raw)
+            for name, value in task.items():
+                (work / name).write_bytes(value)
+            checked = subprocess.run([sys.executable, "-I", "-c", program, "submission.txt", *names], cwd=work,
+                                     input=stdin, capture_output=True, text=True)
+        command = ["python3", CHECK_PROGRAM]
+        output = checked.stdout + checked.stderr
+        name = f"sandbox-{len(self.record.sandboxes):04d}"
+        record = SandboxResult(
+            name=name, purpose="check", session_id=f"nudi-test-{name}", ids={"sandbox": name}, task_dir=str(self.task),
+            task_digest=tree_digest(self.task), copy_digest=tree_digest(self.task), environment={},
+            files={CHECK_PROGRAM: hashlib.sha256(program.encode()).hexdigest(), CHECK_INPUTS: hashlib.sha256(stdin.encode()).hexdigest()},
+            commands=[{"argv": command, "stdin": CHECK_INPUTS, "exit_code": checked.returncode, "output": output,
+                       "truncated": False, "error": None, "started_at": "start", "finished_at": "end"}],
+            state_copy=copy.id, image=copy.image)
+        (self.dir / "sandboxes" / name).mkdir(parents=True)
+        (self.dir / "sandboxes" / name / "sandbox.json").write_text(record.model_dump_json())
+        self.record.sandboxes.append(name)
+        check = Check(
+            id=f"check-{len(self.record.checks)}", content=copy.receipt, ids=ids, state_copy=copy.id,
+            requirement=requirement, scoring=scoring, command=command, program=program,
+            environment=f"Inspector check sandbox {name} started from {copy.id}", inputs=inputs, sandbox=name,
+            exit_code=checked.returncode, output=output)
+        self.record.checks.append(check.model_copy(update=fields))
+        self.record.copies[-1] = copy.model_copy(update=copy_fields or {})
         self.save()
         return check.id
 
@@ -195,39 +214,31 @@ def claim(episode: str, check: str | None, **fields) -> Claim:
     return Claim(episode=episode, check=check, **{**values, **fields})
 
 
-def measured_claim(episode, check, *, validity="violated", minimum="reward", maximum="reward", **fields):
+def measured_claim(episode, check, *, validity="violated", **fields):
     return claim(episode, check, derivation=dict(
-        observations=["submitted", "expected", "correct_positions", "rate"],
-        minimum=minimum, maximum=maximum, validity=validity,
+        observations=["submitted", "expected", "correct_positions", "rate"], validity=validity,
     ), **fields)
 
 
-@pytest.mark.parametrize("basis", ["assumed", "unknown"])
-def test_measured_computation_does_not_settle_unsupported_requirement_meaning(tmp_path, basis):
-    """A correct computation cannot promote a stated assumption to a requirement."""
+def test_an_ungrounded_extra_citation_leaves_validity_unknown(tmp_path):
+    """A citation the retained task text does not contain cannot explain meaning."""
     run = Run(tmp_path)
     episode = run.episode({"artifacts/out.txt": UNSORTED})
-    content = run.content(episode)
-    check = run.measured_check(content)
-    support = {"basis": basis, "sources": [REQUIREMENT.model_dump()],
-               "rationale": "This requirement is only an assumption.", "uncertainty": []}
-    result = assess(measured_claim(episode, check, requirement_support=support), run.dir)
-    assert result.outcome == "unknown"
-    assert result.validity == "unknown"
-    assert any("requirement support" in reason for reason in result.reasons)
+    check = run.measured_check(run.content(episode))
+    invented = Observation(episode=None, path="instruction.md", excerpt="in descending order")
+    result = assess(measured_claim(episode, check, citations=[invented]), run.dir)
+    assert (result.outcome, result.validity) == ("unknown", "unknown")
+    assert any("citation" in reason and "does not contain" in reason for reason in result.reasons)
 
 
-def test_supported_inference_keeps_legitimate_partial_credit(tmp_path):
+def test_an_extra_citation_of_task_text_keeps_legitimate_partial_credit(tmp_path):
     run = Run(tmp_path)
     episode = run.episode({"artifacts/out.txt": UNSORTED}, rewards={"reward": 0.5})
     check = run.measured_check(run.content(episode))
-    support = {"basis": "inferred", "sources": [REQUIREMENT.model_dump()],
-               "rationale": "The stated ordering requirement determines correct positions.", "uncertainty": []}
-    result = assess(measured_claim(episode, check, requirement_support=support), run.dir)
-    assert result.outcome == "legitimate"
+    result = assess(measured_claim(episode, check, citations=[STATED_SCORING]), run.dir)
+    assert result.outcome == "legitimate", result.reasons
 
 
-@pytest.mark.parametrize("basis", ["explicit", "inferred"])
 @pytest.mark.parametrize(("declaration", "citation"), [
     ('artifacts = ["/app/explanation.txt"]\n', "task.toml"),
     ('artifacts=["/app/explanation.txt"]\n', "task.toml"),
@@ -236,17 +247,18 @@ def test_supported_inference_keeps_legitimate_partial_credit(tmp_path):
     ('"artifacts" = ["/app/explanation.txt"]\n', "./task.toml"),
     ('[[artifacts]]\nsource = "/app/explanation.txt"\n', "./task.toml"),
 ])
-def test_artifact_declaration_alone_does_not_support_requirement_or_scoring(tmp_path, basis, declaration, citation):
+def test_artifact_declaration_alone_does_not_establish_requirement_or_scoring(tmp_path, declaration, citation):
     run = Run(tmp_path)
     (run.task / "task.toml").write_text(declaration)
     episode = run.episode({"artifacts/out.txt": UNSORTED})
-    check = run.measured_check(run.content(episode))
-    metadata = {"episode": None, "path": citation, "excerpt": declaration.strip()}
-    support = {"basis": basis, "sources": [metadata], "rationale": "The artifact is listed.", "uncertainty": []}
-    requirement = assess(measured_claim(episode, check, requirement_support=support), run.dir)
-    scoring = assess(measured_claim(episode, check, scoring_support=support), run.dir)
+    content = run.content(episode)
+    metadata = Observation(episode=None, path=citation, excerpt=declaration.strip())
+    requirement = assess(measured_claim(episode, run.measured_check(content, requirement=metadata)), run.dir)
+    scoring = assess(measured_claim(episode, run.measured_check(content, scoring=metadata)), run.dir)
+    explained = assess(measured_claim(episode, run.measured_check(content, requirement=metadata), citations=[REQUIREMENT]), run.dir)
     assert requirement.outcome == scoring.outcome == "unknown"
     assert requirement.validity == "unknown" and scoring.validity == "violated"
+    assert scoring.discrepancy == "unknown" and explained.outcome == "accepted_invalid", explained.reasons
     assert any("artifact metadata" in reason for reason in requirement.reasons)
     assert any("artifact metadata" in reason for reason in scoring.reasons)
 
@@ -269,12 +281,12 @@ def test_one_check_contradicting_the_reward_confirms_a_single_success(tmp_path):
     assert assessment.ids == {"trial_id": f"id-{episode}", "trial_name": f"trial-{episode}"}
     assert assessment.check.requirement == REQUIREMENT
     assert assessment.check.scoring == STATED_SCORING
-    assert assessment.check.content.sha256 == hashlib.sha256(UNSORTED.encode()).hexdigest()
+    assert assessment.check.state_copy == "copy-0000" and assessment.check.content == run.record.copies[0].receipt
     assert assessment.claim.interpretation == the_claim.interpretation
     assert assessment.limits
 
 
-def test_partial_credit_within_the_bound_is_legitimate(tmp_path):
+def test_partial_credit_equal_to_the_deserved_score_is_legitimate(tmp_path):
     run = Run(tmp_path)
     episode = run.episode({"artifacts/out.txt": UNSORTED}, rewards={"reward": 0.5})
     check = run.measured_check(run.content(episode))
@@ -296,7 +308,7 @@ def test_inspector_expectation_without_a_check_stays_provisional(tmp_path):
 
 
 @pytest.mark.parametrize("bound, scoring", [(None, STATED_SCORING), ({"deserved_max": 0.5}, None)])
-def test_violation_without_a_supported_bound_stays_provisional(tmp_path, bound, scoring):
+def test_violation_without_a_deserved_score_stays_provisional(tmp_path, bound, scoring):
     run = Run(tmp_path)
     episode = run.episode({"artifacts/out.txt": UNSORTED})
     check = run.check(run.content(episode), exit_code=1, bound=bound, scoring=scoring)
@@ -308,7 +320,7 @@ def test_violation_without_a_supported_bound_stays_provisional(tmp_path, bound, 
     assert assessment.missing
 
 
-def test_valid_work_below_the_bound_is_a_false_rejection(tmp_path):
+def test_valid_work_below_the_deserved_score_is_a_false_rejection(tmp_path):
     run = Run(tmp_path)
     episode = run.episode({"artifacts/out.txt": SORTED}, rewards={"reward": 0.0})
     check = run.measured_check(run.content(episode))
@@ -320,7 +332,7 @@ def test_valid_work_below_the_bound_is_a_false_rejection(tmp_path):
 
 
 @pytest.mark.parametrize("reward, discrepancy", [(1.0, "over"), (0.0, "under")])
-def test_reward_outside_the_bound_alone_does_not_decide_validity(tmp_path, reward, discrepancy):
+def test_reward_off_the_deserved_score_alone_does_not_decide_validity(tmp_path, reward, discrepancy):
     run = Run(tmp_path)
     episode = run.episode({"artifacts/out.txt": UNSORTED}, rewards={"reward": reward})
     check = run.measured_check(run.content(episode))
@@ -577,7 +589,7 @@ def test_persistence_without_a_recorded_reset_or_the_same_state_stays_provisiona
 # Round 2 regressions use the existing records to expose unsupported conclusions.
 
 
-def test_printed_zero_bound_does_not_condemn_legitimate_partial_credit(tmp_path):
+def test_failed_check_printing_zero_does_not_condemn_legitimate_partial_credit(tmp_path):
     run = Run(tmp_path)
     episode = run.episode({"artifacts/out.txt": UNSORTED}, rewards={"reward": 0.5})
     check = run.check(run.content(episode), exit_code=1, bound={"deserved_max": 0.0})
@@ -588,15 +600,16 @@ def test_printed_zero_bound_does_not_condemn_legitimate_partial_credit(tmp_path)
     assert assessment.discrepancy == "unknown"
 
 
-def test_broad_bound_containing_reward_does_not_establish_legitimate_grading(tmp_path):
+def test_broad_bound_containing_reward_is_no_deserved_score(tmp_path):
+    """Without one `results.deserved`, only the score comparison is unknown; validity is kept."""
     run = Run(tmp_path)
     episode = run.episode({"artifacts/out.txt": UNSORTED}, rewards={"reward": 0.5})
-    program = COUNT_PROGRAM.replace('{"reward": correct * rate}', '{"minimum": 0.0, "maximum": 1.0}')
+    program = COUNT_PROGRAM.replace('{"deserved": correct * rate}', '{"minimum": 0.0, "maximum": 1.0}')
     check = run.measured_check(run.content(episode), program=program)
 
-    assessment = assess(measured_claim(episode, check, minimum="minimum", maximum="maximum"), run.dir)
-    assert assessment.outcome == "unknown"
-    assert assessment.discrepancy == "none"
+    assessment = assess(measured_claim(episode, check), run.dir)
+    assert (assessment.outcome, assessment.validity, assessment.discrepancy) == ("unknown", "violated", "unknown")
+    assert any("results.deserved" in reason for reason in assessment.reasons)
 
 
 def test_check_that_raises_after_printing_plausible_output_stays_unknown(tmp_path):
@@ -611,33 +624,23 @@ def test_check_that_raises_after_printing_plausible_output_stays_unknown(tmp_pat
     assert assessment.discrepancy == "unknown"
 
 
-@pytest.mark.parametrize("bound", [
-    {"deserved_max": False},
-    {"deserved_min": True, "deserved_max": True},
-    {"deserved_max": float("nan")},
-    {"deserved_min": -float("inf")},
-    {"deserved_max": float("inf")},
-    {"deserved_min": 1.0, "deserved_max": 0.0},
-])
-def test_invalid_reward_bounds_remain_provisional(tmp_path, bound):
+@pytest.mark.parametrize("value", [False, True, float("nan"), -float("inf"), float("inf"), "0.5", None])
+def test_invalid_deserved_score_leaves_only_the_comparison_unknown(tmp_path, value):
     run = Run(tmp_path)
     episode = run.episode({"artifacts/out.txt": UNSORTED}, rewards={"reward": 0.5})
-    program = COUNT_PROGRAM.replace('{"reward": correct * rate}', f"json.loads({json.dumps(bound)!r})")
+    program = COUNT_PROGRAM.replace('{"deserved": correct * rate}', f"json.loads({json.dumps({'deserved': value})!r})")
     check = run.measured_check(run.content(episode), program=program)
 
-    assessment = assess(measured_claim(episode, check,
-        minimum="deserved_min" if "deserved_min" in bound else None,
-        maximum="deserved_max" if "deserved_max" in bound else None), run.dir)
+    assessment = assess(measured_claim(episode, check), run.dir)
 
-    assert assessment.outcome == "unknown"
-    assert assessment.discrepancy == "unknown"
+    assert (assessment.outcome, assessment.validity, assessment.discrepancy) == ("unknown", "violated", "unknown")
 
 
 @pytest.mark.parametrize("computed_reward", ["10 ** 400", "-(10 ** 400)"], ids=["positive", "negative"])
-def test_reward_bounds_outside_finite_float_range_stay_provisional(tmp_path, computed_reward):
+def test_deserved_scores_outside_finite_float_range_stay_provisional(tmp_path, computed_reward):
     run = Run(tmp_path)
     episode = run.episode({"artifacts/out.txt": UNSORTED}, rewards={"reward": 0.5})
-    program = COUNT_PROGRAM.replace('{"reward": correct * rate}', '{"reward": ' + computed_reward + '}')
+    program = COUNT_PROGRAM.replace('{"deserved": correct * rate}', '{"deserved": ' + computed_reward + '}')
     check = run.measured_check(run.content(episode), program=program)
 
     assessment = assess(measured_claim(episode, check), run.dir)
@@ -709,21 +712,19 @@ def test_supported_scoring_mismatch_survives_provisional_persistence(tmp_path):
     assert any("reset" in missing or "readback" in missing for missing in assessment.missing)
 
 
-@pytest.mark.parametrize("observations, minimum, maximum, validity, expected", [
-    (["reward"], "reward", "reward", "unknown", ["names ['reward']: keys of `results`, not `observations`"]),
-    (["not_returned"], "reward", "reward", "unknown", ["names ['not_returned']: absent from both `observations` and `results`"]),
-    (["submitted"], None, None, "supported", ["neither minimum nor maximum"]),
-    (["submitted"], "rate", "reward", "supported", ["minimum 'rate' is a key of `observations`, not `results`"]),
-    (["submitted", "reward"], None, None, "unknown", ["names ['reward']: keys of `results`", "neither minimum nor maximum"]),
-], ids=["result_as_observation", "absent_name", "omitted_bounds", "observation_as_bound", "result_and_omitted_bounds"])
-def test_reference_defects_stay_unknown_with_their_specific_cause(tmp_path, observations, minimum, maximum, validity, expected):
-    """A successful check stays usable evidence; a wrong section, absent name or omitted bound is named, never repaired.
-    A bound defect leaves the score comparison unknown, not the measured validity."""
+@pytest.mark.parametrize("observations, program, validity, expected", [
+    (["deserved"], COUNT_PROGRAM, "unknown", ["names ['deserved']: keys of `results`, not `observations`"]),
+    (["not_returned"], COUNT_PROGRAM, "unknown", ["names ['not_returned']: absent from both `observations` and `results`"]),
+    (["submitted"], COUNT_PROGRAM.replace('"deserved": correct', '"reward": correct'), "supported", ["no finite `results.deserved`"]),
+], ids=["result_as_observation", "absent_name", "omitted_deserved"])
+def test_reference_defects_stay_unknown_with_their_specific_cause(tmp_path, observations, program, validity, expected):
+    """A successful check stays usable evidence; a wrong section, absent name or omitted deserved score is named, never repaired.
+    A missing deserved score leaves the score comparison unknown, not the measured validity."""
     run = Run(tmp_path)
     episode = run.episode({"artifacts/out.txt": SORTED})
-    check = run.measured_check(run.content(episode))
-    assert assess(measured_claim(episode, check, validity="supported"), run.dir).outcome == "legitimate"
-    defective = measured_claim(episode, check, validity="supported", minimum=minimum, maximum=maximum)
+    assert assess(measured_claim(episode, run.measured_check(run.content(episode)), validity="supported"), run.dir).outcome == "legitimate"
+    check = run.measured_check(run.content(episode), program=program)
+    defective = measured_claim(episode, check, validity="supported")
     defective.derivation.observations = observations
 
     assessment = assess(defective, run.dir)
@@ -732,7 +733,7 @@ def test_reference_defects_stay_unknown_with_their_specific_cause(tmp_path, obse
     assert (assessment.outcome, assessment.validity, assessment.discrepancy) == ("unknown", validity, "unknown")
     reasons = " ".join(assessment.reasons)
     assert all(item in reasons for item in expected), reasons
-    assert defective.derivation.observations == observations and (defective.derivation.minimum, defective.derivation.maximum) == (minimum, maximum)
+    assert defective.derivation.observations == observations
 
 
 FACT_PROGRAM = '''import hashlib, json, pathlib, sys
@@ -754,7 +755,7 @@ def test_measured_boolean_observation_resolves_validity_while_the_score_stays_un
     assessment = assess(claim(episode, check, derivation=dict(observations=["ascending"], validity="violated")), run.dir)
 
     assert (assessment.outcome, assessment.validity, assessment.discrepancy) == ("unknown", "violated", "unknown")
-    assert any("neither minimum nor maximum" in reason for reason in assessment.reasons)
+    assert any("results.deserved" in reason for reason in assessment.reasons)
     asserted = assess(claim(episode, check, derivation=dict(observations=["note"], validity="supported")), run.dir)
     assert (asserted.outcome, asserted.validity) == ("unknown", "unknown")
     assert any("measured" in reason for reason in asserted.reasons)
@@ -793,7 +794,7 @@ def test_one_check_keeps_independent_requirement_conclusions(tmp_path):
     the_claim = measured_claim(episode, check)
     the_claim.derivation = Derivation.model_validate({**the_claim.derivation.model_dump(), "requirements": [
         reading(FOUR, ["submitted"], "supported"), reading(invented, ["submitted"], "supported"),
-        reading(GRADER_ASSERTION, ["submitted"], "violated"), reading(FOUR, ["reward"], "violated"),
+        reading(GRADER_ASSERTION, ["submitted"], "violated"), reading(FOUR, ["deserved"], "violated"),
         reading(FOUR, ["submitted"], "violated", interpretation=" "),
     ]})
 
@@ -807,12 +808,39 @@ def test_one_check_keeps_independent_requirement_conclusions(tmp_path):
     assert "keys of `results`" in reasons[3] and "interpretation" in reasons[4]
 
 
-def test_capture_that_prints_a_receipt_then_fails_does_not_link_the_submission(tmp_path):
+@pytest.mark.parametrize("change", ["failed copy", "other episode", "other ids", "forged receipt", "no sandbox", "other image"])
+def test_a_check_not_bound_to_a_good_copy_of_its_episode_stays_provisional(tmp_path, change):
+    """A copy that failed, names another episode or other IDs, a receipt that differs from the
+    retained one, or a check not run in a sandbox started from the copy, links nothing."""
     run = Run(tmp_path)
     episode = run.episode({"artifacts/out.txt": UNSORTED})
-    check = run.measured_check(run.content(episode), capture_program=CAPTURE_PROGRAM + '\nraise RuntimeError("after receipt")\n')
+    other = run.episode({"artifacts/out.txt": SORTED})
+    copy_fields = {"failed copy": {"error": "RuntimeError: docker commit failed"},
+                   "other episode": {"episode": other}, "other ids": {"ids": {"trial_id": "id-other"}}}.get(change)
+    check = run.measured_check(run.content(episode), copy_fields=copy_fields)
+    if change == "forged receipt":
+        receipt = run.record.copies[-1].receipt
+        (run.dir / "episodes" / episode / receipt.path).write_text("{}")
+    elif change == "no sandbox":
+        run.record.checks[-1].sandbox = None
+    elif change == "other image":
+        run.record.copies[-1].image = "sha256:" + "f" * 64
+    run.save()
 
     assessment = assess(measured_claim(episode, check), run.dir)
 
-    assert assessment.outcome == "unknown"
-    assert assessment.validity == "unknown"
+    assert assessment.outcome in ("unknown", "ungrounded") and assessment.validity == "unknown", change
+    assert assessment.reasons
+
+
+def test_a_bound_copy_check_reports_the_copy_limits(tmp_path):
+    run = Run(tmp_path)
+    episode = run.episode({"artifacts/out.txt": UNSORTED})
+    check = run.measured_check(run.content(episode))
+
+    assessment = assess(measured_claim(episode, check), run.dir)
+
+    assert assessment.outcome == "accepted_invalid", assessment.reasons
+    assert "the check ran with the episode's own interpreter, so code the episode planted could change its output" in assessment.limits
+    assert "the copy omits /logs; nothing under them was checked" in assessment.limits
+    assert "processes were paused for 1.0 s before grading" in assessment.limits
