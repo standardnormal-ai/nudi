@@ -30,11 +30,11 @@ from harbor.trial.hooks import TrialEvent
 from harbor.trial.trial import Trial
 
 from nudi import checks, copies, report, runner, sandbox, workflow
-from nudi.records import (Assessment, Check, Claim, Content, Coverage, EpisodeResult, ErrorRecord, ModelConfig,
+from nudi.records import (Assessment, Check, Claim, Content, Coverage, DiskFull, EpisodeResult, ErrorRecord, ModelConfig,
                           Observation, RunRecord)
 from test_attack import GO_DIR, GO_FILE, GO_LINK, stat_header
 from test_inspection import CHECKER, Images, InspectorScript, Sandboxes, sandbox_record
-from test_limits import credentials, new_run  # noqa: F401  (pytest fixture)
+from test_limits import credentials, new_run, session_messages  # noqa: F401  (pytest fixture)
 from test_runner import CONTRACT_TASK, serve, tree_digest
 
 REQUIREMENT = "At verification start, /app/explanation.txt must exist."
@@ -256,6 +256,99 @@ def test_cancellation_records_the_partial_pool(tmp_path, monkeypatch, credential
     assert (simulation.status, simulation.episodes) == ("cancelled", ["0000-simulator"])
     episode = json.loads((run.config.output_dir / "episodes" / "0000-simulator" / "episode.json").read_text())
     assert episode["cancelled"]
+
+
+def test_a_full_disk_in_one_worker_stops_the_other_workers_before_it_propagates(tmp_path, monkeypatch, credentials):
+    """With two workers, a full disk in one cancels the other before the error propagates, so no episode runs during
+    cleanup."""
+    run = new_run(tmp_path, monkeypatch, credentials)
+    events, second = [], asyncio.Event()
+
+    async def episode(run, role):
+        if not events:
+            events.append("first")
+            await second.wait()
+            raise DiskFull("no space left on the records host to write run.json")
+        events.append("second")
+        second.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            events.append("second cancelled")
+            raise
+
+    monkeypatch.setattr(workflow, "run_role_episode", episode)
+
+    async def main():
+        with pytest.raises(DiskFull):
+            await workflow.simulate(run, 2)
+        events.append("propagated")
+
+    asyncio.run(main())
+    assert events == ["first", "second", "second cancelled", "propagated"]
+
+
+def consuming(events, started):
+    """Native episodes. The first sets `started` and waits; cancelled, it finishes its teardown and returns
+    normally, the way Harbor's shielded environment stop (`Trial._stop_agent_environment`) consumes the
+    cancellation. Later ones return at once."""
+    async def episode(run, role):
+        number = sum(event.startswith("episode") for event in events)
+        events.append(f"episode {number}")
+        if number == 0:
+            started.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.05)
+                events.append("teardown finished")
+        return SimpleNamespace(errors=[], rewards={"reward": 1.0})
+
+    return episode
+
+
+def test_a_worker_whose_cancellation_harbor_consumes_starts_no_episode_after_a_full_disk(tmp_path, monkeypatch, credentials):
+    """Such a worker must not go back to its loop and start a third episode."""
+    run = new_run(tmp_path, monkeypatch, credentials, capacity=(3, 4096))
+    assert run.record.capacity.concurrency == 2
+    events, started, calls = [], asyncio.Event(), []
+    native = consuming(events, started)
+
+    async def episode(run, role):
+        calls.append(role)
+        if len(calls) == 2:
+            await started.wait()
+            raise DiskFull("no space left on the records host to write run.json")
+        return await native(run, role)
+
+    monkeypatch.setattr(workflow, "run_role_episode", episode)
+
+    async def main():
+        with pytest.raises(DiskFull):
+            await workflow.simulate(run, 3)
+        events.append("propagated")
+
+    asyncio.run(main())
+    assert events == ["episode 0", "teardown finished", "propagated"]
+
+
+def test_a_worker_whose_cancellation_harbor_consumes_starts_no_episode_after_ctrl_c(tmp_path, monkeypatch, credentials):
+    run = new_run(tmp_path, monkeypatch, credentials, capacity=(2, 4096))
+    assert run.record.capacity.concurrency == 1
+    events, started = [], asyncio.Event()
+    monkeypatch.setattr(workflow, "run_role_episode", consuming(events, started))
+
+    async def main():
+        running = asyncio.create_task(workflow.simulate(run, 3))
+        await started.wait()
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        events.append("cancelled")
+
+    asyncio.run(main())
+    assert events == ["episode 0", "teardown finished", "cancelled"]
+    assert stored(run).simulation.status == "cancelled"
 
 
 @pytest.mark.parametrize("reward, status", [(0.0, "complete"), (None, "partial")])
@@ -586,7 +679,9 @@ def test_measured_facts_and_requirement_conclusions_reach_labels_and_reports(tmp
 
     built = report.build(run.config.output_dir)
     episodes = built["metrics"]["episodes"]
+    # No check of pool[4] reads the newline requirement: it is listed as unobserved and keeps completion unknown.
     assert [episodes[name]["completion"] for name in pool] == ["incomplete", "unknown", "incomplete", "complete", "unknown", "unknown"]
+    assert episodes[pool[4]]["unobserved"] == [f"instruction.md: {NEWLINE!r}"] and episodes[pool[3]]["unobserved"] == []
     assert any("conflicting" in reason for reason in episodes[pool[5]]["completion_reasons"])
     assert built["labels"]["review"]["unresolved"] == [pool[0], pool[1], pool[4], pool[5]]
     assert built["labels"]["review"]["unreviewed"] == {}
@@ -727,17 +822,20 @@ def test_corrected_interpretation_uses_the_next_existing_attempt_without_rerunni
         assert len(inspection.assessments) == 1 and label.label == "unknown" and NEWLINE in " ".join(label.reasons)
         assert built["labels"]["review"]["unresolved"] == [name] and built["labels"]["review"]["unreviewed"] == {}
         if case == "invalid":
-            assert inspection.attempts[1].status == "model_output_failure" and "check-0009" in inspection.attempts[1].error
+            assert inspection.attempts[1].status == "duplicate_case", "an unknown experiment assesses nothing and fails nothing"
+            shown = json.dumps(session_messages(run.config.output_dir, "grader-accepted_invalid"))
+            assert "invalid_experiment" in shown and "check-0009" in shown
 
 
 @pytest.mark.parametrize(("invalid", "error"), [
-    ("unlisted", "check-0009"),
-    ("item", "no measured experiment"),
+    ("unlisted", None),
+    ("item", None),
     ("claim", "Invalid Claim"),
-    ("list", "no measured experiment"),
+    ("list", None),
 ])
 def test_invalid_reinterpretation_preserves_other_repairs_and_ordinary_probes(tmp_path, monkeypatch, credentials, invalid, error):
-    """One invalid repair stays a reported failure while independent work uses the same attempt."""
+    """An invalid claim stays a reported failure; a repair naming no retained check is returned to the model as
+    invalid_experiment and fails nothing. Independent work uses the same attempt either way."""
     task = answer_task(tmp_path)
     first, second = "0000-simulator", "0001-simulator"
     native = Native(monkeypatch, files={name: {"/app/answer.txt": b"42\n"} for name in (first, second)})
@@ -770,11 +868,17 @@ def test_invalid_reinterpretation_preserves_other_repairs_and_ordinary_probes(tm
     built = report.build(run.config.output_dir)
     assert len(script.requests) == 4, "the ordinary probe runs without a replacement planning call"
     assert len(run.record.checks) == 2 and sum(sandbox_record(run, name)["purpose"] == "check" for name in run.record.sandboxes) == 2
-    assert len(inspection.attempts) == 2 and inspection.attempts[1].status == "model_output_failure"
-    assert error in inspection.attempts[1].error and inspection.status == "partial"
+    status = "model_output_failure" if error else "no_evidenced_issue"
+    assert len(inspection.attempts) == 2 and inspection.attempts[1].status == status
+    assert built["inspections"]["grader_inspector"]["attempts"][1]["status"] == status
+    if error:
+        assert error in inspection.attempts[1].error
+    else:
+        assert "invalid_experiment" in json.dumps(session_messages(run.config.output_dir, "grader-accepted_invalid"))
+    # Without a usable repair the first episode stays unknown, so only a corrected unknown reference completes.
+    assert inspection.status == ("complete" if invalid in ("unlisted", "item") else "partial")
     assert inspection.unreviewed == {} and inspection.ordinary[second].label == "legitimate"
     assert built["metrics"]["episodes"][second]["completion"] == "complete"
-    assert built["inspections"]["grader_inspector"]["attempts"][1]["status"] == "model_output_failure"
     if invalid == "list":
         assert inspection.ordinary[first].label == "unknown"
     else:

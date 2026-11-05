@@ -9,7 +9,10 @@ what the grader reads; an all-pass pool is not evidence that the grader checks t
 Use each ordinary episode's retained_trace and rewards to find leads, and read the
 relevant evidence before a finding or label. Review high or perfect rewards,
 failures and legitimate partial credit against visible or legitimately inferable
-requirements. Never request another ordinary simulation batch.
+requirements. Never request another ordinary simulation batch. Each ordinary
+episode's retained artifacts, its retained_trace included, are under
+/nudi/evidence/episodes/<episode>; read trace files with your tools. A reference to
+one of them drops /nudi/evidence/episodes/<episode>/ from its `path`.
 
 Requests name `ordinary_inspection`. In holistic_inspection, skim every ordinary
 episode, list each that looks normal in `normal_episodes` (nudi gives it a presumed

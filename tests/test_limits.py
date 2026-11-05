@@ -45,6 +45,8 @@ from test_runner import (
 FILE_KEY = "nudi-limits-file-key"
 OUTSIDE_KEY = "nudi-limits-outside-key"
 UNPRICED = "openai/nudi-unpriced-model"
+GATEWAY = {"model": "openai/deepseek/deepseek-v4.1-flash-1017", "api_base": "https://api-gateway.merge.dev/v1/openai",
+           "api_key_var": "MERGE_GATEWAY_API_KEY"}
 TINY_CAP = 1e-12
 
 
@@ -84,12 +86,11 @@ class RecordingTerminus(TerminusScript):
 @pytest.fixture
 def credentials(tmp_path, monkeypatch):
     """A credentials file; the provider variables are absent from the environment."""
-    for name in ("XAI_API_KEY", "XIAOMI_MIMO_API_KEY", "NUDI_UNPRICED_KEY"):
+    names = ("MERGE_GATEWAY_API_KEY", "XAI_API_KEY", "XIAOMI_MIMO_API_KEY", "NUDI_UNPRICED_KEY")
+    for name in names:
         monkeypatch.delenv(name, raising=False)
     path = tmp_path / "credentials.env"
-    path.write_text(
-        f"XAI_API_KEY={FILE_KEY}\nXIAOMI_MIMO_API_KEY={FILE_KEY}\nNUDI_UNPRICED_KEY={FILE_KEY}\n"
-    )
+    path.write_text("".join(f"{name}={FILE_KEY}\n" for name in names))
     return path
 
 
@@ -98,6 +99,15 @@ def new_run(tmp_path, monkeypatch, credentials, *, name="run", capacity=(8, 4096
     fields.setdefault("task_dir", CONTRACT_TASK)
     config = RunConfig(output_dir=tmp_path / name, credentials_file=credentials, **fields)
     return start_run(config)
+
+
+def session_messages(output_dir, name: str) -> list[dict]:
+    """The retained transcript of Inspector session `name` as role and content. A fork's starts with
+    the conversation it continues."""
+    artifacts = next(found[name] for path in output_dir.glob("inspection-*.json")
+                     if name in (found := json.loads(path.read_text())["artifacts"]))
+    lines = (output_dir / artifacts["transcript"]).read_text().splitlines()
+    return [{"role": entry["type"], "content": entry["data"]["content"]} for entry in map(json.loads, lines)]
 
 
 def stored_run(run) -> RunRecord:
@@ -203,9 +213,8 @@ def test_run_records_defaults_capacity_and_limitations_without_secrets(tmp_path,
 
     record = stored_run(run)
     assert record.models == DEFAULT_MODELS
-    assert record.models["simulator"].model == "xiaomi_mimo/mimo-v2.6-pro"
-    assert record.models["simulator"].reasoning_effort == "high"
-    assert record.models["inspector"] == ModelConfig(model="xai/grok-4.7", reasoning_effort="xhigh")
+    assert record.models["simulator"] == ModelConfig(**GATEWAY, reasoning_effort="medium")
+    assert record.models["inspector"] == record.models["attacker"] == ModelConfig(**GATEWAY, reasoning_effort="high")
     assert record.credential_sources == {role: "credentials file" for role in DEFAULT_MODELS}
     capacity = record.capacity
     assert (capacity.docker_cpus, capacity.docker_memory_mb) == (8, 4096)
@@ -213,9 +222,17 @@ def test_run_records_defaults_capacity_and_limitations_without_secrets(tmp_path,
     assert record.spending_cap is None and record.warnings == []
     assert record.cost_map
     limits = "\n".join(record.limitations)
-    for disclosed in ("not a guarantee", "may exceed the cap", "differentiated", "whole-episode retries"):
+    for disclosed in ("not a guarantee", "may exceed the cap", "whole-episode retries"):
         assert disclosed in limits
+    assert "MiMo" not in limits
     assert FILE_KEY not in (run.config.output_dir / "run.json").read_text()
+
+
+def test_a_mimo_role_discloses_its_unverified_effort(tmp_path, monkeypatch, credentials):
+    mimo = ModelConfig(model="xiaomi_mimo/mimo-v2.6-pro", reasoning_effort="high")
+    run = new_run(tmp_path, monkeypatch, credentials, models={"simulator": mimo})
+
+    assert any("differentiated" in item for item in run.record.limitations)
 
 
 def test_overrides_win_for_their_role(tmp_path, monkeypatch, credentials):
@@ -231,14 +248,13 @@ def test_run_models_are_copies_so_changes_reach_no_default_or_other_run(tmp_path
     second = new_run(tmp_path, monkeypatch, credentials, name="second", models={"attacker": override})
     first.record.models["inspector"].api_base = first.record.models["attacker"].api_base = "http://changed"
 
-    assert DEFAULT_MODELS["inspector"] == ModelConfig(model="xai/grok-4.7", reasoning_effort="xhigh")
-    assert second.record.models["inspector"].api_base is None
+    assert DEFAULT_MODELS["inspector"] == ModelConfig(**GATEWAY, reasoning_effort="high")
+    assert second.record.models["inspector"].api_base == GATEWAY["api_base"]
     assert override.api_base == second.record.models["attacker"].api_base == "http://override"
 
 
 def test_environment_credentials_are_used_when_no_file_names_them(tmp_path, monkeypatch):
-    monkeypatch.setenv("XAI_API_KEY", OUTSIDE_KEY)
-    monkeypatch.setenv("XIAOMI_MIMO_API_KEY", OUTSIDE_KEY)
+    monkeypatch.setenv("MERGE_GATEWAY_API_KEY", OUTSIDE_KEY)
     run = new_run(tmp_path, monkeypatch, None)
 
     assert run.record.credential_sources == {role: "environment" for role in DEFAULT_MODELS}
@@ -255,16 +271,18 @@ def test_credentials_file_does_not_change_the_environment(tmp_path, monkeypatch,
 def test_missing_credential_fails_before_execution(tmp_path, monkeypatch, credentials):
     credentials.write_text(f"XAI_API_KEY={FILE_KEY}\n")
 
-    with pytest.raises(MissingCredential, match="simulator.*XIAOMI_MIMO_API_KEY") as error:
+    with pytest.raises(MissingCredential, match="attacker.*MERGE_GATEWAY_API_KEY") as error:
         new_run(tmp_path, monkeypatch, credentials)
     assert FILE_KEY not in str(error.value)
     assert not (tmp_path / "run").exists()
 
 
 def test_only_the_requested_roles_need_credentials(tmp_path, monkeypatch, credentials):
-    credentials.write_text(f"XAI_API_KEY={FILE_KEY}\n")
+    credentials.write_text(f"MERGE_GATEWAY_API_KEY={FILE_KEY}\n")
     monkeypatch.setattr("nudi.workflow.docker_capacity", lambda: (8, 4096))
-    config = RunConfig(task_dir=CONTRACT_TASK, output_dir=tmp_path / "run", credentials_file=credentials)
+    # The Simulator's MiMo key is absent, and only the Simulator needs it.
+    config = RunConfig(task_dir=CONTRACT_TASK, output_dir=tmp_path / "run", credentials_file=credentials,
+                       models={"simulator": ModelConfig(model="xiaomi_mimo/mimo-v2.6-pro")})
 
     run = start_run(config, roles=frozenset({"inspector", "attacker"}))
 

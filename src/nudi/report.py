@@ -16,7 +16,7 @@ from pathlib import Path
 
 from nudi.assessment import Evidence, Ungrounded, classify_probe, conclusions
 from nudi.checks import AttackResult, InspectionResult, evidenced
-from nudi.records import PROVIDER_REPORTED, Assessment, EpisodeResult, MetricBasis, Observation, RunRecord
+from nudi.records import PROVIDER_REPORTED, Assessment, EpisodeResult, MetricBasis, Observation, RunRecord, write_private
 
 ANALYSES = ("simulation", "grader", "hack", "attack")
 FILES = {"grader": "inspection-grader.json", "hack": "inspection-hack.json", "attack": "attack.json"}
@@ -64,8 +64,8 @@ FINDINGS_NOTE = (
     "are listed beside it. A legitimate finding has a reward equal to its deserved score and no open condition, which does "
     "not judge the work. An inconclusive finding established no outcome, or is legitimate with an open condition. Package findings come from an Inspector sandbox "
     "running a copy of the task package, native findings from a task episode. An earlier reading of a check stays listed, "
-    "marked with the later reading that superseded it. Category settlement reads the latest reading of each check; local "
-    "labels and metrics read every reading."
+    "marked with the later reading that superseded it. Category settlement and the evidenced count read the latest "
+    "reading of each check; local labels and metrics read every reading."
 )
 CATEGORY_RULE = (
     "A category is evidenced_issue once one of its cases is evidenced (for the hack inspector, an accepted_invalid case), and a "
@@ -141,8 +141,8 @@ def write(run_dir: Path, secrets=(), selected=None) -> tuple[Path, Path]:
     """Write `report.json` and `report.md` beside the run's records."""
     report = build(run_dir, secrets, selected)
     paths = run_dir / "report.json", run_dir / "report.md"
-    paths[0].write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-    paths[1].write_text(markdown(report))
+    write_private(paths[0], json.dumps(report, indent=2, sort_keys=True) + "\n")
+    write_private(paths[1], markdown(report))
     return paths
 
 
@@ -310,12 +310,15 @@ def labels(pool: list[str], result: InspectionResult, warnings: list[str]) -> di
     return {"mode": result.ordinary_inspection, "counts": counts, "basis": basis, "review": review, "episodes": episodes}
 
 
-def completion_gaps(basis: MetricBasis, own: list[Assessment]) -> list[str]:
-    """Why a basis does not establish completion; empty when it does. `own` are the
-    episode's own checked assessments, each with one conclusion per requirement it read.
+def completion_gaps(basis: MetricBasis, own: list[Assessment], run_dir: Path, name: str) -> tuple[list[str], list[Observation]]:
+    """Why a basis does not establish completion, empty when it does, and the cited requirements
+    no check of this episode reads. `own` are the episode's own checked assessments, each with
+    one conclusion per requirement it read. An unread requirement is listed, not a reason, while a
+    cited check observes another cited requirement satisfied, no check of this episode observes a
+    violation and its quote is in the task.
     Semantic completeness stays the grader inspector's interpretation."""
     if basis.completion == "unknown":
-        return [f"the grader inspector left completion unknown: {basis.explanation}"]
+        return [f"the grader inspector left completion unknown: {basis.explanation}"], []
     gaps = [f"unresolved: {item}" for item in basis.unresolved]
     if not basis.explanation.strip():
         gaps.append("its basis explains nothing")
@@ -338,19 +341,34 @@ def completion_gaps(basis: MetricBasis, own: list[Assessment]) -> list[str]:
         # One uncontested violation suffices; unrelated unknown or contested conclusions do not erase it.
         if not any(validity == "violated" and item in basis.requirements and not contested(item) for item, validity in observed):
             gaps += conflicts or ["no cited resolved check of this episode observed a violation of a cited requirement"]
-        return gaps
+        return gaps, []
     gaps += [f"cited check {id} is not a resolved check of this episode" for id in basis.checks if all(item.check.id != id for item in cited)]
     gaps += conflicts
     gaps += [f"cited check observed requirement {item.path}: {item.excerpt!r} violated outside the completion basis; its relevance is unresolved"
              for item, validity in observed if validity == "violated" and item not in basis.requirements]
+    read = [requirement for item in own for requirement, _ in conclusions(item)]
+    violation = any(validity == "violated" for item in own for _, validity in conclusions(item))
+    unobserved = []
     for item in basis.requirements:
         if contested(item):
             continue
         if (item, "violated") in every:
             gaps.append(f"requirement {item.path}: {item.excerpt!r} was observed violated")
+        elif item not in read:
+            # A violation may be this requirement quoted differently.
+            if violation:
+                gaps.append(f"no check reads requirement {item.path}: {item.excerpt!r} and a check of this episode observed a violation")
+            elif reason := grounded(run_dir, name, item):
+                gaps.append(f"requirement {item.path}: {item.excerpt!r}: {reason}")
+            else:
+                # Grounding the quote does not establish the episode met it.
+                gaps.append(f"no check reads requirement {item.path}: {item.excerpt!r}; whether the episode met it is unknown")
+                unobserved.append(item)
         elif (item, "supported") not in observed:
             gaps.append(f"no cited check observes requirement {item.path}: {item.excerpt!r} satisfied")
-    return gaps
+    if basis.requirements and not any((item, "supported") in observed for item in basis.requirements):
+        gaps.append("no cited check observes a cited requirement satisfied")
+    return gaps, unobserved
 
 
 def ordinary_assessments(name: str, assessments: list[Assessment]) -> list[Assessment]:
@@ -359,24 +377,26 @@ def ordinary_assessments(name: str, assessments: list[Assessment]) -> list[Asses
             and item.check is not None and item.check.content.episode == name]
 
 
-def reference(name: str, own: list[Assessment]) -> tuple[str, list[str]]:
-    """The episode's completion reference: complete, incomplete or unknown, with reasons.
+def reference(name: str, own: list[Assessment], run_dir: Path) -> tuple[str, list[str], list[str]]:
+    """The episode's completion reference: complete, incomplete or unknown, with reasons and
+    the cited requirements no check reads, each of which keeps completion unknown.
     Reward never supplies it, and legitimate partial credit alone is neither label."""
     own = ordinary_assessments(name, own)
     bases = [assessment.claim.basis for assessment in own if assessment.claim.basis is not None]
     if not bases:
-        return "unknown", ["no metric basis was supplied for this episode; missing evidence stays unknown"]
-    found, reasons = set(), []
+        return "unknown", ["no metric basis was supplied for this episode; missing evidence stays unknown"], []
+    found, reasons, unobserved = set(), [], {}
     for basis in bases:
-        gaps = completion_gaps(basis, own)
+        gaps, missing = completion_gaps(basis, own, run_dir, name)
         reasons += gaps or [basis.explanation]
+        unobserved.update((f"{item.path}: {item.excerpt!r}", None) for item in missing)
         if not gaps:
             found.add("complete" if basis.completion == "supported" else "incomplete")
     if len(found) == 1:
-        return found.pop(), reasons
+        return found.pop(), reasons, list(unobserved)
     if found:
         reasons.append("its completion references disagree")
-    return "unknown", reasons
+    return "unknown", reasons, list(unobserved)
 
 
 def grounded(run_dir: Path, name: str, source: Observation) -> str | None:
@@ -477,8 +497,9 @@ def metrics(run_dir: Path, pool: list[str], results: dict, result: InspectionRes
     for name in pool:
         own = ordinary_assessments(name, result.assessments)
         bases = [assessment.claim.basis for assessment in own if assessment.claim.basis is not None]
-        completion, completion_reasons = reference(name, own)
-        entry = episodes[name] = {"completion": completion, "completion_reasons": completion_reasons, "decision": None, "score": None}
+        completion, completion_reasons, unobserved = reference(name, own, run_dir)
+        entry = episodes[name] = {"completion": completion, "completion_reasons": completion_reasons, "unobserved": unobserved,
+                                  "decision": None, "score": None}
         config = json.dumps(configuration(results[name]), sort_keys=True) if results.get(name) else ""
         if config:
             configs.setdefault(config, []).append(name)
@@ -519,8 +540,12 @@ def metrics(run_dir: Path, pool: list[str], results: dict, result: InspectionRes
         for name in names:
             entry, label, rule = episodes[name], result.ordinary.get(name), rules.get(name)
             assumed = label is not None and label.basis == "presumed" and entry["completion"] == "unknown"
-            if assumed and rule is None and len(groups) == 1:
+            # An episode without a usable rule of its own takes its configuration's one native decision rule.
+            if rule is None and len(groups) == 1 and (assumed or not valid[name]):
                 rule = next(iter(groups.values()))
+                if rule and not assumed and (value := native_value(results[name], rule.reward)[0]) is not None:
+                    entry["decision_reasons"].append("it takes this configuration's one native decision rule")
+                    entry["decision"] = "pass" if passes(rule, value) else "fail"
             key = identity(rule, "values") if rule else None
             if native_value(results[name], environment)[0] is None:
                 kinds[name] = "operational_failure" if results[name].errors else "missing_reward"
@@ -925,7 +950,9 @@ def markdown(report: dict) -> str:
         lines.append("The grader inspector was not selected or not run, so no metric reference exists.")
     else:
         lines += [f"- {name}: completion {item['completion']}; native decision {item['decision'] or 'unavailable'}; "
-                  f"score {number(item['score'])}" for name, item in metric["episodes"].items()]
+                  f"score {number(item['score'])}"
+                  + (f"; unobserved requirements: {', '.join(item['unobserved'])}" if item["unobserved"] else "")
+                  for name, item in metric["episodes"].items()]
         coverage = metric["coverage"]
         excluded = ", ".join(f"{kind.replace('_', ' ')} {len(names)}" for kind, names in coverage["excluded"].items() if names)
         lines.append(f"- Coverage: {coverage['resolved']} of {coverage['ordinary']} ordinary episodes have a resolved completion "
@@ -978,8 +1005,8 @@ def markdown(report: dict) -> str:
                     if values:
                         entries[-1] += f". {label}: " + "; ".join(values)
                 limits += [limit for limit in outcome["limits"] if limit not in limits]
-                total += kind == "evidenced"
-                doubted += kind == "evidenced" and bool(claim["unresolved"])
+                total += kind == "evidenced" and not later
+                doubted += kind == "evidenced" and not later and bool(claim["unresolved"])
     lines += [f"Evidenced findings: {total}, {doubted} of them with open conditions.", ""] * bool(entries)
     lines += entries or ["None retained."]
     # Limits that many findings share are stated once; the JSON keeps each finding's own list.

@@ -125,6 +125,20 @@ def _protect_startup(environment) -> None:
     environment._validate_image_os = validate_image_os
 
 
+def _remove_at_once(environment) -> None:
+    """Bring a Docker sandbox down with a stop timeout of 0. Its PID 1, `sh -c "sleep infinity"`,
+    ignores SIGTERM, so a plain `down` waits Docker's 10 s stop timeout for a sandbox nudi no
+    longer needs. Harbor's ownership fix still runs first; native episodes keep Harbor's stop."""
+    original = environment._run_docker_compose_command
+
+    async def run(command, *args, **kwargs):
+        if command[:1] == ["down"]:
+            command = ["down", "--timeout", "0", *command[1:]]
+        return await original(command, *args, **kwargs)
+
+    environment._run_docker_compose_command = run
+
+
 class Sandbox:
     """One started sandbox. Every call is recorded before it runs and saved after."""
 
@@ -315,6 +329,7 @@ async def sandbox(run, purpose: str, *, copy=None, definition: bool = False, art
             enable_environment_dir_upload=upload, **extra)
         if backend == "docker":
             _protect_startup(box.environment)
+            _remove_at_once(box.environment)
         # As in Harbor's trial, a verifier definition also starts within the main environment's bound.
         await asyncio.wait_for(box.environment.start(force_build=False), task.config.environment.build_timeout_sec)
         if own:
@@ -365,5 +380,7 @@ async def sandbox(run, purpose: str, *, copy=None, definition: bool = False, art
             if tree_digest(run.config.task_dir) != record.task_digest:
                 record.errors.append(ErrorRecord(type="TaskChanged", message="the original task changed while the sandbox ran"))
                 run.warn(f"{name}: the original task changed while the sandbox ran")
+            if (box.directory / "nudi-evidence").is_dir():
+                record.artifacts["nudi_evidence"] = "nudi-evidence"
             box.save()
             run.save()

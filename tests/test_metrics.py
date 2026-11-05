@@ -218,9 +218,11 @@ def test_completion_references_and_native_decisions_count_each_ordinary_episode_
     violated_fail = run.episode(rewards={"reward": 0.0})
     run.label(violated_fail, "unknown", checked(violated_fail, "c8", "sorted", "violated",
                                                basis=basis("violated", ["sorted"], ["c8"], decision=RULE)))
+    # A requirement observed satisfied only by a check the basis does not cite still needs that citation.
     uncovered = run.episode(rewards={"reward": 1.0})
     run.label(uncovered, "unknown", checked(uncovered, "c9", "sorted", "supported",
-                                           basis=basis("supported", both, ["c9"], decision=RULE)))
+                                           basis=basis("supported", both, ["c9"], decision=RULE)),
+              checked(uncovered, "c12", "summary", "supported"))
     no_reward = run.episode(rewards={})
     run.label(no_reward, "unavailable", checked(no_reward, "c10", "sorted", "supported"),
               checked(no_reward, "c11", "summary", "supported", basis=basis("supported", both, ["c10", "c11"], decision=RULE)))
@@ -246,6 +248,76 @@ def test_completion_references_and_native_decisions_count_each_ordinary_episode_
     # Local findings stay separate from binary labels.
     assert result["labels"]["counts"] == {"accepted_invalid": 2, "legitimate": 2, "rejected_valid": 1,
                                           "unavailable": 1, "unknown": 2}
+
+
+def test_a_cited_requirement_no_check_observes_keeps_completion_unknown_and_is_listed(tmp_path):
+    """No check of the episode reads the 3-second requirement. Whether the episode met it is unknown, so completion
+    stays unknown (completion needs every cited requirement observed satisfied); it is listed."""
+    run = RunDir(tmp_path)
+    both = ["sorted", "summary"]
+    unobserved = run.episode(rewards={"reward": 1.0})
+    run.label(unobserved, "legitimate", checked(unobserved, "c0", "sorted", "supported", outcome="legitimate",
+                                                basis=basis("supported", both, ["c0"], decision=RULE)))
+    # Completion still needs one cited requirement observed satisfied.
+    nothing = run.episode(rewards={"reward": 1.0})
+    run.label(nothing, "unknown", checked(nothing, "c1", "sorted", "supported",
+                                          basis=basis("supported", ["summary"], ["c1"], decision=RULE)))
+
+    result = run.report()
+    episodes = result["metrics"]["episodes"]
+    summary = f"instruction.md: {REQUIREMENTS['summary']!r}"
+    assert (episodes[unobserved]["completion"], episodes[unobserved]["unobserved"]) == ("unknown", [summary])
+    assert f"no check reads requirement {summary}; whether the episode met it is unknown" in episodes[unobserved]["completion_reasons"]
+    assert (episodes[nothing]["completion"], episodes[nothing]["unobserved"]) == ("unknown", [summary])
+    assert "no cited check observes a cited requirement satisfied" in episodes[nothing]["completion_reasons"]
+    assert all(group["episodes"] == [] for group in result["metrics"]["confusion"])
+    assert (f"- {unobserved}: completion unknown; native decision pass; score unavailable; "
+            f"unobserved requirements: {summary}") in report.markdown(result)
+
+
+def test_an_unobserved_requirement_is_listed_only_when_never_read_no_violation_is_observed_and_its_quote_is_grounded(tmp_path):
+    """Review of the unobserved rule: an inconclusive read, a violation quoted differently or an invented quote
+    keeps completion unknown, as before."""
+    run = RunDir(tmp_path)
+    both = ["sorted", "summary"]
+    inconclusive = run.episode(rewards={"reward": 1.0})
+    run.label(inconclusive, "unknown", checked(inconclusive, "c0", "sorted", "supported", basis=basis("supported", both, ["c0"], decision=RULE)),
+              checked(inconclusive, "c1", "summary", "unknown"))
+    violated = run.episode(rewards={"reward": 1.0})
+    longer = checked(violated, "c3", "summary", "violated", outcome="accepted_invalid")
+    longer.check.requirement = Observation(episode=None, path="instruction.md", excerpt="Write a one-line summary to /app/summary.txt.")
+    run.label(violated, "accepted_invalid", checked(violated, "c2", "sorted", "supported", basis=basis("supported", both, ["c2"], decision=RULE)),
+              longer)
+    invented = run.episode(rewards={"reward": 1.0})
+    poem = MetricBasis(completion="supported", requirements=[requirement("sorted"), Observation(episode=None, path="instruction.md", excerpt="Write a poem")],
+                       checks=["c4"], explanation="completion supported", decision=RULE)
+    run.label(invented, "unknown", checked(invented, "c4", "sorted", "supported", basis=poem))
+
+    episodes = run.report()["metrics"]["episodes"]
+    assert [(episodes[name]["completion"], episodes[name]["unobserved"]) for name in (inconclusive, violated, invented)] == [
+        ("unknown", []), ("unknown", []), ("unknown", [])]
+    assert any("observed a violation" in reason for reason in episodes[violated]["completion_reasons"])
+    assert any("Write a poem" in reason and "not retained evidence" in reason for reason in episodes[invented]["completion_reasons"])
+
+
+def test_an_episode_without_its_own_usable_decision_rule_takes_its_configurations_one_rule(tmp_path):
+    """One episode cites the grader's rule, the others cite none or an excerpt its source lacks.
+    The configuration's one grounded rule decides them from their recorded native rewards."""
+    run = RunDir(tmp_path)
+    cited = referenced(run, "supported", {"reward": 1.0}, decision=RULE)
+    silent = referenced(run, "supported", {"reward": 1.0})
+    stdout = RULE.model_copy(update={"source": Observation(episode=None, path="tests/test.sh", excerpt="TEST PASSED")})
+    refused = referenced(run, "violated", {"reward": 0.0}, decision=stdout)
+
+    metrics = run.report()["metrics"]
+    episodes = metrics["episodes"]
+    assert [episodes[name]["decision"] for name in (cited, silent, refused)] == ["pass", "pass", "fail"]
+    for name in (silent, refused):
+        assert "it takes this configuration's one native decision rule" in episodes[name]["decision_reasons"]
+    assert any("TEST PASSED" in reason for reason in episodes[refused]["decision_reasons"])
+    (group,) = metrics["confusion"]
+    assert group["episodes"] == [cited, silent, refused] and (group["tp"], group["fp"], group["fn"], group["tn"]) == (2, 0, 0, 1)
+    assert group["false_discovery_rate"]["value"] == group["false_negative_rate"]["value"] == 0.0
 
 
 def test_an_evidenced_finding_with_an_open_claim_condition_still_counts_in_grader_error_rates(tmp_path):
@@ -423,7 +495,8 @@ def test_grader_agreement_groups_by_configuration_and_rule_and_keeps_exclusions_
                          errors=[ErrorRecord(type="VerifierTimeoutError", message="grader timed out")])
     unrecorded = run.episode(errors=[ErrorRecord(type="RuntimeError", message="runner raised")], retained=False)
     missing = referenced(run, "supported", {}, decision=RULE)
-    undecided = referenced(run, "supported", {"reward": 1.0})
+    # Without its own rule, an episode of a configuration with two grounded rules has no decision.
+    undecided = referenced(run, "supported", {"reward": 1.0}, model="xai/grok-4.7")
     # Attacker and probe episodes stay outside the ordinary pool and its observed reward values.
     run.episode("attacker", {"reward": 0.5})
     run.record.probe_episodes.append(run.episode("attacker", {"reward": 0.5}))
@@ -812,4 +885,4 @@ def test_ordinary_metrics_exclude_package_or_other_episode_evidence(tmp_path, in
                  ("unknown", None, None), ("unknown", None, None)]
     (group,) = metrics["confusion"]
     assert (group["status"], group["episodes"], group["tp"]) == ("unavailable", [], None) and metrics["auroc"] == []
-    assert report.reference(supported, run.grader.assessments)[0] == "unknown"
+    assert report.reference(supported, run.grader.assessments, run.path)[0] == "unknown"

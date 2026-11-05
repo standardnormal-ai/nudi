@@ -4,7 +4,13 @@
 returns. On Docker the main container is committed to an image tagged
 `nudi-copy-<run id>-<n>`, with its entrypoint emptied and a sleep command, so a check
 container started from it runs none of the task's startup code. On Modal the sandbox's
-filesystem is snapshotted. Every copy of a run is deleted when the run ends.
+filesystem is snapshotted.
+
+A copy is read by checks of its own episode or sandbox and as an attack inspector's workspace.
+The grader inspector reads Simulator copies and its own probes' copies; the hack inspector's
+experiments may name any retained episode or sandbox, so every copy stays through the hack phase.
+An attack inspector reads only its own Attacker attempt's copies, so `discard` deletes every copy
+taken so far before each attempt. `delete` at run end removes everything left, also after a failure.
 """
 
 import asyncio
@@ -38,8 +44,8 @@ COMMIT_CHANGES = ("--change", "ENTRYPOINT []", "--change", 'CMD ["sh","-c","slee
 # Every path the container has from a mount rather than its own filesystem, and the size of its
 # writable layer, which `docker inspect --size` reports.
 MOUNTS_FORMAT = '{"mounts":{{json .Mounts}},"tmpfs":{{json .HostConfig.Tmpfs}},"size":{{json .SizeRw}}}'
-# Copies stay until the run ends, so one container that wrote more than this is not copied: a
-# probe writing large files would otherwise fill Docker's disk with copies of them.
+# Copies taken before the attack phase stay until it starts, so one container that wrote more than
+# this is not copied: a probe writing large files would otherwise fill Docker's disk with copies of them.
 COPY_BYTES = 2 * 1024 ** 3
 UNPAUSE_TIMEOUT = 10
 
@@ -52,10 +58,10 @@ def excluded():
     return sorted({LOGS, *map(str, RUNTIME_ROOTS), *map(str, RUNTIME_FILES)})
 
 
-def excluded_by(copy: StateCopy, location: str) -> str | None:
+def excluded_by(excluded: list[str], location: str) -> str | None:
     """The excluded path `location` lies under, if any."""
     path = PurePosixPath(location)
-    return next((root for root in copy.excluded if path == PurePosixPath(root) or PurePosixPath(root) in path.parents), None)
+    return next((root for root in excluded if path == PurePosixPath(root) or PurePosixPath(root) in path.parents), None)
 
 
 async def take(run, verifier, point: str, *, episode: str, owner: Path, ids: dict[str, str]) -> None:
@@ -134,6 +140,30 @@ def _seconds(copy: StateCopy) -> float:
     return (datetime.fromisoformat(copy.finished_at) - datetime.fromisoformat(copy.started_at)).total_seconds()
 
 
+async def discard(run) -> None:
+    """Delete every finished copy not yet deleted, each by its own tag on Docker or its snapshot on
+    Modal, and mark it deleted. A failed copy, and one whose deletion fails, is left to `delete`."""
+    from nudi.checks import host_command
+
+    for copy in run.record.copies:
+        if copy.receipt is None or copy.deleted:
+            continue
+        with contextlib.suppress(Exception):
+            if run.record.backend == "docker":
+                status, _, _ = await host_command(["docker", "image", "rm", copy.tag], timeout=COPY_TIMEOUT)
+                if status == 0:
+                    copy.deleted = True
+            else:
+                from modal.experimental import image_delete
+
+                from nudi.modal_box import _guarded
+
+                await asyncio.wait_for(_guarded("image delete", image_delete.aio(copy.image)), COPY_TIMEOUT)
+                copy.deleted = True
+                run.images.pop(copy.id, None)
+    run.save()
+
+
 async def delete(run) -> None:
     """Delete every copy of the run. On Docker this is every image with the run's tag prefix,
     so an image committed after its client timed out goes too. What remains is a warning, and
@@ -157,7 +187,7 @@ async def delete(run) -> None:
             pass
         late = [copy.id for copy in run.record.copies if copy.tag and copy.error and copy.tag not in listed]
         for copy in run.record.copies:
-            copy.deleted = None if remaining is None or copy.tag is None or copy.id in late else copy.tag not in remaining
+            copy.deleted = copy.deleted or (None if remaining is None or copy.tag is None or copy.id in late else copy.tag not in remaining)
         if remaining != set():
             run.warn(f"copy images named {prefix}* may remain: {sorted(remaining or [])}; remove them with `docker image rm`")
         if late:
@@ -170,7 +200,7 @@ async def delete(run) -> None:
         from nudi.modal_box import _guarded
 
         for copy in run.record.copies:
-            if copy.image is None:
+            if copy.image is None or copy.deleted:
                 continue
             try:
                 await asyncio.wait_for(_guarded("image delete", image_delete.aio(copy.image)), COPY_TIMEOUT)

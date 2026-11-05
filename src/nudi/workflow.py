@@ -14,10 +14,13 @@ import logging
 import math
 import os
 import secrets
+import shutil
 import subprocess
+import time
 import tomllib
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import get_args
 
@@ -86,6 +89,9 @@ MIMO_LIMITATION = (
 # Representative workspace file, search and JSON work peaked at 14-16 MiB in the measured task images.
 WORKSPACE_MEMORY_MB = 512
 OVERSHOOT = "known cost exceeded the spending cap: calls admitted before it was reached finished"
+# Free bytes a run needs where records go: one measured run's copy images reached 8.5 GB, and on Linux and
+# Docker Desktop hosts Docker's storage is usually on the same disk.
+FREE_DISK_MINIMUM = 10 * 2**30
 
 logger = logging.getLogger("nudi")
 
@@ -241,6 +247,11 @@ class Run:
                       "CPUs: no CPU headroom remains for Docker, image builds or host processes")
 
 
+def elapsed(started: float) -> str:
+    """Wall time since `started`, a `time.monotonic()` value, as H:MM:SS."""
+    return str(timedelta(seconds=round(time.monotonic() - started)))
+
+
 def resolve_credentials(config: RunConfig, models, roles) -> tuple[dict[Role, str], dict[Role, str]]:
     """Each role's credential and its source: the credentials file first, then the environment."""
     if config.credentials_file and not config.credentials_file.is_file():
@@ -263,6 +274,11 @@ def start_run(config: RunConfig, roles: frozenset[Role] = ROLES) -> Run:
     starts. Docker's capacity comes from `docker info`; on Modal, Harbor's preflight
     checks for a Modal credential instead, which nudi never reads."""
     check_output(config.output_dir, config.task_dir)
+    records = next(path for path in [config.output_dir, *config.output_dir.parents] if path.exists())
+    free = shutil.disk_usage(records).free
+    if free < FREE_DISK_MINIMUM:
+        raise CapacityError(f"{free / 2**30:.1f} GiB is free where records go ({config.output_dir}); "
+                            f"a run needs at least {FREE_DISK_MINIMUM // 2**30} GiB there")
     if config.credentials_file and config.credentials_file.resolve().is_relative_to(config.task_dir.resolve()):
         raise UnsupportedTask(f"the credentials file {config.credentials_file} is inside the task")
     # Copies, so a change to one run's models reaches no default or other run.
@@ -316,8 +332,14 @@ def start_run(config: RunConfig, roles: frozenset[Role] = ROLES) -> Run:
         limitations=(LIMITATIONS if config.backend == "docker" else MODAL_LIMITATIONS + LIMITATIONS[1:])
         + [MIMO_LIMITATION] * mimo + [HELPER_STATE.strip()] * (len(compose_services(config.task_dir)) > 1),
     )
-    for warning in warnings:
-        logger.warning(warning)
+    machine = ("each sandbox has the CPUs and memory the task declares" if docker_cpus is None
+               else f"Docker has {docker_cpus} CPUs and {docker_memory_mb} MiB")
+    reason = warnings[0] if warnings else (
+        f"the task's declared {cpus} CPUs and {memory_mb} MiB per episode fit {concurrency} within 90% of Docker's capacity"
+        if concurrency < config.concurrency else None)
+    logger.log(logging.WARNING if warnings else logging.INFO,
+               f"backend {config.backend}; {machine}; {free / 2**30:.1f} GiB free where records go ({config.output_dir}); "
+               f"concurrency {concurrency} of {config.concurrency}" + (f": {reason}" if reason else ""))
     if not any(isinstance(callback, RunCalls) for callback in litellm.callbacks):
         litellm.callbacks.append(RunCalls())
     # The root becomes 0700 and nudi creates new directories 0700 and new files 0600 under it.
@@ -514,7 +536,7 @@ async def simulate(run: Run, episodes: int = 20) -> Simulation:
     an episode only while the spending cap allows; admitted episodes finish. Failed
     episodes stay recorded and are not retried; the pool is partial only when one has no
     usable reward. Each episode's state copies serve grader inspection, which reuses this pool."""
-    from nudi.checks import redacted
+    from nudi.checks import finish_cleanup, redacted
 
     if type(episodes) is not int or episodes < 1:
         raise ValueError("episodes must be a positive integer")
@@ -524,7 +546,8 @@ async def simulate(run: Run, episodes: int = 20) -> Simulation:
     unusable = set()
 
     async def worker():
-        while len(simulation.episodes) < episodes:
+        # Harbor's shielded environment stop consumes a cancellation and the trial returns normally.
+        while not asyncio.current_task().cancelling() and len(simulation.episodes) < episodes:
             try:
                 run.check_cap()
             except SpendingCapReached:
@@ -548,13 +571,22 @@ async def simulate(run: Run, episodes: int = 20) -> Simulation:
                     simulation.refusals[name] = refusals
                 run.save()
 
+    workers = [asyncio.create_task(worker()) for _ in range(min(episodes, run.record.capacity.concurrency))]
+
+    async def stop():
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+
     try:
-        await asyncio.gather(*(worker() for _ in range(min(episodes, run.record.capacity.concurrency))))
+        await asyncio.gather(*workers)
         if simulation.status == "running":
             simulation.status = "partial" if unusable else "complete"
     except asyncio.CancelledError:
         simulation.status = "cancelled"
         raise
     finally:
+        # gather passes on one worker's stop, a full disk among them, while the others keep running.
+        await finish_cleanup(asyncio.create_task(stop()))
         run.save()
     return simulation

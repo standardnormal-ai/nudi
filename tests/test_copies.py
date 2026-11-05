@@ -24,7 +24,7 @@ from harbor.trial.trial import Trial
 from harbor.trial.errors import VerifierTimeoutError
 
 from nudi import api, checks, copies, runner, sandbox, workflow
-from nudi.records import Observation, RunRecord, StateCopy
+from nudi.records import Observation, RunRecord, StateCopy, write_private
 from nudi.runner import COPY_TIMEOUT, UnsupportedTask, grading_bound
 from test_backend import Aio, Modal, leak, modal_run, stored, trial_config, TOKEN_SECRET
 from test_inspection import Images, Sandboxes, explained_task, no_native_actor, retained_copy
@@ -490,6 +490,57 @@ def test_modal_snapshots_are_deleted_at_run_end(tmp_path, monkeypatch, fails):
     assert TOKEN_SECRET not in json.dumps(record.warnings)
 
 
+def test_a_finished_docker_copy_is_deleted_mid_run_by_its_own_tag(tmp_path, monkeypatch, credentials):
+    """`discard` removes each finished copy by its own tag and marks it deleted; a failed copy, whose
+    image the daemon may still commit, and a copy whose removal fails stay for run-end deletion,
+    which keeps the mid-run result and removes the rest."""
+    sandboxes = Sandboxes(monkeypatch)
+    commands = recording(monkeypatch, sandboxes)
+    run = new_run(tmp_path, monkeypatch, credentials)
+    done, refused = retained_copy(run, sandboxes), retained_copy(run, sandboxes)
+    failed = retained_copy(run, sandboxes, error="TimeoutError: ", image=None)
+    failed.receipt = None
+    docker = sandboxes.docker
+
+    async def host(command, **kwargs):
+        commands.append(command)
+        if command == ["docker", "image", "rm", refused.tag]:
+            return 1, "", "image is in use"
+        return await docker(command, **kwargs)
+
+    monkeypatch.setattr(checks, "host_command", host)
+    asyncio.run(copies.discard(run))
+    assert [command for command in commands if command[:3] == ["docker", "image", "rm"]] == [
+        ["docker", "image", "rm", done.tag], ["docker", "image", "rm", refused.tag]]
+    assert [copy.deleted for copy in stored(run).copies] == [True, None, None]
+    assert done.tag not in sandboxes.images.files and {refused.tag, failed.tag} <= set(sandboxes.images.files)
+    asyncio.run(copies.discard(run))
+    assert sum(command == ["docker", "image", "rm", done.tag] for command in commands) == 1, "a deleted copy is not removed again"
+    monkeypatch.setattr(checks, "host_command", docker)
+    asyncio.run(copies.delete(run))
+    assert [copy.deleted for copy in stored(run).copies] == [True, True, True] and sandboxes.images.files == {}
+
+
+def test_a_finished_modal_snapshot_is_deleted_mid_run_and_not_again_at_run_end(tmp_path, monkeypatch):
+    from modal.experimental import image_delete
+
+    deleted = []
+
+    async def delete(image):
+        deleted.append(image)
+
+    monkeypatch.setattr(image_delete, "aio", delete)
+    run = modal_run(tmp_path, monkeypatch)
+    receipt = {"episode": "0000-simulator", "path": "nudi-evidence/copy-0000.json", "sha256": "a" * 64}
+    run.record.copies = [StateCopy(id="copy-0000", episode="0000-simulator", point="verification_start", environment="agent",
+                                   backend="modal", ids={}, image="im-1", receipt=receipt, started_at="2026-01-01T00:00:00+00:00")]
+    run.images["copy-0000"] = SimpleNamespace(object_id="im-1")
+    asyncio.run(copies.discard(run))
+    assert deleted == ["im-1"] and stored(run).copies[0].deleted is True and run.images == {}
+    asyncio.run(copies.delete(run))
+    assert deleted == ["im-1"] and stored(run).copies[0].deleted is True and stored(run).warnings == []
+
+
 # Check sandboxes: started from the copy, never from a task compose file.
 
 
@@ -579,11 +630,10 @@ def test_a_modal_copy_sandbox_starts_from_the_snapshot(tmp_path, monkeypatch):
 # Experiments read the copy in place.
 
 
-@pytest.mark.parametrize(("location", "root"), [("/dev/shm/answer.txt", "/dev"), ("/srv/shared/answer.txt", "/srv/shared"),
-                                              ("/var/lib/data/answer.txt", "/var/lib/data")])
+@pytest.mark.parametrize(("location", "root"), [("/srv/shared/answer.txt", "/srv/shared"), ("/var/lib/data/answer.txt", "/var/lib/data")])
 def test_a_location_under_an_excluded_path_is_unavailable_not_absent(tmp_path, monkeypatch, credentials, location, root):
-    """A runtime path, a bind-mount destination and an image volume are not in the copy, so
-    a location under one is unavailable and no check sandbox starts."""
+    """A bind-mount destination and an image volume are not in the copy, so a location under
+    one is unavailable and no check sandbox starts."""
     sandboxes = Sandboxes(monkeypatch)
     no_native_actor(monkeypatch)
     sandboxes.images.mounts = [{"Type": "bind", "Source": "/host/data", "Destination": "/srv/shared"}]
@@ -599,6 +649,20 @@ def test_a_location_under_an_excluded_path_is_unavailable_not_absent(tmp_path, m
     assert list(sandboxes.environments) == [receipt["episode"]]
 
 
+@pytest.mark.parametrize(("location", "root"), [("/dev/shm/answer.txt", "/dev"), ("/logs/verifier/reward.json", "/logs")])
+def test_a_location_no_copy_keeps_is_refused_before_anything_runs(tmp_path, monkeypatch, credentials, location, root):
+    """Harbor's logs and the runtime's paths are in no copy, so such a probe is returned to the model unrun."""
+    sandboxes = Sandboxes(monkeypatch)
+    no_native_actor(monkeypatch)
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
+    probe = {"category": "package_oracles", "setup_program": "true\n", "location": location,
+             "timing": "at verification start", "program": "print(1)",
+             "requirement": {"episode": None, "path": "instruction.md", "excerpt": "Write the number 42"}}
+    with pytest.raises(checks.InvalidProbe, match=f"{location} lies under {root}, which no state copy keeps"):
+        asyncio.run(checks.measure_experiment(run, probe))
+    assert not sandboxes.environments and run.record.sandboxes == []
+
+
 @pytest.mark.parametrize("location", ["app/answer.txt", "/app/../etc/passwd", "/app//answer.txt", "//app", "/app/*.txt",
                                       "/app/answer.txt/", "/app/\x00", None, 3])
 def test_a_location_is_one_normalized_absolute_path(location):
@@ -608,7 +672,7 @@ def test_a_location_is_one_normalized_absolute_path(location):
 def test_excluded_paths_cover_the_path_and_its_children_only():
     copy = StateCopy(id="copy-0000", episode="e", point="verification_start", environment="agent", backend="docker", ids={},
                      excluded=["/logs", "/data"], started_at="now")
-    assert [copies.excluded_by(copy, path) for path in ("/logs", "/logs/verifier/reward.txt", "/data/x", "/datafile", "/app")] == [
+    assert [copies.excluded_by(copy.excluded, path) for path in ("/logs", "/logs/verifier/reward.txt", "/data/x", "/datafile", "/app")] == [
         "/logs", "/logs", "/data", None, None]
     assert checks.location_problem("/app/answer.txt") is None
 
@@ -634,8 +698,14 @@ def test_records_from_before_state_copies_still_load_and_report(tmp_path, monkey
 
 def test_a_real_docker_copy_is_checked_in_place_and_deleted(tmp_path, docker_env, monkeypatch, credentials):
     """Integration: Docker commits a real probe sandbox with a passing healthcheck; a check container
-    started from the image reads the file in place; run end deletes the image."""
+    started from the image reads the file in place. `discard` then deletes the first probe's copies
+    by their own tags mid-run, and run end deletes a later probe's copies by the run's tag prefix."""
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
+
+    async def listed():
+        _, output, _ = await checks.host_command(["docker", "image", "ls", "--format", "{{.Repository}}",
+                                                  "--filter", f"reference=nudi-copy-{run.record.run_id}-*"])
+        return set(output.split())
 
     async def main():
         await checks.package_probe(run, "mkdir -p /app && echo 42 > /app/answer.txt\n")
@@ -645,13 +715,19 @@ def test_a_real_docker_copy_is_checked_in_place_and_deleted(tmp_path, docker_env
         program = "import json; print(json.dumps({'observations': {'answer': open('/app/answer.txt').read().strip()}}))"
         check = await checks.check_submission(run, copy, Observation(episode=None, path="instruction.md", excerpt="Write the number 42"),
                                               None, program, timing="at verification start")
+        await copies.discard(run)
+        first = [copy.tag for copy in run.record.copies]
+        after_discard = await listed()
+        await checks.package_probe(run, "true\n")
+        later = await listed()
         await copies.delete(run)
-        status, output, _ = await checks.host_command(["docker", "image", "ls", "-q", f"nudi-copy-{run.record.run_id}-*"])
-        return check, output
+        return check, first, after_discard, later, await listed()
 
-    check, output = asyncio.run(main())
+    check, first, after_discard, later, remaining = asyncio.run(main())
     assert check.exit_code == 0 and '"answer": "42"' in check.output
-    assert output.strip() == "" and all(copy.deleted for copy in run.record.copies)
+    assert len(first) == 2 and not after_discard & set(first)
+    assert later == {copy.tag for copy in run.record.copies[2:]} and len(later) == 2
+    assert remaining == set() and all(copy.deleted for copy in run.record.copies)
 
 
 # Acceptance: the real pinned DockerEnvironment, with only the docker CLI replaced.
@@ -730,3 +806,53 @@ def test_copies_of_a_directory_a_large_file_and_a_grader_written_file_reach_judg
         assert check.state_copy == (end.id if case == "grader-written file" else start.id)
     assert list((state / "images").iterdir()) == [] and list((state / "projects").iterdir()) == []
     assert all(copy.deleted is True for copy in run.record.copies)
+
+
+def test_a_docker_sandbox_is_removed_without_waiting_for_its_stop_timeout(tmp_path, monkeypatch, credentials):
+    """PID 1 is `sh -c "sleep infinity"`, which ignores SIGTERM, so a plain `down` waits Docker's 10 s stop timeout."""
+    from fake_docker import install
+
+    state = install(tmp_path / "docker", monkeypatch)
+    run = new_run(tmp_path, monkeypatch, credentials)
+
+    async def main():
+        async with sandbox.sandbox(run, "probe"):
+            pass
+
+    asyncio.run(main())
+    downs = [command for command in map(json.loads, (state / "compose.log").read_text().splitlines()) if command[0] == "down"]
+    assert downs and all(command[1:3] == ["--timeout", "0"] for command in downs)
+    assert list((state / "projects").iterdir()) == []
+
+
+def test_a_modal_sandbox_keeps_harbor_removal(tmp_path, monkeypatch):
+    """The Docker removal change is skipped on Modal, whose sandbox is terminated, not brought down."""
+    modal = Modal(monkeypatch)
+    run = modal_run(tmp_path, monkeypatch)
+
+    async def main():
+        async with sandbox.sandbox(run, "probe") as box:
+            return box.environment
+
+    environment = asyncio.run(main())
+    assert "_run_docker_compose_command" not in vars(environment)
+    assert [box.terminate_calls for box in modal.created] == [1]
+    assert json.loads((run.config.output_dir / "sandboxes" / "sandbox-0000" / "sandbox.json").read_text())["cleanup"]["removed"] is True
+
+
+def test_a_sandbox_names_its_nudi_evidence_directory_only_when_it_was_written(tmp_path, monkeypatch):
+    """390 of 616 sandbox records and all 38 inspector sessions named a missing `nudi-evidence` directory."""
+    Modal(monkeypatch)
+    run = modal_run(tmp_path, monkeypatch)
+
+    async def main(write):
+        async with sandbox.sandbox(run, "probe") as box:
+            if write:
+                write_private(box.directory / "nudi-evidence" / "copy-0000.json", "{}")
+            return box.directory
+
+    for write in (False, True):
+        directory = asyncio.run(main(write))
+        artifacts = json.loads((directory / "sandbox.json").read_text())["artifacts"]
+        assert artifacts == ({"nudi_evidence": "nudi-evidence"} if write else {})
+        assert all((directory / path).is_dir() for path in artifacts.values())

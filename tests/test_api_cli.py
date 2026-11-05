@@ -8,6 +8,7 @@ or model calls. The analyses themselves have their own suites.
 import asyncio
 import inspect
 import json
+import signal
 import subprocess
 from collections import Counter
 from pathlib import Path
@@ -18,7 +19,7 @@ from pydantic import ValidationError
 
 from nudi import api, checks, cli, report, send_nudis, send_nudis_async
 from nudi.checks import AttackResult, EpisodeLabel, InspectionResult
-from nudi.records import DEFAULT_MODELS, Assessment, Capacity, Claim, EpisodeResult, RunRecord, Simulation
+from nudi.records import DEFAULT_MODELS, Assessment, Capacity, Claim, DiskFull, EpisodeResult, RunRecord, Simulation
 from nudi.runner import tree_digest
 from nudi.workflow import Run
 from test_metrics import RULE, TASK, basis, checked
@@ -126,8 +127,9 @@ def test_default_is_full_analysis_with_default_counts(tmp_path, monkeypatch, cap
     analyses = Analyses(monkeypatch)
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
 
-    assert analyses.calls == [("start_run", ALL_ROLES), ("simulate", 20), ("inspect_grader", [], 2, False), ("inspect_hacks", 2),
-                              ("attack", 2, 1, 0)]
+    # The hack chain runs first: its result needs no Simulator or grader inspector result.
+    assert analyses.calls == [("start_run", ALL_ROLES), ("inspect_hacks", 2), ("attack", 2, 1, 0), ("simulate", 20),
+                              ("inspect_grader", [], 2, False)]
     assert report["analyses"] == {"simulation": "complete", "grader": "complete", "hack": "complete", "attack": "complete"}
     assert report["status"] == "complete"
     assert sorted(report["inspections"]) == ["grader_inspector", "hack_inspector"]
@@ -175,12 +177,12 @@ def test_python_async_and_cli_share_configuration_and_report(tmp_path, monkeypat
     assert code == 0
     assert capsys.readouterr().out == (tmp_path / "cli" / "report.md").read_text()
     assert reports[0] == reports[1] == reports[2]
-    assert calls[0] == calls[1] == calls[2] == [("start_run", ALL_ROLES), ("simulate", 7), ("inspect_grader", [], 1, False),
-                                                ("inspect_hacks", 1), ("attack", 4, 3, 0)]
+    assert calls[0] == calls[1] == calls[2] == [("start_run", ALL_ROLES), ("inspect_hacks", 1), ("attack", 4, 3, 0),
+                                                ("simulate", 7), ("inspect_grader", [], 1, False)]
     assert configs[0]["discovery_attempts"] == 3
     analyses = Analyses(monkeypatch)
     send_nudis(task, config, output_dir=tmp_path / "file")
-    assert analyses.calls[-1] == ("attack", 4, 2, 0)
+    assert analyses.calls[2] == ("attack", 4, 2, 0)
     assert configs[0] == configs[1] == configs[2]
     # The keyword or flag replaces the file's value; the rest of the file stays.
     assert configs[0]["episodes"] == 7 and configs[0]["spending_cap"] == 2.5 and configs[0]["workspace_memory_mb"] == 1024
@@ -283,7 +285,7 @@ def test_isolated_inspections_switch_parses_from_cli_api_and_file(tmp_path, monk
         analyses = Analyses(monkeypatch)
         start(tmp_path / name)
         found[name] = [call for call in analyses.calls if call[0] in ("inspect_grader", "inspect_hacks")]
-    assert found == {name: [("inspect_grader", [], 2, name.endswith("on")), ("inspect_hacks", 2)] for name in runs}
+    assert found == {name: [("inspect_hacks", 2), ("inspect_grader", [], 2, name.endswith("on"))] for name in runs}
     with pytest.raises(ValidationError):
         send_nudis(task, output_dir=tmp_path / "invalid", isolated_inspections="yes")
     with pytest.raises(SystemExit) as error:
@@ -428,6 +430,26 @@ def test_only_accepted_invalid_or_guided_findings_become_candidates(tmp_path, mo
     assert [item["id"] for item in report["attack"]["candidates"]] == ["hack-2"]
 
 
+def test_a_later_reading_of_its_check_replaces_only_an_unguided_candidate():
+    """A re-interpretation with guidance replaces the unguided reading of its check. A guided reading stays a
+    candidate after a later legitimate or unguided one, and a claim without a check is never superseded."""
+    def reading(check, outcome="accepted_invalid", **guidance):
+        return Assessment(claim=Claim(mechanism=MECHANISM, episode="0000-inspector", interpretation=INTERPRETATION,
+                                      check=check, **guidance), outcome=outcome)
+
+    hack = InspectionResult(mode="hack", categories={}, applicability={}, assessments=[
+        reading("check-0000"), reading("check-0001", full_guidance=REPRODUCTION), reading(None), reading(None),
+        reading("check-0000", full_guidance=REPRODUCTION, hint_location=LOCATION), reading("check-0001", outcome="legitimate"),
+        reading("check-0002", hint_location=LOCATION), reading("check-0002"),
+    ])
+    candidates = {item.id: item for item in api.guidance(hack)["candidates"]}
+    assert list(candidates) == ["hack-1", "hack-2", "hack-3", "hack-4", "hack-6", "hack-7"]
+    assert candidates["hack-4"].guidance == {"full": REPRODUCTION, "minimal": f"{WHERE_TO_LOOK}\n{LOCATION}"}
+    assert candidates["hack-1"].guidance == {"full": REPRODUCTION, "minimal": None}
+    assert candidates["hack-6"].guidance == {"full": None, "minimal": f"{WHERE_TO_LOOK}\n{LOCATION}"}
+    assert candidates["hack-7"].guidance == {"full": None, "minimal": None}
+
+
 def test_no_candidate_leaves_guidance_unavailable_and_still_attacks(tmp_path, monkeypatch):
     analyses = Analyses(monkeypatch)
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
@@ -445,6 +467,7 @@ def test_inspector_prompt_requests_reproduction_steps_and_a_location_only():
     assert "`full_guidance`" in prompt and "concrete steps that reproduce it" in prompt
     assert "`hint_location`" in prompt and "file, interface, or component" in prompt
     assert "must not contain a solution or a reproduction recipe" in prompt
+    assert "A finding without either field gives the Attacker nothing to run." in prompt
 
 
 def test_failed_analysis_keeps_independent_results_and_redacts_credentials(tmp_path, monkeypatch):
@@ -452,7 +475,7 @@ def test_failed_analysis_keeps_independent_results_and_redacts_credentials(tmp_p
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
 
     # The attack still runs, without candidates, after the hack inspection failed.
-    assert analyses.calls[-1] == ("attack", 2, 1, 0)
+    assert analyses.calls[2] == ("attack", 2, 1, 0)
     assert report["analyses"] == {"simulation": "complete", "grader": "complete", "hack": "not run", "attack": "complete"}
     assert report["status"] == "partial"
     assert "run: hack failed: RuntimeError: provider echoed [redacted]" in report["warnings"]
@@ -461,12 +484,89 @@ def test_failed_analysis_keeps_independent_results_and_redacts_credentials(tmp_p
 
 
 def test_cancellation_writes_the_partial_report_and_propagates(tmp_path, monkeypatch):
-    analyses = Analyses(monkeypatch, fail={"grader": asyncio.CancelledError()})
+    """A run stopped during the ordinary-episode path keeps the hack chain's results."""
+    analyses = Analyses(monkeypatch, fail={"simulation": asyncio.CancelledError()})
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(send_nudis_async(tmp_path / "task", output_dir=tmp_path / "run"))
 
-    assert [call[0] for call in analyses.calls] == ["start_run", "simulate", "inspect_grader"]
+    assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks", "attack", "simulate"]
     report = json.loads((tmp_path / "run" / "report.json").read_text())
-    assert report["analyses"] == {"simulation": "complete", "grader": "not run", "hack": "not run", "attack": "not run"}
+    assert report["analyses"] == {"simulation": "not run", "grader": "not run", "hack": "complete", "attack": "complete"}
     assert report["status"] == "partial"
-    assert "run: cancelled during grader" in report["warnings"]
+    assert "run: cancelled during simulation" in report["warnings"]
+
+
+def test_the_command_reports_each_phase_on_stderr_with_its_time_and_count(tmp_path, monkeypatch, capsys):
+    Analyses(monkeypatch, rewards=[1.0, 0.0])
+    assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run"), "--episodes", "2"]) == 0
+    assert capsys.readouterr().err.splitlines() == [
+        "nudi: hack inspector started",
+        "nudi: hack inspector finished after 0:00:00: 0 experiments, 0 assessments; status complete",
+        "nudi: attack started",
+        "nudi: attack finished after 0:00:00: 0 Attacker attempts, 0 findings; status complete",
+        "nudi: Simulator started",
+        "nudi: Simulator finished after 0:00:00: 2 of 2 episodes; status complete",
+        "nudi: grader inspector started",
+        "nudi: grader inspector finished after 0:00:00: 0 experiments, 0 assessments; status complete",
+    ]
+    Analyses(monkeypatch, fail={"hack": RuntimeError(f"provider echoed {SECRET}")})
+    assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "failed")]) == 1
+    error = capsys.readouterr().err.splitlines()
+    assert error[0:2] == ["nudi: hack inspector started",
+                          "nudi: hack inspector ended after 0:00:00: hack failed: RuntimeError: provider echoed [redacted]"]
+    assert error[-1].startswith("nudi: grader inspector finished after ")
+
+
+def test_ctrl_c_prints_one_line_naming_the_written_report_and_exits_130(tmp_path, monkeypatch, capsys):
+    analyses = Analyses(monkeypatch)
+
+    async def interrupted(run, ordinary_pool, **options):
+        signal.raise_signal(signal.SIGINT)
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(api, "inspect_grader", interrupted)
+    assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run")]) == 130
+    error = capsys.readouterr().err.splitlines()
+    assert error[error.index("nudi: grader inspector started") + 1:] == [
+        f"nudi: cancelled; report written to {tmp_path / 'run' / 'report.md'}"]
+    assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks", "attack", "simulate"]
+    assert "run: cancelled during grader" in json.loads((tmp_path / "run" / "report.json").read_text())["warnings"]
+
+
+def test_ctrl_c_before_any_report_says_none_was_written(tmp_path, monkeypatch, capsys):
+    def interrupted(*args, **options):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(api, "send_nudis", interrupted)
+    assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run")]) == 130
+    assert capsys.readouterr().err == "nudi: cancelled; no report was written\n"
+
+
+def test_no_space_on_the_records_host_stops_the_run_with_one_message(tmp_path, monkeypatch, capsys):
+    """The analyses after the full disk do not run; the report is still written once space allows it."""
+    full = DiskFull(f"no space left on the records host to write {tmp_path / 'run' / 'inspection-hack.json'}")
+    analyses = Analyses(monkeypatch, fail={"hack": full})
+    assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run")]) == 1
+    error = capsys.readouterr().err.splitlines()
+    assert error == ["nudi: hack inspector started", f"nudi: stopped: {full}; report written to {tmp_path / 'run' / 'report.md'}"]
+    assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks"]
+    assert f"run: hack stopped: {full}" in json.loads((tmp_path / "run" / "report.json").read_text())["warnings"]
+
+
+def test_a_full_disk_at_the_final_save_still_writes_the_smaller_report(tmp_path, monkeypatch, capsys):
+    """When the last `run.save()` finds no space, the smaller report is still written."""
+    analyses = Analyses(monkeypatch)
+    full = DiskFull(f"no space left on the records host to write {tmp_path / 'run' / 'run.json'}")
+
+    async def attack(run, **options):
+        def no_space():
+            raise full
+
+        monkeypatch.setattr(run, "save", no_space)
+        raise full
+
+    monkeypatch.setattr(api, "attack", attack)
+    assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run")]) == 1
+    assert capsys.readouterr().err.splitlines()[-1] == f"nudi: stopped: {full}; report written to {tmp_path / 'run' / 'report.md'}"
+    assert json.loads((tmp_path / "run" / "report.json").read_text())["analyses"]["attack"] == "not run"
+    assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks"]

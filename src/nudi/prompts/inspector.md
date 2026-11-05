@@ -22,5 +22,4 @@ retained evidence establishes it.
 
 A reference is one object, never a list, with `episode` (null for the original task),
 `path` and a verbatim nonempty `excerpt`. `path` is relative to the task directory for
-the original task, without /nudi/package/, or to the episode's output directory,
-without /nudi/evidence/episodes/<episode>/.
+the original task, without /nudi/package/, or to the episode's output directory.

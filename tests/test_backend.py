@@ -7,6 +7,7 @@ copy). No test calls Modal or Docker, and none needs a Modal account.
 """
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -30,8 +31,8 @@ from harbor.models.trial.paths import TrialPaths
 from harbor.trial.trial import Trial
 from pydantic import ValidationError
 
-from nudi import api, checks, cli, modal_box, report, runner, sandbox, workflow
-from nudi.records import EpisodeConfig, EpisodeResult, ModalSandbox, RunConfig, RunRecord
+from nudi import api, checks, cli, modal_box, records, report, runner, sandbox, workflow
+from nudi.records import DiskFull, EpisodeConfig, EpisodeResult, ModalSandbox, RunConfig, RunRecord
 from test_inspection import Sandboxes, sandbox_record
 from test_limits import credentials, new_run  # noqa: F401  (pytest fixture)
 from test_runner import CONTRACT_TASK, SEPARATE_TASK, VERIFIER_ENVIRONMENT, task_with
@@ -548,3 +549,72 @@ def test_records_from_before_the_backend_switch_still_load_and_report(tmp_path, 
     record = RunRecord.model_validate_json(path.read_text())
     assert (record.backend, record.modal, record.capacity.concurrency_setting) == ("docker", [], None)
     assert report.build(run.config.output_dir)["configuration"]["modal_cost"] is None
+
+
+# Both backends: the start line, free space where records go, and a full records host.
+
+
+def free_space(monkeypatch, gib):
+    """`shutil.disk_usage` reporting `gib` free; it records each path asked."""
+    asked = []
+
+    def usage(path):
+        asked.append(Path(path))
+        return SimpleNamespace(total=2**40, used=0, free=int(gib * 2**30))
+
+    monkeypatch.setattr(workflow.shutil, "disk_usage", usage)
+    return asked
+
+
+def nudi_lines(caplog):
+    return [(record.levelname, record.getMessage()) for record in caplog.records if record.name == "nudi"]
+
+
+def test_a_run_states_its_backend_capacity_free_space_and_concurrency_in_one_line(tmp_path, monkeypatch, credentials, caplog):
+    caplog.set_level(logging.INFO, logger="nudi")
+    free_space(monkeypatch, 123.4)
+    undeclared = task_with(tmp_path, CONTRACT_TASK, 'schema_version = "1.4"\n[environment]\ndocker_image = "python:3.12-slim"\n')
+    new_run(tmp_path, monkeypatch, credentials, name="lower")
+    new_run(tmp_path, monkeypatch, credentials, name="setting", concurrency=2)
+    new_run(tmp_path, monkeypatch, credentials, name="undeclared", task_dir=undeclared)
+    modal_run(tmp_path, monkeypatch, concurrency=3)
+    docker = "backend docker; Docker has 8 CPUs and 4096 MiB; 123.4 GiB free where records go"
+    assert nudi_lines(caplog) == [
+        ("INFO", f"{docker} ({tmp_path / 'lower'}); concurrency 7 of 8: the task's declared 1 CPUs and 512 MiB per episode "
+                 "fit 7 within 90% of Docker's capacity"),
+        ("INFO", f"{docker} ({tmp_path / 'setting'}); concurrency 2 of 2"),
+        ("WARNING", f"{docker} ({tmp_path / 'undeclared'}); concurrency 1 of 8: {workflow.plan_concurrency(8, 4096, None, None)[1][0]}"),
+        ("INFO", f"backend modal; each sandbox has the CPUs and memory the task declares; 123.4 GiB free where records go "
+                 f"({tmp_path / 'run'}); concurrency 3 of 3"),
+    ]
+
+
+@pytest.mark.parametrize("backend", ["docker", "modal"])
+def test_too_little_free_space_where_records_go_stops_the_run_with_exit_code_2(tmp_path, monkeypatch, credentials, capsys, backend):
+    monkeypatch.setattr(workflow, "FREE_DISK_MINIMUM", 10 * 2**30)  # the suite's conftest lowers it for every other test
+    asked = free_space(monkeypatch, 9.5)
+    with pytest.raises(workflow.CapacityError) as error:
+        modal_run(tmp_path, monkeypatch) if backend == "modal" else new_run(tmp_path, monkeypatch, credentials)
+    assert str(error.value) == f"9.5 GiB is free where records go ({tmp_path / 'run'}); a run needs at least 10 GiB there"
+    assert asked == [tmp_path] and not (tmp_path / "run").exists()
+    assert cli.main(["send-nudis", str(CONTRACT_TASK), "--output", str(tmp_path / "run"), "--backend", backend]) == 2
+    assert capsys.readouterr().err == f"nudi: {error.value}\n"
+
+
+@pytest.mark.parametrize("backend", ["docker", "modal"])
+def test_no_space_left_for_a_record_stops_the_run_and_keeps_the_earlier_record(tmp_path, monkeypatch, credentials, backend):
+    run = modal_run(tmp_path, monkeypatch) if backend == "modal" else new_run(tmp_path, monkeypatch, credentials)
+    path = run.config.output_dir / "run.json"
+    earlier = path.read_text()
+
+    def full(descriptor, *args, **kwargs):
+        os.close(descriptor)
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+    monkeypatch.setattr(records, "open", full, raising=False)
+    run.record.warnings.append("unsaved")
+    with pytest.raises(DiskFull) as stopped:
+        run.save()
+    assert str(stopped.value) == f"no space left on the records host to write {path}"
+    assert not isinstance(stopped.value, Exception)
+    assert path.read_text() == earlier and not list(path.parent.glob(".*"))

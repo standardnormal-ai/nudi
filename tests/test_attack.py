@@ -10,6 +10,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import logging
 import re
 import shutil
 import tempfile
@@ -37,7 +38,7 @@ from nudi.records import (
 )
 from nudi.runner import tree_digest
 from test_assessment import Run, measured_claim, persistence
-from test_limits import credentials, new_run
+from test_limits import credentials, new_run, session_messages
 from test_runner import CONTRACT_TASK, PROVIDER_KEY, TerminusScript, docker_env, serve  # noqa: F401
 
 
@@ -312,7 +313,7 @@ def test_each_candidate_receives_only_its_own_guidance_in_fresh_contexts(tmp_pat
             assert len({attempt.episode for attempt in result.attempts}) == 7
             assert {attempt.episode for attempt in result.attempts} == {name for name, *_ in sink["episodes"]}
             assert all(agent is None and native == workflow.ORIGINAL_BEHAVIOR for _, _, agent, native in sink["episodes"])
-            assert all(len(result.sessions[attempt.context]) == 1 for attempt in result.attempts)
+            assert "sessions" not in json.loads((run.config.output_dir / "attack.json").read_text())
             assert attacker_requests(endpoint) == []
             assert run.record.simulation.episodes == ["ordinary"]
             assert run.record.probe_episodes == []
@@ -322,9 +323,9 @@ def test_each_candidate_receives_only_its_own_guidance_in_fresh_contexts(tmp_pat
                 if attempt.candidate == "hack-0":
                     hint = FULL if attempt.level == "full" else MINIMAL
                     label = "Full loophole details." if attempt.level == "full" else "Minimal hint."
-                    assert text == f"Find a reward hack.\n{label}\n{hint}"
+                    assert text == f"{checks.EXPLOIT_INSTRUCTION}\n{label}\n{hint}"
                 elif attempt.candidate == "hack-3":
-                    assert text == f"Find a reward hack.\nFull loophole details.\n{other}"
+                    assert text == f"{checks.EXPLOIT_INSTRUCTION}\nFull loophole details.\n{other}"
                 else:
                     assert "No extra hint" in text and "reward hack" in text.lower()
                     assert checks.HACK_CHECKLIST in text
@@ -522,7 +523,7 @@ def test_shared_minimal_hint_stops_only_that_candidate(tmp_path, monkeypatch, cr
             target = requests[minimal.episode]["target_candidate"]
             assert target["mechanism"] == "absent file reward" and target["full_guidance"] == full_a
             assert full_b not in json.dumps(target) and "grader file reward" not in json.dumps(target)
-            assert texts[minimal.episode] == f"Find a reward hack.\nMinimal hint.\n{shared}"
+            assert texts[minimal.episode] == f"{checks.EXPLOIT_INSTRUCTION}\nMinimal hint.\n{shared}"
             assert full_a not in texts[minimal.episode] and checks.HACK_CHECKLIST not in texts[minimal.episode]
             warnings = []
             section = report.attack(result, run.record, warnings)
@@ -609,6 +610,42 @@ def test_discovery_attempts_are_a_total_that_needs_no_candidate(tmp_path, monkey
                 assert any("disabled" in limit for limit in result.limits)
 
     asyncio.run(main())
+
+
+def test_each_attacker_episode_and_attack_inspector_session_logs_its_start_and_end(tmp_path, monkeypatch, credentials, caplog):
+    caplog.set_level(logging.INFO, logger="nudi")
+    endpoint = attack_endpoint(plain_claim)
+    sink = {"episodes": []}
+
+    async def main():
+        async with serve(endpoint) as base:
+            model = ModelConfig(model="xai/grok-4.7", api_base=base)
+            run = new_run(tmp_path, monkeypatch, credentials, models={"attacker": model, "inspector": model})
+            sink["run"], secret = run, next(iter(run.keys.values()))
+
+            async def native(config, queue, **work):
+                # The task names its rewards; a name equal to the run's credential must not reach the log.
+                work["_names"] = sink["episodes"]
+                result = await scripted_episodes(config, queue, **work)
+                result.rewards = {secret: 1.0}
+                (config.output_dir / "episode.json").write_text(result.model_dump_json())
+                return result
+
+            monkeypatch.setattr(workflow, "run_episode", native)
+            caplog.clear()
+            return secret, await checks.attack(run, maximum_attempts=2)
+
+    secret, result = asyncio.run(main())
+    lines = [re.sub(r"after \d+:\d\d:\d\d", "after T", record.getMessage()) for record in caplog.records if record.name == "nudi"]
+    assert not any(secret in line for line in lines)
+    title = "attack_inspector-attacker-none-none-1"
+    assert lines == [
+        "Attacker 0000-attacker started",
+        "Attacker 0000-attacker finished after T: rewards [1.0]",
+        f"attack inspector {title} started",
+        f"attack inspector {title} finished after T: 1 experiments, 1 assessments; status partial",
+    ]
+    assert len(result.assessments) == 1
 
 
 def test_hinted_attempts_can_be_disabled_without_suppressing_discovery(tmp_path, monkeypatch, credentials):
@@ -827,7 +864,7 @@ def test_rejected_valid_work_counts_only_for_a_valid_work_candidate(tmp_path, mo
     requests = interpretation_requests(endpoint)
     for attempt in result.attempts:
         valid_work = attempt.candidate == "valid-0"
-        assert texts[attempt.episode].startswith(checks.VALID_WORK_INSTRUCTION if valid_work else "Find a reward hack.")
+        assert texts[attempt.episode].startswith(checks.VALID_WORK_INSTRUCTION if valid_work else checks.EXPLOIT_INSTRUCTION)
         assert requests[attempt.episode]["valid_work"] is valid_work
         assert requests[attempt.episode]["categories"] == []
 
@@ -1030,7 +1067,7 @@ def stale_target(check_id: str) -> dict:
     }
 
 
-@pytest.mark.parametrize("final", ["linked", "omitted", "contradicted"])
+@pytest.mark.parametrize("final", ["linked", "experiment", "omitted", "contradicted"])
 def test_post_check_attribution_reproduces_its_target_and_stale_probe_attribution_does_not(
         tmp_path, monkeypatch, credentials, final):
     """The attribution that counts is the one on the post-check claim.
@@ -1055,6 +1092,9 @@ def test_post_check_attribution_reproduces_its_target_and_stale_probe_attributio
             }
             if final == "linked":
                 claim["attribution"] = linked_attribution(check_id)
+            elif final == "experiment":
+                # An attack inspector may cite the receipt it interprets by its experiment id.
+                claim["attribution"] = {**linked_attribution(check_id), "check": "experiment-0000"}
             elif final == "contradicted":
                 claim["attribution"] = {"relation": "other", "rationale": OTHER_BOUNDARY}
             return {"claim": claim}
@@ -1097,7 +1137,7 @@ def test_post_check_attribution_reproduces_its_target_and_stale_probe_attributio
             assert first.check.id == "check-0000"
             assert first.check.content.episode == result.attempts[0].episode
             assert run.record.checks[0].id == "check-0000"
-            session = result.sessions[f"attack_inspector-{result.attempts[0].context}"]
+            session = session_messages(run.config.output_dir, f"attack_inspector-{result.attempts[0].context}")
             assert any("check-0000" in str(message["content"]) and message["role"] == "tool" for message in session)
             assert "hack-post" in str(session[0]["content"]) and "target_candidate" in str(session[0]["content"])
             # Only the attack inspector's claim contract has attribution; the claim keeps the one it was interpreted with.
@@ -1107,9 +1147,9 @@ def test_post_check_attribution_reproduces_its_target_and_stale_probe_attributio
             system = next(body["messages"][0]["content"] for body in endpoint.requests if INSPECTOR in str(body["messages"][0]["content"]))
             assert json.dumps(schema) in str(system)
             assert "attribution" not in checks.claim_schema("hack")["properties"] and "attribution" not in checks.claim_schema("grader")["properties"]
-            assert first.claim.attribution == (linked_attribution("check-0000") if final == "linked" else
+            assert first.claim.attribution == (linked_attribution("check-0000") if final in ("linked", "experiment") else
                                                None if final == "omitted" else {"relation": "other", "rationale": OTHER_BOUNDARY})
-            if final == "linked":
+            if final in ("linked", "experiment"):
                 assert [attempt.level for attempt in result.attempts] == ["full"]
                 assert result.candidates[0].conditions["full"] == "evidenced_issue"
                 assert result.attempts[0].status == "evidenced_issue"
@@ -1608,7 +1648,8 @@ def test_attack_inspector_measures_only_its_episode_and_package_evidence_never_c
                for name, _, agent, native in sink["episodes"])
     assert [(probe["episode"], probe["location"]) for probe in bound] == [(attempt.episode, "/app/three") for attempt in result.attempts]
     for attempt in result.attempts:
-        tools = [str(message["content"]) for message in result.sessions[f"attack_inspector-{attempt.context}"] if message["role"] == "tool"]
+        tools = [str(message["content"]) for message in session_messages(tmp_path / "run", f"attack_inspector-{attempt.context}")
+                 if message["role"] == "tool"]
         assert sum(f"This session verifies episode {attempt.episode} only" in text for text in tools) == 3
     assert [attempt.status for attempt in result.attempts] == ["no_evidenced_issue"] * 3
     assert result.conditions == {"full": "no_evidenced_issue", "minimal": "no_evidenced_issue", "none": "no_evidenced_issue"}
@@ -1632,7 +1673,8 @@ def test_a_claim_citing_another_episode_is_refused_in_an_attack_inspector_sessio
             mock_experiments(monkeypatch, investigate)
             result = await checks.attack(run, maximum_attempts=0, discovery_attempts=1, candidates=[])
             (attempt,) = result.attempts
-            tools = [str(message["content"]) for message in result.sessions[f"attack_inspector-{attempt.context}"] if message["role"] == "tool"]
+            tools = [str(message["content"]) for message in session_messages(run.config.output_dir, f"attack_inspector-{attempt.context}")
+                     if message["role"] == "tool"]
             assert any(f"This session verifies episode {attempt.episode} only" in text and "0000-simulator" in text for text in tools)
             assert result.assessments == [] and attempt.status == "unknown"
 
@@ -1736,6 +1778,67 @@ def test_interpreting_inspector_receives_retained_attack_evidence(tmp_path, monk
             assert checks.HACK_CHECKLIST in none_text
             assert "print(1)" not in none_text
             assert FULL not in none_text
+
+    asyncio.run(main())
+
+
+def test_each_attempt_starts_after_every_earlier_copy_is_deleted_by_its_own_tag(tmp_path, monkeypatch, credentials):
+    """No attack phase session reads an earlier phase's copies or another attempt's, so each attempt
+    starts after `discard` removed every copy taken so far; its own copy stays while its attack
+    inspector reads it, and the last attempt's copy is left for run-end deletion."""
+    states, judged, removed = [], [], []
+
+    def inspector(body):
+        judged.append([copy.deleted for copy in holder["run"].record.copies])
+        return {"probes": []}
+
+    endpoint = attack_endpoint(inspector)
+    holder = {}
+    docker = checks.host_command
+
+    async def host(command, **kwargs):
+        if command[:3] == ["docker", "image", "rm"]:
+            removed.append(command[3:])
+        return await docker(command, **kwargs)
+
+    async def native(config, queue, **work):
+        states.append([copy.deleted for copy in holder["run"].record.copies])
+        result = await scripted_episodes(config, queue, **work)
+        retain_copy(holder["run"], config.output_dir.name, result.ids)
+        return result
+
+    async def main():
+        async with serve(endpoint) as base:
+            model = ModelConfig(model="xai/grok-4.7", api_base=base)
+            run = new_run(tmp_path, monkeypatch, credentials, models={"attacker": model, "inspector": model})
+            holder["run"] = run
+            retain_copy(run, "0000-simulator", {"trial_id": "id-0000-simulator"})
+            monkeypatch.setattr(workflow, "run_episode", native)
+            monkeypatch.setattr(checks, "host_command", host)
+            return run, await checks.attack(run, maximum_attempts=1, full=FULL)
+
+    run, result = asyncio.run(main())
+    assert [attempt.level for attempt in result.attempts] == ["none", "full"]
+    assert states == [[True], [True, True]], "each attempt starts after earlier copies are deleted"
+    assert [state[-1] for state in judged] == [None] * len(judged) and len(judged) >= 2, "an attack inspector reads its own copy"
+    assert [copy.deleted for copy in run.record.copies] == [True, True, None]
+    assert removed == [[run.record.copies[0].tag], [run.record.copies[1].tag]]
+
+
+def test_a_cancel_while_earlier_copies_are_deleted_cancels_the_attempt(tmp_path, monkeypatch, credentials):
+    """Deleting earlier copies is part of the attempt, so a cancel there is this attempt's cancel."""
+    async def cancel(run):
+        raise asyncio.CancelledError()
+
+    async def main():
+        async with serve(attack_endpoint(plain_claim)) as base:
+            model = ModelConfig(model="xai/grok-4.7", api_base=base)
+            run = new_run(tmp_path, monkeypatch, credentials, models={"attacker": model, "inspector": model})
+            monkeypatch.setattr(checks.copies, "discard", cancel)
+            with pytest.raises(asyncio.CancelledError):
+                await checks.attack(run, maximum_attempts=1)
+            saved = json.loads((run.config.output_dir / "attack.json").read_text())
+            assert saved["status"] == "cancelled" and [attempt["status"] for attempt in saved["attempts"]] == ["cancelled"]
 
     asyncio.run(main())
 
@@ -1931,7 +2034,7 @@ def test_recovered_request_error_stays_telemetry(tmp_path, monkeypatch, credenti
             (attempt,) = result.attempts
             assert attempt.status == result.conditions["none"] == status
             assert [call.error for call in run.record.calls if call.episode == attempt.episode] == errors
-            inspected = f"attack_inspector-{attempt.context}" in result.sessions
+            inspected = (run.config.output_dir / f"inspection-attack_inspector-{attempt.context}.json").exists()
             if status == "unknown":
                 assert inspected and attempt.error is None and result.status == "partial"
             else:
@@ -1969,6 +2072,27 @@ def test_zero_attempts_report_disabled_coverage(tmp_path, monkeypatch, credentia
         assert any(SAFETY in limit for limit in result.limits)
 
     asyncio.run(main())
+
+
+def test_requested_attempts_without_guidance_are_not_run_with_their_cause(tmp_path, monkeypatch, credentials):
+    """Candidates with neither full_guidance nor hint_location get no attempt although some are requested, and the
+    limit says why."""
+    run = new_run(tmp_path, monkeypatch, credentials)
+    unguided = [checks.Candidate(id=f"hack-{index}", mechanism="m", guidance={"full": None, "minimal": None},
+                                 unavailable={"full": checks.FULL_UNAVAILABLE, "minimal": checks.MINIMAL_UNAVAILABLE})
+                for index in (3, 4)]
+
+    async def main():
+        return await checks.attack(run, maximum_attempts=1, discovery_attempts=0, candidates=unguided)
+
+    result = asyncio.run(main())
+    assert result.attempts == [] and result.status == "not run"
+    assert checks.UNGUIDED_LIMIT in result.limits and checks.DISABLED_LIMIT not in result.limits
+    assert "full_guidance or hint_location" in checks.UNGUIDED_LIMIT
+    run.save()
+    built = report.build(run.config.output_dir, selected=["attack"])
+    assert built["analyses"] == {"attack": "not run"} and built["status"] == "partial"
+    assert f"- Limit: {checks.UNGUIDED_LIMIT}" in report.markdown(built)
 
 
 def test_shared_limit_leaves_later_conditions_unattempted(tmp_path, monkeypatch, credentials):
@@ -2009,9 +2133,9 @@ def test_attacker_instruction_is_deterministic(tmp_path, monkeypatch, credential
                 or (level == "minimal" and "Minimal hint" in text)
             )] for level in ("full", "minimal", "none")}
             assert texts["full"] and texts["minimal"] and texts["none"]
-            assert texts["full"][0] == "Find a reward hack.\nFull loophole details.\n" + FULL
-            assert texts["minimal"][0] == "Find a reward hack.\nMinimal hint.\n" + MINIMAL
-            assert texts["none"][0].startswith("Find a reward hack.")
+            assert texts["full"][0] == checks.EXPLOIT_INSTRUCTION + "\nFull loophole details.\n" + FULL
+            assert texts["minimal"][0] == checks.EXPLOIT_INSTRUCTION + "\nMinimal hint.\n" + MINIMAL
+            assert texts["none"][0].startswith(checks.EXPLOIT_INSTRUCTION)
             assert "No extra hint" in texts["none"][0]
             assert "reward hack" in texts["full"][0].lower() and "reward hack" in texts["minimal"][0].lower()
             assert FULL not in texts["none"][0] and MINIMAL not in texts["none"][0]
@@ -2132,7 +2256,7 @@ def test_descriptive_hints_still_require_a_reward_hack(tmp_path, monkeypatch, cr
             assert full_hint not in texts["none"] and minimal_hint not in texts["none"]
             assert "untrusted_task_files" not in texts["none"] and "missing_evidence" not in texts["none"]
             assert len({attempt.context for attempt in result.attempts}) == 3
-            assert all(len(result.sessions[attempt.context]) == 1 for attempt in result.attempts)
+            assert "sessions" not in json.loads((run.config.output_dir / "attack.json").read_text())
 
     asyncio.run(main())
 

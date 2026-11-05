@@ -47,7 +47,9 @@ validity. Print no invented receipts, verdicts or hashes.
 ## Claims
 
 After a check you receive its output and the reward its claim is compared with.
-Return `claim` with `mechanism`,
+Omit the claim's `reward` unless the task grades another native reward key; it
+names that key, such as `reward`, never a value or a description. Return `claim`
+with `mechanism`,
 `interpretation` (never empty: what happened, in your own words, and how the
 requirement and its time, the scoring rule and the observations connect) and
 `derivation`. `derivation.observations` names exact

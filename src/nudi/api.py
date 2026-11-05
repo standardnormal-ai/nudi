@@ -8,6 +8,7 @@ credentials never reach it.
 """
 
 import asyncio
+import time
 import tomllib
 from pathlib import Path
 from typing import Literal
@@ -17,12 +18,20 @@ from pydantic import ConfigDict, Field
 from nudi import copies, report
 from nudi.checks import (FULL_UNAVAILABLE, MINIMAL_UNAVAILABLE, Candidate, InspectionResult, attack, finish_cleanup, inspect_grader,
                          inspect_hacks, redacted)
-from nudi.records import RunConfig
-from nudi.workflow import simulate, start_run
+from nudi.records import DiskFull, RunConfig
+from nudi.workflow import elapsed, logger, simulate, start_run
 
 Analysis = Literal["full", "simulation", "hacking"]
-SELECTED = {"full": ("simulation", "grader", "hack", "attack"), "simulation": ("simulation", "grader"),
+# The hack chain first: it needs no Simulator or grader inspector result, and its finding comes hours earlier.
+SELECTED = {"full": ("hack", "attack", "simulation", "grader"), "simulation": ("simulation", "grader"),
             "hacking": ("hack", "attack")}
+# Each step's name on stderr and what it produced.
+PHASES = {
+    "simulation": ("Simulator", lambda result: f"{len(result.episodes)} of {result.requested} episodes"),
+    "grader": ("grader inspector", lambda result: f"{len(result.experiments)} experiments, {len(result.assessments)} assessments"),
+    "hack": ("hack inspector", lambda result: f"{len(result.experiments)} experiments, {len(result.assessments)} assessments"),
+    "attack": ("attack", lambda result: f"{len(result.attempts)} Attacker attempts, {len(result.findings)} findings"),
+}
 ROLES = {"full": frozenset({"simulator", "inspector", "attacker"}), "simulation": frozenset({"simulator", "inspector"}),
          "hacking": frozenset({"inspector", "attacker"})}
 
@@ -81,13 +90,20 @@ def guidance(hack: InspectionResult | None) -> dict:
     A missing or blank field is unavailable for that candidate only. Identical text stays
     distinct here. Attack shares one native run only for records with the same mechanism
     and the same full and minimal guidance. A shared hint string alone stays separate.
+    A reading that supplies neither guidance field is no candidate when a later reading of the
+    same check exists: it could never run, and a re-interpretation replaces it. Every other reading
+    stays a candidate, also a guided one a later legitimate or unguided reading supersedes.
+    A claim without a check is never superseded.
     """
     candidates = []
-    for index, item in enumerate(hack.assessments if hack else []):
+    assessments = hack.assessments if hack else []
+    latest = {item.claim.check: index for index, item in enumerate(assessments) if item.claim.check}
+    for index, item in enumerate(assessments):
         if item.outcome == "legitimate":
             continue
         full, location = _supplied(item.claim.full_guidance), _supplied(item.claim.hint_location)
-        if item.outcome not in ("accepted_invalid", "rejected_valid") and full is None and location is None:
+        if full is None and location is None and (item.outcome not in ("accepted_invalid", "rejected_valid")
+                                                  or latest.get(item.claim.check, index) != index):
             continue
         unavailable = {}
         if full is None:
@@ -129,19 +145,32 @@ async def send_nudis_async(task_dir, config=None, **options) -> dict:
     }
     try:
         for name in selected:
+            phase, produced = PHASES[name]
+            started = time.monotonic()
+            logger.info(f"{phase} started")
             try:
                 results[name] = await steps[name]()
+                logger.info(f"{phase} finished after {elapsed(started)}: {produced(results[name])}; status {results[name].status}")
             except asyncio.CancelledError:
-                run.warn(f"cancelled during {name}")
+                # Recorded without a stderr line: the command prints one cancellation message.
+                run.record.warnings.append(f"cancelled during {name}")
+                raise
+            except DiskFull as error:
+                run.record.warnings.append(f"{name} stopped: {error}")
                 raise
             except Exception as error:
-                run.warn(f"{name} failed: {type(error).__name__}: {redacted(run, str(error))}")
+                failure = f"{name} failed: {type(error).__name__}: {redacted(run, str(error))}"
+                run.record.warnings.append(failure)
+                logger.warning(f"{phase} ended after {elapsed(started)}: {failure}")
     finally:
         try:
             await finish_cleanup(asyncio.create_task(copies.delete(run)))
         finally:
-            run.save()
-            report.write(settings.output_dir, run.keys.values(), selected)
+            try:
+                run.save()
+            finally:
+                # Tried also when the save found no space: the smaller report may still fit.
+                report.write(settings.output_dir, run.keys.values(), selected)
     return report.build(settings.output_dir, run.keys.values(), selected)
 
 

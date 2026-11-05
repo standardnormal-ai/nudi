@@ -2,12 +2,10 @@
 
 Each investigation has one workspace with file, search and shell tools. Its memory
 limit can differ from the task's, so a resource failure there is not task evidence.
-Complete sources are at /nudi/package; retained episode artifacts, each
-retained_trace included, are under /nudi/evidence/episodes. Read trace files with
-your tools. A focused or grader inspector episode session continues a copy of the
-broad conversation; without one, its request carries labeled `broad_history`, prior
-context and not an observation. Inspect the requested categories broadly, then the
-focused one.
+Complete sources are at /nudi/package. A focused or grader inspector episode
+session continues a copy of the broad conversation; without one, its request carries
+labeled `broad_history`, prior context and not an observation. Inspect the requested
+categories broadly, then the focused one.
 
 Measure each new case with run_experiment; workspace files are never experiment
 inputs. Read its raw setup, grader, copy and check output, errors included, then

@@ -4,7 +4,8 @@
 run their own subprocess calls against it. A container's root is a directory. `exec` runs
 the command on the host with the container paths /app, /tests, /logs and /nudi in its
 arguments moved under the root, and the root in COPY_ROOT for the programs it runs. A bind
-mount is a symlink. `commit` copies the root to an image that `compose up` can start.
+mount is a symlink. `commit` copies the root to an image that `compose up` can start. Each
+compose command is logged in `compose.log`, one JSON list per line.
 """
 
 import hashlib
@@ -99,6 +100,8 @@ class Docker:
             elif flag == "-f":
                 files.append(Path(value))
         command, rest = args[0], args[1:]
+        with (self.state / "compose.log").open("a") as log:
+            log.write(json.dumps(args) + "\n")
         home = self.state / "projects" / project
         root = home / "root"
         if command == "down":

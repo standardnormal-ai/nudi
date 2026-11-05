@@ -63,10 +63,10 @@ def test_reports_are_deterministic_and_never_expose_resolved_credentials(tmp_pat
     loaded = json.loads(texts[0])
     assert loaded == report.build(run.path, secrets=[SECRET])
     # Credentials appear only as references: the variable name and where it was found.
-    assert loaded["configuration"]["models"]["inspector"]["model"] == "xai/grok-4.7"
+    assert loaded["configuration"]["models"]["inspector"]["model"] == "openai/deepseek/deepseek-v4.1-flash-1017"
     assert loaded["configuration"]["credential_sources"]["inspector"] == "environment"
     assert loaded["ordinary"]["groups"][0]["configuration"]["versions"] == {"harbor": "0.24.0"}
-    assert "xai/grok-4.7" in texts[1] and "harbor 0.24.0" in texts[1]
+    assert "openai/deepseek/deepseek-v4.1-flash-1017" in texts[1] and "harbor 0.24.0" in texts[1]
 
 
 def test_attack_reports_actual_attempts_and_failure_kinds_without_a_success_rate(tmp_path):
@@ -214,7 +214,7 @@ def test_records_before_requirement_conclusions_stay_readable_without_invented_e
 
 def test_a_record_saved_before_the_single_deserved_score_loads_and_reports_its_stored_outcomes(tmp_path):
     """Old fields stay in the raw JSON and are not reassessed or converted: supports, min/max, the label's
-    assessment indices, the old attack session name and an attribution with a checks list."""
+    assessment indices, the embedded session copies and an attribution with a checks list."""
     run = RunDir(tmp_path)
     graded = run.episode(rewards={"reward": 1.0})
     run.label(graded, "accepted_invalid", evidenced(graded, "c0"))
@@ -238,6 +238,7 @@ def test_a_record_saved_before_the_single_deserved_score_loads_and_reports_its_s
             legacy["sessions"] = {"inspector-attacker-none-none-1": [{"role": "system", "content": "old prompt"}]}
             legacy["findings"] = [{"kind": "discovery", "attempt": 0, "assessment": 0, "checks": ["c1"]}]
         else:
+            legacy["sessions"] = {"grader-broad": [{"role": "human", "content": "old request"}]}
             legacy["ordinary"][graded]["assessments"] = [0]
         path.write_text(json.dumps(legacy))
 
@@ -410,6 +411,21 @@ def test_an_earlier_reading_stays_listed_and_names_the_later_reading_that_supers
             "attempts none") in lines
 
 
+def test_the_evidenced_count_reads_only_the_latest_reading_of_each_check(tmp_path):
+    """A check read twice counts once: a superseded reading stays listed but is not counted."""
+    run = RunDir(tmp_path)
+    graded = run.episode(rewards={"reward": 1.0})
+    doubted = evidenced(graded, "check-0000")
+    doubted.claim.unresolved = ["whether the copied grader is the hosted grader"]
+    run.label(graded, "accepted_invalid", doubted, evidenced(graded, "check-0000"), evidenced(graded, "check-0001"),
+              checked(graded, "check-0001", "summary", "unknown"))
+    run.grader.categories = {"accepted_invalid": "evidenced_issue"}
+
+    lines = report.markdown(run.report()).splitlines()
+    assert lines[lines.index("## Findings") + 2] == "Evidenced findings: 1, 0 of them with open conditions."
+    assert sum(line.startswith("- grader_inspector evidenced") for line in lines) == 3
+
+
 def test_a_repair_evidences_the_category_of_its_session_and_keeps_its_experiment(tmp_path):
     """Broad measured a check for accepted_invalid; a rejected_valid session reinterpreted it and evidenced an issue."""
     run = RunDir(tmp_path)
@@ -510,8 +526,8 @@ def test_configuration_names_the_task_without_its_host_path_and_states_what_cost
     assert str(tmp_path) not in text and str(tmp_path) not in json.dumps(result)
     assert "known cost $0.000000, excluding 85 calls with unknown prices" in text
     assert "provider-reported" not in text
-    assert "inspector: xai/grok-4.7, reasoning effort xhigh, credential from environment" in text
-    assert "- attacker: xai/grok-4.7, reasoning effort xhigh, no credential resolved; the selected analyses do not run this role" in text
+    assert "inspector: openai/deepseek/deepseek-v4.1-flash-1017, reasoning effort high, credential from environment" in text
+    assert "- attacker: openai/deepseek/deepseek-v4.1-flash-1017, reasoning effort high, no credential resolved; the selected analyses do not run this role" in text
     assert "nowhere" not in text
     # Session workspaces are Inspector sandboxes too, not package experiments only.
     assert "Outside the ordinary pool: 2 Inspector sandboxes (session workspaces and package experiments), 0 persistence probes" in text

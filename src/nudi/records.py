@@ -5,6 +5,7 @@ the credentials file or the host environment only when a call is sent. Paths in
 `EpisodeResult.artifacts` are relative to the episode's output directory.
 """
 
+import errno
 import os
 from pathlib import Path
 from typing import Literal
@@ -28,10 +29,26 @@ def private_dir(path: Path) -> None:
 
 
 def write_private(path: Path, data: str | bytes) -> None:
-    """Write `path`, created owner-only with its missing parents."""
-    private_dir(path.parent)
-    with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as file:
-        file.write(data.encode() if isinstance(data, str) else data)
+    """Write `path`, created owner-only with its missing parents. The data goes to a hidden sibling
+    first and replaces `path` whole, so a failed write leaves the earlier version for the report.
+    No space left on the device stops the run (`DiskFull`)."""
+    partial = path.with_name(f".{path.name}.partial")
+    try:
+        private_dir(path.parent)
+        with open(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as file:
+            file.write(data.encode() if isinstance(data, str) else data)
+        os.replace(partial, path)
+    except OSError as error:
+        partial.unlink(missing_ok=True)
+        if error.errno == errno.ENOSPC:
+            raise DiskFull(f"no space left on the records host to write {path}") from error
+        raise
+
+
+class DiskFull(BaseException):
+    """No space was left on the records host for one of nudi's own writes, so the run stops.
+    Like cancellation, it passes the handlers that keep a run going after an ordinary failure.
+    A sandbox or container that runs out of its own space reports that inside its own output."""
 
 
 class InfrastructureAbort(Exception):
@@ -58,10 +75,13 @@ class ModelConfig(BaseModel):
         return f"{self.model.split('/')[0].upper()}_API_KEY"
 
 
+# DeepSeek V4.1 Flash 1017 through the Merge gateway's OpenAI-compatible route, for every role.
+_GATEWAY = {"model": "openai/deepseek/deepseek-v4.1-flash-1017", "api_base": "https://api-gateway.merge.dev/v1/openai",
+            "api_key_var": "MERGE_GATEWAY_API_KEY"}
 DEFAULT_MODELS: dict[Role, ModelConfig] = {
-    "simulator": ModelConfig(model="xiaomi_mimo/mimo-v2.6-pro", reasoning_effort="high"),
-    "inspector": ModelConfig(model="xai/grok-4.7", reasoning_effort="xhigh"),
-    "attacker": ModelConfig(model="xai/grok-4.7", reasoning_effort="xhigh"),
+    "simulator": ModelConfig(**_GATEWAY, reasoning_effort="medium"),
+    "inspector": ModelConfig(**_GATEWAY, reasoning_effort="high"),
+    "attacker": ModelConfig(**_GATEWAY, reasoning_effort="high"),
 }
 
 
@@ -402,7 +422,8 @@ class SandboxResult(BaseModel):
     cancelled: bool = False
     verifier_timeout: bool = False
     cleanup: dict = {}
-    artifacts: dict[str, str] = {"nudi_evidence": "nudi-evidence"}
+    artifacts: dict[str, str] = {}
+    """`nudi_evidence` names the sandbox's state copy receipts, only when they were written."""
     state_copy: str | None = None
     """The `StateCopy` this sandbox started from, if any."""
     image: str | None = None
@@ -442,7 +463,7 @@ class StateCopy(BaseModel):
     error: str | None = None
     receipt: Content | None = None
     deleted: bool | None = None
-    """Set at run end: whether the image or snapshot was deleted."""
+    """Whether the image or snapshot was deleted: once no later phase reads it, or at run end."""
 
 
 class PersistenceProbe(BaseModel):
@@ -580,9 +601,11 @@ class MetricBasis(BaseModel):
     """Grader inspector interpretation of one ordinary episode's whole-task completion.
 
     Local validity, legitimate partial credit and complete-scoring coverage are not
-    completion. `supported` needs every cited completion requirement observed satisfied
-    by the episode's checks; `violated` needs one observed violation of a cited necessary
-    requirement. Any `unresolved` condition keeps completion unknown. Missing fields
+    completion. `supported` needs every cited completion requirement to be observed
+    satisfied by a cited check; a cited requirement no check reads keeps completion
+    unknown, and nudi lists it. `violated` needs one observed
+    violation of a cited necessary requirement. Any `unresolved` condition keeps
+    completion unknown. Missing fields
     mean missing evidence or an older record."""
 
     completion: Literal["supported", "violated", "unknown"] = "unknown"

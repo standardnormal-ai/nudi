@@ -6,6 +6,7 @@ to a fresh experiment implicitly.
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -21,14 +22,17 @@ from deepagents import create_deep_agent
 from deepagents.backends import sandbox as sdk_sandbox
 from deepagents.backends.protocol import ExecuteResponse, FileDownloadResponse, FileUploadResponse
 from deepagents.backends.sandbox import BaseSandbox
+from deepagents.backends.utils import EMPTY_CONTENT_WARNING
 from deepagents.middleware import filesystem as sdk_filesystem
 from deepagents.profiles import GeneralPurposeSubagentProfile, HarnessProfile, register_harness_profile
 from langchain.agents.middleware import AgentMiddleware
-from langchain.agents.structured_output import StructuredOutputError, ToolStrategy
+from langchain.agents.structured_output import ToolStrategy
 from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.messages import BaseMessage, HumanMessage, message_to_dict
 from langchain_litellm import ChatLiteLLM
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.errors import NodeCancelledError
 from langsmith import tracing_context
 
 from nudi import checks, sandbox
@@ -42,6 +46,8 @@ register_harness_profile("nudi-inspector", HarnessProfile(
 ))
 # A broad search of a task image can outlast the SDK's 10 to 35 s search deadlines, which it reads at call time.
 sdk_sandbox.ASYNC_GREP_TIMEOUT = sdk_sandbox.ASYNC_GLOB_TIMEOUT = sdk_filesystem.GLOB_TIMEOUT = 120
+# Where the host `transcript.jsonl` is uploaded before every inference, so it is not retained from the workspace.
+HISTORY = "/conversation_history/transcript.jsonl"
 
 
 class InspectorModel(ChatLiteLLM):
@@ -117,13 +123,21 @@ class HarborBackend(BaseSandbox):
 
 
 class Transcript(AsyncCallbackHandler):
-    """Save raw messages before SDK compaction, including its summary model's replies."""
+    """Save raw messages before SDK compaction, including its summary model's replies.
+
+    `inferences.jsonl` has one row per model request: its run id and, for each batch, the keys of
+    its messages. A key is the SHA-256 of one message's redacted `message_to_dict` JSON, stored once
+    as a `{"key", "message"}` line of this session's `inference-messages.jsonl`; a fork starts its own.
+    Rebuild batch i of a row with `messages_from_dict([store[key] for key in row["messages"][i]])`,
+    where `store` maps each line's key to its message.
+    """
 
     raise_error = True
 
     def __init__(self, run, directory, backend):
-        self.run, self.directory, self.backend, self.seen = run, directory, backend, set()
+        self.run, self.directory, self.backend, self.seen, self.keys = run, directory, backend, set(), set()
         write_private(directory / "transcript.jsonl", "")
+        write_private(directory / "inference-messages.jsonl", "")
 
     def save(self, messages):
         with (self.directory / "transcript.jsonl").open("a") as output:
@@ -136,13 +150,22 @@ class Transcript(AsyncCallbackHandler):
                 self.seen.add(key)
                 output.write(checks.redacted(self.run, json.dumps(message_to_dict(message), ensure_ascii=False)) + "\n")
 
+    def stored(self, message) -> str:
+        text = checks.redacted(self.run, json.dumps(message_to_dict(message), ensure_ascii=False))
+        key = hashlib.sha256(text.encode()).hexdigest()
+        if key not in self.keys:
+            with (self.directory / "inference-messages.jsonl").open("a") as output:
+                output.write(f'{{"key": "{key}", "message": {text}}}\n')
+            # Only a written message is skipped later.
+            self.keys.add(key)
+        return key
+
     async def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
         with (self.directory / "inferences.jsonl").open("a") as output:
-            output.write(checks.redacted(self.run, json.dumps({"id": str(run_id), "messages": [
-                [message_to_dict(message) for message in batch] for batch in messages]}, ensure_ascii=False)) + "\n")
+            output.write(json.dumps({"id": str(run_id), "messages": [[self.stored(message) for message in batch] for batch in messages]}) + "\n")
         # Restore protected history/results before inference, including summaries. Tools
         # can change their sandbox copies but cannot change these retained host sources.
-        sources = [(self.directory / "transcript.jsonl", "/conversation_history/transcript.jsonl")]
+        sources = [(self.directory / "transcript.jsonl", HISTORY)]
         sources.extend((source, f"/nudi/evidence/tool-results/{source.name}")
                        for source in sorted((self.directory / "tool-outputs").iterdir()))
         for source, destination in sources:
@@ -152,6 +175,21 @@ class Transcript(AsyncCallbackHandler):
 
     async def on_tool_end(self, output, **kwargs):
         if isinstance(output, BaseMessage):
+            # The SDK returns a binary read as one media block, which a text-only route refuses for the rest of
+            # the session. The model and every record get this text instead.
+            if output.name == "read_file" and isinstance(output.content, list):
+                block, = output.content
+                # An empty binary file arrives as the SDK's empty-file reminder in place of base64.
+                size = 0 if block["base64"] == EMPTY_CONTENT_WARNING else len(base64.b64decode(block["base64"]))
+                output.content = (f"{output.additional_kwargs['read_file_path']} is a binary file ({block['mime_type']}, "
+                                  f"{size} bytes) and is not shown. Inspect it with execute, for example pdftotext, strings or python3.")
+            # A binary over the SDK's preview limit is an answer about the file, not a broken tool
+            # (freecad-platform-drawing, a 1,089,613-byte PNG), so it does not count as a tool error.
+            elif output.name == "read_file" and str(output.content).endswith(
+                    f"Binary file exceeds maximum preview size of {sdk_sandbox.MAX_BINARY_BYTES} bytes"):
+                output.status = "success"
+                output.content = (output.content.removeprefix("Error: ") + ". It is not shown. "
+                                  "Inspect it with execute, for example pdftotext, strings or python3.")
             if isinstance(output.artifact, dict) and (path := output.artifact.get("output_file")):
                 captured, = await self.backend.adownload_files([path])
                 if captured.error or captured.content is None:
@@ -185,7 +223,7 @@ class ToolOwnership(AgentMiddleware):
     """
 
     def __init__(self):
-        self.pending, self.experiments = set(), asyncio.Lock()
+        self.pending, self.experiments, self.failed = set(), asyncio.Lock(), None
 
     async def awrap_tool_call(self, request, handler):
         task = asyncio.current_task()
@@ -196,8 +234,9 @@ class ToolOwnership(AgentMiddleware):
         async with self.experiments:
             try:
                 return await handler(request)
-            except BaseException:
+            except BaseException as error:
                 # A raised experiment ends the turn; stop queued experiments before they start.
+                self.failed = error
                 for other in self.pending - {task}:
                     other.cancel()
                 raise
@@ -216,7 +255,9 @@ class Investigation:
     def __init__(self, run, name, prompt, box, backend):
         self.run, self.name, self.prompt, self.box, self.backend = run, name, prompt, box, backend
         self.state, self.closed, self.busy, self.retained = {"messages": []}, False, False, False
-        self.checkpointer = InMemorySaver()
+        # The checkpoint keeps the structured response, the one nudi type in its state; LangGraph blocks an unregistered type
+        # under LANGGRAPH_STRICT_MSGPACK and warns otherwise.
+        self.checkpointer = InMemorySaver(serde=JsonPlusSerializer(allowed_msgpack_modules=[checks.InspectionSummary]))
         self.ownership = ToolOwnership()
         (box.directory / "tool-outputs").mkdir(mode=0o700)
         self.transcript = Transcript(run, box.directory, backend)
@@ -232,17 +273,17 @@ class Investigation:
         write_private(box.directory / "system-prompt.txt", checks.redacted(run, prompt))
         write_private(box.directory / "results.jsonl", "")
         write_private(box.directory / "inferences.jsonl", "")
-        write_private(box.directory / "state.json", '{"messages": []}')
-        box.record.artifacts.update(transcript="transcript.jsonl", inferences="inferences.jsonl", workspace="workspace",
-                                    state="state.json", results="results.jsonl", system_prompt="system-prompt.txt",
-                                    tool_outputs="tool-outputs")
+        box.record.artifacts.update(transcript="transcript.jsonl", inferences="inferences.jsonl",
+                                    inference_messages="inference-messages.jsonl", workspace="workspace", results="results.jsonl",
+                                    system_prompt="system-prompt.txt", tool_outputs="tool-outputs")
         box.save()
 
     def graph(self, tools=(), schema=None):
         return create_deep_agent(
             model=self.model, tools=tools, backend=self.backend, system_prompt=self.prompt,
             middleware=[self.ownership],
-            response_format=ToolStrategy(schema, handle_errors=False) if schema else None,
+            # A summary that fails validation goes back to the model, which retries it (full e2e run, resource_exhaustion).
+            response_format=ToolStrategy(schema) if schema else None,
             subagents=[], skills=None, memory=None, interrupt_on=None, checkpointer=self.checkpointer, store=None,
         )
 
@@ -250,7 +291,7 @@ class Investigation:
         if self.closed or self.busy:
             raise RuntimeError("An investigation must be open and have only one active turn")
         self.run.check_cap()
-        self.busy = True
+        self.busy, self.ownership.failed = True, None
         message = HumanMessage(content=context, id=uuid4().hex)
         self.transcript.save([message])
         try:
@@ -272,15 +313,15 @@ class Investigation:
             raise
         except litellm.ContentPolicyViolationError as error:
             raise checks.ProviderRefusal(checks.redacted(self.run, str(error))) from error
-        except StructuredOutputError as error:
-            raise checks.ModelOutputFailure(checks.redacted(self.run, str(error))) from error
         except Exception as error:
+            # A raised experiment cancels the ones waiting their turn, and the SDK can report that cancel
+            # first; the experiment's own error is the turn's cause.
+            if isinstance(error, NodeCancelledError) and self.ownership.failed is not None:
+                raise self.ownership.failed
             raise checks.InferenceFailure(checks.redacted(self.run, f"{type(error).__name__}: {error}")) from error
         finally:
             await checks.finish_cleanup(asyncio.create_task(self.ownership.cancel()))
             self.busy = False
-            write_private(self.box.directory / "state.json", checks.redacted(
-                self.run, json.dumps(self.state, default=lambda value: value.model_dump(), ensure_ascii=False)))
 
     async def fork(self, source):
         """Continue a copy of another investigation's final SDK state on a new thread of its
@@ -297,7 +338,8 @@ class Investigation:
         self.transcript.seen = set(source.transcript.seen)
 
     async def retain(self):
-        """Copy only regular workspace and SDK artifact files to host records before removal."""
+        """Copy only regular workspace and SDK artifact files to host records before removal.
+        `HISTORY` is skipped: it is the host `transcript.jsonl`, which a fork copies and uploads."""
         listing = await self.backend.aexecute(
             "find /nudi/workspace /conversation_history /large_tool_results -type f -print0")
         if listing.exit_code or listing.truncated:
@@ -305,7 +347,7 @@ class Investigation:
         root = self.box.directory / "workspace"
         root.mkdir(mode=0o700, exist_ok=True)
         for name in listing.output.split("\0"):
-            if not name:
+            if not name or name == HISTORY:
                 continue
             path = PurePosixPath(name)
             if ".." in path.parts or not any(path.is_relative_to(prefix) for prefix in (
