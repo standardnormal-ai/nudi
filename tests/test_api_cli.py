@@ -8,6 +8,7 @@ or model calls. The analyses themselves have their own suites.
 import asyncio
 import inspect
 import json
+import re
 import signal
 import subprocess
 from collections import Counter
@@ -25,6 +26,8 @@ from nudi.workflow import Run
 from test_metrics import RULE, TASK, basis, checked
 
 SECRET = "sk-live-api-0123456789"
+# Each progress line begins with the clock time.
+CLOCK = re.compile(r"^nudi: \d\d:\d\d:\d\d ")
 ALL_ROLES = ["attacker", "inspector", "simulator"]
 
 
@@ -155,7 +158,7 @@ def test_python_async_and_cli_share_configuration_and_report(tmp_path, monkeypat
     config = tmp_path / "conf" / "nudi.toml"
     config.parent.mkdir()
     config.write_text('episodes = 5\nfocused_attempts = 1\nattacker_tries = 4\ndiscovery_attempts = 2\nspending_cap = 2.5\ncredentials_file = ".env"\n'
-                      'workspace_memory_mb = 1024\n'
+                      'workspace_memory_mb = 1024\ntime_limit = 600\n'
                       '[models.simulator]\nmodel = "openai/gpt-test"\nreasoning_effort = "low"\napi_key_var = "TEST_KEY"\n')
     task = tmp_path / "task"
     reports, calls, configs = [], [], []
@@ -186,6 +189,7 @@ def test_python_async_and_cli_share_configuration_and_report(tmp_path, monkeypat
     assert configs[0] == configs[1] == configs[2]
     # The keyword or flag replaces the file's value; the rest of the file stays.
     assert configs[0]["episodes"] == 7 and configs[0]["spending_cap"] == 2.5 and configs[0]["workspace_memory_mb"] == 1024
+    assert configs[0]["time_limit"] == 600
     analyses = Analyses(monkeypatch)
     assert cli.main(["send-nudis", str(task), "--config", str(config), "--output", str(tmp_path / "flag"),
                      "--workspace-memory-mb", "768"]) == 0
@@ -255,6 +259,8 @@ INVALID = {
     "nonpositive workspace memory": "workspace_memory_mb = 0\n",
     "text workspace memory": 'workspace_memory_mb = "512"\n',
     "text isolated inspections": 'isolated_inspections = "yes"\n',
+    "nonpositive time limit": "time_limit = 0\n",
+    "infinite time limit": "time_limit = inf\n",
 }
 
 
@@ -336,12 +342,12 @@ def test_each_inspector_candidate_composes_its_own_guidance_without_a_model_call
     leak = "Copy the hidden expected digest from the grader source into the submission."
     other, place = "Write the reward file directly before verification.", "logs/verifier/reward.txt"
     analyses = Analyses(monkeypatch, candidates=[
-        candidate(MECHANISM, INTERPRETATION, full_guidance=REPRODUCTION, hint_location=LOCATION),
+        candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION),
         candidate("leakage_metadata", "the reward matches the submitted work", outcome="legitimate",
                   full_guidance=leak, hint_location="secret/expected.txt"),
-        candidate("reward file", "the verifier trusts the reward file", full_guidance=other, hint_location=place),
-        # An identical repeat stays a distinct candidate: no semantic deduplication.
-        candidate("reward file", "the verifier trusts the reward file", full_guidance=other, hint_location=place),
+        candidate("reward file", "the verifier trusts the reward file", "accepted_invalid", full_guidance=other, hint_location=place),
+        # An identical repeat stays a distinct candidate here; attack merges it into one run.
+        candidate("reward file", "the verifier trusts the reward file", "accepted_invalid", full_guidance=other, hint_location=place),
     ])
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
 
@@ -368,7 +374,7 @@ def test_rejected_valid_hack_findings_become_valid_work_candidates(tmp_path, mon
                    full_guidance="Write the answer in the documented format.", hint_location="fn/private-grader.py")
     candidates = [fn]
     if not only_false_negative:
-        candidates.append(candidate(MECHANISM, INTERPRETATION, full_guidance=REPRODUCTION, hint_location=LOCATION))
+        candidates.append(candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION))
     analyses = Analyses(monkeypatch, candidates=candidates)
     result = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
     sent = analyses.candidates_sent
@@ -386,7 +392,8 @@ def test_rejected_valid_hack_findings_become_valid_work_candidates(tmp_path, mon
     (REPRODUCTION, "   "),
 ], ids=["full missing", "full blank", "location missing", "location blank"])
 def test_missing_or_blank_guidance_field_leaves_that_condition_unavailable(tmp_path, monkeypatch, full_guidance, hint_location):
-    analyses = Analyses(monkeypatch, candidates=[candidate(MECHANISM, INTERPRETATION, full_guidance=full_guidance, hint_location=hint_location)])
+    analyses = Analyses(monkeypatch, candidates=[candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=full_guidance,
+                                                           hint_location=hint_location)])
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
 
     assert analyses.calls[-1] == ("attack", 2, 1, 1)
@@ -395,9 +402,9 @@ def test_missing_or_blank_guidance_field_leaves_that_condition_unavailable(tmp_p
     rendered = json.dumps(sent.guidance)
     assert MECHANISM not in rendered and INTERPRETATION not in rendered
     # The candidate and its interpretation stay in the inspection evidence.
-    inconclusive = report["inspections"]["hack_inspector"]["findings"]["inconclusive"]
-    assert inconclusive[0]["claim"]["mechanism"] == MECHANISM
-    assert inconclusive[0]["interpretation"]["interpretation"] == INTERPRETATION
+    evidenced = report["inspections"]["hack_inspector"]["findings"]["evidenced"]
+    assert evidenced[0]["claim"]["mechanism"] == MECHANISM
+    assert evidenced[0]["interpretation"]["interpretation"] == INTERPRETATION
     conditions = report["attack"]["candidates"][0]["conditions"]
     if isinstance(full_guidance, str) and full_guidance.strip():
         assert sent.guidance["full"] == REPRODUCTION and "full" not in sent.unavailable
@@ -415,24 +422,59 @@ def test_missing_or_blank_guidance_field_leaves_that_condition_unavailable(tmp_p
     assert NO_CANDIDATE not in sent.unavailable.values()
 
 
-def test_only_accepted_invalid_or_guided_findings_become_candidates(tmp_path, monkeypatch):
-    analyses = Analyses(monkeypatch, candidates=[
-        candidate("found nothing", INTERPRETATION),
-        candidate("no measurement", INTERPRETATION, outcome="unavailable", full_guidance=" ", hint_location=""),
-        candidate(MECHANISM, INTERPRETATION, outcome="accepted_invalid"),
+def test_only_evidenced_or_suspected_findings_become_candidates_with_their_check_and_category():
+    """A guided unavailable, ungrounded or legitimate reading supplies nothing; a guided unknown one follows the
+    evidenced candidates.
+    Each candidate keeps its check and the category of the experiment that measured it."""
+    def reading(outcome, check, **guidance):
+        return Assessment(claim=Claim(mechanism=MECHANISM, episode="0000-inspector", interpretation=INTERPRETATION,
+                                      check=check, **guidance), outcome=outcome)
+
+    guided = {"full_guidance": REPRODUCTION, "hint_location": LOCATION}
+    hack = InspectionResult(mode="hack", categories={}, applicability={}, assessments=[
+        reading("unknown", "check-0000", **guided), reading("unavailable", "check-0001", **guided),
+        reading("ungrounded", "check-0002", **guided), reading("legitimate", "check-0003", **guided),
+        reading("accepted_invalid", "check-0004"), reading("rejected_valid", "check-0005", **guided),
+    ], experiments=[{"id": "experiment-0000", "category": "timing_interference", "check": "check-0004", "status": "assessed"},
+                    {"id": "experiment-0001", "category": "unchecked_requirements", "check": "check-0005", "status": "assessed"}])
+    first, second, suspected = api.guidance(hack)["candidates"]
+    assert (suspected.id, suspected.outcome, suspected.valid_work) == ("hack-0", "unknown", False)
+    assert (first.id, first.check, first.category, first.valid_work) == ("hack-4", "check-0004", "timing_interference", False)
+    assert first.guidance == {"full": None, "minimal": None}
+    assert first.unavailable == {"full": FULL_UNAVAILABLE, "minimal": MINIMAL_UNAVAILABLE}
+    assert (second.id, second.check, second.category, second.valid_work) == ("hack-5", "check-0005", "unchecked_requirements", True)
+
+
+def test_a_guided_unknown_reading_is_a_suspected_candidate_after_the_evidenced_ones():
+    """A reading can measure a violated requirement at reward 1.0 with both guidance fields and stay unknown only
+    because the scoring input was empty. So a guided unknown reading is a candidate behind every evidenced one and
+    keeps its outcome. One that a later reading of its check
+    withdraws, superseded or read legitimate, is not; an unguided one supplies nothing."""
+    def reading(outcome, check, **guidance):
+        return Assessment(claim=Claim(mechanism=f"{MECHANISM} {check}", episode="0000-inspector", interpretation=INTERPRETATION,
+                                      check=check, **guidance), outcome=outcome, reward=1.0)
+
+    guided = {"full_guidance": REPRODUCTION, "hint_location": LOCATION}
+    hack = InspectionResult(mode="hack", categories={}, applicability={}, assessments=[
+        reading("unknown", "check-0000", **guided),
+        reading("unknown", "check-0001", **guided), reading("unknown", "check-0001", full_guidance=REPRODUCTION),
+        reading("unknown", "check-0002", **guided), reading("legitimate", "check-0002", **guided),
+        reading("unknown", "check-0003"),
+        reading("accepted_invalid", "check-0004", **guided),
+        reading("unknown", "check-0005", **guided), reading("rejected_valid", "check-0005", **guided),
+        reading("unknown", None, hint_location=LOCATION),
     ])
-    report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
-
-    assert analyses.calls[-1] == ("attack", 2, 1, 1)
-    (sent,) = analyses.candidates_sent
-    assert sent.id == "hack-2" and sent.guidance == {"full": None, "minimal": None}
-    assert sent.unavailable == {"full": FULL_UNAVAILABLE, "minimal": MINIMAL_UNAVAILABLE}
-    assert [item["id"] for item in report["attack"]["candidates"]] == ["hack-2"]
+    found = api.guidance(hack)["candidates"]
+    assert [item.id for item in found] == ["hack-6", "hack-8", "hack-0", "hack-2", "hack-9"]
+    assert [item.outcome for item in found] == ["accepted_invalid", "rejected_valid", "unknown", "unknown", "unknown"]
+    assert found[2].guidance == {"full": REPRODUCTION, "minimal": f"{WHERE_TO_LOOK}\n{LOCATION}"} and not found[2].valid_work
+    assert found[3].unavailable == {"minimal": MINIMAL_UNAVAILABLE}
 
 
-def test_a_later_reading_of_its_check_replaces_only_an_unguided_candidate():
-    """A re-interpretation with guidance replaces the unguided reading of its check. A guided reading stays a
-    candidate after a later legitimate or unguided one, and a claim without a check is never superseded."""
+def test_a_later_reading_of_its_check_withdraws_every_earlier_candidate():
+    """A later reading of its check withdraws an evidenced reading, guided or not, also
+    when the later one is legitimate or unguided. The latest stays a candidate, also unguided, and a claim without a
+    check is never superseded."""
     def reading(check, outcome="accepted_invalid", **guidance):
         return Assessment(claim=Claim(mechanism=MECHANISM, episode="0000-inspector", interpretation=INTERPRETATION,
                                       check=check, **guidance), outcome=outcome)
@@ -443,10 +485,8 @@ def test_a_later_reading_of_its_check_replaces_only_an_unguided_candidate():
         reading("check-0002", hint_location=LOCATION), reading("check-0002"),
     ])
     candidates = {item.id: item for item in api.guidance(hack)["candidates"]}
-    assert list(candidates) == ["hack-1", "hack-2", "hack-3", "hack-4", "hack-6", "hack-7"]
+    assert list(candidates) == ["hack-2", "hack-3", "hack-4", "hack-7"]
     assert candidates["hack-4"].guidance == {"full": REPRODUCTION, "minimal": f"{WHERE_TO_LOOK}\n{LOCATION}"}
-    assert candidates["hack-1"].guidance == {"full": REPRODUCTION, "minimal": None}
-    assert candidates["hack-6"].guidance == {"full": None, "minimal": f"{WHERE_TO_LOOK}\n{LOCATION}"}
     assert candidates["hack-7"].guidance == {"full": None, "minimal": None}
 
 
@@ -496,10 +536,26 @@ def test_cancellation_writes_the_partial_report_and_propagates(tmp_path, monkeyp
     assert "run: cancelled during simulation" in report["warnings"]
 
 
-def test_the_command_reports_each_phase_on_stderr_with_its_time_and_count(tmp_path, monkeypatch, capsys):
+def test_a_second_ctrl_c_still_records_the_cancellation_and_writes_the_report(tmp_path, monkeypatch):
+    """asyncio raises a second SIGINT as KeyboardInterrupt, which passes a CancelledError handler."""
+    Analyses(monkeypatch, fail={"attack": KeyboardInterrupt()})
+    with pytest.raises(KeyboardInterrupt):
+        send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
+    assert "run: cancelled during attack" in json.loads((tmp_path / "run" / "report.json").read_text())["warnings"]
+
+
+def logged(text: str) -> list[str]:
+    """stderr lines with the clock time of each progress line removed."""
+    return [CLOCK.sub("nudi: ", line) for line in text.splitlines()]
+
+
+def test_the_command_reports_each_phase_on_stderr_with_its_clock_time_duration_and_count(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(api, "elapsed", lambda started: "0:00:00")
     Analyses(monkeypatch, rewards=[1.0, 0.0])
     assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run"), "--episodes", "2"]) == 0
-    assert capsys.readouterr().err.splitlines() == [
+    error = capsys.readouterr().err
+    assert all(CLOCK.match(line) for line in error.splitlines())
+    assert logged(error) == [
         "nudi: hack inspector started",
         "nudi: hack inspector finished after 0:00:00: 0 experiments, 0 assessments; status complete",
         "nudi: attack started",
@@ -511,13 +567,14 @@ def test_the_command_reports_each_phase_on_stderr_with_its_time_and_count(tmp_pa
     ]
     Analyses(monkeypatch, fail={"hack": RuntimeError(f"provider echoed {SECRET}")})
     assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "failed")]) == 1
-    error = capsys.readouterr().err.splitlines()
+    error = logged(capsys.readouterr().err)
     assert error[0:2] == ["nudi: hack inspector started",
                           "nudi: hack inspector ended after 0:00:00: hack failed: RuntimeError: provider echoed [redacted]"]
     assert error[-1].startswith("nudi: grader inspector finished after ")
 
 
-def test_ctrl_c_prints_one_line_naming_the_written_report_and_exits_130(tmp_path, monkeypatch, capsys):
+def test_ctrl_c_prints_the_report_and_one_line_naming_it_and_exits_130(tmp_path, monkeypatch, capsys):
+    """Most measured runs ended with a stop, so a stop must not leave stdout empty."""
     analyses = Analyses(monkeypatch)
 
     async def interrupted(run, ordinary_pool, **options):
@@ -526,11 +583,73 @@ def test_ctrl_c_prints_one_line_naming_the_written_report_and_exits_130(tmp_path
 
     monkeypatch.setattr(api, "inspect_grader", interrupted)
     assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run")]) == 130
-    error = capsys.readouterr().err.splitlines()
+    output, error = capsys.readouterr()
+    assert output == (tmp_path / "run" / "report.md").read_text() and output.startswith("# nudi report\n\n## Answer\n")
+    error = logged(error)
     assert error[error.index("nudi: grader inspector started") + 1:] == [
         f"nudi: cancelled; report written to {tmp_path / 'run' / 'report.md'}"]
     assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks", "attack", "simulate"]
     assert "run: cancelled during grader" in json.loads((tmp_path / "run" / "report.json").read_text())["warnings"]
+
+
+def test_a_time_limit_ends_the_run_as_a_stop_does_but_exits_0(tmp_path, monkeypatch, capsys):
+    """Some tasks take many hours, so the limit is one option with no default. At the limit
+    the run cleans up and reports as a stop does; reaching the limit is a normal end."""
+    assert api.AnalysisConfig.model_fields["time_limit"].default is None
+    analyses = Analyses(monkeypatch)
+
+    async def slow(run, ordinary_pool, **options):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(api, "inspect_grader", slow)
+    assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run"), "--time-limit", "0.01"]) == 0
+    output, error = capsys.readouterr()
+    assert output == (tmp_path / "run" / "report.md").read_text()
+    assert ("- The run reached its time limit, so it may miss more: hack complete, attack complete, simulation complete, "
+            "grader not run.\n") in output
+    assert logged(error)[-1] == "nudi: the run stopped at its time limit of 0.01 minutes during grader"
+    assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks", "attack", "simulate"]
+    report = json.loads((tmp_path / "run" / "report.json").read_text())
+    assert report["status"] == "time_limit"
+    assert "run: the run stopped at its time limit of 0.01 minutes during grader" in report["warnings"]
+
+
+def sleeping(run, *args, **options):
+    return asyncio.sleep(30)
+
+
+@pytest.mark.parametrize("shape", ["raised", "returned"])
+def test_a_failed_phase_before_the_time_limit_still_exits_1(tmp_path, monkeypatch, shape):
+    """Reaching the limit is a normal end only when no phase failed before it, by an error or an
+    incomplete result."""
+    analyses = Analyses(monkeypatch, fail={"hack": RuntimeError("hack broke")} if shape == "raised" else {})
+    if shape == "returned":
+        async def incomplete(run, *, focused_attempts):
+            result = analyses.inspection(run, "hack").model_copy(update={"status": "partial"})
+            (run.config.output_dir / "inspection-hack.json").write_text(result.model_dump_json())
+            return result
+        monkeypatch.setattr(api, "inspect_hacks", incomplete)
+    monkeypatch.setattr(api, "attack", sleeping)
+    assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run"), "--time-limit", "0.01"]) == 1
+    report = json.loads((tmp_path / "run" / "report.json").read_text())
+    assert report["status"] == "partial"
+    assert "run: the run stopped at its time limit of 0.01 minutes during attack" in report["warnings"]
+
+
+def test_a_phase_that_swallows_the_limit_still_marks_it_reached(tmp_path, monkeypatch):
+    """Harbor can catch the cancellation and return; the run then ends past its limit, and says so."""
+    analyses = Analyses(monkeypatch)
+
+    async def swallowing(run, ordinary_pool, **options):
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            pass
+        return analyses.inspection(run, "grader")
+
+    monkeypatch.setattr(api, "inspect_grader", swallowing)
+    assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run"), "--time-limit", "0.01"]) == 0
+    assert json.loads((tmp_path / "run" / "report.json").read_text())["status"] == "time_limit"
 
 
 def test_ctrl_c_before_any_report_says_none_was_written(tmp_path, monkeypatch, capsys):
@@ -539,7 +658,7 @@ def test_ctrl_c_before_any_report_says_none_was_written(tmp_path, monkeypatch, c
 
     monkeypatch.setattr(api, "send_nudis", interrupted)
     assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run")]) == 130
-    assert capsys.readouterr().err == "nudi: cancelled; no report was written\n"
+    assert tuple(capsys.readouterr()) == ("", "nudi: cancelled; no report was written\n")
 
 
 def test_no_space_on_the_records_host_stops_the_run_with_one_message(tmp_path, monkeypatch, capsys):
@@ -547,10 +666,35 @@ def test_no_space_on_the_records_host_stops_the_run_with_one_message(tmp_path, m
     full = DiskFull(f"no space left on the records host to write {tmp_path / 'run' / 'inspection-hack.json'}")
     analyses = Analyses(monkeypatch, fail={"hack": full})
     assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run")]) == 1
-    error = capsys.readouterr().err.splitlines()
+    error = logged(capsys.readouterr().err)
     assert error == ["nudi: hack inspector started", f"nudi: stopped: {full}; report written to {tmp_path / 'run' / 'report.md'}"]
     assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks"]
     assert f"run: hack stopped: {full}" in json.loads((tmp_path / "run" / "report.json").read_text())["warnings"]
+
+
+def test_a_task_environment_that_cannot_start_stops_the_run_with_its_reason(tmp_path, monkeypatch, capsys):
+    """A verifier image that never builds must not keep the run going for hours. Once the hack inspector stops
+    environment_unavailable, no later analysis runs; stderr, the report's analyses and its warnings say why."""
+    from nudi.records import EnvironmentUnavailable
+
+    analyses = Analyses(monkeypatch)
+    reason = ("the task's verifier environment failed to start 3 times in a row, last with ModalFailure: Modal start failed: "
+              "ImageBuildError; no later sandbox or episode can use it, so the run stops")
+
+    async def inspect_hacks(run, *, focused_attempts):
+        analyses.calls.append(("inspect_hacks", focused_attempts))
+        result = InspectionResult(mode="hack", status="environment_unavailable", categories={}, applicability={})
+        (run.config.output_dir / "inspection-hack.json").write_text(result.model_dump_json())
+        raise EnvironmentUnavailable(reason)
+
+    monkeypatch.setattr(api, "inspect_hacks", inspect_hacks)
+    assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run")]) == 1
+    error = logged(capsys.readouterr().err)
+    assert error == ["nudi: hack inspector started", f"nudi: hack inspector stopped after 0:00:00: {reason}"]
+    assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks"]
+    built = json.loads((tmp_path / "run" / "report.json").read_text())
+    assert built["analyses"] == {"hack": "environment_unavailable", "attack": "not run", "simulation": "not run", "grader": "not run"}
+    assert f"run: hack stopped: {reason}" in built["warnings"]
 
 
 def test_a_full_disk_at_the_final_save_still_writes_the_smaller_report(tmp_path, monkeypatch, capsys):

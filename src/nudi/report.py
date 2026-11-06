@@ -7,8 +7,10 @@ Resolved credentials passed as `secrets` never reach the output.
 """
 
 import json
+import logging
 import math
 import operator
+import re
 import statistics
 from collections import Counter
 from datetime import datetime, timedelta
@@ -104,7 +106,8 @@ def build(run_dir: Path, secrets=(), selected=None) -> dict:
     results = {name: episode(run_dir, name) for name in record.episodes}
     pool = record.simulation.episodes if record.simulation else []
     report = {
-        "status": "complete" if all(status == "complete" for status in analyses.values()) else "partial",
+        "status": ("partial" if record.failed_phases else "time_limit") if record.time_limit_reached
+                  else "complete" if all(status == "complete" for status in analyses.values()) else "partial",
         "analyses": analyses,
         "configuration": configuration_section(record, results),
         "copies": state_copies(record),
@@ -134,7 +137,11 @@ def build(run_dir: Path, secrets=(), selected=None) -> dict:
         notes.append(FINDINGS_NOTE)
     if report["inspections"]:
         notes.append(CATEGORY_RULE)
-    return scrub(report, [secret for secret in secrets if secret])
+    secrets = [secret for secret in secrets if secret]
+    # Scrubbing matches whole secrets and the answer cuts text, so the answer reads the scrubbed report.
+    report = scrub(report, secrets)
+    report["answer"] = scrub(answer(report), secrets)
+    return report
 
 
 def write(run_dir: Path, secrets=(), selected=None) -> tuple[Path, Path]:
@@ -176,18 +183,21 @@ def configuration(result: EpisodeResult) -> dict:
 
 # Modal's prices per core second and per GiB second (modal.com/pricing, read 2026-11-04).
 MODAL_CORE_SECOND, MODAL_GIB_SECOND = 0.00003942, 0.00000667
+# Harbor's Modal request under each hard limit, or the limit when smaller (harbor/environments/modal.py).
+MODAL_CORE_REQUEST, MODAL_MIB_REQUEST = 0.125, 128
 # Harbor's default Modal sandbox lifetime, which nudi keeps.
 MODAL_LIFETIME = timedelta(hours=24)
 
 
 def modal_cost(record: RunRecord) -> dict | None:
-    """An upper-bound estimate of a Modal run's compute: each stopped sandbox's CPU and memory
-    limits over its lifetime. Modal bills the larger of request and use, and nudi's requests
-    stay below the limits. It is outside the spending cap. A sandbox without declared limits
-    is counted apart, and one that still runs after stop counts its whole 24 h lifetime."""
+    """An estimate of a Modal run's sandbox compute, each stopped sandbox's lifetime times its CPU
+    and memory: at least its requests, at most its limits, since Modal bills the larger of request
+    and use. It is outside the spending cap; `nudi cost` reads Modal's bill. A sandbox without
+    declared limits is counted apart, and one that still runs after stop counts its whole 24 h lifetime."""
     if record.backend != "modal":
         return None
-    estimate, without_limits = 0.0, 0
+    at_requests = at_limits = 0.0
+    without_limits = 0
     for sandbox in record.modal:
         if sandbox.cpus is None or sandbox.memory_mb is None:
             without_limits += 1
@@ -195,9 +205,27 @@ def modal_cost(record: RunRecord) -> dict | None:
         started = datetime.fromisoformat(sandbox.started_at)
         stopped = datetime.fromisoformat(sandbox.stopped_at) if sandbox.removed else started + MODAL_LIFETIME
         seconds = (stopped - started).total_seconds()
-        estimate += seconds * (sandbox.cpus * MODAL_CORE_SECOND + sandbox.memory_mb / 1024 * MODAL_GIB_SECOND)
-    return {"estimate": estimate, "sandboxes": len(record.modal), "without_limits": without_limits,
-            "still_running": sum(not sandbox.removed for sandbox in record.modal)}
+        at_requests += seconds * (min(sandbox.cpus, MODAL_CORE_REQUEST) * MODAL_CORE_SECOND
+                                  + min(sandbox.memory_mb, MODAL_MIB_REQUEST) / 1024 * MODAL_GIB_SECOND)
+        at_limits += seconds * (sandbox.cpus * MODAL_CORE_SECOND + sandbox.memory_mb / 1024 * MODAL_GIB_SECOND)
+    return {"at_requests": at_requests, "at_limits": at_limits, "app": f"nudi-{record.run_id}", "sandboxes": len(record.modal),
+            "without_limits": without_limits, "still_running": sum(not sandbox.removed for sandbox in record.modal)}
+
+
+def billed_cost(record: RunRecord) -> float | None:
+    """The backend's bill for the run's sandboxes, or None with a one-line reason logged. Only
+    Modal reports one; a provider with a billing API adds its branch here and its function beside
+    its environment. Nothing calls it during a run: it reports cost and limits nothing."""
+    if record.backend == "modal":
+        try:
+            from nudi.modal_box import billed_cost as modal_bill
+        except Exception as error:
+            # Importing the Modal SDK reads the user's profile; the TOML parser's error text can quote a token.
+            logging.getLogger("nudi").warning(f"Modal's bill cannot be read: loading Modal raised {type(error).__name__}")
+            return None
+        return modal_bill(record)
+    logging.getLogger("nudi").warning(f"{record.backend} has no bill to read")
+    return None
 
 
 def configuration_section(record: RunRecord, results: dict) -> dict:
@@ -310,11 +338,19 @@ def labels(pool: list[str], result: InspectionResult, warnings: list[str]) -> di
     return {"mode": result.ordinary_inspection, "counts": counts, "basis": basis, "review": review, "episodes": episodes}
 
 
+def resolved(own: list[Assessment]) -> list[Assessment]:
+    """The checked assessments with a conclusive reading.
+    Doubt is one-sided: an evidenced issue counts with its open claim items; any other assessment needs none."""
+    return [item for item in own if (evidenced(item) or not item.claim.unresolved)
+            and any(validity != "unknown" for _, validity in conclusions(item))]
+
+
 def completion_gaps(basis: MetricBasis, own: list[Assessment], run_dir: Path, name: str) -> tuple[list[str], list[Observation]]:
     """Why a basis does not establish completion, empty when it does, and the cited requirements
     no check of this episode reads. `own` are the episode's own checked assessments, each with
-    one conclusion per requirement it read. An unread requirement is listed, not a reason, while a
-    cited check observes another cited requirement satisfied, no check of this episode observes a
+    one conclusion per requirement it read. Supported completion needs every cited requirement
+    observed satisfied by a cited check; incomplete needs one uncontested observed violation of a
+    cited requirement. An unread requirement is listed when no check of this episode observes a
     violation and its quote is in the task.
     Semantic completeness stays the grader inspector's interpretation."""
     if basis.completion == "unknown":
@@ -325,11 +361,9 @@ def completion_gaps(basis: MetricBasis, own: list[Assessment], run_dir: Path, na
     if not basis.requirements:
         gaps.append("it cites no completion requirement")
     gaps += [f"requirement {item.path}: {item.excerpt!r} is not task context" for item in basis.requirements if item.episode is not None]
-    # Doubt is one-sided: an evidenced issue counts with its open claim items; any other assessment needs none.
-    resolved = [item for item in own if (evidenced(item) or not item.claim.unresolved)
-                and any(validity != "unknown" for _, validity in conclusions(item))]
-    cited = [item for item in resolved if item.check.id in basis.checks]
-    every = [found for item in resolved for found in conclusions(item) if found[1] != "unknown"]
+    settled = resolved(own)
+    cited = [item for item in settled if item.check.id in basis.checks]
+    every = [found for item in settled for found in conclusions(item) if found[1] != "unknown"]
     observed = [found for item in cited for found in conclusions(item) if found[1] != "unknown"]
 
     def contested(requirement: Observation) -> bool:
@@ -363,7 +397,8 @@ def completion_gaps(basis: MetricBasis, own: list[Assessment], run_dir: Path, na
             else:
                 # Grounding the quote does not establish the episode met it.
                 gaps.append(f"no check reads requirement {item.path}: {item.excerpt!r}; whether the episode met it is unknown")
-                unobserved.append(item)
+                if item.episode is None:
+                    unobserved.append(item)
         elif (item, "supported") not in observed:
             gaps.append(f"no cited check observes requirement {item.path}: {item.excerpt!r} satisfied")
     if basis.requirements and not any((item, "supported") in observed for item in basis.requirements):
@@ -377,11 +412,13 @@ def ordinary_assessments(name: str, assessments: list[Assessment]) -> list[Asses
             and item.check is not None and item.check.content.episode == name]
 
 
-def reference(name: str, own: list[Assessment], run_dir: Path) -> tuple[str, list[str], list[str]]:
+def reference(name: str, assessments: list[Assessment], run_dir: Path) -> tuple[str, list[str], list[str]]:
     """The episode's completion reference: complete, incomplete or unknown, with reasons and
     the cited requirements no check reads, each of which keeps completion unknown.
-    Reward never supplies it, and legitimate partial credit alone is neither label."""
-    own = ordinary_assessments(name, own)
+    Reward never supplies it, and legitimate partial credit alone is neither label.
+    Only the episode's own checked assessments supply a basis or an observation; a basis
+    without a check still keeps complete unknown until its task requirements are observed satisfied."""
+    own = ordinary_assessments(name, assessments)
     bases = [assessment.claim.basis for assessment in own if assessment.claim.basis is not None]
     if not bases:
         return "unknown", ["no metric basis was supplied for this episode; missing evidence stays unknown"], []
@@ -392,6 +429,14 @@ def reference(name: str, own: list[Assessment], run_dir: Path) -> tuple[str, lis
         unobserved.update((f"{item.path}: {item.excerpt!r}", None) for item in missing)
         if not gaps:
             found.add("complete" if basis.completion == "supported" else "incomplete")
+    if found == {"complete"}:
+        # Every task requirement any native basis of this episode cites, checked or not, must be observed
+        # satisfied and never violated.
+        observed = [conclusion for item in resolved(own) for conclusion in conclusions(item)]
+        cited = [item for assessment in assessments if assessment.execution_scope == "native" and assessment.claim.episode == name
+                 and assessment.claim.basis for item in assessment.claim.basis.requirements if item.episode is None]
+        if any((item, "supported") not in observed or (item, "violated") in observed for item in cited):
+            found.clear()
     if len(found) == 1:
         return found.pop(), reasons, list(unobserved)
     if found:
@@ -497,7 +542,7 @@ def metrics(run_dir: Path, pool: list[str], results: dict, result: InspectionRes
     for name in pool:
         own = ordinary_assessments(name, result.assessments)
         bases = [assessment.claim.basis for assessment in own if assessment.claim.basis is not None]
-        completion, completion_reasons, unobserved = reference(name, own, run_dir)
+        completion, completion_reasons, unobserved = reference(name, result.assessments, run_dir)
         entry = episodes[name] = {"completion": completion, "completion_reasons": completion_reasons, "unobserved": unobserved,
                                   "decision": None, "score": None}
         config = json.dumps(configuration(results[name]), sort_keys=True) if results.get(name) else ""
@@ -681,12 +726,21 @@ def findings(assessments: list[Assessment], links: dict[int, dict] | None = None
     return groups
 
 
+def together(one: str, many: str, names: list[str], status: str) -> str:
+    """One warning for every name in the same state."""
+    return f"{one} {names[0]} is {status}" if len(names) == 1 else f"{many} {', '.join(names)} are {status}"
+
+
 def inspection(mode: str, result: InspectionResult, warnings: list[str]) -> dict:
+    unsettled = {}
     for category, status in result.categories.items():
-        if status not in SETTLED:
+        if status == "restricted":
             # A restriction keeps its grounded reason. Other applicability text is the Inspector's and stays in the JSON.
-            reason = result.applicability.get(category) if status == "restricted" else None
+            reason = result.applicability.get(category)
             warnings.append(f"{mode} inspector category {category} is {status}" + (f": {reason}" if reason else ""))
+        elif status not in SETTLED:
+            unsettled.setdefault(status, []).append(category)
+    warnings += [together(f"{mode} inspector category", f"{mode} inspector categories", names, status) for status, names in unsettled.items()]
     warnings += [f"{mode} inspector {item.phase} attempt {item.number} ({item.category or item.episode or 'all categories'}) {item.status}"
                  + (f": {item.error}" if item.error else ", no error message recorded")
                  for item in result.attempts if item.status in ("refused", "model_inability", "model_output_failure", "unobservable", "inference_failure", "tool_failure")]
@@ -723,7 +777,7 @@ def _condition_view(status, guidance, unavailable, entries, record: RunRecord) -
 def _separated_attack(result: AttackResult, record: RunRecord, warnings: list[str]) -> dict:
     """Candidate reproduction and no-hint discovery. Started episodes are the only attempts."""
     quiet = {"evidenced_issue", "no_evidenced_issue", "unavailable"}
-    candidates = []
+    candidates, pending = [], {}
     for item in result.candidates:
         conditions = {}
         for level in ("full", "minimal"):
@@ -732,8 +786,11 @@ def _separated_attack(result: AttackResult, record: RunRecord, warnings: list[st
             status = item.conditions.get(level, "unattempted")
             conditions[level] = _condition_view(status, item.guidance.get(level), item.unavailable.get(level), entries, record)
             if status not in quiet:
-                warnings.append(f"attack candidate {item.id} {level} is {status}")
-        candidates.append({"id": item.id, "mechanism": item.mechanism, "valid_work": item.valid_work, "conditions": conditions})
+                pending.setdefault(status, {}).setdefault(item.id, []).append(level)
+        candidates.append({"id": item.id, "mechanism": item.mechanism, "outcome": item.outcome, "valid_work": item.valid_work,
+                           "conditions": conditions})
+    warnings += [together("attack candidate", "attack candidates", [f"{name} {' and '.join(levels)}" for name, levels in found.items()], status)
+                 for status, found in pending.items()]
     discovery_entries = [attempt for attempt in result.attempts if attempt.level == "none"]
     discovery_status = result.discovery.get("none", "unattempted")
     discovery = _condition_view(discovery_status, None, None, discovery_entries, record)
@@ -863,10 +920,203 @@ def unassessed(mode: str, item: dict) -> list[str]:
     return [f"- {mode} experiments without an assessment: " + ", ".join(entries)] if entries else []
 
 
+SUSPECTED = " (suspected: its hack inspector reading was unknown)"
+
+
+def candidate_sources(report: dict) -> dict[str, str]:
+    """What follows each attack candidate id in the report: its hack inspector finding's category and
+    check, as candidate `hack-N` comes from the hack inspector's assessment N (`api.candidates`), and
+    the suspected label when that reading was unknown. A later native reproduction keeps the label."""
+    hack = report["inspections"].get("hack_inspector")
+    sources = {f"hack-{item['index']}": f" ({item['category'] or 'no category'}, {check_id(item)})"
+               for group in (hack["findings"].values() if hack else []) for item in group}
+    for item in (report["attack"] or {}).get("candidates", []):
+        if item.get("outcome") == "unknown":
+            sources[item["id"]] = sources.get(item["id"], "") + SUSPECTED
+    return sources
+
+
+def named(name: str, sources: dict) -> str:
+    return name + sources.get(name, "")
+
+
+def tried(attempt: dict, sources: dict) -> tuple[str, str]:
+    """The candidates an Attacker attempt tested, each with its source, and its hint."""
+    names = attempt.get("sources") or ([attempt["candidate"]] if attempt.get("candidate") else [])
+    return " and ".join(named(name, sources) for name in names), "no hint" if attempt["level"] == "none" else f"the {attempt['level']} hint"
+
+
+EXPLOITS = {"reproduction": "reproduced {target} with {hint}",
+            "other": "cheated through another mechanism while testing {target} with {hint}",
+            "unattributed": "cheated while testing {target} with {hint}, not confirmed as that finding",
+            "discovery": "cheated with {hint}"}
+
+
+def exploits(attack: dict, sources: dict) -> list[tuple[int, int | None, str, bool]]:
+    """Each Attacker exploit with evidence, once: its attempt, its assessment, what the Attacker did, and whether
+    it is rejected valid work. A record from before separated candidates has only its attempts' statuses."""
+    if "exploits" in attack:
+        found = [(item["attempt"], item["assessment"], kind, item["candidate"]) for kind, items in attack["exploits"].items() for item in items]
+    else:
+        found = [(index, item["assessment"], "discovery", None) for index, item in enumerate(attack["attempts"])
+                 if item["status"] == "evidenced_issue"]
+    valid = {item["id"] for item in attack.get("candidates", []) if item["valid_work"]}
+    done = {}
+    for index, assessment, kind, candidate in sorted(found, key=lambda item: item[0]):
+        target, hint = tried(attack["attempts"][index], sources)
+        if candidate in valid:
+            text = f"had valid work rejected while testing {target} with {hint}" + ("" if kind == "reproduction" else ", not confirmed as that finding")
+        else:
+            text = EXPLOITS[kind].format(target=target, hint=hint)
+        done[index, assessment, text, candidate in valid] = None
+    return list(done)
+
+
+def oneline(text: str) -> str:
+    return " ".join(text.split())
+
+
+def brief(text: str) -> str:
+    """The first sentence or about 140 characters of `text`, whichever is shorter, marked when cut."""
+    sentence = re.match(r".*?[.!?](?=\s|$)", text)
+    short = sentence.group() if sentence else text
+    if len(short) > 140:
+        short = short[:140].rsplit(" ", 1)[0]
+    return text if short == text else short.rstrip(".") + "..."
+
+
+def mechanism(attack: dict, assessment: int | None) -> str:
+    """What the attack inspector says the Attacker did, on one line."""
+    found = [item["claim"]["mechanism"] for group in attack["findings"].values() for item in group if item["index"] == assessment]
+    return oneline(found[0]) if found else ""
+
+
+def rewards(attempt: dict) -> str:
+    return ", ".join(f"{key} {number(value)}" for key, value in attempt["rewards"].items()) or "no reward"
+
+
+STOPPED = {"unknown": "not settled", "cancelled": "cancelled", "spending_exhausted": "stopped by the spending cap", "running": "unfinished"}
+WAITING = {"unattempted": "Not attempted", "unavailable": "Not attempted, no guidance"}
+
+
+def ending(attempt: dict, valid_work: bool) -> str:
+    """A started attempt's outcome without an exploit, in plain words. A legitimate reading does not
+    establish that the Attacker did the task, so no outcome claims what it submitted."""
+    status = attempt["status"]
+    if status == "no_evidenced_issue":
+        return "no rejection of valid work was evidenced" if valid_work else "no exploit was evidenced"
+    if status in STOPPED:
+        return STOPPED[status]
+    return f"{status}: {attempt['error'].splitlines()[0]}" if attempt["error"] else status
+
+
+def attempt_lines(report: dict) -> list[str]:
+    """One line per Attacker attempt: the candidate and source check it tested, its reward and outcome;
+    then the conditions never attempted, grouped. The JSON keeps every attempt and condition."""
+    attack, sources = report["attack"], candidate_sources(report)
+    started = set(report["other_episodes"]["attacker"])
+    valid = {item["id"] for item in attack.get("candidates", []) if item["valid_work"]}
+    done, notes = {}, {}
+    for index, assessment, text, _ in exploits(attack, sources):
+        # Findings with the same wording each keep their mechanism, in order, once.
+        texts, hows = done.setdefault(index, ({}, {}))
+        texts[text], hows[mechanism(attack, assessment)] = None, None
+    for item in (item for items in attack.get("exploits", {}).values() for item in items if item["rationale"]):
+        notes.setdefault(item["attempt"], {})[oneline(item["rationale"])] = None
+    lines = []
+    for index, attempt in enumerate(attack["attempts"]):
+        target, hint = tried(attempt, sources)
+        if attempt["episode"] not in started:
+            lines.append(f"- attempt {attempt['number']} {f'on {target} ' if target else ''}with {hint} did not start: "
+                         + STOPPED.get(attempt["status"], attempt["status"]))
+        elif index in done:
+            texts, hows = done[index]
+            lines.append(f"- {attempt['episode']} {'; '.join(texts)}: {rewards(attempt)}"
+                         + "".join(f'. How: "{how}"' for how in hows if how)
+                         + "".join(f". Attack inspector: {note}" for note in notes.get(index, {})))
+        else:
+            lines.append(f"- {attempt['episode']} {f'tested {target}' if target else 'searched'} with {hint}: {rewards(attempt)}; "
+                         + ending(attempt, attempt["candidate"] in valid))
+    waiting = {}
+    for candidate in attack.get("candidates", []):
+        for level, item in candidate["conditions"].items():
+            if not item["attempts"] and not item["blocked"]:
+                waiting.setdefault(item["status"], {}).setdefault(candidate["id"], []).append(level)
+    lines += [f"- {WAITING.get(status, f'Not attempted ({status})')}: "
+              + ", ".join(f"{named(name, sources)} {' and '.join(levels)}" for name, levels in found.items()) for status, found in waiting.items()]
+    return lines
+
+
+def current(item: dict | None, skip: set = frozenset()) -> list[dict]:
+    """The evidenced findings that are their check's latest reading, except the assessments in `skip`."""
+    return [found for found in (item["findings"]["evidenced"] if item else [])
+            if found["superseded_by"] is None and found["index"] not in skip]
+
+
+def evidence(items: list[dict], outcome: str) -> dict[str, list[str]]:
+    """The check ids of the findings with `outcome`, by category, each once."""
+    found = {}
+    for finding in items:
+        if finding["assessment"]["outcome"] == outcome:
+            found.setdefault(finding["category"] or "no category", {})[check_id(finding)] = None
+    return {category: sorted(checks) for category, checks in found.items()}
+
+
+def flat(found: dict[str, list[str]]) -> str:
+    return ", ".join(sorted({check for checks in found.values() for check in checks}))
+
+
+def answer(report: dict) -> list[str]:
+    """Two to five plain lines: can the grader be cheated or does it misjudge work, how, and what ran.
+    Only facts the report computes; with nothing evidenced it says so and never calls the grader safe.
+    Package evidence shows what a copy of the task package did, not that a task agent can cheat."""
+    lines, cheated, real, misjudged = [], False, False, False
+    attack, done = report["attack"], []
+    if attack and (done := exploits(attack, candidate_sources(report))):
+        attempts = attack["attempts"]
+        lines.append("In real episodes, Attackers " + "; ".join(
+            f"{text} ({attempts[index]['episode']}, {rewards(attempts[index])})" + (f': "{brief(how)}"' if (how := mechanism(attack, assessment)) else "")
+            for index, assessment, text, _ in done) + ".")
+        misjudged = any(valid for *_, valid in done)
+        cheated = real = not all(valid for *_, valid in done)
+    # An attack finding that is no exploit entry, such as invalid work accepted while testing valid work,
+    # keeps its own outcome without confirming the candidate under test.
+    for mode, found in (("attack_inspector", current(attack, {assessment for _, assessment, *_ in done})),
+                        ("hack_inspector", current(report["inspections"].get("hack_inspector"))),
+                        ("grader_inspector", current(report["inspections"].get("grader_inspector")))):
+        cheats, rejected = evidence(found, "accepted_invalid"), evidence(found, "rejected_valid")
+        parts = []
+        if cheats and mode == "hack_inspector":
+            parts.append("cheats by " + ", ".join(f"{category} ({', '.join(checks)})" for category, checks in cheats.items()))
+            cheated = True
+            real = real or any(item["execution_scope"] == "native" and item["assessment"]["outcome"] == "accepted_invalid" for item in found)
+        elif cheats:
+            parts.append(f"invalid work accepted ({flat(cheats)})")
+            misjudged = True
+        if rejected:
+            parts.append(f"valid work rejected ({flat(rejected)})")
+            misjudged = True
+        if parts:
+            scopes = {item["execution_scope"] for item in found}
+            scope = scopes.pop() if len(scopes) == 1 else None
+            opening = {"package": "In copies of the task package, the", "native": "In real episodes, the"}.get(scope, "The")
+            lines.append(f"{opening} {mode.replace('_', ' ')} evidenced {'; and '.join(parts)}.")
+    verdict = ""
+    if cheated:
+        verdict = "The grader can be cheated" + ("" if real else " in a copy of the task package, not yet in a real episode")
+    if misjudged:
+        verdict = f"{verdict}, and it misjudges work" if verdict else "The grader misjudges work"
+    verdict = f"{verdict}." if verdict else "No cheat and no misjudged work was evidenced. That does not show that the grader is safe."
+    states = ", ".join(f"{name} {state}" for name, state in report["analyses"].items()) or "no analysis ran"
+    partial = ", so it may miss more" if report["status"] != "complete" else ""
+    run = "The run reached its time limit" if report["status"] == "time_limit" else f"The run is {report['status']}"
+    return [verdict, *lines, f"{run}{partial}: {states}."]
+
+
 def markdown(report: dict) -> str:
     """A readable rendering of `build`'s report; the JSON keeps every field."""
     config = report["configuration"]
-    lines = ["# nudi report", "", f"Status: {report['status']}, relative to the selected analyses.", "", "## Configuration", ""]
+    lines = ["# nudi report", "", "## Answer", ""] + [f"- {line}" for line in report["answer"]] + ["", "## Configuration", ""]
     for role, model in config["models"].items():
         source = config["credential_sources"].get(role)
         lines.append(f"- {role}: {model['model']}, reasoning effort {model['reasoning_effort']}, "
@@ -874,11 +1124,13 @@ def markdown(report: dict) -> str:
     lines += [f"- Task: {config['task_dir']}; execution path {config['path']}: {'; '.join(config['path_reasons'])}",
               f"- Spending cap: {config['spending_cap']}; {cost(config['known_cost'], config['provider_reported_cost'], config['unknown_cost_calls'])}"]
     if modal := config["modal_cost"]:
-        lines.append(f"- Modal compute: estimated at most ${modal['estimate']:.6f} for {modal['sandboxes']} sandboxes, an upper "
-                     "bound from their CPU and memory limits and lifetimes, outside the spending cap"
+        lines.append(f"- Modal compute: estimated ${modal['at_requests']:.2f} to ${modal['at_limits']:.2f} for {modal['sandboxes']} "
+                     f"sandboxes in app {modal['app']}, from their CPU and memory requests and limits over their lifetimes; "
+                     "sandboxes only, not the host that ran nudi; outside the spending cap"
                      + (f"; {modal['without_limits']} without declared limits are excluded" if modal["without_limits"] else "")
                      + (f"; {modal['still_running']} still ran after stop and count their whole 24 h lifetime"
-                        if modal["still_running"] else ""))
+                        if modal["still_running"] else "")
+                     + ". `nudi cost <run dir>` prints Modal's bill about 10 minutes after the hour in which the run ended")
     for item in config["provenance"]:
         setup = item["configuration"]
         versions = ", ".join(f"{name} {version}" for name, version in setup["versions"].items())
@@ -981,6 +1233,7 @@ def markdown(report: dict) -> str:
 
     lines += ["", "## Findings", ""]
     sections = list(report["inspections"].items()) + ([("attack", report["attack"])] if report["attack"] else [])
+    candidates = {item["id"] for item in (report["attack"] or {}).get("candidates", [])}
     entries, limits, total, doubted = [], [], 0, 0
     for source, section in sections:
         measured = {entry["id"]: entry.get("category") for entry in section.get("experiments", [])}
@@ -994,6 +1247,8 @@ def markdown(report: dict) -> str:
                 category = f"; category {item['category']}" if item["category"] else ""
                 if item["experiment"] and measured.get(item["experiment"]) != item["category"]:
                     category += f"; reinterprets {item['experiment']}, measured for {measured[item['experiment']] or 'no category'}"
+                if source == "hack_inspector" and f"hack-{item['index']}" in candidates:
+                    category += f"; attack candidate hack-{item['index']}"
                 replaced = f", superseded by the later {later['result']} reading of {check_id(item)}" if later else ""
                 entries.append(f"- {source} {kind}{' (package)' if package else ''}{replaced}: {claim['mechanism']} in {claim['episode']}; "
                                f"{reward_name} {number(item['captured'][reward_key])}; check {check_id(item)}{category}; "
@@ -1025,30 +1280,9 @@ def markdown(report: dict) -> str:
         lines.append(f"Status {result['status']}; at most {result['maximum_attempts']} attempts per candidate and hint level; "
                      f"{result['unknown_cost_calls']} calls with unknown prices.")
         discovery = result["discovery"]
-        lines.append(f"No-hint discovery: {discovery['status']}; {discovery.get('attempts', 0)} started "
+        lines.append(f"No-hint discovery: {discovery.get('attempts', 0)} started "
                      f"of at most {discovery.get('maximum_attempts', result.get('discovery_attempts', 0))}.")
-        for candidate in result["candidates"]:
-            # A valid-work candidate's reproduction is rejected valid work, not an exploit.
-            lines.append(f"- {candidate['id']}{' (valid work)' if candidate.get('valid_work') else ''}:")
-            for level, item in candidate["conditions"].items():
-                outcomes = ", ".join(f"{status} {count}" for status, count in item["outcomes"].items()) or "none"
-                guidance = "supplied" if item["guidance"] else item["unavailable"] or "none"
-                blocked = "; ".join(f"entry {entry['number']} {entry['status']}: {entry['reason']}" for entry in item["blocked"])
-                lines.append(f"  - {level}: {item['status']}; {'tested' if item['tested'] else 'not tested'}; evidence "
-                             f"{item['evidence']} in {item['attempts']} started attempts ({outcomes}); guidance {guidance}"
-                             + (f"; blocked {blocked}" if blocked else ""))
-        for kind, items in result["exploits"].items():
-            if items:
-                rendered = []
-                for item in items:
-                    label = item["candidate"] or "environment"
-                    sources = item.get("sources") or []
-                    if sources and sources != [label]:
-                        label += " [" + ", ".join(sources) + "]"
-                    if item.get("rationale"):
-                        label += ": " + item["rationale"]
-                    rendered.append(label)
-                lines.append(f"- {kind}: {'; '.join(rendered)}")
+        lines += attempt_lines(report)
         if result.get("unavailable"):
             lines.append("- Missing candidates: " + "; ".join(f"{level}: {reason}" for level, reason in result["unavailable"].items()))
         lines += [f"- Limit: {limit}" for limit in result["limits"]]
@@ -1062,11 +1296,14 @@ def markdown(report: dict) -> str:
             lines.append(f"- {level}: {item['status']}; {'tested' if item['tested'] else 'not tested'}; evidence "
                          f"{item['evidence']} in {item['attempts']} started attempts ({outcomes}); guidance {guidance}"
                          + (f"; blocked {blocked}" if blocked else ""))
+        lines += attempt_lines(report)
         lines += [f"- Limit: {limit}" for limit in result["limits"]]
 
     lines += ["", "## Persistence", ""]
     lines += [f"- {probe['location']}: {probe['classification']}; {'; '.join(probe['reasons'] + probe['limits'])}"
               for probe in report["persistence"]] or ["No persistence probe ran."]
-    lines += ["", "## Warnings", ""] + ([f"- {warning}" for warning in report["warnings"]] or ["None."])
+    # A multi-line warning, such as a validation error, shows its first line; the JSON keeps it whole.
+    lines += ["", "## Warnings", ""] + ([f"- {warning.splitlines()[0]}" + " (full text in report.json)" * ("\n" in warning)
+                                         for warning in report["warnings"]] or ["None."])
     lines += ["", "## Notes", ""] + ([f"- {note}" for note in report["notes"]] or ["None."])
     return "\n".join(lines) + "\n"

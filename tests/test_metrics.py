@@ -275,6 +275,115 @@ def test_a_cited_requirement_no_check_observes_keeps_completion_unknown_and_is_l
             f"unobserved requirements: {summary}") in report.markdown(result)
 
 
+@pytest.mark.parametrize("wide_first", [False, True])
+@pytest.mark.parametrize("reward", [1.0, 0.0])
+def test_a_narrower_complete_basis_does_not_erase_a_requirement_another_basis_cites_and_no_check_reads(tmp_path, wide_first, reward):
+    """One basis cites sorted, another sorted and summary, and no check reads summary.
+    The narrower basis alone would establish completion; the unread summary keeps it unknown, in either order."""
+    run = RunDir(tmp_path)
+    both = ["sorted", "summary"]
+    narrow = lambda name: checked(name, "c0", "sorted", "supported", basis=basis("supported", ["sorted"], ["c0"], decision=RULE))
+    wide = lambda name: checked(name, "c1", "sorted", "supported", basis=basis("supported", both, ["c1"], decision=RULE))
+    unread = run.episode(rewards={"reward": reward})
+    run.label(unread, "unknown", *([wide(unread), narrow(unread)] if wide_first else [narrow(unread), wide(unread)]))
+    # Control: once a cited check observes summary satisfied, both bases establish completion.
+    read = run.episode(rewards={"reward": reward})
+    run.label(read, "unknown", narrow(read),
+              checked(read, "c1", "summary", "supported", basis=basis("supported", both, ["c0", "c1"], decision=RULE)))
+
+    result = run.report()
+    episodes = result["metrics"]["episodes"]
+    summary = f"instruction.md: {REQUIREMENTS['summary']!r}"
+    assert (episodes[unread]["completion"], episodes[unread]["unobserved"]) == ("unknown", [summary])
+    assert (episodes[read]["completion"], episodes[read]["unobserved"]) == ("complete", [])
+    assert all(unread not in group["episodes"] for group in result["metrics"]["confusion"])
+
+
+def summary_violated_as_quoted_longer(name: str) -> Assessment:
+    longer = checked(name, "c2", "summary", "violated")
+    longer.check.requirement = Observation(episode=None, path="instruction.md", excerpt="Write a one-line summary to /app/summary.txt.")
+    return longer
+
+
+WIDER = {
+    "unknown basis": lambda name: [checked(name, "c1", "sorted", "supported", basis=basis("unknown", ["sorted", "summary"], ["c1"], decision=RULE))],
+    "violation elsewhere": lambda name: [checked(name, "c1", "sorted", "supported", basis=basis("supported", ["sorted", "summary"], ["c1"], decision=RULE)),
+                                         summary_violated_as_quoted_longer(name)],
+    "inconclusive read": lambda name: [checked(name, "c1", "sorted", "supported", basis=basis("supported", ["sorted", "summary"], ["c1"], decision=RULE)),
+                                       checked(name, "c2", "summary", "unknown")],
+}
+
+
+@pytest.mark.parametrize("wide_first", [False, True])
+@pytest.mark.parametrize("reward", [1.0, 0.0])
+@pytest.mark.parametrize("wider", WIDER)
+def test_complete_needs_every_task_requirement_any_basis_cites_observed_satisfied(tmp_path, wider, reward, wide_first):
+    """A wider basis left unknown, a violation observed elsewhere or an
+    inconclusive read must not let a narrower basis establish completion while summary is never observed satisfied."""
+    run = RunDir(tmp_path)
+    name = run.episode(rewards={"reward": reward})
+    narrow = checked(name, "c0", "sorted", "supported", basis=basis("supported", ["sorted"], ["c0"], decision=RULE))
+    run.label(name, "unknown", *(WIDER[wider](name) + [narrow] if wide_first else [narrow] + WIDER[wider](name)))
+
+    result = run.report()
+    assert result["metrics"]["episodes"][name]["completion"] == "unknown"
+    assert all(name not in group["episodes"] for group in result["metrics"]["confusion"])
+
+
+def test_a_rejected_episode_output_citation_does_not_veto_a_valid_complete_basis(tmp_path):
+    """A basis citing an episode's own output is rejected, but its quote is not a
+    task requirement, so it neither vetoes the valid basis nor appears among unobserved requirements."""
+    run = RunDir(tmp_path)
+    name = run.episode(rewards={"reward": 1.0})
+    directory = run.path / "episodes" / name
+    (directory / "nudi-evidence").mkdir()
+    (directory / "nudi-evidence" / "out.txt").write_text("1 2 3\n")
+    episode = json.loads((directory / "episode.json").read_text())
+    (directory / "episode.json").write_text(json.dumps({**episode, "artifacts": {"evidence": "nudi-evidence"}}))
+    output = Observation(episode=name, path="nudi-evidence/out.txt", excerpt="1 2 3")
+    valid = checked(name, "c0", "sorted", "supported", basis=basis("supported", ["sorted"], ["c0"], decision=RULE))
+    rejected = checked(name, "c1", "sorted", "supported", basis=MetricBasis(
+        completion="supported", requirements=[requirement("sorted"), output], checks=["c1"], explanation="sorted output", decision=RULE))
+    run.label(name, "unknown", valid, rejected)
+
+    episode = run.report()["metrics"]["episodes"][name]
+    assert (episode["completion"], episode["unobserved"]) == ("complete", [])
+    assert any("is not task context" in reason for reason in episode["completion_reasons"])
+
+
+def unchecked(name: str, completion: MetricBasis) -> Assessment:
+    """A probe whose state copy is missing: the grader inspector's interpretation keeps its basis, but no check ran."""
+    item = checked(name, "c1", "summary", "unknown", basis=completion)
+    item.claim.check, item.check = None, None
+    return item
+
+
+@pytest.mark.parametrize("wide_first", [False, True])
+@pytest.mark.parametrize("reward", [1.0, 0.0])
+def test_a_basis_on_an_assessment_without_a_check_still_vetoes_complete(tmp_path, reward, wide_first):
+    """The summary a checkless basis cites is never observed satisfied, so the
+    narrower checked basis must not establish completion."""
+    run = RunDir(tmp_path)
+    name = run.episode(rewards={"reward": reward})
+    narrow = checked(name, "c0", "sorted", "supported", basis=basis("supported", ["sorted"], ["c0"], decision=RULE))
+    wide = unchecked(name, basis("unknown", ["sorted", "summary"], []))
+    run.label(name, "unknown", *([wide, narrow] if wide_first else [narrow, wide]))
+
+    result = run.report()
+    assert result["metrics"]["episodes"][name]["completion"] == "unknown"
+    assert all(name not in group["episodes"] for group in result["metrics"]["confusion"])
+
+
+def test_a_basis_without_a_check_does_not_veto_complete_once_its_requirements_are_observed_satisfied(tmp_path):
+    run = RunDir(tmp_path)
+    name = run.episode(rewards={"reward": 1.0})
+    narrow = checked(name, "c0", "sorted", "supported", basis=basis("supported", ["sorted"], ["c0"], decision=RULE))
+    wide = unchecked(name, basis("unknown", ["sorted", "summary"], []))
+    run.label(name, "unknown", narrow, wide, checked(name, "c2", "summary", "supported"))
+
+    assert run.report()["metrics"]["episodes"][name]["completion"] == "complete"
+
+
 def test_an_unobserved_requirement_is_listed_only_when_never_read_no_violation_is_observed_and_its_quote_is_grounded(tmp_path):
     """Review of the unobserved rule: an inconclusive read, a violation quoted differently or an invented quote
     keeps completion unknown, as before."""

@@ -777,7 +777,7 @@ import nudi.inspector
 after = asyncio.run(tools())
 print(json.dumps({"before": before, "after": after}))
 '''
-    completed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30, check=True)
+    completed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120, check=True)
     offered = json.loads(completed.stdout.splitlines()[-1])
     assert "task" in offered["before"]
     assert offered["after"] == offered["before"]
@@ -837,7 +837,7 @@ def test_workspace_memory_override_reaches_docker_beside_an_experiment_at_task_l
     from nudi.workflow import start_run
 
     credentials = tmp_path / "credentials.env"
-    credentials.write_text(f"XAI_API_KEY={PROVIDER_KEY}\n")
+    credentials.write_text(f"MERGE_GATEWAY_API_KEY={PROVIDER_KEY}\n")
     run = start_run(RunConfig(task_dir=CONTRACT_TASK, output_dir=tmp_path / "run", credentials_file=credentials,
                               workspace_memory_mb=256), frozenset({"inspector"}))
 

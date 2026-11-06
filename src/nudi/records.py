@@ -52,10 +52,15 @@ class DiskFull(BaseException):
 
 
 class InfrastructureAbort(Exception):
-    """The paused container did not resume, so the affected episode must stop.
+    """An infrastructure failure that stops the affected work: a paused container that did not resume stops its episode.
 
     Ordinary observation errors stay Exception and must not use this type.
     """
+
+
+class EnvironmentUnavailable(InfrastructureAbort):
+    """A task environment failed to start several times in a row, so the run stops: no later sandbox
+    or episode can use it, and a verifier image that never builds cannot keep a run going for hours."""
 
 
 class ModelConfig(BaseModel):
@@ -96,11 +101,15 @@ class RunConfig(BaseModel):
     spending_cap: float | None = Field(None, gt=0)
     """Optional US dollar cap on the run's known inference cost. No default."""
     workspace_memory_mb: int | None = Field(None, gt=0, strict=True)
-    """Memory limit in MiB of a held Inspector workspace; by default the smaller of 512 and
-    the task's declared memory_mb. Experiments and native episodes keep the task's limits."""
+    """Memory limit in MiB of a held Inspector workspace; by default on Docker the smaller of 512
+    and the task's declared memory_mb, on Modal the task's. Experiments and native episodes keep
+    the task's limits."""
     backend: Backend = "docker"
     concurrency: int = Field(8, ge=1, strict=True)
     """Containers at once: the limit on Modal, and on Docker a cap on what Docker's capacity allows."""
+    time_limit: float | None = Field(None, gt=0, allow_inf_nan=False)
+    """Optional whole-run time limit in minutes; no default. At the limit the run stops and
+    reports as a stop does. On Modal each sandbox lives at most this limit plus 15 minutes, and 24 h at most."""
 
 
 class EpisodeConfig(BaseModel):
@@ -158,7 +167,7 @@ class Capacity(BaseModel):
     """The run's `concurrency` setting, which also caps its containers; None in earlier records."""
     workspace_memory_mb: int | None = None
     """Memory limit in MiB that Harbor's override enforces on a held Inspector workspace.
-    None in earlier records, whose workspaces inherited the task's limit."""
+    None in earlier records and on Modal for a task without one: the workspace has the task's limit."""
 
 
 PROVIDER_REPORTED = "provider-reported usage.cost"
@@ -537,6 +546,9 @@ class RunRecord(BaseModel):
     Harbor retries a refused call, up to 9 attempts for one Terminus 2 turn."""
     warnings: list[str] = []
     limitations: list[str] = []
+    time_limit_reached: bool = False
+    failed_phases: list[str] = []
+    """Phases that raised an error or returned an incomplete result; a stop is no failure."""
     events: list[EpisodeEvent] = []
     """Episode lifecycle in the order nudi observed it."""
     checks: list[Check] = []
@@ -547,7 +559,7 @@ class RunRecord(BaseModel):
     capture_selection: CaptureSelection | None = None
     """Older records only."""
     run_id: str = ""
-    """Names this run's copy images, `nudi-copy-<run id>-<n>`."""
+    """Names this run's copy images, `nudi-copy-<run id>-<n>`, and its Modal App, `nudi-<run id>`."""
     copies: list[StateCopy] = []
     simulation: Simulation | None = None
     probe_episodes: list[str] = []

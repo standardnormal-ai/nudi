@@ -542,6 +542,19 @@ def test_cancellation_during_adapter_close_out_propagates_and_keeps_the_episode(
     assert_artifacts_retained(docker_env, result)
 
 
+def test_a_second_ctrl_c_records_the_episode_cancelled(tmp_path, monkeypatch):
+    """asyncio raises a second SIGINT as KeyboardInterrupt, past the CancelledError handlers; episode.json
+    must still read `cancelled` true."""
+    async def interrupted(*args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("nudi.runner.run_verifiers", interrupted)
+    config = EpisodeConfig(task_dir=CONTRACT_TASK, output_dir=tmp_path / "episode", model=MODEL, api_key_var="XAI_API_KEY")
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(run_episode(config))
+    assert stored(tmp_path / "episode").cancelled
+
+
 @pytest.mark.parametrize("alias", [False, True])
 @pytest.mark.parametrize("inside", ["", "results"])
 def test_output_overlapping_the_task_is_rejected_before_writing(tmp_path, monkeypatch, alias, inside):

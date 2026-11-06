@@ -1,7 +1,7 @@
 """State copies: nudi's copies of the container filesystem that grades an episode.
 
-`RewardVerifier.verify` calls the run's callback before grading and after the grader
-returns. On Docker the main container is committed to an image tagged
+`RewardVerifier.verify` calls the run's callback before grading and after the grader,
+unless the run is cancelled. On Docker the main container is committed to an image tagged
 `nudi-copy-<run id>-<n>`, with its entrypoint emptied and a sleep command, so a check
 container started from it runs none of the task's startup code. On Modal the sandbox's
 filesystem is snapshotted.

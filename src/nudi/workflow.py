@@ -79,14 +79,19 @@ MODAL_LIMITATIONS = [
     "with a small request; an undeclared value has no limit. Hardware differs from a local Docker host, "
     "so timing-sensitive grading can differ between backends.",
     "On Modal, task files, episode files and the Attacker's work are uploaded to Modal. Modal compute is "
-    "outside the spending cap; the report estimates it as an upper bound from each sandbox's limits and "
-    "lifetime. A sandbox nudi fails to remove can run up to 24 h and is reported as a warning.",
+    "outside the spending cap; the report estimates its sandboxes' compute as a range from their requests "
+    "and limits over their lifetimes, and `nudi cost` reads Modal's bill for the run's App once Modal has "
+    "reported it. A sandbox nudi fails to remove can run up to 24 h and is reported as a warning.",
+    "On Modal, a held Inspector workspace has the task's memory limit unless `workspace_memory_mb` sets one; "
+    "a command beyond it ends the whole workspace.",
 ]
 MIMO_LIMITATION = (
     "MiMo requests enable thinking explicitly and send the requested reasoning effort; "
     "whether MiMo gives differentiated intensity for that effort is unverified."
 )
 # Representative workspace file, search and JSON work peaked at 14-16 MiB in the measured task images.
+# Docker only: there the workspace and an experiment share the machine. On Modal, workspaces of
+# 512 MiB ran out of memory in 4 of 5 measured runs, so there a workspace keeps the task's limit.
 WORKSPACE_MEMORY_MB = 512
 OVERSHOOT = "known cost exceeded the spending cap: calls admitted before it was reached finished"
 # Free bytes a run needs where records go: one measured run's copy images reached 8.5 GB, and on Linux and
@@ -180,6 +185,8 @@ class Run:
     """Native episodes started and not yet returned, queued or running."""
     images: dict = field(default_factory=dict)
     """Modal snapshot images by copy id, for check sandboxes; held in memory only."""
+    failed_starts: dict[str, int] = field(default_factory=dict)
+    """Failed starts in a row of each task environment, by its name in `sandbox.sandbox`."""
 
     def save(self) -> None:
         write_private(self.config.output_dir / "run.json", self.record.model_dump_json(indent=2))
@@ -304,7 +311,8 @@ def start_run(config: RunConfig, roles: frozenset[Role] = ROLES) -> Run:
         docker_cpus, docker_memory_mb = docker_capacity()
         concurrency, warnings = plan_concurrency(docker_cpus, docker_memory_mb, cpus, memory_mb)
         concurrency = min(concurrency, config.concurrency)
-    workspace_memory_mb = config.workspace_memory_mb or min(WORKSPACE_MEMORY_MB, memory_mb or WORKSPACE_MEMORY_MB)
+    workspace_memory_mb = config.workspace_memory_mb or (
+        memory_mb if config.backend == "modal" else min(WORKSPACE_MEMORY_MB, memory_mb or WORKSPACE_MEMORY_MB))
     if docker_memory_mb is not None and 10 * workspace_memory_mb > 9 * docker_memory_mb:
         raise CapacityError(f"the Inspector workspace's {workspace_memory_mb} MiB of memory exceeds 90% of Docker's "
                             f"{docker_memory_mb} MiB")
@@ -329,7 +337,7 @@ def start_run(config: RunConfig, roles: frozenset[Role] = ROLES) -> Run:
         run_id=secrets.token_hex(4),
         cost_map=get_model_cost_map_source_info(),
         warnings=warnings,
-        limitations=(LIMITATIONS if config.backend == "docker" else MODAL_LIMITATIONS + LIMITATIONS[1:])
+        limitations=(LIMITATIONS if config.backend == "docker" else MODAL_LIMITATIONS + LIMITATIONS[2:])
         + [MIMO_LIMITATION] * mimo + [HELPER_STATE.strip()] * (len(compose_services(config.task_dir)) > 1),
     )
     machine = ("each sandbox has the CPUs and memory the task declares" if docker_cpus is None
@@ -462,7 +470,7 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
                            probe: bool = False) -> EpisodeResult:
     """Run one episode of `role` through the run's queue, under its credential and cap.
 
-    The grader's environment is copied before grading and after the grader returns
+    The grader's environment is copied before grading and after the grader, unless cancelled
     (`nudi.copies`). Its lifecycle events record execution order. `finished` means the
     runner returned; Harbor may return after a failed environment stop. Neither return nor
     ordering establishes successful teardown or a normal reset.

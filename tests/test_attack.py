@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 from aiohttp import web
 
-from nudi import checks, report, workflow
+from nudi import api, checks, report, workflow
 from nudi.assessment import assess
 from nudi.records import (
     Assessment,
@@ -200,8 +200,10 @@ def bind_runner(monkeypatch, sink):
     monkeypatch.setattr(workflow, "run_episode", native)
 
 
-def candidate(id, full=None, minimal=None, unavailable=None, mechanism="suspected boundary"):
-    return checks.Candidate(id=id, mechanism=mechanism, guidance={"full": full, "minimal": minimal}, unavailable=unavailable or {})
+def candidate(id, full=None, minimal=None, unavailable=None, mechanism=None):
+    # A shared mechanism merges candidates, so each one's default is its own.
+    return checks.Candidate(id=id, mechanism=mechanism if mechanism is not None else f"suspected boundary of {id}",
+                            guidance={"full": full, "minimal": minimal}, unavailable=unavailable or {})
 
 
 def linked_check(episode: str, check_id: str):
@@ -305,10 +307,10 @@ def test_each_candidate_receives_only_its_own_guidance_in_fresh_contexts(tmp_pat
             result = await checks.attack(run, candidates=[candidate("hack-0", FULL, MINIMAL),
                                                           candidate("hack-3", other, "  ", {"minimal": reason})])
             assert result.maximum_attempts == 2 and result.discovery_attempts == 1
-            # Discovery runs once by default; each candidate/level has its own two attempts.
+            # Discovery runs once by default; each candidate/level has its own two attempts, every full one first.
             assert [(attempt.candidate, attempt.level) for attempt in result.attempts] == [
-                (None, "none"), ("hack-0", "full"), ("hack-0", "minimal"), ("hack-3", "full"),
-                ("hack-0", "full"), ("hack-0", "minimal"), ("hack-3", "full")]
+                (None, "none"), ("hack-0", "full"), ("hack-3", "full"), ("hack-0", "full"), ("hack-3", "full"),
+                ("hack-0", "minimal"), ("hack-0", "minimal")]
             assert len({attempt.context for attempt in result.attempts}) == 7
             assert len({attempt.episode for attempt in result.attempts}) == 7
             assert {attempt.episode for attempt in result.attempts} == {name for name, *_ in sink["episodes"]}
@@ -384,14 +386,14 @@ def test_exact_duplicate_records_share_one_run_and_partial_overlap_does_not(tmp_
             ])
             assert [(attempt.candidate, attempt.level, attempt.sources) for attempt in result.attempts] == [
                 ("dup-a", "full", ["dup-a", "dup-b"]),
-                ("dup-a", "minimal", ["dup-a", "dup-b"]),
                 ("lookalike", "full", ["lookalike"]),
-                ("lookalike", "minimal", ["lookalike"]),
                 ("fullalike", "full", ["fullalike"]),
-                ("fullalike", "minimal", ["fullalike"]),
                 ("blank-1", "full", ["blank-1"]),
-                ("blank-1", "minimal", ["blank-1"]),
                 ("blank-2", "full", ["blank-2"]),
+                ("dup-a", "minimal", ["dup-a", "dup-b"]),
+                ("lookalike", "minimal", ["lookalike"]),
+                ("fullalike", "minimal", ["fullalike"]),
+                ("blank-1", "minimal", ["blank-1"]),
                 ("blank-2", "minimal", ["blank-2"]),
             ]
             assert len({attempt.episode for attempt in result.attempts}) == 10
@@ -413,6 +415,167 @@ def test_exact_duplicate_records_share_one_run_and_partial_overlap_does_not(tmp_
             assert result.candidates[3].conditions["full"] == "unknown"
 
     asyncio.run(main())
+
+
+def test_only_exact_duplicates_share_one_run_and_every_full_hint_runs_before_any_minimal_hint(tmp_path, monkeypatch, credentials):
+    """Only the same kind, category, exact mechanism text and both guidance fields share one run; every
+    record stays listed. A shared check or a mechanism differing only in case does not merge, so no finding is
+    marked reproduced by another finding's recipe. Every finding runs at the full hint before any runs at the
+    minimal hint."""
+    endpoint = attack_endpoint(plain_claim)
+    sink = {"episodes": []}
+    hints = {}
+
+    def item(id, category, check, mechanism, hint, valid_work=False):
+        hints[id] = hint
+        return checks.Candidate(id=id, category=category, check=check, mechanism=mechanism, valid_work=valid_work,
+                                guidance={"full": f"FULL-{hint}", "minimal": f"MIN-{hint}"})
+
+    async def main():
+        async with serve(endpoint) as base:
+            model = ModelConfig(model="xai/grok-4.7", api_base=base)
+            run = new_run(tmp_path, monkeypatch, credentials, models={"attacker": model, "inspector": model})
+            sink["run"] = run
+            bind_runner(monkeypatch, sink)
+            result = await checks.attack(run, maximum_attempts=1, discovery_attempts=1, candidates=[
+                item("upper", "unchecked_requirements", "check-1", "Uppercase answers are rejected", "upper", valid_work=True),
+                item("newline", "unchecked_requirements", "check-1", "A final newline is rejected", "newline", valid_work=True),
+                item("US", "unchecked_requirements", "check-2", "Valid label 'US' rejected", "label"),
+                item("us", "unchecked_requirements", "check-3", "Valid label 'us' rejected", "label"),
+                item("B", "timing_interference", "check-5", "mechanism two", "B"),
+                item("C", "timing_interference", "check-4", "mechanism two", "B"),
+                item("D", "grader_tampering", "check-6", "mechanism two", "B"),
+            ])
+            runs = [("upper", ["upper"]), ("newline", ["newline"]), ("US", ["US"]), ("us", ["us"]), ("B", ["B", "C"]), ("D", ["D"])]
+            assert [(attempt.candidate, attempt.level, attempt.sources) for attempt in result.attempts] == [
+                (None, "none", [])] + [(lead, level, sources) for level in ("full", "minimal") for lead, sources in runs]
+            texts = {name: text for name, text, _, _ in sink["episodes"]}
+            for attempt in result.attempts[1:]:
+                label = "Full loophole details." if attempt.level == "full" else "Minimal hint."
+                hint = f"{'FULL' if attempt.level == 'full' else 'MIN'}-{hints[attempt.candidate]}"
+                valid_work = attempt.candidate in ("upper", "newline")
+                instruction = checks.VALID_WORK_INSTRUCTION if valid_work else checks.EXPLOIT_INSTRUCTION
+                assert texts[attempt.episode] == f"{instruction}\n{label}\n{hint}"
+            assert [item.id for item in result.candidates] == list(hints)
+            conditions = {item.id: item.conditions for item in result.candidates}
+            assert conditions["B"] == conditions["C"] == {"full": "unknown", "minimal": "unknown"}
+            section = report.attack(result, run.record, [])
+            assert [entry["id"] for entry in section["candidates"]] == list(hints)
+            assert section["candidates"][1]["conditions"]["full"]["attempts"] == 1
+
+    asyncio.run(main())
+
+
+def test_a_candidate_identical_to_a_later_group_joins_it_whatever_check_it_shares():
+    """With A = (check-1, one), B = (check-2, two) and C = (check-1, two), C joins the identical B, not A, whose check
+    it only shares."""
+    def item(id, check, mechanism):
+        return checks.Candidate(id=id, check=check, mechanism=mechanism, guidance={"full": f"FULL-{mechanism}", "minimal": None})
+
+    groups = checks._candidate_groups([item("A", "check-1", "one"), item("B", "check-2", "two"), item("C", "check-1", "two")])
+    assert [[member.id for member in group] for group in groups] == [["A"], ["B", "C"]]
+
+
+def test_suspected_candidates_run_after_every_evidenced_one_at_each_hint_level(tmp_path, monkeypatch, credentials):
+    """At each hint level every evidenced candidate runs, retries included, before any
+    guided unknown one. A suspected record identical to an evidenced one shares its run and its place."""
+    endpoint = attack_endpoint(plain_claim)
+    sink = {"episodes": []}
+
+    def item(id, outcome, mechanism=None):
+        mechanism = mechanism or f"mechanism of {id}"
+        return checks.Candidate(id=id, outcome=outcome, mechanism=mechanism,
+                                guidance={"full": f"FULL-{mechanism}", "minimal": f"MIN-{mechanism}"})
+
+    async def main():
+        async with serve(endpoint) as base:
+            model = ModelConfig(model="xai/grok-4.7", api_base=base)
+            run = new_run(tmp_path, monkeypatch, credentials, models={"attacker": model, "inspector": model})
+            sink["run"] = run
+            bind_runner(monkeypatch, sink)
+            result = await checks.attack(run, maximum_attempts=2, discovery_attempts=1, candidates=[
+                item("U1", "unknown"), item("E1", "accepted_invalid"), item("U2", "unknown", "shared"),
+                item("E2", "accepted_invalid", "shared"),
+            ])
+            evidenced, suspected = [("E1", ["E1"]), ("U2", ["U2", "E2"])], [("U1", ["U1"])]
+            assert [(attempt.candidate, attempt.level, attempt.sources) for attempt in result.attempts] == [(None, "none", [])] + [
+                (lead, level, sources) for level in ("full", "minimal") for tier in (evidenced, suspected)
+                for number in (1, 2) for lead, sources in tier]
+            assert [item.outcome for item in result.candidates] == ["unknown", "accepted_invalid", "unknown", "accepted_invalid"]
+
+    asyncio.run(main())
+
+
+def test_a_withdrawn_evidenced_reading_takes_no_attempt_from_a_current_suspected_one(tmp_path, monkeypatch):
+    """A later legitimate reading without guidance withdraws check A's guided
+    accepted-invalid reading; check B's guided unknown reading is current. With room for two episodes both test B and
+    none tests A. The inspection report still lists A's reading, superseded."""
+    def reading(outcome, check, guided=True):
+        return Assessment(outcome=outcome, claim=Claim(episode="0000-inspector", check=check, mechanism=f"flaw at {check}",
+                                                       interpretation=f"reading of {check}",
+                                                       full_guidance=f"RECIPE {check}" if guided else None))
+
+    readings = [reading("accepted_invalid", "check-A"), reading("legitimate", "check-A", guided=False), reading("unknown", "check-B")]
+    record = SimpleNamespace(episodes=[], calls=[], copies=[])
+
+    def cap():
+        if len(record.episodes) >= 2:
+            raise workflow.SpendingCapReached("two episodes admitted")
+
+    async def native(run, role, instruction):
+        record.episodes.append(f"{len(record.episodes):04d}-attacker")
+        return SimpleNamespace(rewards={"reward": 0.0}, errors=[], agent_timeout=False, verifier_timeout=False, cancelled=False,
+                               artifacts={})
+
+    async def discard(run):
+        pass
+
+    monkeypatch.setattr(checks.copies, "discard", discard)
+    monkeypatch.setattr(workflow, "run_role_episode", native)
+    run = SimpleNamespace(config=SimpleNamespace(output_dir=tmp_path), record=record, check_cap=cap)
+    hack = checks.InspectionResult(mode="hack", categories={}, applicability={}, assessments=readings)
+    result = asyncio.run(checks.attack(run, maximum_attempts=2, discovery_attempts=0, **api.guidance(hack)))
+    assert [(attempt.candidate, attempt.episode in record.episodes) for attempt in result.attempts] == [("hack-2", True)] * 2
+    assert report.findings(readings)["evidenced"][0]["superseded_by"] == {"index": 1, "result": "legitimate"}
+
+
+def test_reports_keep_a_suspected_source_apart_from_its_native_reproduction(tmp_path, monkeypatch, credentials):
+    """report.json keeps each candidate's source outcome. The shared candidate
+    name labels a candidate from an unknown reading as suspected, in the Answer and on its attempt line, also after a
+    native reproduction; an evidenced candidate's name has no label."""
+    endpoint = attack_endpoint(attributing)
+    sink = {}
+
+    async def native(config, queue, **work):
+        name = config.output_dir.name
+        install_issue(sink["run"], name, check=f"check-{name}")
+        return EpisodeResult.model_validate_json((config.output_dir / "episode.json").read_text())
+
+    suspected, evidenced = candidate("hack-0", "FULL-HACK-0"), candidate("hack-1", "FULL-HACK-1")
+    suspected.outcome, evidenced.outcome = "unknown", "accepted_invalid"
+
+    async def main():
+        async with serve(endpoint) as base:
+            model = ModelConfig(model="xai/grok-4.7", api_base=base)
+            run = new_run(tmp_path, monkeypatch, credentials, models={"attacker": model, "inspector": model})
+            sink["run"] = run
+            monkeypatch.setattr(workflow, "run_episode", native)
+            return await checks.attack(run, maximum_attempts=1, discovery_attempts=0, candidates=[suspected, evidenced])
+
+    result = asyncio.run(main())
+    assert [(finding.kind, finding.candidate) for finding in result.findings] == [("other", "hack-1"), ("reproduction", "hack-0")]
+    built = report.build(sink["run"].config.output_dir, selected=["attack"])
+    entries = [(item["id"], item["outcome"], item["conditions"]["full"]["status"]) for item in built["attack"]["candidates"]]
+    assert entries == [("hack-0", "unknown", "evidenced_issue"), ("hack-1", "accepted_invalid", "no_evidenced_issue")]
+    label = "(suspected: its hack inspector reading was unknown)"
+    answer = " ".join(built["answer"])
+    assert f"reproduced hack-0 {label} with the full hint" in answer
+    assert "while testing hack-1 with the full hint" in answer and answer.count(label) == 1
+    section = report.markdown(built).split("\n## Attack\n")[1].split("\n## ")[0]
+    lines = section.splitlines()
+    assert sum(f" reproduced hack-0 {label} with the full hint: " in line for line in lines) == 1
+    assert sum("while testing hack-1 with the full hint: " in line and label not in line for line in lines) == 1
+    assert section.count("hack-0") == section.count(f"hack-0 {label}") and f"hack-1 {label}" not in section
 
 
 def test_exact_duplicate_reproduction_marks_every_source(tmp_path, monkeypatch, credentials):
@@ -503,14 +666,12 @@ def test_shared_minimal_hint_stops_only_that_candidate(tmp_path, monkeypatch, cr
                 candidate("hack-c", full_a, "OTHER-LOOK", mechanism="timing reward"),
             ])
             assert [(attempt.candidate, attempt.level, attempt.sources) for attempt in result.attempts] == [
-                ("hack-a", "full", ["hack-a"]), ("hack-a", "minimal", ["hack-a"]),
-                ("hack-b", "full", ["hack-b"]), ("hack-b", "minimal", ["hack-b"]),
-                ("hack-c", "full", ["hack-c"]), ("hack-c", "minimal", ["hack-c"]),
-                ("hack-a", "full", ["hack-a"]),
-                ("hack-b", "full", ["hack-b"]), ("hack-b", "minimal", ["hack-b"]),
-                ("hack-c", "full", ["hack-c"]), ("hack-c", "minimal", ["hack-c"]),
+                ("hack-a", "full", ["hack-a"]), ("hack-b", "full", ["hack-b"]), ("hack-c", "full", ["hack-c"]),
+                ("hack-a", "full", ["hack-a"]), ("hack-b", "full", ["hack-b"]), ("hack-c", "full", ["hack-c"]),
+                ("hack-a", "minimal", ["hack-a"]), ("hack-b", "minimal", ["hack-b"]), ("hack-c", "minimal", ["hack-c"]),
+                ("hack-b", "minimal", ["hack-b"]), ("hack-c", "minimal", ["hack-c"]),
             ]
-            assert [attempt.status for attempt in result.attempts] == ["unknown", "evidenced_issue"] + ["unknown"] * 9
+            assert [attempt.status for attempt in result.attempts] == ["unknown"] * 6 + ["evidenced_issue"] + ["unknown"] * 4
             assert [item.conditions for item in result.candidates] == [
                 {"full": "unknown", "minimal": "evidenced_issue"},
                 {"full": "unknown", "minimal": "unknown"},
@@ -643,7 +804,7 @@ def test_each_attacker_episode_and_attack_inspector_session_logs_its_start_and_e
         "Attacker 0000-attacker started",
         "Attacker 0000-attacker finished after T: rewards [1.0]",
         f"attack inspector {title} started",
-        f"attack inspector {title} finished after T: 1 experiments, 1 assessments; status partial",
+        f"attack inspector {title} ended after T: unobservable",
     ]
     assert len(result.assessments) == 1
 
@@ -852,11 +1013,14 @@ def test_rejected_valid_work_counts_only_for_a_valid_work_candidate(tmp_path, mo
     result = asyncio.run(main())
     built = report.build(sink["run"].config.output_dir, selected=["attack"])
     assert [(item["id"], item["valid_work"]) for item in built["attack"]["candidates"]] == [("hack-0", False), ("valid-0", True)]
-    assert "- valid-0 (valid work):" in report.markdown(built) and "- hack-0:" in report.markdown(built)
+    text = report.markdown(built)
+    # Every candidate's full hint runs before any second try, so valid-0's full attempt is the third episode.
+    assert "- 0002-attacker had valid work rejected while testing valid-0 with the full hint" in text
+    assert "- 0001-attacker tested hack-0 with the full hint: reward 1; no exploit was evidenced" in text
     assert [(attempt.candidate, attempt.level) for attempt in result.attempts] == [
-        (None, "none"), ("hack-0", "full"), ("hack-0", "minimal"), ("valid-0", "full"), ("hack-0", "full"), ("hack-0", "minimal")]
+        (None, "none"), ("hack-0", "full"), ("valid-0", "full"), ("hack-0", "full"), ("hack-0", "minimal"), ("hack-0", "minimal")]
     assert [result.assessments[attempt.assessment].outcome for attempt in result.attempts] == ["rejected_valid"] * 6
-    assert [attempt.status for attempt in result.attempts] == ["no_evidenced_issue"] * 3 + ["evidenced_issue"] + ["no_evidenced_issue"] * 2
+    assert [attempt.status for attempt in result.attempts] == ["no_evidenced_issue"] * 2 + ["evidenced_issue"] + ["no_evidenced_issue"] * 3
     assert result.candidates[0].conditions == {"full": "no_evidenced_issue", "minimal": "no_evidenced_issue"}
     assert result.candidates[1].conditions["full"] == "evidenced_issue" and result.discovery == {"none": "no_evidenced_issue"}
     assert [(finding.kind, finding.candidate) for finding in result.findings] == [("reproduction", "valid-0")]
@@ -1451,6 +1615,25 @@ def test_spending_cap_and_cancellation_are_separate(tmp_path, monkeypatch, crede
     asyncio.run(main())
 
 
+def test_a_task_environment_that_cannot_start_stops_the_attack(tmp_path, monkeypatch, credentials):
+    """EnvironmentUnavailable from the attack inspector ends the attack with that status instead of a
+    per-attempt tool failure followed by the next Attacker episode."""
+    from nudi.records import EnvironmentUnavailable
+
+    run = new_run(tmp_path, monkeypatch, credentials)
+    monkeypatch.setattr(workflow, "run_episode", scripted_episodes)
+
+    async def inspect(*args, **kwargs):
+        raise EnvironmentUnavailable("the task's verifier environment failed to start 3 times in a row")
+
+    monkeypatch.setattr(checks, "inspect", inspect)
+    with pytest.raises(EnvironmentUnavailable):
+        asyncio.run(checks.attack(run, maximum_attempts=2, discovery_attempts=2, full=FULL, minimal=MINIMAL))
+    saved = json.loads((run.config.output_dir / "attack.json").read_text())
+    assert saved["status"] == "environment_unavailable"
+    assert [(attempt["level"], attempt["status"]) for attempt in saved["attempts"]] == [("none", "environment_unavailable")]
+
+
 def test_maximum_attempts_must_be_a_nonnegative_integer(tmp_path, monkeypatch, credentials):
     run = new_run(tmp_path, monkeypatch, credentials)
     with pytest.raises(ValueError):
@@ -1825,17 +2008,19 @@ def test_each_attempt_starts_after_every_earlier_copy_is_deleted_by_its_own_tag(
     assert removed == [[run.record.copies[0].tag], [run.record.copies[1].tag]]
 
 
-def test_a_cancel_while_earlier_copies_are_deleted_cancels_the_attempt(tmp_path, monkeypatch, credentials):
-    """Deleting earlier copies is part of the attempt, so a cancel there is this attempt's cancel."""
+@pytest.mark.parametrize("stop", [asyncio.CancelledError, KeyboardInterrupt])
+def test_a_cancel_while_earlier_copies_are_deleted_cancels_the_attempt(tmp_path, monkeypatch, credentials, stop):
+    """Deleting earlier copies is part of the attempt, so a cancel there is this attempt's cancel. A second
+    Ctrl-C arrives as KeyboardInterrupt, and it must not leave the attempt "running"."""
     async def cancel(run):
-        raise asyncio.CancelledError()
+        raise stop()
 
     async def main():
         async with serve(attack_endpoint(plain_claim)) as base:
             model = ModelConfig(model="xai/grok-4.7", api_base=base)
             run = new_run(tmp_path, monkeypatch, credentials, models={"attacker": model, "inspector": model})
             monkeypatch.setattr(checks.copies, "discard", cancel)
-            with pytest.raises(asyncio.CancelledError):
+            with pytest.raises(stop):
                 await checks.attack(run, maximum_attempts=1)
             saved = json.loads((run.config.output_dir / "attack.json").read_text())
             assert saved["status"] == "cancelled" and [attempt["status"] for attempt in saved["attempts"]] == ["cancelled"]

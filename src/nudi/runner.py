@@ -191,9 +191,10 @@ class RewardVerifier(Verifier):
     verifier, so an unset `skip_tests_upload` is resolved here the same way.
 
     With a `state_copy` callback it copies the grading environment before grading and after
-    the grader returns. The grader keeps the task's own limit; its caller's limit is
-    `grading_bound`. A timeout or cancellation skips the second copy. The callback bounds
-    and records its own failures."""
+    the grader, also after a grader error or timeout; only cancellation skips the second
+    copy. A grader error's text names its direct cause, which Harbor's own text drops. The
+    grader keeps the task's own limit; its caller's limit is `grading_bound`. The callback
+    bounds and records its own failures."""
 
     def __init__(self, *, task: Task, skip_tests_upload: bool | None = None, **kwargs):
         if skip_tests_upload is None:
@@ -205,10 +206,19 @@ class RewardVerifier(Verifier):
         take = state_copy.get()
         if take is not None:
             await take(self, "verification_start")
-        result = await asyncio.wait_for(super().verify(), self.task.config.verifier.timeout_sec)
-        if take is not None:
-            await take(self, "grading_end")
-        return result
+        try:
+            return await asyncio.wait_for(super().verify(), self.task.config.verifier.timeout_sec)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            take = None
+            raise
+        except Exception as error:
+            # Harbor and nudi record str(error) only, which can be just "Failed to download verifier directory".
+            if isinstance(error.__cause__, Exception):
+                error.args = (f"{error}: {type(error.__cause__).__name__}: {error.__cause__}",)
+            raise
+        finally:
+            if take is not None:
+                await take(self, "grading_end")
 
     def _parse_reward_text(self) -> dict[str, float | int]:
         path = self.trial_paths.reward_text_path
@@ -814,7 +824,7 @@ async def run_episode(config: EpisodeConfig, queue: TrialQueue | None = None, *,
                 await run_verifiers(config, task_dir, result)
             else:
                 await run_harbor(config, task_dir, result, queue or episode_queue(1), agent)
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, KeyboardInterrupt):  # KeyboardInterrupt: a second Ctrl-C
         result.cancelled = True
         raise
     except Exception as error:

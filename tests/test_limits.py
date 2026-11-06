@@ -561,7 +561,7 @@ def test_each_call_is_counted_once_with_a_litellm_estimate(tmp_path, monkeypatch
 
 
 def test_provider_reported_cost_is_kept_beside_the_estimate(tmp_path, monkeypatch, credentials):
-    run = new_run(tmp_path, monkeypatch, credentials)
+    run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": ModelConfig(model="xai/grok-4.7")})
     endpoint = Endpoint(usage={"cost": 0.25})
 
     async def main():
@@ -576,17 +576,19 @@ def test_provider_reported_cost_is_kept_beside_the_estimate(tmp_path, monkeypatc
     assert recorded.cost is not None
 
 
-def test_provider_reported_cost_counts_when_litellm_has_no_price(tmp_path, monkeypatch, credentials):
-    override = ModelConfig(model=UNPRICED, api_key_var="NUDI_UNPRICED_KEY")
+# The default model is absent from LiteLLM's cost map; the Merge gateway reports usage.cost.
+@pytest.mark.parametrize("model", [UNPRICED, GATEWAY["model"]])
+def test_provider_reported_cost_counts_when_litellm_has_no_price(tmp_path, monkeypatch, credentials, model):
+    override = ModelConfig(model=model, api_key_var="NUDI_UNPRICED_KEY")
     run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": override}, spending_cap=0.1)
     endpoint = Endpoint(usage={"cost": 0.25})
 
     async def main():
         async with serve(endpoint) as base_url:
             with model_calls(run, "inspector", "probe"):
-                await call(base_url, model=UNPRICED)
+                await call(base_url, model=model)
                 with pytest.raises(SpendingCapReached):
-                    await call(base_url, model=UNPRICED)
+                    await call(base_url, model=model)
 
     asyncio.run(main())
 
@@ -717,13 +719,13 @@ def test_overlapping_runs_are_isolated_and_unrelated_callbacks_kept(tmp_path, mo
 LIMITS_PROBE = f"{PROBE}; echo cgroup_memory=$(cat /sys/fs/cgroup/memory.max) cgroup_cpu=$(cat /sys/fs/cgroup/cpu.max)"
 
 
-def docker_run(output, credentials, script, monkeypatch, role, task=CONTRACT_TASK, **fields):
-    """Start a run with real Docker capacity and run one episode of `role` against `script`."""
+def docker_run(output, credentials, script, monkeypatch, role, model, task=CONTRACT_TASK, **fields):
+    """Start a run with real Docker capacity and run one episode of `role` with `model` against `script`."""
     monkeypatch.delenv("XAI_API_KEY", raising=False)
 
     async def main():
         async with serve(script) as base_url:
-            models = {role: DEFAULT_MODELS[role].model_copy(update={"api_base": base_url})}
+            models = {role: model.model_copy(update={"api_base": base_url})}
             config = RunConfig(
                 task_dir=task, output_dir=output, models=models, credentials_file=credentials, **fields
             )
@@ -742,7 +744,8 @@ def test_simulator_episode_routes_mimo_with_the_file_credential_and_keeps_task_l
     credentials.write_text(f"XIAOMI_MIMO_API_KEY={PROVIDER_KEY}\n")
     script = RecordingTerminus(LIMITS_PROBE)
 
-    run, result = docker_run(docker_env, credentials, script, monkeypatch, "simulator")
+    mimo = ModelConfig(model="xiaomi_mimo/mimo-v2.6-pro", reasoning_effort="high")
+    run, result = docker_run(docker_env, credentials, script, monkeypatch, "simulator", mimo)
 
     assert result.path == "harbor" and result.errors == []
     assert result.rewards["reward"] == 1.0
@@ -771,7 +774,8 @@ def test_cap_reached_during_an_episode_refuses_calls_without_inventing_a_reward(
     task = long_agent_budget(tmp_path, CONTRACT_TASK)
 
     run, result = docker_run(
-        docker_env, credentials, script, monkeypatch, "attacker", task=task, spending_cap=TINY_CAP
+        docker_env, credentials, script, monkeypatch, "attacker", ModelConfig(model="xai/grok-4.7", reasoning_effort="xhigh"),
+        task=task, spending_cap=TINY_CAP
     )
 
     assert len(script.requests) == 1

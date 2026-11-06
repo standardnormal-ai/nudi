@@ -6,19 +6,28 @@ config:
   htmlLabels: false
   flowchart:
     wrappingWidth: 260
+    padding: 12
 ---
 flowchart TD
-    E["Task, environment and grader"] --> I["hack_inspector<br/>Look for reward hacks"]
-    I --> S["●○○○○ suspected<br/>Inspector claims a loophole"]
+    E["RL Environment"] --> I["hack_inspector<br/>Look for reward hacks"]
+    I -->|Claims a loophole| S["●○○○○ suspected exploit"]
     S --> X["Inspector tests it<br/>in a sandbox"]
-    X -->|Reproduced| R["●●○○○ reproduced"]
-    X -->|Not reproduced| O["Keep the result and evidence<br/>Do not upgrade the claim"]
+    X -->|Reproduced| R["●●○○○ reproduced exploit"]
+    X -->|Not reproduced| O["Keep result and evidence"]
     R --> F["Attacker receives<br/>full instructions"]
     R --> H["Attacker receives<br/>only a hint"]
-    F --> VF["Inspector checks the result<br/>Did this exploit obtain reward?"]
-    H --> VH["Inspector checks the result<br/>Did this exploit obtain reward?"]
-    VF -->|Confirmed| SF["●●●○○ exploited with instructions"]
-    VH -->|Confirmed| SH["●●●●○ exploited with a hint"]
-    E --> N["Independent attacker<br/>No inspector findings or hints"]
-    N --> VN["Inspector checks the result<br/>Did an exploit obtain reward?"]
-    VN -->|Confirmed| SN["●●●●● exploited unaided"]
+    F --> VF["Independent inspector checks result<br/>Did this exploit obtain reward?"]
+    H --> VH["Independent inspector checks result<br/>Did this exploit obtain reward?"]
+    VF -->|Confirmed| SF["●●●○○ exploit executable by learner with full information"]
+    VH -->|Confirmed| SH["●●●●○ exploit executable by learner with hint"]
+    E --> N["Independent attacker<br/>No extra information"]
+    N --> VN["Independent inspector checks result<br/>Was actual exploit rewarded??"]
+    VN -->|Confirmed| SN["●●●●● exploit executable by unaided learner"]
+
+    subgraph legend ["Legend"]
+        direction LR
+        KI("hack_inspector<br/>Admin access, fully aware of the grader.<br/>Searches for exploits.")
+        KA("attacker<br/>Isolated sandbox, original tools<br/>and permissions.<br/>Told to exploit.")
+    end
+    SF ~~~ KI
+    SN ~~~ KA

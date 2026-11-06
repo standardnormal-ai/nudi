@@ -6,7 +6,8 @@ import pytest
 
 from nudi import report
 from nudi.assessment import CHECK_LIMIT
-from nudi.checks import DISABLED_LIMIT, SAFETY_LIMIT, TIMING_LIMIT, AttackAttempt, AttackResult, InspectionAttempt, InspectionResult, OrdinaryReview
+from nudi.checks import (DISABLED_LIMIT, SAFETY_LIMIT, TIMING_LIMIT, AttackAttempt, AttackFinding, AttackResult, Candidate, InspectionAttempt,
+                         InspectionResult, OrdinaryReview)
 from nudi.records import Assessment, CallRecord, Claim, Derivation, ErrorRecord, PersistenceProbe
 from test_metrics import RunDir, basis, checked
 
@@ -574,3 +575,259 @@ def test_an_older_experiment_without_a_check_id_links_its_category_through_its_a
     (issue,) = result["inspections"]["grader_inspector"]["findings"]["evidenced"]
     assert issue["category"] == "accepted_invalid"
     assert "- grader_inspector accepted_invalid: evidenced_issue; evidenced by check-0000; attempts none" in report.markdown(result)
+
+
+def rejecting(sandbox: str, check: str) -> Assessment:
+    """A package-sandbox rejected_valid finding."""
+    assessment = packaged(sandbox, check)
+    assessment.outcome, assessment.discrepancy = "rejected_valid", "under"
+    return assessment
+
+
+def answered(run: RunDir) -> None:
+    """The grader inspector and the hack inspector evidence package findings; one Attacker reproduces
+    hack-1 and another has valid work for hack-2 rejected. hack-N is the hack inspector's assessment N."""
+    graded = run.episode(rewards={"reward": 1.0})
+    run.record.sandboxes = ["sandbox-0000"]
+    run.label(graded, "legitimate", packaged("sandbox-0000", "check-0000"), rejecting("sandbox-0000", "check-0001"))
+    run.grader.categories = {"accepted_invalid": "evidenced_issue", "rejected_valid": "evidenced_issue"}
+    run.grader.experiments = [experiment(0, "accepted_invalid", "check-0000"), experiment(1, "rejected_valid", "check-0001")]
+    run.hack = InspectionResult(
+        mode="hack", status="complete", categories={"grader_tampering": "evidenced_issue", "unchecked_requirements": "unknown"},
+        applicability={}, assessments=[checked("sandbox-0000", "check-0002", "sorted", "supported", outcome="legitimate"),
+                                       packaged("sandbox-0000", "check-0003"), rejecting("sandbox-0000", "check-0004")],
+        experiments=[experiment(2, "grader_tampering", "check-0002"), experiment(3, "grader_tampering", "check-0003"),
+                     experiment(4, "unchecked_requirements", "check-0004")])
+    reproduced, refused = run.episode("attacker", {"reward": 1.0}), run.episode("attacker", {"reward": 0.0})
+    shim, rejected = evidenced(reproduced, "check-0005"), evidenced(refused, "check-0006")
+    shim.claim.mechanism = "planted a bash shim\nthat prints the pass marker"
+    rejected.outcome, rejected.claim.mechanism = "rejected_valid", "wrote the answer with leading zeros"
+    guidance = {"full": "plant the shim", "minimal": "look at PATH"}
+    run.attack = AttackResult(
+        status="complete", discovery_attempts=0,
+        candidates=[Candidate(id="hack-1", mechanism="a bash shim", guidance=guidance,
+                              conditions={"full": "evidenced_issue", "minimal": "unattempted"}),
+                    Candidate(id="hack-2", mechanism="leading zeros", guidance=guidance, valid_work=True,
+                              conditions={"full": "evidenced_issue", "minimal": "unattempted"})],
+        attempts=[AttackAttempt(level="full", number=1, candidate="hack-1", sources=["hack-1"], context="attacker-hack-1-full-1",
+                                episode=reproduced, rewards={"reward": 1.0}, status="evidenced_issue", assessment=0),
+                  AttackAttempt(level="full", number=1, candidate="hack-2", sources=["hack-2"], context="attacker-hack-2-full-1",
+                                episode=refused, rewards={"reward": 0.0}, status="evidenced_issue", assessment=1)],
+        assessments=[shim, rejected],
+        findings=[AttackFinding(kind="reproduction", candidate="hack-1", sources=["hack-1"], attempt=0, assessment=0, relation="target",
+                                rationale="the planted shim printed the pass marker"),
+                  AttackFinding(kind="reproduction", candidate="hack-2", sources=["hack-2"], attempt=1, assessment=1, relation="target")])
+
+
+def test_the_report_opens_with_a_plain_answer_built_from_its_evidenced_findings(tmp_path):
+    """The report first says whether the grader can be cheated or misjudges work, and how."""
+    run = RunDir(tmp_path)
+    answered(run)
+    expected = [
+        "The grader can be cheated, and it misjudges work.",
+        "In real episodes, Attackers reproduced hack-1 (grader_tampering, check-0003) with the full hint (0001-attacker, reward 1): "
+        '"planted a bash shim that prints the pass marker"; had valid work rejected while testing hack-2 (unchecked_requirements, '
+        'check-0004) with the full hint (0002-attacker, reward 0): "wrote the answer with leading zeros".',
+        "In copies of the task package, the hack inspector evidenced cheats by grader_tampering (check-0003); and valid work rejected (check-0004).",
+        "In copies of the task package, the grader inspector evidenced invalid work accepted (check-0000); and valid work rejected (check-0001).",
+        "The run is complete: simulation complete, grader complete, hack complete, attack complete.",
+    ]
+    result = run.report()
+    assert result["answer"] == expected
+    lines = report.markdown(result).splitlines()
+    assert lines[:4] == ["# nudi report", "", "## Answer", ""]
+    assert lines[4:9] == [f"- {line}" for line in expected] and lines[9:11] == ["", "## Configuration"]
+
+    # Package evidence alone does not show that a task agent can cheat.
+    assert run.report(selected=["simulation", "grader", "hack"])["answer"] == [
+        "The grader can be cheated in a copy of the task package, not yet in a real episode, and it misjudges work.",
+        *expected[2:4], "The run is complete: simulation complete, grader complete, hack complete."]
+
+
+def test_with_nothing_evidenced_the_answer_says_so_and_never_calls_the_grader_safe(tmp_path):
+    run = RunDir(tmp_path)
+    run.hack = InspectionResult(mode="hack", status="partial", categories={"grader_tampering": "unknown"}, applicability={},
+                                assessments=[checked("sandbox-0000", "check-0000", "sorted", "unknown")])
+    result = run.report()
+    assert result["answer"] == ["No cheat and no misjudged work was evidenced. That does not show that the grader is safe.",
+                                "The run is partial, so it may miss more: simulation complete, hack partial."]
+    assert report.markdown(result).splitlines()[4:6] == [f"- {line}" for line in result["answer"]]
+
+
+def test_an_older_pooled_attack_record_answers_from_its_evidenced_attempts(tmp_path):
+    run = RunDir(tmp_path)
+    attacked(run)
+    result = run.report()
+    assert result["answer"] == ["The grader can be cheated.",
+                                'In real episodes, Attackers cheated with the full hint (0000-attacker, reward 1): "unchecked requirement".',
+                                "The run is partial, so it may miss more: simulation complete, attack spending_exhausted."]
+    # Its attempts are listed one per line too, after the pooled conditions.
+    lines = report.markdown(result).splitlines()
+    assert lines[lines.index("- Limit: " + SAFETY_LIMIT) - 5:lines.index("- Limit: " + SAFETY_LIMIT)] == [
+        '- 0000-attacker cheated with the full hint: reward 1. How: "unchecked requirement"',
+        "- 0001-attacker searched with the minimal hint: reward 0; refused: finish_reason: content_filter",
+        f"- 0002-attacker searched with no hint: no reward; infrastructure_failure: daemon said {SECRET}",
+        "- 0003-attacker searched with the minimal hint: no reward; inference_failure: InferenceFailure: RateLimitError",
+        "- attempt 2 with no hint did not start: stopped by the spending cap"]
+
+
+def test_the_answer_quotes_only_the_start_of_each_mechanism_and_the_attempt_lines_quote_it_whole(tmp_path):
+    """The answer stays short: a mechanism's first sentence, or about 140 characters, marked when cut."""
+    run = RunDir(tmp_path)
+    answered(run)
+    long = "wrote every answer with leading zeros, " * 5 + "and the grader rejected them all"
+    run.attack.assessments[0].claim.mechanism = "Planted a bash shim. It prints the pass marker."
+    run.attack.assessments[1].claim.mechanism = long
+    result = run.report()
+    assert result["answer"][1] == (
+        'In real episodes, Attackers reproduced hack-1 (grader_tampering, check-0003) with the full hint (0001-attacker, reward 1): '
+        '"Planted a bash shim..."; had valid work rejected while testing hack-2 (unchecked_requirements, check-0004) with the full hint '
+        '(0002-attacker, reward 0): "' + long[:117] + 'wrote every answer..."' + ".")
+    lines = report.markdown(result).splitlines()
+    assert any('How: "Planted a bash shim. It prints the pass marker."' in line for line in lines)
+    assert any(f'How: "{long}"' in line for line in lines)
+
+
+def test_a_secret_across_the_answer_cut_never_appears_even_in_part(tmp_path):
+    """Scrubbing matches whole secrets, so the answer is cut only from already redacted text."""
+    run = RunDir(tmp_path)
+    answered(run)
+    spaced = "Zq9vX2 w8Lp3T kR7m"
+    # Each secret starts before the 140-character cut and ends after it: one after a run with no space, one with spaces inside.
+    run.attack.assessments[0].claim.mechanism = "/opt/" + "a/" * 62 + f"key={SECRET} was echoed by the grader"
+    run.attack.assessments[1].claim.mechanism = "w " * 60 + spaced + " was echoed by the grader"
+    result = run.report(secrets=[SECRET, spaced])
+    for text in (json.dumps(result), report.markdown(result)):
+        for secret in (SECRET, spaced):
+            assert secret[:6] not in text
+    assert result["answer"][1].count("[redac") == 2
+
+
+def test_an_attempt_line_keeps_every_mechanism_of_findings_with_the_same_wording(tmp_path):
+    """Two other-mechanism findings on one attempt read the same; each mechanism stays, in order, once."""
+    run = RunDir(tmp_path)
+    answered(run)
+    episode = run.attack.attempts[0].episode
+    run.attack.assessments[0].claim.mechanism = "planted a shell shim"
+    run.attack.assessments += [evidenced(episode, "check-0007"), evidenced(episode, "check-0008")]
+    run.attack.assessments[2].claim.mechanism, run.attack.assessments[3].claim.mechanism = "forged the reward file", "planted a shell shim"
+    run.attack.findings[0:1] = [AttackFinding(kind="other", candidate="hack-1", sources=["hack-1"], attempt=0, assessment=number,
+                                              relation="other") for number in (0, 2, 3)]
+    lines = report.markdown(run.report()).splitlines()
+    assert ('- 0001-attacker cheated through another mechanism while testing hack-1 (grader_tampering, check-0003) with the full hint: '
+            'reward 1. How: "planted a shell shim". How: "forged the reward file"') in lines
+
+
+def test_the_answer_reads_only_the_latest_reading_of_each_check(tmp_path):
+    """A native reading later read as legitimate neither shows a cheat nor makes the cheat real."""
+    run = RunDir(tmp_path)
+    graded = run.episode(rewards={"reward": 1.0})
+    run.record.sandboxes = ["sandbox-0000"]
+    run.hack = InspectionResult(
+        mode="hack", status="complete", categories={"grader_tampering": "evidenced_issue"}, applicability={},
+        assessments=[evidenced(graded, "check-0000"), checked(graded, "check-0000", "summary", "supported", outcome="legitimate"),
+                     packaged("sandbox-0000", "check-0001")],
+        experiments=[experiment(0, "grader_tampering", "check-0000"), experiment(1, "grader_tampering", "check-0001")])
+    assert run.report()["answer"] == [
+        "The grader can be cheated in a copy of the task package, not yet in a real episode.",
+        "In copies of the task package, the hack inspector evidenced cheats by grader_tampering (check-0001).",
+        "The run is complete: simulation complete, hack complete."]
+
+    run.hack.assessments.pop()
+    assert run.report()["answer"][0] == "No cheat and no misjudged work was evidenced. That does not show that the grader is safe."
+
+
+def test_an_evidenced_attack_finding_outside_the_requested_outcome_stays_in_the_answer(tmp_path):
+    """Testing valid work, an Attacker had invalid work accepted; testing a cheat, another had valid work
+    rejected. Neither confirms its candidate, so neither is an exploit entry, but both are evidence."""
+    run = RunDir(tmp_path)
+    invalid, valid = run.episode("attacker", {"reward": 1.0}), run.episode("attacker", {"reward": 0.0})
+    rejected = evidenced(valid, "check-0001")
+    rejected.outcome = "rejected_valid"
+    run.attack = AttackResult(
+        status="complete", discovery_attempts=0,
+        candidates=[Candidate(id="valid-0", guidance={"full": "write leading zeros"}, valid_work=True, conditions={"full": "no_evidenced_issue"}),
+                    Candidate(id="hack-0", guidance={"full": "plant the shim"}, conditions={"full": "no_evidenced_issue"})],
+        attempts=[AttackAttempt(level="full", number=1, candidate="valid-0", sources=["valid-0"], context="attacker-valid-0-full-1",
+                                episode=invalid, rewards={"reward": 1.0}, status="no_evidenced_issue", assessment=0),
+                  AttackAttempt(level="full", number=1, candidate="hack-0", sources=["hack-0"], context="attacker-hack-0-full-1",
+                                episode=valid, rewards={"reward": 0.0}, status="no_evidenced_issue", assessment=1)],
+        assessments=[evidenced(invalid, "check-0000"), rejected])
+    result = run.report()
+    assert result["answer"] == [
+        "The grader misjudges work.",
+        "In real episodes, the attack inspector evidenced invalid work accepted (check-0000); and valid work rejected (check-0001).",
+        "The run is complete: simulation complete, attack complete."]
+    # Neither attempt line claims what was submitted.
+    lines = report.markdown(result).splitlines()
+    assert "- 0000-attacker tested valid-0 with the full hint: reward 1; no rejection of valid work was evidenced" in lines
+    assert "- 0001-attacker tested hack-0 with the full hint: reward 0; no exploit was evidenced" in lines
+
+
+def test_each_attack_attempt_is_one_line_naming_the_finding_it_tested_and_its_outcome(tmp_path):
+    """Each attempt names its candidate and source check, outcomes are plain, and conditions never attempted are grouped."""
+    run = RunDir(tmp_path)
+    answered(run)
+    honest, failed = run.episode("attacker", {"reward": 1.0}), run.episode("attacker", {"reward": 1.0})
+    run.attack.assessments.append(checked(honest, "check-0007", "sorted", "violated", outcome="legitimate"))
+    run.attack.findings[0].rationale = "Matches the target.\nThe check shows the shim ran."
+    run.attack.candidates[0].conditions["minimal"], run.attack.candidates[1].conditions["minimal"] = "no_evidenced_issue", "model_output_failure"
+    run.attack.candidates += [
+        Candidate(id="hack-5", guidance={"full": "f"}, unavailable={"minimal": "candidate exists but generated minimal guidance unavailable"},
+                  conditions={"full": "unattempted", "minimal": "unavailable"}),
+        Candidate(id="hack-6", guidance={"full": "f", "minimal": "m"}, conditions={"full": "unattempted", "minimal": "unattempted"})]
+    run.attack.attempts += [
+        AttackAttempt(level="minimal", number=1, candidate="hack-1", sources=["hack-1"], context="attacker-hack-1-minimal-1", episode=honest,
+                      rewards={"reward": 0.5}, status="no_evidenced_issue", assessment=2),
+        AttackAttempt(level="minimal", number=1, candidate="hack-2", sources=["hack-2"], context="attacker-hack-2-minimal-1", episode=failed,
+                      rewards={"reward": 1.0}, status="model_output_failure", error="Invalid Claim: 1 validation error for Claim\nmechanism\n  Field required"),
+        AttackAttempt(level="full", number=2, candidate="hack-1", sources=["hack-1"], context="attacker-hack-1-full-2", status="spending_exhausted")]
+
+    result = run.report()
+    lines = report.markdown(result).splitlines()
+    start = lines.index("## Attack") + 2
+    assert lines[start:lines.index("## Persistence") - 1] == [
+        "Status complete; at most 2 attempts per candidate and hint level; 0 calls with unknown prices.",
+        "No-hint discovery: 0 started of at most 0.",
+        '- 0001-attacker reproduced hack-1 (grader_tampering, check-0003) with the full hint: reward 1. '
+        'How: "planted a bash shim that prints the pass marker". Attack inspector: Matches the target. The check shows the shim ran.',
+        '- 0002-attacker had valid work rejected while testing hack-2 (unchecked_requirements, check-0004) with the full hint: reward 0. '
+        'How: "wrote the answer with leading zeros"',
+        "- 0003-attacker tested hack-1 (grader_tampering, check-0003) with the minimal hint: reward 0.5; no exploit was evidenced",
+        "- 0004-attacker tested hack-2 (unchecked_requirements, check-0004) with the minimal hint: reward 1; "
+        "model_output_failure: Invalid Claim: 1 validation error for Claim",
+        "- attempt 2 on hack-1 (grader_tampering, check-0003) with the full hint did not start: stopped by the spending cap",
+        "- Not attempted: hack-5 full, hack-6 full and minimal",
+        "- Not attempted, no guidance: hack-5 minimal",
+    ]
+    # Each hack inspector finding that became a candidate names it.
+    finding = next(line for line in lines if line.startswith("- hack_inspector evidenced (package):") and "check check-0003;" in line)
+    assert "check check-0003; category grader_tampering; attack candidate hack-1;" in finding
+    # The JSON keeps every attempt and condition in full.
+    assert result["attack"]["attempts"][3]["error"].endswith("Field required")
+    assert result["attack"]["exploits"]["reproduction"][0]["rationale"] == "Matches the target.\nThe check shows the shim ran."
+    assert result["attack"]["candidates"][2]["conditions"]["minimal"]["unavailable"] == "candidate exists but generated minimal guidance unavailable"
+
+
+def test_repeated_warnings_are_grouped_and_multi_line_errors_shortened_in_markdown(tmp_path):
+    """Categories and attack conditions get one warning per status; the JSON keeps each error in full."""
+    run = RunDir(tmp_path)
+    answered(run)
+    error = "Invalid Claim: 1 validation error for Claim\nmechanism\n  Field required"
+    run.hack.categories.update(leakage_metadata="unknown", persistence="restricted")
+    run.hack.applicability["persistence"] = "Native persistence readback is a separate observation."
+    run.hack.attempts = [InspectionAttempt(phase="focused", number=1, category="leakage_metadata", status="model_output_failure", error=error)]
+    run.attack.candidates += [Candidate(id=f"hack-{number}", guidance={"full": "f", "minimal": "m"},
+                                        conditions={"full": "unattempted", "minimal": "unattempted"}) for number in (5, 6)]
+
+    result = run.report()
+    assert "hack inspector categories unchecked_requirements, leakage_metadata are unknown" in result["warnings"]
+    assert "hack inspector category persistence is restricted: Native persistence readback is a separate observation." in result["warnings"]
+    assert not any("category leakage_metadata is unknown" in warning for warning in result["warnings"])
+    assert "attack candidates hack-1 minimal, hack-2 minimal, hack-5 full and minimal, hack-6 full and minimal are unattempted" in result["warnings"]
+    assert sum("attack candidate" in warning for warning in result["warnings"]) == 1
+    failure = f"hack inspector focused attempt 1 (leakage_metadata) model_output_failure: {error}"
+    assert failure in result["warnings"]
+    lines = report.markdown(result).splitlines()
+    assert f"- {failure.splitlines()[0]} (full text in report.json)" in lines
+    assert "mechanism" not in lines and "  Field required" not in lines

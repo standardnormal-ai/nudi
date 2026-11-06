@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -24,6 +25,7 @@ import pytest
 from aiohttp import web
 from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.environments.docker.docker import DockerEnvironment
+from harbor.environments.docker.docker_unix import UnixOps
 from harbor.environments.factory import EnvironmentFactory
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.config import TaskOS
@@ -582,14 +584,16 @@ def test_cap_and_cancellation_preserve_partial_inspection(tmp_path, monkeypatch,
             assert report.status == "spending_exhausted"
             assert run.record.calls == []
             run.record.known_cost = 0
-            async def cancelled(*args, **kwargs):
-                raise asyncio.CancelledError()
-            monkeypatch.setattr(inspector.Investigation, "ask", cancelled)
-            with pytest.raises(asyncio.CancelledError):
-                await checks.inspect_hacks(run, categories=["package_oracles"])
-            saved = json.loads((run.config.output_dir / "inspection-hack.json").read_text())
-            assert saved["status"] == "cancelled"
-            assert saved["attempts"][0]["status"] == "cancelled"
+            # A second Ctrl-C arrives as KeyboardInterrupt.
+            for stop in (asyncio.CancelledError, KeyboardInterrupt):
+                async def cancelled(*args, **kwargs):
+                    raise stop()
+                monkeypatch.setattr(inspector.Investigation, "ask", cancelled)
+                with pytest.raises(stop):
+                    await checks.inspect_hacks(run, categories=["package_oracles"])
+                saved = json.loads((run.config.output_dir / "inspection-hack.json").read_text())
+                assert saved["status"] == "cancelled"
+                assert saved["attempts"][0]["status"] == "cancelled"
     asyncio.run(main())
 
 
@@ -971,6 +975,8 @@ class SandboxEnvironment:
         self.trial_paths, self.task_env_config = config["trial_paths"], config["task_env_config"]
         self.logger = logging.getLogger(__name__)
         self.os = TaskOS.LINUX
+        # Harbor's Linux file operations over this double; only its engine-copy fallback test reaches them.
+        self._platform = UnixOps(self)
         self.capabilities = SimpleNamespace(mounted=True)
         self.default_user = None
         self.uploads = {}
@@ -1058,11 +1064,17 @@ class SandboxEnvironment:
         return any(location.startswith(path + "/") for location in self.owner.files.get(self.name, {}))
 
     async def service_download_file(self, source_path, target_path, service=None):
-        """A setup program's file, which a separate verifier's artifact collection downloads."""
+        """A setup program's file, which a separate verifier's artifact collection downloads. Ellipsis is a
+        download that never returns, as Modal's read of a link to /dev/zero or of a FIFO without a writer."""
         self.event("download_file", source_path)
         files = self.owner.files.get(self.name, {})
         if source_path not in files:
             raise FileNotFoundError(source_path)
+        if files[source_path] is Ellipsis:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.event("download_stopped", source_path)
         place(Path(target_path), files[source_path])
 
     async def stop(self, delete):
@@ -1414,6 +1426,33 @@ def test_unchecked_requirements_is_a_default_hack_family_and_yields_a_candidate(
     (item,) = api.guidance(result)["candidates"]
     assert item.guidance["full"] == "Write the number in any format." and item.guidance["minimal"].endswith("tests/test.sh")
     assert item.valid_work is False
+
+
+def test_each_inspector_session_logs_its_start_and_end_and_each_evidenced_finding_as_it_happens(
+        tmp_path, monkeypatch, credentials, caplog, unit_sandboxes):
+    """Without these lines a run can be silent for hours, and findings reach the terminal long after a session found them.
+    A line names only nudi's own values: the session, the outcome, an approved category and the check, never model text."""
+    caplog.set_level(logging.INFO, logger="nudi")
+    no_native_actor(monkeypatch)
+    probes = [{"category": "unchecked_requirements", "case": "unread format", "setup_program": "true"},
+              {"category": "made up family", "case": "found elsewhere", "setup_program": "false"},
+              {"category": "online_lookup", "case": "nothing found", "setup_program": "exit 3"}]
+    inspector_responses(monkeypatch, [{"probes": probes, "applicability": package_applicability("unchecked_requirements")}])
+
+    async def measured(run, probe, session):
+        outcome = "unknown" if probe["case"] == "nothing found" else "accepted_invalid"
+        return Assessment(claim=Claim(mechanism="model text that never reaches the terminal", episode="sandbox-0000"),
+                          execution_scope="package", outcome=outcome)
+
+    mock_experiments(monkeypatch, measured)
+    run = new_run(tmp_path, monkeypatch, credentials)
+    caplog.clear()
+    asyncio.run(checks.inspect_hacks(run, focused_attempts=0))
+    lines = [re.sub(r"after \d+:\d\d:\d\d", "after T", record.getMessage()) for record in caplog.records if record.name == "nudi"]
+    assert lines == ["hack inspector hack-broad started",
+                     "hack inspector evidenced accepted_invalid in unchecked_requirements (experiment-0000)",
+                     "hack inspector evidenced accepted_invalid (experiment-0001)",
+                     "hack inspector hack-broad ended after T: evidenced_issue"]
 
 
 @pytest.mark.parametrize("outcome", ["accepted_invalid", "rejected_valid"])
@@ -2496,7 +2535,7 @@ def test_startup_subprocess_is_joined_before_sandbox_removal(tmp_path, monkeypat
         environment = StartingEnvironment(sandboxes, **config)
         sandboxes.environments[environment.name] = environment
         if interruption == "build_timeout":
-            config["task_env_config"].build_timeout_sec = 0.1
+            config["task_env_config"].build_timeout_sec = 2
         return environment
 
     monkeypatch.setattr(EnvironmentFactory, "create_environment", staticmethod(create))
@@ -2909,6 +2948,66 @@ def test_failed_review_a_later_review_recovers_leaves_a_complete_inspection(tmp_
     assert [item.status for item in result.attempts] == ["tool_failure", "no_evidenced_issue"]
     assert (result.ordinary[pool[0]].label, result.ordinary[pool[0]].basis) == ("legitimate", "verified")
     assert result.categories == {"accepted_invalid": "no_evidenced_issue"} and result.status == "complete"
+
+
+@pytest.mark.parametrize("cited", ["uninterpreted", "foreign"])
+def test_receipt_that_leaves_a_review_unresolved_names_the_blocking_check(tmp_path, monkeypatch, credentials, cited, unit_sandboxes):
+    """A receipt can say the reward matched while the review cites a check measured and never interpreted, which
+    otherwise only inspection_status says. The receipt carries inspection_status's reasons for its episode first, so
+    a long receipt's preview shows them, and the reason names the next action. Interpreting another episode's check
+    cannot help, so the action is conditional."""
+    from nudi.records import Check, Content, Coverage
+    run = new_run(tmp_path, monkeypatch, credentials)
+    pool = ordinary_pool(run, 2)
+    owner = pool[0] if cited == "uninterpreted" else pool[1]
+    requirement = Observation(episode=None, path="instruction.md", excerpt="Write the number 42")
+    scoring = Observation(episode=None, path="tests/test.sh", excerpt="reward")
+    first, second = (Check(id=f"scripted-check-{index}", content=Content(episode=episode, path="state", sha256="hash"), ids={},
+                           requirement=requirement, scoring=scoring, command=[], exit_code=0, output="")
+                     for index, episode in enumerate([pool[0], owner]))
+    coverage = Coverage(requirements=[requirement], scoring=scoring, checks=[first.id, second.id],
+                        explanation="Both checks observe the only scored requirement, so the reward 1.0 is deserved.")
+
+    async def investigate(run, probe, session):
+        check = first if probe == review_probe(pool[0]) else second
+        return Assessment(claim=Claim(mechanism="review", episode=probe["episode"], coverage=coverage if check is first else None),
+                          outcome="legitimate", check=check, validity="supported", discrepancy="none")
+
+    mock_experiments(monkeypatch, investigate)
+    replies = []
+
+    async def behave(name, tools, schema):
+        if name == "grader-broad":
+            if cited == "foreign":
+                receipt = await tools["run_experiment"].ainvoke({"probe": review_probe(owner)})
+                await tools["interpret_experiment"].ainvoke({"experiment": receipt["id"], "claim": receipt["scripted_claim"]})
+            return schema(applicability=package_applicability("accepted_invalid"), completed=["accepted_invalid"])
+        if name != f"grader-episode-{pool[0]}":
+            return schema()
+        receipt = await tools["run_experiment"].ainvoke({"probe": review_probe(pool[0])})
+        if cited == "uninterpreted":
+            await tools["run_experiment"].ainvoke({"probe": review_probe(pool[0], location="/app/other.txt")})
+        replies.append(await tools["interpret_experiment"].ainvoke({"experiment": receipt["id"], "claim": receipt["scripted_claim"]}))
+        replies.append(await tools["inspection_status"].ainvoke({}))
+        if cited == "uninterpreted":
+            replies.append(await tools["interpret_experiment"].ainvoke({"experiment": second.id, "claim": {"mechanism": "review"}}))
+        return schema()
+
+    episode_tools(monkeypatch, behave)
+    result = asyncio.run(checks.inspect_grader(run, pool, categories=["accepted_invalid"], focused_attempts=0,
+                                               isolated_inspections=True))
+    blocked, status, *repaired = replies
+    assert blocked["investigation_result"]["reasons"] == [], "the assessment alone reads as settled"
+    assert list(blocked) == ["unresolved_ordinary_review", "investigation_result"]
+    assert blocked["unresolved_ordinary_review"] == status["unresolved_ordinary_reviews"][pool[0]], "the same words as inspection_status"
+    assert (f"cited check {second.id} is not a consistent check of this episode; interpret {second.id} with interpret_experiment "
+            f"only if its retained measurements can support this episode, otherwise replace it or remove it from coverage.checks"
+            ) in " ".join(blocked["unresolved_ordinary_review"]["reasons"])
+    if cited == "uninterpreted":
+        assert [list(reply) for reply in repaired] == [["investigation_result"]], "a receipt that resolves the review adds nothing"
+        assert (result.ordinary[pool[0]].label, result.ordinary[pool[0]].basis) == ("legitimate", "verified")
+    else:
+        assert result.ordinary[pool[0]].label == "unknown"
 
 
 @pytest.mark.parametrize("outcome, unresolved, settled, label", [
@@ -4049,6 +4148,81 @@ def test_inspector_searches_wait_120_seconds(monkeypatch):
     assert len(backend.interrupted) == 2
 
 
+def test_a_workspace_call_still_stuck_after_sandbox_removal_lets_the_session_end(tmp_path, monkeypatch, credentials):
+    """A timed-out call stays owned until sandbox removal. A client whose transport stays stuck after
+    removal is cancelled within a bound, so the session ends and its command's outcome is recorded as unknown."""
+    Sandboxes(monkeypatch)
+    original, release, sessions, replies = SandboxEnvironment.exec, asyncio.Event(), [], []
+
+    async def stuck(environment, command, **kwargs):
+        if "hang" in command:
+            await release.wait()
+        return await original(environment, command, **kwargs)
+
+    monkeypatch.setattr(SandboxEnvironment, "exec", stuck)
+    monkeypatch.setattr(inspector, "COMMAND_TIMEOUT", .2)
+    monkeypatch.setattr(inspector, "DRAIN_TIMEOUT", .2)
+    run = new_run(tmp_path, monkeypatch, credentials)
+
+    async def investigate():
+        async with inspector.investigation(run, "hack-broad", "Inspect the copied package.", {}) as session:
+            sessions.append(session)
+            replies.append(await session.backend.aexecute("hang"))
+
+    async def main():
+        task = asyncio.create_task(investigate())
+        try:
+            await asyncio.wait({task}, timeout=10)
+            ended = task.done()
+            task.cancel()
+            await asyncio.wait({task}, timeout=10)
+            return ended, task.done()
+        finally:
+            release.set()
+
+    assert asyncio.run(main()) == (True, True)
+    assert "timed out after 0.2 s" in replies[0].output
+    record = sandbox_record(run, sessions[0].box.record.name)
+    assert record["cleanup"]["removed"] is True
+    hang, = [entry for entry in record["commands"] if entry["argv"][-1] == "hang"]
+    assert hang["exit_code"] is None and hang["error"].startswith("unfinished")
+    assert any("outcome is unknown" in warning for warning in run.record.warnings)
+
+
+def test_a_hung_workspace_command_times_out_and_the_session_goes_on(tmp_path, monkeypatch, credentials):
+    """A hung workspace command, such as a script importing vllm, must not stall the hack inspector's session. A
+    command without a timeout gets the default bound and an explicit one is kept; a command past its bound answers
+    that it timed out, and the session goes on."""
+    Sandboxes(monkeypatch)
+    original, bounds = SandboxEnvironment.exec, []
+
+    async def hung(environment, command, **kwargs):
+        if "sleep 99" in command:
+            bounds.append(kwargs["timeout_sec"])
+            # Harbor's Docker exec stops the command at its bound, after nudi's own wait has answered.
+            await asyncio.sleep(kwargs["timeout_sec"])
+            raise RuntimeError(f"Command timed out after {kwargs['timeout_sec']} seconds")
+        return await original(environment, command, **kwargs)
+
+    monkeypatch.setattr(SandboxEnvironment, "exec", hung)
+    monkeypatch.setattr(inspector, "COMMAND_TIMEOUT", .2)
+    script = AgentScript(("execute", {"command": "sleep 99"}), ("execute", {"command": "sleep 99", "timeout": 1}),
+                         ("InspectionSummary", {"applicability": package_applicability(), "completed": []}))
+
+    async def main():
+        async with serve(script) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path),
+                          models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
+            return await asyncio.wait_for(checks.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0), 30)
+
+    result = asyncio.run(main())
+    results = script.tool_results()
+    assert "timed out after 0.2 s" in results[0] and "timed out after 1 s" in results[1]
+    assert bounds == [.2, 1]
+    attempt, = result.attempts
+    assert (attempt.status, attempt.error) == ("no_evidenced_issue", None)
+
+
 def test_a_filesystem_answer_that_a_path_is_missing_is_no_tool_error(tmp_path, monkeypatch, credentials):
     """A hack inspector may list /nudi/evidence/episodes, which its job has not, and one `path_not_found` answer must
     not make every category it left open a tool failure. A missing path is an answer.
@@ -4410,6 +4584,7 @@ def test_a_separate_verifier_probe_grades_in_the_verifier_environment_with_the_d
     # The host collection is removed once uploaded; the manifest stays in the verifier's record.
     assert not (run.config.output_dir / "sandboxes" / "sandbox-0000" / "artifacts").exists()
     assert verifier.setup == "sandbox-0000" and verifier.rewards == {"reward": 1.0}
+    assert sandbox_record(run, "sandbox-0000")["errors"] == [], "a collection within its bound is unchanged"
     assert verifier.grader["skip_tests_upload"] is definition.bundled_tests is declared
     tests_uploaded = any(event[:3] == ("upload_dir", "sandbox-0001", "/tests") for event in sandboxes.events)
     assert tests_uploaded is not declared
@@ -4420,6 +4595,101 @@ def test_a_separate_verifier_probe_grades_in_the_verifier_environment_with_the_d
     receipt = asyncio.run(checks.measure_experiment(run, probe))
     assert receipt["execution_scope"] == "package" and receipt["setup"]["name"] == "sandbox-0002"
     assert receipt["episode"] == "sandbox-0003"
+
+
+def separate_task(tmp_path) -> Path:
+    task = tmp_path / "task"
+    shutil.copytree(SEPARATE_TASK, task)
+    return task
+
+
+def test_three_failed_starts_in_a_row_of_one_task_environment_stop_the_run(tmp_path, monkeypatch, credentials):
+    """A separate verifier image that never builds must not keep experiments starting it for hours.
+    Three failed starts in a row of the same task environment raise EnvironmentUnavailable, which names the
+    environment and the last error. A successful start resets the count; starts of the task's own environment
+    in between do not, since each environment counts alone."""
+    from nudi.records import EnvironmentUnavailable, SandboxResult
+
+    sandboxes = Sandboxes(monkeypatch)
+    no_native_actor(monkeypatch)
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=separate_task(tmp_path))
+    # Each probe starts the task's environment (even sandboxes), then its verifier environment (odd ones).
+    for name in ("sandbox-0001", "sandbox-0003", "sandbox-0007", "sandbox-0009", "sandbox-0011"):
+        sandboxes.fail[("start", name)] = RuntimeError("image build failed")
+    outcomes = []
+    for _ in range(6):
+        try:
+            asyncio.run(checks.package_probe(run, SETUP_PROGRAM))
+            outcomes.append("graded")
+        except Exception as error:
+            outcomes.append(type(error).__name__)
+    assert outcomes == ["RuntimeError", "RuntimeError", "graded", "RuntimeError", "RuntimeError", "EnvironmentUnavailable"]
+    stopped = SandboxResult.model_validate_json((run.config.output_dir / "sandboxes" / "sandbox-0011" / "sandbox.json").read_text())
+    assert [error.type for error in stopped.errors] == ["EnvironmentUnavailable"]
+    assert stopped.errors[0].message == ("the task's verifier environment failed to start 3 times in a row, last with RuntimeError: "
+                                         "image build failed; no later sandbox or episode can use it, so the run stops")
+    assert issubclass(EnvironmentUnavailable, workflow.InfrastructureAbort), "it passes the handlers that stop on infrastructure"
+
+
+def test_a_start_that_succeeds_after_the_third_failure_keeps_the_count(tmp_path, monkeypatch, credentials):
+    """A start already running when the third failed start stops the run may succeed afterwards, and it must not
+    clear the count and lose the stop. A count that reached three stays; a success resets only a lower one."""
+    sandboxes = Sandboxes(monkeypatch)
+    run = new_run(tmp_path, monkeypatch, credentials)
+    for number in (1, 2, 3):
+        sandboxes.fail[("start", f"sandbox-{number:04d}")] = RuntimeError("image build failed")
+    original, waiting, release = SandboxEnvironment.start, asyncio.Event(), asyncio.Event()
+
+    async def start(environment, force_build):
+        if environment.name == "sandbox-0000":
+            waiting.set()
+            await release.wait()
+        await original(environment, force_build)
+
+    monkeypatch.setattr(SandboxEnvironment, "start", start)
+
+    async def check():
+        async with sandbox.sandbox(run, "check"):
+            pass
+
+    async def main():
+        held, outcomes = asyncio.create_task(check()), []
+        await waiting.wait()
+        for _ in range(3):
+            try:
+                await check()
+            except Exception as error:
+                outcomes.append(type(error).__name__)
+        release.set()
+        await held
+        return outcomes
+
+    assert asyncio.run(main()) == ["RuntimeError", "RuntimeError", "EnvironmentUnavailable"]
+    assert run.failed_starts == {"environment": 3}
+
+
+def test_a_hack_inspection_whose_verifier_never_starts_stops_after_three_experiments(tmp_path, monkeypatch, credentials):
+    """The hack inspector's run_experiment raises EnvironmentUnavailable on the third failed verifier start: the
+    inspection ends environment_unavailable with three experiments, and no focused attempt starts."""
+    from nudi.records import EnvironmentUnavailable
+
+    sandboxes = Sandboxes(monkeypatch)
+    no_native_actor(monkeypatch)
+    # sandbox-0000 is the broad workspace; each experiment then starts a setup and a verifier sandbox.
+    for number in range(2, 20, 2):
+        sandboxes.fail[("start", f"sandbox-{number:04d}")] = RuntimeError("image build failed")
+    probes = [setup_probe(case=f"case {number}", setup_program=f"echo {number} > /app/answer.txt\n", location="/app/answer.txt", scoring=None,
+                          requirement={"episode": None, "path": "instruction.md", "excerpt": "Write the number 42"}) for number in range(6)]
+    inspector_responses(monkeypatch, [{"probes": probes, "applicability": package_applicability()}, {"probes": []}, {"probes": []}])
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=separate_task(tmp_path))
+    with pytest.raises(EnvironmentUnavailable, match="verifier environment failed to start 3 times in a row"):
+        asyncio.run(checks.inspect_hacks(run, categories=["package_oracles"]))
+    saved = checks.InspectionResult.model_validate_json((run.config.output_dir / "inspection-hack.json").read_text())
+    assert saved.status == "environment_unavailable"
+    assert [item["status"] for item in saved.experiments] == ["tool_failure"] * 3
+    assert [(attempt.phase, attempt.status) for attempt in saved.attempts] == [("broad", "tool_failure")]
+    assert saved.categories == {"package_oracles": "unknown"}
+    assert len(run.record.sandboxes) == 7
 
 
 def test_a_separate_verifier_sandbox_starts_within_the_main_environments_build_timeout(tmp_path, monkeypatch, credentials):
@@ -4469,6 +4739,220 @@ def test_links_and_special_files_never_reach_a_separate_verifier(tmp_path, monke
         "sandbox-0000: links and special files were removed from the collected artifacts before upload: "
         "['app/answer.txt', 'logs/artifacts/hard', 'logs/artifacts/host', 'logs/artifacts/pipe']"]
     assert (host / "key").read_text() == "host only"
+
+
+def test_a_collection_that_never_returns_ends_at_the_grading_bound_and_the_hack_inspector_receives_the_outcome(
+        tmp_path, monkeypatch, credentials):
+    """A setup program can make a declared artifact a link to /dev/zero or a FIFO,
+    whose download never returns. Collection has the bound grading uses for this task, as an infrastructure
+    policy. At expiry it stops, the setup sandbox is removed, nothing is graded, and the hack inspector receives
+    the named outcome, with no reward and no assessment."""
+    sandboxes = Sandboxes(monkeypatch, files={"sandbox-0001": {"/app/answer.txt": ...}})
+    no_native_actor(monkeypatch)
+    bounds = []
+    monkeypatch.setattr(checks, "grading_bound", lambda timeout_sec: bounds.append(timeout_sec) or 0.2)
+    task = tmp_path / "task"
+    shutil.copytree(SEPARATE_TASK, task)
+    probe = setup_probe(location="/app/answer.txt", scoring=None,
+                        requirement={"episode": None, "path": "instruction.md", "excerpt": "Write the number 42"})
+    inspector_responses(monkeypatch, [{"probes": [probe], "applicability": package_applicability()}])
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
+    result = asyncio.run(asyncio.wait_for(checks.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0), 10))
+
+    assert bounds == [60.0], "the bound is grading's, from this task's verifier limit"
+    setup = sandbox_record(run, "sandbox-0001")
+    (error,) = setup["errors"]
+    message = error["message"]
+    assert error["type"] == "TimeoutError"
+    assert message.startswith("Artifact collection from sandbox-0001 did not finish within 0.2 s, this task's grading bound")
+    assert float(message.split("stopped after ")[1].split(" s")[0]) >= 0.2
+    assert "the last artifact it started was /app/answer.txt" in message
+    # The download stopped before the sandbox was removed; nothing was graded and no verifier sandbox started.
+    events = [event[:3] for event in sandboxes.events if event[1] == "sandbox-0001"]
+    assert events.index(("download_stopped", "sandbox-0001", "/app/answer.txt")) < events.index(("stop", "sandbox-0001", True))
+    assert not setup["cancelled"] and setup["cleanup"]["removed"] is True and not sandboxes.running
+    assert run.record.sandboxes == ["sandbox-0000", "sandbox-0001"] and setup["grader"] is None and setup["rewards"] == {}
+    (experiment,) = result.experiments
+    assert (experiment["status"], experiment["error"]) == ("tool_failure", f"TimeoutError: {message}")
+    assert result.assessments == [] and result.attempts[0].error == experiment["error"]
+    (received,) = [json.loads(item["content"]) for item in session_messages(run.config.output_dir, "hack-broad") if item["role"] == "tool"
+                   and "TimeoutError" in item["content"]]
+    assert (received["status"], received["error"]) == ("tool_failure", experiment["error"]) and "rewards" not in received
+    assert [record["name"] for record in received["raw_feedback"]] == ["sandbox-0001"]
+
+
+def test_cancellation_during_a_collection_that_never_returns_stays_clean(tmp_path, monkeypatch, credentials):
+    """SIGINT cancels the run's task. The stalled download stops, the setup sandbox is recorded cancelled and
+    removed, no verifier sandbox starts, and no collection timeout is recorded."""
+    sandboxes = Sandboxes(monkeypatch, files={"sandbox-0000": {"/app/answer.txt": ...}})
+    no_native_actor(monkeypatch)
+    task = tmp_path / "task"
+    shutil.copytree(SEPARATE_TASK, task)
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
+
+    async def main():
+        probing = asyncio.create_task(checks.package_probe(run, SETUP_PROGRAM))
+
+        async def downloading():
+            while ("download_file", "sandbox-0000", "/app/answer.txt") not in sandboxes.events:
+                await asyncio.sleep(0.01)
+        await asyncio.wait_for(downloading(), 10)
+        probing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(probing, 10)
+
+    asyncio.run(main())
+    record = sandbox_record(run, "sandbox-0000")
+    assert record["cancelled"] and record["errors"] == [] and record["cleanup"]["removed"] is True
+    assert run.record.sandboxes == ["sandbox-0000"] and not sandboxes.running
+    assert [event[0] for event in sandboxes.events if event[0] in ("download_stopped", "stop")] == ["download_stopped", "stop"]
+
+
+def test_a_fallback_engine_copy_is_killed_and_reaped_before_the_setup_sandbox_is_removed(tmp_path, monkeypatch, credentials):
+    """When `docker compose cp` fails, Harbor resolves the container and downloads with `docker cp`. Python children
+    stand in for both engine commands, and the copy writes its target until it is stopped. At the collection bound
+    both children have exited, and the target no longer grows, before the setup sandbox is removed."""
+    sandboxes = Sandboxes(monkeypatch, files={"sandbox-0000": {"/app/answer.txt": b"42\n"}})
+    no_native_actor(monkeypatch)
+    monkeypatch.setattr(checks, "grading_bound", lambda timeout_sec: 0.3)
+    children, targets, stopped = [], [], []
+    real_spawn = asyncio.create_subprocess_exec
+
+    async def spawn(*command, **kwargs):
+        assert command[0] == sys.executable, "the fallback test must not launch Docker"
+        children.append(await real_spawn(*command, **kwargs))
+        return children[-1]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+    async def host_command(command, **kwargs):
+        return await (trusted_host_command if command[0] == sys.executable else sandboxes.docker)(command, **kwargs)
+
+    monkeypatch.setattr(checks, "host_command", host_command)
+    writer = "import sys, time\nwith open(sys.argv[1], 'ab', buffering=0) as file:\n    while True:\n        file.write(b'x' * 4096)\n        time.sleep(0.01)"
+
+    class FallbackEnvironment(SandboxEnvironment):
+        runtime = staticmethod(DockerEnvironment.runtime)
+
+        @classmethod
+        def _engine_cmd(cls, *args):
+            if args[0] == "ps":
+                return [sys.executable, "-c", "print('container\\tproject-main-1')"]
+            assert args[:2] == ("cp", "container:/app/answer.txt")
+            return [sys.executable, "-c", writer, args[2]]
+
+        async def _run_docker_compose_command(self, command, **kwargs):
+            raise RuntimeError(f"compose cp failed: {command}")
+
+        async def service_download_file(self, source_path, target_path, service=None):
+            targets.append(Path(target_path))
+            await self._platform.download_file(source_path, target_path, service=service)
+
+        async def stop(self, delete):
+            size = targets[0].stat().st_size
+            await asyncio.sleep(0.1)
+            stopped.append(([child.returncode for child in children], size, targets[0].stat().st_size))
+            await super().stop(delete)
+
+    def create(**config):
+        environment = FallbackEnvironment(sandboxes, **config)
+        sandboxes.environments[environment.name] = environment
+        return environment
+
+    monkeypatch.setattr(EnvironmentFactory, "create_environment", staticmethod(create))
+    task = tmp_path / "task"
+    shutil.copytree(SEPARATE_TASK, task)
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
+
+    async def main():
+        try:
+            with pytest.raises(TimeoutError, match="did not finish within 0.3 s"):
+                await checks.package_probe(run, SETUP_PROGRAM)
+        finally:
+            for child in children:
+                if child.returncode is None:
+                    child.kill()
+                await child.wait()
+
+    asyncio.run(main())
+    (codes, size, later), = stopped
+    assert len(codes) == 2 and None not in codes, "an engine child was still running when the sandbox was removed"
+    assert 0 < size == later, "the fallback copy still wrote its target during sandbox removal"
+    assert sandbox_record(run, "sandbox-0000")["cleanup"]["removed"] is True
+
+
+def test_a_fallback_container_lookup_slower_than_the_helper_default_still_collects_the_artifact(tmp_path, monkeypatch, credentials):
+    """Harbor's container lookup has no deadline of its own; only the collection bound stops it. A lookup slower
+    than host_command's default timeout, shortened here to 0.1 s, still collects the artifact within that bound."""
+    sandboxes = Sandboxes(monkeypatch, files={"sandbox-0000": {"/app/answer.txt": b"42\n"}})
+    no_native_actor(monkeypatch)
+    monkeypatch.setattr(checks, "grading_bound", lambda timeout_sec: 30)
+    monkeypatch.setitem(trusted_host_command.__kwdefaults__, "timeout", 0.1)
+
+    async def host_command(command, **kwargs):
+        return await (trusted_host_command if command[0] == sys.executable else sandboxes.docker)(command, **kwargs)
+
+    monkeypatch.setattr(checks, "host_command", host_command)
+
+    class FallbackEnvironment(SandboxEnvironment):
+        runtime = staticmethod(DockerEnvironment.runtime)
+
+        @classmethod
+        def _engine_cmd(cls, *args):
+            if args[0] == "ps":
+                return [sys.executable, "-c", "import time; time.sleep(0.5); print('container\\tproject-main-1')"]
+            return [sys.executable, "-c", "import sys; open(sys.argv[1], 'wb').write(b'42')", args[2]]
+
+        async def _run_docker_compose_command(self, command, **kwargs):
+            raise RuntimeError(f"compose cp failed: {command}")
+
+        async def service_download_file(self, source_path, target_path, service=None):
+            await self._platform.download_file(source_path, target_path, service=service)
+
+    def create(**config):
+        environment = FallbackEnvironment(sandboxes, **config)
+        sandboxes.environments[environment.name] = environment
+        return environment
+
+    monkeypatch.setattr(EnvironmentFactory, "create_environment", staticmethod(create))
+    task = tmp_path / "task"
+    shutil.copytree(SEPARATE_TASK, task)
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
+    name = asyncio.run(checks.package_probe(run, SETUP_PROGRAM))
+
+    manifest = sandbox_record(run, name)["artifact_manifest"]
+    assert {entry["source"]: entry["status"] for entry in manifest}["/app/answer.txt"] == "ok"
+    assert sandboxes.environments[name].uploads["/app/answer.txt"] == b"42"
+
+
+def test_the_engine_fallback_decodes_cli_output_with_replacement_and_merges_copy_stderr_as_harbor_does():
+    """Harbor's lookup and engine copy decode CLI output with replacement, so non-UTF-8 output never fails them. A
+    successful copy ignores its output; a failed copy reports stdout and stderr merged in the order written."""
+    programs = {"ps": "import os; os.write(1, b'\\xff\\ncontainer\\tproject-main-1\\n')",
+                "cp": "import os; os.write(1, b'\\xff')"}
+
+    class Engine:
+        session_id, _collect_buffered_output = "project", None
+
+        def __init__(self):
+            self._platform = UnixOps(self)
+
+        @classmethod
+        def _engine_cmd(cls, *args):
+            return [sys.executable, "-c", programs[args[0]]]
+
+    engine = Engine()
+    sandbox._protect_subprocesses(engine)
+
+    async def main():
+        assert await engine._platform._resolve_service_container("main") == "container"
+        assert await engine._platform._engine_cp("a", "b") is None
+        programs["cp"] = "import os; os.write(1, b'out1'); os.write(2, b'err1'); os.write(1, b'\\xffout2'); raise SystemExit(7)"
+        with pytest.raises(RuntimeError) as failure:
+            await engine._platform._engine_cp("a", "b")
+        assert str(failure.value) == "Engine cp failed ('a' -> 'b'): out1err1�out2"
+
+    asyncio.run(main())
 
 
 @pytest.mark.parametrize("separate", [True, False])

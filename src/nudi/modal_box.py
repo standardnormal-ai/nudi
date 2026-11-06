@@ -1,21 +1,61 @@
 """Harbor's Modal environment for every Modal container of a nudi run: native agent and
 separate verifier environments and Inspector sandboxes.
 
-Only `runner.MODAL_BOX`, Harbor's import path, names this module, so importing nudi or
-running on Docker never imports the Modal SDK, which reads the user's Modal profile.
+Only `runner.MODAL_BOX`, Harbor's import path, and `report.billed_cost` import this module, so
+importing nudi or running on Docker never imports the Modal SDK, which reads the user's Modal profile.
 """
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 from harbor.environments import modal
 from harbor.utils.optional_import import MissingExtraError
 
-from nudi.records import ModalSandbox
+from nudi.records import ModalSandbox, RunRecord
+from nudi.report import MODAL_LIFETIME
 from nudi.sandbox import _now
-from nudi.workflow import current
+from nudi.workflow import current, logger
 
 # Bounds each Modal call of a stop: the termination, the wait for it and each removal check.
 REMOVAL_TIMEOUT = 60
+# Modal reports an hour minutes after it ends; collection can take longer (modal.com/docs/guide/billing).
+BILLING_DELAY = timedelta(minutes=10)
+
+
+def _hour(moment: str, after: timedelta = timedelta()) -> datetime:
+    return (datetime.fromisoformat(moment) + after).replace(minute=0, second=0, microsecond=0)
+
+
+def billed_cost(record: RunRecord) -> float | None:
+    """Modal's metered cost, before credits, of the run's App over the whole hours its sandboxes
+    ran, or None with a one-line reason logged. Modal reports whole hours only, so the bill is
+    complete minutes after the hour in which the last sandbox stopped. The report needs a Team
+    or Enterprise plan. The host that ran nudi is not in the App and is not counted."""
+    app = f"nudi-{record.run_id}"
+    if not record.modal:
+        logger.warning(f"the run recorded no Modal sandbox, so app {app} has no bill")
+        return None
+    start = min(_hour(box.started_at) for box in record.modal)
+    # A sandbox Modal never ended is billed until its lifetime ends.
+    end = max(_hour(box.stopped_at) if box.removed else _hour(box.started_at, MODAL_LIFETIME)
+              for box in record.modal) + timedelta(hours=1)
+    if datetime.now(timezone.utc) < end + BILLING_DELAY:
+        logger.warning(f"Modal's bill for app {app} is not complete; try again after {end + BILLING_DELAY:%Y-%m-%d %H:%MZ}, "
+                       "since Modal reports whole hours minutes after each ends")
+        return None
+    try:
+        from modal import Workspace
+
+        rows = Workspace.from_context().billing.report(start=start, end=end, resolution="h")
+    except Exception as error:
+        # Its text can quote the Modal credential or profile, as `_guarded` explains.
+        logger.warning(f"Modal's billing report failed with {type(error).__name__}; it needs a Modal Team or Enterprise plan")
+        return None
+    costs = [row.cost for row in rows if row.description == app]
+    if not costs:
+        logger.warning(f"Modal's billing report has no row for app {app} from {start:%Y-%m-%d %H:%MZ} to {end:%Y-%m-%d %H:%MZ}")
+        return None
+    return float(sum(costs))
 
 
 class ModalFailure(RuntimeError):
@@ -45,10 +85,19 @@ class ModalBox(modal.ModalEnvironment):
     Stop terminates the sandbox and asks Modal whether it ended; if not, it terminates it
     once more. Each Modal call of a stop is bounded by `REMOVAL_TIMEOUT`. Each stopped
     sandbox is recorded in the run, with a warning when it still runs: it can run up to
-    Harbor's 24 h lifetime. The run is the one given, else the run whose model calls
-    surround the trial. With `copy_image`, the snapshot of a state copy, the sandbox starts from it."""
+    Harbor's 24 h lifetime, or the run's time limit plus 15 minutes. The run is the one given,
+    else the run whose model calls surround the trial. A run's sandboxes share the Modal App
+    `nudi-<run id>`, so Modal's billing report has rows for that run alone. With `copy_image`,
+    the snapshot of a state copy, the sandbox starts from it."""
 
     def __init__(self, *args, run=None, copy_image=None, **kwargs):
+        run = run or (scope[0] if (scope := current.get()) else None)
+        if run is not None:
+            kwargs.setdefault("app_name", f"nudi-{run.record.run_id}")
+            if run.config.time_limit:
+                # A host that dies without cleanup leaves its sandboxes running until Modal ends them.
+                # Modal's maximum lifetime is 24 h.
+                kwargs["sandbox_timeout_secs"] = min(round(run.config.time_limit * 60) + 15 * 60, 86400)
         super().__init__(*args, **kwargs)
         self.run, self.created_at, self.removed, self.sandbox_id = run, _now(), None, None
         self.copy_image = copy_image
@@ -127,7 +176,7 @@ class ModalBox(modal.ModalEnvironment):
         self._record(failure)
 
     def _record(self, failure: str) -> None:
-        run = self.run or (scope[0] if (scope := current.get()) else None)
+        run = self.run
         message = (f"Modal sandbox {self.sandbox_id} ({self.session_id}) still runs after two terminations{failure}; "
                    "it can run up to 24 h and is billed until Modal ends it")
         if run is None:

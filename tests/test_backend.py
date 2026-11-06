@@ -14,10 +14,13 @@ import os
 import subprocess
 import sys
 import traceback
+from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
 import litellm
+import modal as modal_sdk
 import pytest
 from grpclib.metadata import encode_metadata
 from harbor.environments import modal as harbor_modal
@@ -102,13 +105,14 @@ class Modal:
     """Replaces Modal's `App` and `Sandbox` in Harbor's Modal module and records each sandbox."""
 
     def __init__(self, monkeypatch, terminations=1, fail=(), hang=False):
-        self.terminations, self.fail, self.hang, self.created = terminations, fail, hang, []
+        self.terminations, self.fail, self.hang, self.created, self.apps = terminations, fail, hang, [], []
         monkeypatch.setattr(harbor_modal, "App", SimpleNamespace(lookup=Aio(self.lookup)))
         monkeypatch.setattr(harbor_modal, "Sandbox", SimpleNamespace(create=Aio(self.create)))
         # Harbor's sandbox creation sets this variable; monkeypatch removes it afterwards.
         monkeypatch.setenv("MODAL_SANDBOX_V2", "1")
 
     async def lookup(self, name, create_if_missing):
+        self.apps.append(name)
         return SimpleNamespace(name=name)
 
     async def create(self, *entrypoint, **kwargs):
@@ -323,6 +327,20 @@ def test_modal_run_records_its_backend_and_never_asks_docker(tmp_path, monkeypat
     assert [config.backend for config in episodes] == ["modal"]
 
 
+@pytest.mark.parametrize(("environment", "override", "expected"), [
+    ("cpus = 1\nmemory_mb = 4096", None, 4096),
+    ("cpus = 1", None, None),
+    ("cpus = 1\nmemory_mb = 4096", 1600, 1600),
+])
+def test_a_modal_workspace_has_the_task_memory_unless_set(tmp_path, monkeypatch, environment, override, expected):
+    """512 MiB workspaces ran out of memory in 4 of 5 measured Modal runs. On Modal no workspace
+    shares a host with an experiment, so it keeps the task's limit as experiments do."""
+    task = task_with(tmp_path, CONTRACT_TASK, f'schema_version = "1.4"\n[environment]\ndocker_image = "python:3.12-slim"\n{environment}\n')
+    record = stored(modal_run(tmp_path, monkeypatch, task_dir=task, workspace_memory_mb=override))
+    assert record.capacity.workspace_memory_mb == expected
+    assert not any("512 MiB" in limitation for limitation in record.limitations)
+
+
 @pytest.mark.parametrize(("terminations", "removed"), [(1, True), (2, True), (None, False)])
 def test_modal_sandbox_has_hard_limits_and_verified_removal(tmp_path, monkeypatch, terminations, removed):
     """Harbor's stop terminates once; a sandbox still running is terminated once more, and one
@@ -340,6 +358,7 @@ def test_modal_sandbox_has_hard_limits_and_verified_removal(tmp_path, monkeypatc
     # The verifier directory is created inside the sandbox; Modal ignores the host side of the mount.
     assert any("/logs/verifier" in command for command in box.commands)
     assert box.terminate_calls == min(terminations or 2, 2)
+    assert modal.apps == [f"nudi-{stored(run).run_id}"], "each run's sandboxes share one App named for the run"
     record = sandbox_record(run, "sandbox-0000")
     assert record["environment"]["type"] == "modal"
     assert record["environment"]["cpu_enforcement"] == record["environment"]["memory_enforcement"] == "limit"
@@ -353,6 +372,28 @@ def test_modal_sandbox_has_hard_limits_and_verified_removal(tmp_path, monkeypatc
             run.admit_container("probe")
     report.write(run.config.output_dir, (), ["simulation"])
     assert_no_modal_credential(run.config.output_dir)
+
+
+# Modal's maximum sandbox lifetime is 24 h.
+@pytest.mark.parametrize(("time_limit", "lifetime"), [(None, 86400), (90, 90 * 60 + 15 * 60), (1440, 86400)])
+def test_each_modal_sandbox_gets_the_run_limit_plus_grace_capped_at_24_hours(tmp_path, monkeypatch, time_limit, lifetime):
+    """A host that dies without cleanup leaves its sandboxes running until Modal ends them.
+    Without a time limit Harbor's 24 h lifetime stays, with no idle timeout."""
+    modal = Modal(monkeypatch)
+    run = modal_run(tmp_path, monkeypatch, time_limit=time_limit)
+    config = trial_config(tmp_path, "modal", CONTRACT_TASK)
+
+    async def main():
+        async with sandbox.sandbox(run, "probe"):
+            pass
+        with workflow.model_calls(run, "simulator", "0000-simulator"):
+            trial = await Trial.create(config)
+            trial._init_agent_environment()
+            await trial.agent_environment.start(force_build=False)
+            await trial.agent_environment.stop(delete=True)
+
+    asyncio.run(main())
+    assert [(box.kwargs["timeout"], box.kwargs["idle_timeout"]) for box in modal.created] == [(lifetime, None)] * 2
 
 
 @pytest.mark.parametrize(("terminations", "removed"), [(1, True), (2, True), (None, False)])
@@ -381,6 +422,7 @@ def test_modal_agent_and_separate_verifier_environments_have_hard_limits_and_ver
     assert [(box.kwargs["cpu"], box.kwargs["memory"]) for box in modal.created] == [((0.125, 1), (128, 512))] * 2
     assert [box.terminate_calls for box in modal.created] == [min(terminations or 2, 2)] * 2
     record = stored(run)
+    assert modal.apps == [f"nudi-{record.run_id}"] * 2
     assert [(use.sandbox_id, use.removed) for use in record.modal] == [("sb-0", removed), ("sb-1", removed)]
     assert len([warning for warning in record.warnings if "still runs" in warning]) == (0 if removed else 2)
     assert_no_modal_credential(run.config.output_dir)
@@ -507,7 +549,7 @@ def test_modal_admission_counts_containers_against_concurrency(tmp_path, monkeyp
     assert len(run.record.sandboxes) == 4
 
 
-def test_modal_cost_is_a_report_only_upper_bound_outside_the_spending_cap(tmp_path, monkeypatch):
+def test_modal_cost_is_a_report_only_estimate_from_requests_to_limits_outside_the_spending_cap(tmp_path, monkeypatch):
     run = modal_run(tmp_path, monkeypatch, spending_cap=1e-9)
     run.record.modal = [
         ModalSandbox(session_id="a", sandbox_id="sb-a", cpus=2, memory_mb=2048, started_at="2026-11-04T00:00:00+00:00",
@@ -520,11 +562,14 @@ def test_modal_cost_is_a_report_only_upper_bound_outside_the_spending_cap(tmp_pa
 
     built = report.build(run.config.output_dir)
     estimate = built["configuration"]["modal_cost"]
-    assert estimate["estimate"] == pytest.approx(100 * (2 * 0.00003942 + 2 * 0.00000667))
-    assert (estimate["sandboxes"], estimate["without_limits"]) == (2, 1)
+    # Modal bills the larger of request and use; Harbor requests 0.125 cores and 128 MiB under each limit.
+    assert estimate["at_requests"] == pytest.approx(100 * (0.125 * 0.00003942 + 0.125 * 0.00000667))
+    assert estimate["at_limits"] == pytest.approx(100 * (2 * 0.00003942 + 2 * 0.00000667))
+    assert (estimate["sandboxes"], estimate["without_limits"], estimate["app"]) == (2, 1, f"nudi-{run.record.run_id}")
     assert built["configuration"]["known_cost"] == 0
     text = report.markdown(built)
-    assert "Modal compute" in text and "upper bound" in text and "outside the spending cap" in text
+    assert f"- Modal compute: estimated $0.00 to $0.01 for 2 sandboxes in app nudi-{run.record.run_id}, from their " in text
+    assert "sandboxes only, not the host that ran nudi; outside the spending cap" in text and "`nudi cost <run dir>`" in text
 
 
 def test_a_modal_sandbox_left_running_counts_up_to_its_24_h_lifetime(tmp_path, monkeypatch):
@@ -533,7 +578,7 @@ def test_a_modal_sandbox_left_running_counts_up_to_its_24_h_lifetime(tmp_path, m
                                      stopped_at="2026-11-04T00:01:40+00:00", removed=False)]
     run.save()
     estimate = report.build(run.config.output_dir)["configuration"]["modal_cost"]
-    assert estimate["estimate"] == pytest.approx(3.694032)
+    assert estimate["at_limits"] == pytest.approx(3.694032)
     assert estimate["still_running"] == 1
 
 
@@ -549,6 +594,98 @@ def test_records_from_before_the_backend_switch_still_load_and_report(tmp_path, 
     record = RunRecord.model_validate_json(path.read_text())
     assert (record.backend, record.modal, record.capacity.concurrency_setting) == ("docker", [], None)
     assert report.build(run.config.output_dir)["configuration"]["modal_cost"] is None
+
+
+def use(started_at, stopped_at, removed=True):
+    return ModalSandbox(session_id="a", sandbox_id="sb-a", cpus=1, memory_mb=512, started_at=started_at,
+                        stopped_at=stopped_at, removed=removed)
+
+
+def billing(monkeypatch, rows=(), error=None):
+    """Modal's `Workspace.from_context().billing.report`: it records each query and returns
+    `rows`, (App, cost) pairs, or raises `error`. No test calls Modal."""
+    queries = []
+
+    def billing_report(**query):
+        queries.append(query)
+        if error is not None:
+            raise error
+        return [SimpleNamespace(description=app, cost=Decimal(cost)) for app, cost in rows]
+
+    workspace = SimpleNamespace(billing=SimpleNamespace(report=billing_report))
+    monkeypatch.setattr(modal_sdk, "Workspace", SimpleNamespace(from_context=lambda: workspace))
+    return queries
+
+
+def test_the_modal_bill_sums_the_runs_app_over_the_whole_hours_its_sandboxes_ran(tmp_path, monkeypatch):
+    run = modal_run(tmp_path, monkeypatch)
+    app = f"nudi-{run.record.run_id}"
+    run.record.modal = [use("2026-11-04T00:10:00+00:00", "2026-11-04T01:20:00+00:00"),
+                        use("2026-11-04T00:30:00+00:00", "2026-11-04T00:40:00+00:00")]
+    queries = billing(monkeypatch, [(app, "0.50"), ("__harbor__", "9"), (app, "0.25"), ("nudi-other", "1")])
+    assert report.billed_cost(run.record) == 0.75
+    assert queries == [{"start": datetime(2026, 11, 4, 0, tzinfo=timezone.utc),
+                        "end": datetime(2026, 11, 4, 2, tzinfo=timezone.utc), "resolution": "h"}]
+    # A sandbox Modal never ended is billed until its 24 h lifetime, so the bill waits for it.
+    run.record.modal.append(use("2026-11-04T00:30:00+00:00", "2026-11-04T00:40:00+00:00", removed=False))
+    report.billed_cost(run.record)
+    assert queries[-1]["end"] == datetime(2026, 11, 5, 1, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("case", ["not reported yet", "report failed", "no row for the app", "no sandbox", "docker"])
+def test_no_bill_is_none_with_a_one_line_reason_and_never_quotes_the_credential(tmp_path, monkeypatch, caplog, case):
+    run = modal_run(tmp_path, monkeypatch)
+    app = f"nudi-{run.record.run_id}"
+    past = use("2026-11-04T00:10:00+00:00", "2026-11-04T01:20:00+00:00")
+    run.record.modal = {"not reported yet": [use(sandbox._now(), sandbox._now())], "no sandbox": []}.get(case, [past])
+    run.record.backend = "docker" if case == "docker" else "modal"
+    queries = billing(monkeypatch, [("__harbor__", "1")],
+                      ValueError(f"token secret {TOKEN_SECRET}") if case == "report failed" else None)
+    assert report.billed_cost(run.record) is None
+    (reason,) = [record.getMessage() for record in caplog.records if record.name == "nudi"]
+    assert "\n" not in reason and TOKEN_SECRET not in caplog.text
+    assert len(queries) == (case in ("report failed", "no row for the app"))
+    assert {"not reported yet": f"bill for app {app} is not complete; try again after",
+            "report failed": "failed with ValueError; it needs a Modal Team or Enterprise plan",
+            "no row for the app": f"no row for app {app} from 2026-11-04 00:00Z to 2026-11-04 02:00Z",
+            "no sandbox": "no Modal sandbox", "docker": "docker has no bill"}[case] in reason
+
+
+def test_nudi_cost_prints_the_bill_or_when_to_try_again(tmp_path, monkeypatch, capsys):
+    """`nudi cost` only reads Modal's report: it limits and stops nothing."""
+    run = modal_run(tmp_path, monkeypatch)
+    app = f"nudi-{run.record.run_id}"
+    run.record.modal = [use("2026-11-04T00:10:00+00:00", "2026-11-04T01:20:00+00:00")]
+    run.save()
+    billing(monkeypatch, [(app, "1.6249")])
+    assert cli.main(["cost", str(run.config.output_dir)]) == 0
+    assert capsys.readouterr().out == (f"Modal billed $1.62 for the sandboxes in app {app}, metered before credits; "
+                                       "the host that ran nudi is not counted\n")
+    run.record.modal = [use(sandbox._now(), sandbox._now())]
+    run.save()
+    assert cli.main(["cost", str(run.config.output_dir)]) == 1
+    printed = capsys.readouterr()
+    assert printed.out == "" and printed.err.startswith(f"nudi: Modal's bill for app {app} is not complete; try again after ")
+    assert cli.main(["cost", str(tmp_path / "missing")]) == 2
+
+
+def test_nudi_cost_names_only_the_type_of_an_unreadable_modal_profile(tmp_path, monkeypatch):
+    """Importing the Modal SDK reads the profile, and the TOML parser's error text can quote a token.
+    A fresh process, so the SDK is not already imported; the profile is synthetic."""
+    run = modal_run(tmp_path, monkeypatch)
+    # A recent stop: a profile that did load would stop at the time rule, before any Modal call.
+    run.record.modal = [use(sandbox._now(), sandbox._now())]
+    run.save()
+    sentinel = "as-nudi-sentinel-profile-token"
+    profile = tmp_path / "modal.toml"
+    profile.write_text(f"[default]\ntoken_secret = {sentinel}\n")
+    environment = {**os.environ, "MODAL_CONFIG_PATH": str(profile), "PYTHONPATH": str(Path(sandbox.__file__).parents[1])}
+    done = subprocess.run([sys.executable, "-c", "import sys; from nudi import cli; sys.exit(cli.main(sys.argv[1:]))",
+                           "cost", str(run.config.output_dir)], env=environment, capture_output=True, text=True)
+    assert done.returncode == 1
+    assert done.stderr == "nudi: Modal's bill cannot be read: loading Modal raised InvalidError\n"
+    # The SDK prints its own installation banner to stdout before raising; it quotes nothing.
+    assert "Modal billed" not in done.stdout and sentinel not in done.stdout + done.stderr
 
 
 # Both backends: the start line, free space where records go, and a full records host.

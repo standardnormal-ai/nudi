@@ -22,7 +22,7 @@ nudi = "nudi.cli:main"
 
 [project.optional-dependencies]
 test = ["pytest"]
-# The installed modal is pinned so the snapshot API used later cannot drift.
+# The installed modal is pinned so the snapshot API cannot drift.
 modal = ["harbor[modal]==0.24.0", "modal==1.6.3"]
 
 [build-system]

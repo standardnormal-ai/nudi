@@ -30,9 +30,13 @@ from harbor.models.task.verifier_mode import resolve_verifier_environment_defini
 from harbor.models.trial.config import ServiceVolumeBind, ServiceVolumeConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 
-from nudi.records import ErrorRecord, SandboxResult, private_dir, write_private
+from nudi.records import EnvironmentUnavailable, ErrorRecord, SandboxResult, private_dir, write_private
 from nudi.runner import RewardVerifier, UnsupportedTask, environment_config, grading_bound, named, snapshot, tree_digest
 
+# Failed starts in a row of one task environment that stop the run. One or two can be a flaky backend;
+# a successful start of that environment resets the count. Error texts are not compared: Docker's
+# names each sandbox's compose project and includes its build output.
+START_FAILURES = 3
 PACKAGE = "/nudi/package"
 RUNNER = "/nudi/run.py"
 SETUP = "/nudi/setup.sh"
@@ -89,12 +93,14 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _protect_startup(environment) -> None:
-    """Adapt the two async subprocess paths in supported Harbor 0.24.0 Docker startup.
+def _protect_subprocesses(environment) -> None:
+    """Adapt the async subprocess paths of supported Harbor 0.24.0 Docker, so a cancelled or
+    timed-out wait ends its host child before the sandbox is removed.
 
-    nudi admits only public networking and zero GPUs. Compose collection and image OS
-    inspection are the remaining async child paths; daemon inspection is synchronous
-    and already has Harbor's timeout. These changes belong only to this environment.
+    nudi admits only public networking and zero GPUs. Compose collection, image OS inspection
+    and the engine `ps` and `cp` that a download falls back to after a compose `cp` failure are
+    the remaining async child paths; daemon inspection is synchronous and already has Harbor's
+    timeout. These changes belong only to this environment.
     """
     from nudi.checks import finish_cleanup, host_command
 
@@ -121,8 +127,29 @@ def _protect_startup(environment) -> None:
         if image_os and image_os != expected:
             raise RuntimeError(f"Task declares {expected} but Docker image {image_name!r} reports OS {image_os!r}")
 
+    # Harbor's lookup and copy have no limit of their own and decode with replacement; the caller's bound stops them.
+    async def resolve_service_container(service: str) -> str:
+        # nudi's session id is already a valid compose project name.
+        project = environment.session_id
+        _, output, _ = await host_command(list(type(environment)._engine_cmd(
+            "ps", "-a", "--filter", f"label=com.docker.compose.project={project}", "--format", "{{.ID}}\t{{.Names}}")),
+            timeout=None, errors="replace")
+        for line in output.splitlines():
+            container, _, name = line.partition("\t")
+            if name.strip().endswith((f"_{service}_1", f"-{service}-1")):
+                return container.strip() or name.strip()
+        raise RuntimeError(f"Could not resolve container for compose service {service!r} in project {project!r}.")
+
+    async def engine_cp(source: str, destination: str) -> None:
+        status, output, _ = await host_command(list(type(environment)._engine_cmd("cp", source, destination)),
+                                               timeout=None, errors="replace", merge_stderr=True)
+        if status:
+            raise RuntimeError(f"Engine cp failed ({source!r} -> {destination!r}): {output}")
+
     environment._collect_buffered_output = collect
     environment._validate_image_os = validate_image_os
+    environment._platform._resolve_service_container = resolve_service_container
+    environment._platform._engine_cp = engine_cp
 
 
 def _remove_at_once(environment) -> None:
@@ -251,7 +278,8 @@ async def sandbox(run, purpose: str, *, copy=None, definition: bool = False, art
     /logs/artifacts is bound to `artifacts/logs/artifacts` under the sandbox record, where
     Harbor's artifact collection reads it.
 
-    The spending cap and the run's container admission are checked first. Removal is
+    The third failed start in a row of the task's environment, or of its separate verifier environment,
+    raises `EnvironmentUnavailable` instead of the error. The spending cap and the run's container admission are checked first. Removal is
     shielded from cancellation and then verified, because upstream stop logs its failures:
     on Docker the project's containers are listed, on Modal `ModalBox` asks Modal."""
     from nudi import checks
@@ -283,6 +311,8 @@ async def sandbox(run, purpose: str, *, copy=None, definition: bool = False, art
         config = config.model_copy(update={"docker_image": copy.tag or copy.image})
     elif definition and (found := resolve_verifier_environment_definition(task.config, task.paths)):
         config, directory, upload, own = found.config, found.directory, not found.bundled_tests, False
+    # The task environment this sandbox builds, whose failed starts count; a state copy builds none.
+    kind = None if copy is not None else "environment" if own else "verifier environment"
     policy = config.resolve_baseline()
     # Harbor's override applies to this environment only; the copied files keep the declaration.
     override = run.record.capacity.workspace_memory_mb if purpose == "workspace" else None
@@ -328,12 +358,24 @@ async def sandbox(run, purpose: str, *, copy=None, definition: bool = False, art
             trial_paths=paths, task_env_config=config, mounts=mounts, network_policy=policy, override_memory_mb=override,
             enable_environment_dir_upload=upload, **extra)
         if backend == "docker":
-            _protect_startup(box.environment)
+            _protect_subprocesses(box.environment)
             _remove_at_once(box.environment)
-        # As in Harbor's trial, a verifier definition also starts within the main environment's bound.
-        await asyncio.wait_for(box.environment.start(force_build=False), task.config.environment.build_timeout_sec)
-        if own:
-            await box.environment.run_healthcheck()
+        try:
+            # As in Harbor's trial, a verifier definition also starts within the main environment's bound.
+            await asyncio.wait_for(box.environment.start(force_build=False), task.config.environment.build_timeout_sec)
+            if own:
+                await box.environment.run_healthcheck()
+        except Exception as error:
+            if kind is not None:
+                run.failed_starts[kind] = run.failed_starts.get(kind, 0) + 1
+                if run.failed_starts[kind] >= START_FAILURES:
+                    raise EnvironmentUnavailable(
+                        f"the task's {kind} failed to start {START_FAILURES} times in a row, last with {type(error).__name__}: "
+                        f"{error}; no later sandbox or episode can use it, so the run stops") from error
+            raise
+        # A count that stopped the run stays, also when a start already running then succeeds.
+        if run.failed_starts.get(kind, 0) < START_FAILURES:
+            run.failed_starts.pop(kind, None)
         if copy is not None:
             record.image = copy.image if backend == "modal" else await _running_image(session_id)
             box.save()

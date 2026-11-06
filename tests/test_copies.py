@@ -22,6 +22,7 @@ from harbor.environments import modal as harbor_modal
 from harbor.models.task.verifier_mode import resolve_verifier_environment_definition
 from harbor.trial.trial import Trial
 from harbor.trial.errors import VerifierTimeoutError
+from harbor.verifier.verifier import DownloadVerifierDirError
 
 from nudi import api, checks, copies, runner, sandbox, workflow
 from nudi.records import Observation, RunRecord, StateCopy, write_private
@@ -132,7 +133,7 @@ def test_the_real_verifier_copies_the_environment_it_grades_in(tmp_path, monkeyp
 
 def test_a_grader_past_its_limit_times_out_as_harbor_reports_it(tmp_path, monkeypatch):
     """The grader keeps the task's own limit inside the longer outer one, so Harbor still
-    records VerifierTimeoutError; the second copy is skipped."""
+    records VerifierTimeoutError; the second copy is still taken."""
     task = tmp_path / "task"
     shutil.copytree(CONTRACT_TASK, task)
     (task / "task.toml").write_text((task / "task.toml").read_text().replace("timeout_sec = 60.0", "timeout_sec = 0.2"))
@@ -152,7 +153,35 @@ def test_a_grader_past_its_limit_times_out_as_harbor_reports_it(tmp_path, monkey
     with pytest.raises(VerifierTimeoutError):
         asyncio.run(main())
     assert time.monotonic() - started < 10
-    assert [copy.point for copy in stored(run).copies] == ["verification_start"]
+    assert [copy.point for copy in stored(run).copies] == ["verification_start", "grading_end"]
+
+
+def test_a_grader_error_still_copies_grading_end_and_names_its_cause(tmp_path, monkeypatch):
+    """A failed verifier-directory download must not skip grading_end or keep only Harbor's
+    own text; otherwise malformed_rewards and resource_exhaustion probes read unobservable."""
+    Snapshots(monkeypatch)
+
+    async def failing(environment, source_dir, target_dir):
+        raise OSError("the grader filled the disk")
+
+    monkeypatch.setattr(harbor_modal.ModalEnvironment, "_sdk_download_dir", failing)
+    run = modal_run(tmp_path, monkeypatch, task_dir=CONTRACT_TASK)
+    config = trial_config(tmp_path, "modal", CONTRACT_TASK)
+
+    async def main():
+        token = runner.state_copy.set(taking(run, tmp_path / "episode"))
+        try:
+            with workflow.model_calls(run, "simulator", "0000-simulator"):
+                return await verify(await Trial.create(config), False, tmp_path)
+        finally:
+            runner.state_copy.reset(token)
+
+    with pytest.raises(DownloadVerifierDirError) as raised:
+        asyncio.run(main())
+    # The Modal cause is named by type only, as ModalBox records every Modal failure.
+    assert str(raised.value) == ("Failed to download verifier directory from environment: "
+                                 "ModalFailure: Modal download failed: OSError")
+    assert [copy.point for copy in stored(run).copies] == ["verification_start", "grading_end"]
 
 
 @pytest.mark.parametrize("failure", ["error", "timeout"])

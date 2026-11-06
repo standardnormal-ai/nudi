@@ -48,6 +48,12 @@ register_harness_profile("nudi-inspector", HarnessProfile(
 sdk_sandbox.ASYNC_GREP_TIMEOUT = sdk_sandbox.ASYNC_GLOB_TIMEOUT = sdk_filesystem.GLOB_TIMEOUT = 120
 # Where the host `transcript.jsonl` is uploaded before every inference, so it is not retained from the workspace.
 HISTORY = "/conversation_history/transcript.jsonl"
+# Seconds a workspace command runs unless the agent sets a timeout, which the SDK caps at 3600 s. In five measured
+# Modal runs every successful workspace command finished within 265 s; a hung `import vllm` gave no result for 49 min.
+COMMAND_TIMEOUT = 600
+# Seconds a workspace call still waiting after sandbox removal gets, and again once cancelled; removal ends a call
+# whose transport works, and a stuck one must not hold the session and its final report.
+DRAIN_TIMEOUT = 10
 
 
 class InspectorModel(ChatLiteLLM):
@@ -78,15 +84,22 @@ class HarborBackend(BaseSandbox):
         raise NotImplementedError("Use adownload_files")
 
     async def aexecute(self, command, *, timeout=None):
+        timeout = timeout or COMMAND_TIMEOUT
+        # The backend also stops the command at the bound, later than this wait, so the answer is the same on Docker and Modal.
         execution = asyncio.create_task(self.box.exec(
             ["sh", "-c", command], runtime=None, timeout=timeout, output_limit=None))
         try:
-            result = await asyncio.shield(execution)
+            done, _ = await asyncio.wait({execution}, timeout=timeout)
         except asyncio.CancelledError:
             # Harbor's compose subprocess can retain inherited output pipes when cancelled.
             # Keep this call owned until sandbox removal stops it, then drain it below.
             self.interrupted.append(execution)
             raise
+        if not done:
+            self.interrupted.append(execution)
+            return ExecuteResponse(output=f"Error: the command timed out after {timeout} s. Set a larger timeout, "
+                                          "at most 3600 s, for a command that needs longer.")
+        result = execution.result()
         return ExecuteResponse(output=result["output"], exit_code=result["exit_code"], truncated=result["truncated"])
 
     async def aupload_files(self, files):
@@ -426,10 +439,19 @@ async def investigation(run, name: str, prompt: str, evidence: dict[str, Path], 
     finally:
         if backend is not None and backend.interrupted:
             async def drain():
-                results = await asyncio.gather(*backend.interrupted, return_exceptions=True)
-                for result in results:
-                    if isinstance(result, dict):
-                        result["interrupted"] = True
+                _, stuck = await asyncio.wait(backend.interrupted, timeout=DRAIN_TIMEOUT)
+                for task in stuck:
+                    task.cancel()
+                if stuck:
+                    await asyncio.wait(stuck, timeout=DRAIN_TIMEOUT)
+                    for entry in backend.box.record.commands:
+                        if entry["exit_code"] is None and entry["error"] is None:
+                            entry["error"] = "unfinished: the call still waited after sandbox removal and was abandoned"
+                    run.warn(f"{backend.box.record.name}: {len(stuck)} workspace calls still waited after sandbox removal "
+                             "and were abandoned; their outcome is unknown")
+                for task in backend.interrupted:
+                    if task.done() and not task.cancelled() and task.exception() is None:
+                        task.result()["interrupted"] = True
                 backend.box.save()
 
             await checks.finish_cleanup(asyncio.create_task(drain()))

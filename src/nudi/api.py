@@ -3,8 +3,8 @@ one implementation over the existing analyses.
 
 Full analysis selects simulation, the grader inspector, the hack inspector and the attack;
 `simulation` and `hacking` select two of them. A failed analysis is recorded and the
-independent ones still run. The report covers the selected analyses only, and resolved
-credentials never reach it.
+independent ones still run, unless a task environment cannot start: then none runs after it.
+The report covers the selected analyses only, and resolved credentials never reach it.
 """
 
 import asyncio
@@ -16,9 +16,9 @@ from typing import Literal
 from pydantic import ConfigDict, Field
 
 from nudi import copies, report
-from nudi.checks import (FULL_UNAVAILABLE, MINIMAL_UNAVAILABLE, Candidate, InspectionResult, attack, finish_cleanup, inspect_grader,
-                         inspect_hacks, redacted)
-from nudi.records import DiskFull, RunConfig
+from nudi.checks import (FULL_UNAVAILABLE, MINIMAL_UNAVAILABLE, Candidate, InspectionResult, attack, evidenced, finish_cleanup,
+                         inspect_grader, inspect_hacks, redacted)
+from nudi.records import DiskFull, EnvironmentUnavailable, RunConfig
 from nudi.workflow import elapsed, logger, simulate, start_run
 
 Analysis = Literal["full", "simulation", "hacking"]
@@ -80,30 +80,31 @@ def _supplied(value: str | None) -> str | None:
 
 
 def guidance(hack: InspectionResult | None) -> dict:
-    """One candidate per hack finding that can guide reproduction, composed without a model call.
+    """One candidate per evidenced or suspected hack finding, composed without a model call.
 
-    Legitimate outcomes supply nothing. A rejected valid finding, work meeting every stated
-    requirement that got less than deserved, is a valid-work candidate. Another finding is a
-    candidate when it is accepted invalid or supplies either guidance field. Full guidance is that
-    candidate's `full_guidance`. Minimal guidance is the fixed where-to-look line plus
-    that candidate's `hint_location`. Mechanism and interpretation are never copied.
-    A missing or blank field is unavailable for that candidate only. Identical text stays
-    distinct here. Attack shares one native run only for records with the same mechanism
-    and the same full and minimal guidance. A shared hint string alone stays separate.
-    A reading that supplies neither guidance field is no candidate when a later reading of the
-    same check exists: it could never run, and a re-interpretation replaces it. Every other reading
-    stays a candidate, also a guided one a later legitimate or unguided reading supersedes.
-    A claim without a check is never superseded.
+    Only the latest reading of a check is a candidate: any later reading of that check, legitimate
+    or unguided included, withdraws it, and the inspection report keeps it as superseded. A claim
+    without a check is never superseded. An evidenced reading, accepted invalid or rejected valid,
+    is a candidate. A suspected one, an unknown reading that supplies a guidance field, follows
+    every evidenced candidate and keeps its `unknown` outcome: a candidate is a suspected mismatch,
+    and a missing scoring input must not hide a measured flaw. A legitimate, unavailable or
+    ungrounded reading supplies nothing, also with guidance. A rejected valid finding, work meeting every
+    stated requirement that got less than deserved, is a valid-work candidate. Full guidance is
+    that candidate's `full_guidance`. Minimal guidance is the fixed where-to-look line plus that
+    candidate's `hint_location`. Mechanism and interpretation are never copied. A missing or blank
+    field is unavailable for that candidate only. Each candidate keeps its check and the category
+    of the experiment that measured it. Identical text stays distinct here. Attack shares one
+    native run only for records of the same kind and category with the same exact mechanism and
+    the same full and minimal guidance.
     """
     candidates = []
     assessments = hack.assessments if hack else []
+    category = {item["check"]: item.get("category") for item in (hack.experiments if hack else []) if item.get("check")}
     latest = {item.claim.check: index for index, item in enumerate(assessments) if item.claim.check}
     for index, item in enumerate(assessments):
-        if item.outcome == "legitimate":
-            continue
         full, location = _supplied(item.claim.full_guidance), _supplied(item.claim.hint_location)
-        if full is None and location is None and (item.outcome not in ("accepted_invalid", "rejected_valid")
-                                                  or latest.get(item.claim.check, index) != index):
+        guided = full is not None or location is not None
+        if latest.get(item.claim.check, index) != index or not (evidenced(item) or item.outcome == "unknown" and guided):
             continue
         unavailable = {}
         if full is None:
@@ -111,10 +112,12 @@ def guidance(hack: InspectionResult | None) -> dict:
         if location is None:
             unavailable["minimal"] = MINIMAL_UNAVAILABLE
         candidates.append(Candidate(
-            id=f"hack-{index}", mechanism=item.claim.mechanism,
-            guidance={"full": full, "minimal": None if location is None else WHERE_TO_LOOK + "\n" + location},
+            id=f"hack-{index}", mechanism=item.claim.mechanism, check=item.claim.check, category=category.get(item.claim.check),
+            outcome=item.outcome, guidance={"full": full, "minimal": None if location is None else WHERE_TO_LOOK + "\n" + location},
             unavailable=unavailable, valid_work=item.outcome == "rejected_valid",
         ))
+    # A stable sort keeps record order within the evidenced and the suspected candidates.
+    candidates.sort(key=lambda item: item.outcome == "unknown")
     return {"candidates": candidates}
 
 
@@ -126,7 +129,9 @@ async def send_nudis_async(task_dir, config=None, **options) -> dict:
     selected roles' credentials are validated before any episode starts, and the output
     directory must be new or empty. The report is
     also written as `report.json` and `report.md` in the output directory, after
-    cancellation too. Every state copy of the run is deleted first, also after a failure."""
+    cancellation too. With `time_limit` the run stops at that many minutes as a cancelled
+    run does, and returns its report with status `time_limit`, or `partial` when a phase
+    failed before. Every state copy of the run is deleted first, also after a failure."""
     settings = configure(task_dir, config, options)
     # Earlier records there would otherwise be reported as this run's results.
     if settings.output_dir.exists() and any(settings.output_dir.iterdir()):
@@ -144,24 +149,47 @@ async def send_nudis_async(task_dir, config=None, **options) -> dict:
                                  discovery_attempts=settings.discovery_attempts, **guidance(results.get("hack"))),
     }
     try:
-        for name in selected:
-            phase, produced = PHASES[name]
-            started = time.monotonic()
-            logger.info(f"{phase} started")
-            try:
-                results[name] = await steps[name]()
-                logger.info(f"{phase} finished after {elapsed(started)}: {produced(results[name])}; status {results[name].status}")
-            except asyncio.CancelledError:
-                # Recorded without a stderr line: the command prints one cancellation message.
-                run.record.warnings.append(f"cancelled during {name}")
-                raise
-            except DiskFull as error:
-                run.record.warnings.append(f"{name} stopped: {error}")
-                raise
-            except Exception as error:
-                failure = f"{name} failed: {type(error).__name__}: {redacted(run, str(error))}"
-                run.record.warnings.append(failure)
-                logger.warning(f"{phase} ended after {elapsed(started)}: {failure}")
+        # The time limit cancels the run as Ctrl-C does, so it stops and cleans up the same way.
+        async with asyncio.timeout(settings.time_limit and settings.time_limit * 60) as limit:
+            for name in selected:
+                phase, produced = PHASES[name]
+                started = time.monotonic()
+                logger.info(f"{phase} started")
+                try:
+                    results[name] = await steps[name]()
+                    logger.info(f"{phase} finished after {elapsed(started)}: {produced(results[name])}; status {results[name].status}")
+                    if results[name].status != "complete":
+                        run.record.failed_phases.append(name)
+                # asyncio raises a second Ctrl-C as KeyboardInterrupt, past a CancelledError handler.
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    if limit.expired():
+                        stopped = f"the run stopped at its time limit of {settings.time_limit:g} minutes during {name}"
+                        run.record.warnings.append(stopped)
+                        logger.info(stopped)
+                    else:
+                        # Recorded without a stderr line: the command prints one cancellation message.
+                        run.record.warnings.append(f"cancelled during {name}")
+                    raise
+                except DiskFull as error:
+                    run.record.warnings.append(f"{name} stopped: {error}")
+                    run.record.failed_phases.append(name)
+                    raise
+                except EnvironmentUnavailable as error:
+                    reason = redacted(run, str(error))
+                    run.record.warnings.append(f"{name} stopped: {reason}")
+                    run.record.failed_phases.append(name)
+                    logger.warning(f"{phase} stopped after {elapsed(started)}: {reason}")
+                    break
+                except Exception as error:
+                    failure = f"{name} failed: {type(error).__name__}: {redacted(run, str(error))}"
+                    run.record.warnings.append(failure)
+                    run.record.failed_phases.append(name)
+                    logger.warning(f"{phase} ended after {elapsed(started)}: {failure}")
+        # A phase that caught the limit's cancellation and returned ends the block normally.
+        run.record.time_limit_reached = limit.expired()
+    except TimeoutError:
+        # Only the time limit raises it here: each phase's own errors are caught above.
+        run.record.time_limit_reached = True
     finally:
         try:
             await finish_cleanup(asyncio.create_task(copies.delete(run)))
