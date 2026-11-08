@@ -35,9 +35,9 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.errors import NodeCancelledError
 from langsmith import tracing_context
 
-from nudi import checks, sandbox
+from nudi import checks, inspection, inspector_sandbox
 from nudi.records import ErrorRecord, InfrastructureAbort, write_private
-from nudi.workflow import SpendingCapReached, model_calls
+from nudi.run_state import SpendingCapReached, model_calls
 
 # The profile identity is private to nudi; LiteLLM still receives the configured route.
 register_harness_profile("nudi-inspector", HarnessProfile(
@@ -59,6 +59,17 @@ DRAIN_TIMEOUT = 10
 class InspectorModel(ChatLiteLLM):
     def _get_ls_params(self, *args, **kwargs):
         return {**super()._get_ls_params(*args, **kwargs), "ls_provider": "nudi-inspector"}
+
+
+def chat_model(config, key: str, callbacks=()) -> InspectorModel:
+    """The inspector role's configured model, reasoning effort and route."""
+    kwargs = {}
+    if config.reasoning_effort is not None:
+        kwargs["reasoning_effort"] = config.reasoning_effort
+    if config.model.startswith("xiaomi_mimo/") and config.reasoning_effort not in (None, "none"):
+        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+    return InspectorModel(model=config.model, api_base=config.api_base, api_key=key, model_kwargs=kwargs, streaming=False,
+                          max_retries=1, cache=False, callbacks=list(callbacks))
 
 
 class HarborBackend(BaseSandbox):
@@ -221,10 +232,10 @@ class Transcript(AsyncCallbackHandler):
         self.save(messages)
         for message in messages:
             if message.response_metadata.get("finish_reason") == "content_filter":
-                raise checks.ProviderRefusal("finish_reason: content_filter")
+                raise inspection.ProviderRefusal("finish_reason: content_filter")
             if refusal := (message.additional_kwargs.get("refusal")
                            or (message.additional_kwargs.get("provider_specific_fields") or {}).get("refusal")):
-                raise checks.ProviderRefusal(checks.redacted(self.run, str(refusal)))
+                raise inspection.ProviderRefusal(checks.redacted(self.run, str(refusal)))
 
 
 class ToolOwnership(AgentMiddleware):
@@ -270,19 +281,12 @@ class Investigation:
         self.state, self.closed, self.busy, self.retained = {"messages": []}, False, False, False
         # The checkpoint keeps the structured response, the one nudi type in its state; LangGraph blocks an unregistered type
         # under LANGGRAPH_STRICT_MSGPACK and warns otherwise.
-        self.checkpointer = InMemorySaver(serde=JsonPlusSerializer(allowed_msgpack_modules=[checks.InspectionSummary]))
+        self.checkpointer = InMemorySaver(serde=JsonPlusSerializer(allowed_msgpack_modules=[inspection.InspectionSummary]))
         self.ownership = ToolOwnership()
         (box.directory / "tool-outputs").mkdir(mode=0o700)
+        (box.directory / "workspace").mkdir(mode=0o700)
         self.transcript = Transcript(run, box.directory, backend)
-        config = run.record.models["inspector"]
-        kwargs = {}
-        if config.reasoning_effort is not None:
-            kwargs["reasoning_effort"] = config.reasoning_effort
-        if config.model.startswith("xiaomi_mimo/") and config.reasoning_effort not in (None, "none"):
-            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-        self.model = InspectorModel(model=config.model, api_base=config.api_base, api_key=run.keys["inspector"],
-                                 model_kwargs=kwargs, streaming=False, max_retries=1, cache=False,
-                                 callbacks=[self.transcript])
+        self.model = chat_model(run.record.models["inspector"], run.keys["inspector"], [self.transcript])
         write_private(box.directory / "system-prompt.txt", checks.redacted(run, prompt))
         write_private(box.directory / "results.jsonl", "")
         write_private(box.directory / "inferences.jsonl", "")
@@ -318,20 +322,20 @@ class Investigation:
                     self.transcript.save(state["messages"])
             result = self.state.get("structured_response")
             if result is None:
-                raise checks.ModelOutputFailure("The Inspector returned no structured result")
+                raise inspection.ModelOutputFailure("The Inspector returned no structured result")
             with (self.box.directory / "results.jsonl").open("a") as output:
                 output.write(checks.redacted(self.run, json.dumps({"schema": schema.__name__, "result": result.model_dump()})) + "\n")
             return result
-        except (asyncio.CancelledError, SpendingCapReached, InfrastructureAbort, checks.ProviderRefusal, checks.ModelOutputFailure):
+        except (asyncio.CancelledError, SpendingCapReached, InfrastructureAbort, inspection.ProviderRefusal, inspection.ModelOutputFailure):
             raise
         except litellm.ContentPolicyViolationError as error:
-            raise checks.ProviderRefusal(checks.redacted(self.run, str(error))) from error
+            raise inspection.ProviderRefusal(checks.redacted(self.run, str(error))) from error
         except Exception as error:
             # A raised experiment cancels the ones waiting their turn, and the SDK can report that cancel
             # first; the experiment's own error is the turn's cause.
             if isinstance(error, NodeCancelledError) and self.ownership.failed is not None:
                 raise self.ownership.failed
-            raise checks.InferenceFailure(checks.redacted(self.run, f"{type(error).__name__}: {error}")) from error
+            raise inspection.InferenceFailure(checks.redacted(self.run, f"{type(error).__name__}: {error}")) from error
         finally:
             await checks.finish_cleanup(asyncio.create_task(self.ownership.cancel()))
             self.busy = False
@@ -358,7 +362,6 @@ class Investigation:
         if listing.exit_code or listing.truncated:
             raise RuntimeError("Workspace retention listing failed or exceeded its output limit")
         root = self.box.directory / "workspace"
-        root.mkdir(mode=0o700, exist_ok=True)
         for name in listing.output.split("\0"):
             if not name or name == HISTORY:
                 continue
@@ -395,7 +398,7 @@ async def investigation(run, name: str, prompt: str, evidence: dict[str, Path], 
         selected[relative] = path
     backend = None
     try:
-        async with sandbox.sandbox(run, "workspace", copy=copy) as box:
+        async with inspector_sandbox.sandbox(run, "workspace", copy=copy) as box:
             runtime, _ = await checks.python3_runtime(box)
             if runtime != "python3":
                 raise RuntimeError("unsupported_runtime: Deep Agents file tools require the python3 executable")

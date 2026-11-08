@@ -6,8 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from nudi import checks, report, workflow
-from nudi.checks import AttackResult, EpisodeLabel, InspectionResult
+import nudi.inspection as inspection_module
+from nudi import report, run_state
+from nudi.attack import AttackResult
+from nudi.episode import tree_digest
+from nudi.inspection import EpisodeLabel, InspectionResult
 from nudi.records import (
     DEFAULT_MODELS,
     Assessment,
@@ -27,7 +30,6 @@ from nudi.records import (
     Simulation,
 )
 from nudi.report import NON_BINARY, UNKNOWN_REWARD
-from nudi.runner import tree_digest
 from test_inspection import InspectorScript, Sandboxes
 from test_limits import credentials, new_run  # noqa: F401  (pytest fixture)
 from test_runner import serve
@@ -64,7 +66,7 @@ class RunDir:
         self.hack: InspectionResult | None = None
         self.attack: AttackResult | None = None
 
-    def episode(self, role="simulator", rewards=None, *, model="xiaomi_mimo/mimo-v2.6-pro", errors=(), retained=True) -> str:
+    def episode(self, role="simulator", rewards=None, *, model="xiaomi_mimo/mimo-v2.6-pro", errors=(), retained=True, **fields) -> str:
         name = f"{len(self.record.episodes):04d}-{role}"
         self.record.episodes.append(name)
         if role == "simulator":
@@ -75,7 +77,7 @@ class RunDir:
         if retained:
             result = EpisodeResult(path="harbor", path_reasons=["original grading and harness"], task_name="sort",
                                    task_dir=str(self.task), task_digest=self.digest, model=model, reasoning_effort="high",
-                                   versions={"harbor": "0.24.0"}, rewards=rewards or {}, errors=list(errors))
+                                   versions={"harbor": "0.24.0"}, rewards=rewards or {}, errors=list(errors), **fields)
             directory = self.path / "episodes" / name
             directory.mkdir()
             # json.dumps keeps a non-finite upstream value that model_dump_json would turn into null.
@@ -188,6 +190,202 @@ def test_constant_and_mixed_rewards_are_descriptive_notes_not_warnings(tmp_path)
     result = constant.report()
     assert any("reward: constant 1.0" in note for note in result["notes"])
     assert not any("constant" in warning for warning in result["warnings"])
+
+
+def ordinary_rewards(run: RunDir, *counts: tuple[float, int], **fields) -> list[str]:
+    """Ordinary episodes with `count` 'reward' rewards of each value, in order."""
+    return [run.episode(rewards={"reward": value}, **fields) for value, count in counts for _ in range(count)]
+
+
+def reward_summary(result: dict, key: str = "reward") -> dict:
+    (group,) = result["ordinary"]["groups"]
+    return group["rewards"][key]
+
+
+def test_twenty_identical_rewards_are_flagged_and_say_passes_only_under_a_grounded_rule(tmp_path):
+    run = RunDir(tmp_path)
+    names = ordinary_rewards(run, (1.0, 20))
+    result = run.report()
+    (flag,) = reward_summary(result)["flags"]
+    assert flag["flag"] == "identical_rewards" and flag["episodes"] == names
+    assert flag["text"].startswith("All 20 usable 'reward' rewards are 1. Whether 1 is the grader's maximum or minimum is not "
+                                   "established. The 95% Wilson interval still allows another value in up to 16% of episodes.")
+    assert "too hard for xiaomi_mimo/mimo-v2.6-pro at this setting" in flag["text"] and "zero advantage" in flag["text"]
+    assert "None recorded an error, timeout or refusal." in flag["text"] and "passes" not in flag["text"]
+    # The flag replaces the constant note and stays out of the warnings.
+    assert not any("constant" in note for note in result["notes"])
+    assert not any("identical" in warning for warning in result["warnings"])
+    assert "\n  - identical_rewards: All 20 usable 'reward' rewards are 1." in report.markdown(result)
+
+    grounded = RunDir(tmp_path / "grounded")
+    for _ in range(20):
+        referenced(grounded, "supported", {"reward": 1.0}, decision=RULE)
+    (flag,) = reward_summary(grounded.report())["flags"]
+    assert flag["text"].startswith("All 20 usable 'reward' rewards are 1. Every usable episode passes its grounded decision rule.")
+    assert "maximum or minimum" not in flag["text"]
+    assert flag["text"].endswith("Every named episode has a presumed or unsupported label, so grader inspection did not examine this pattern.")
+
+
+@pytest.mark.parametrize("higher, lower, interval, skewness", [(17, 3, [0.64, 0.95], -2.12), (16, 4, [0.58, 0.92], -1.62),
+                                                               (15, 5, [0.53, 0.89], -1.25)])
+def test_a_few_lower_rewards_beyond_the_outer_fence_are_named(tmp_path, higher, lower, interval, skewness):
+    run = RunDir(tmp_path)
+    names = ordinary_rewards(run, (1.0, higher), (0.0, lower))
+    result = run.report()
+    summary = reward_summary(result)
+    assert (summary["median"], summary["minimum"], summary["maximum"], round(summary["skewness"], 2)) == (1.0, 0.0, 1.0, skewness)
+    share = summary["share"]
+    assert (share["value"], share["lower"], share["count"], share["range"]) == (1.0, 0.0, higher, None)
+    assert [round(bound, 2) for bound in share["interval"]] == interval
+    assert (f"; share at 1: {higher} of 20, 95% Wilson interval {interval[0]} to {interval[1]}; SD and skewness follow from "
+            "this share") in report.markdown(result)
+    if lower == 5:
+        assert summary["flags"] == [] and summary["flags_not_evaluated"] is None
+        return
+    (flag,) = summary["flags"]
+    minority = names[higher:]
+    assert flag["flag"] == "low_minority" and flag["episodes"] == minority
+    assert flag["text"].startswith(f"{lower} of 20 usable 'reward' rewards are below the rest by the quartile rule ("
+                                   + ", ".join(f"{name} 0" for name in minority)
+                                   + "; median 1, lower fence 1). None recorded an error, timeout or refusal. A few lower rewards")
+    assert (f"{higher} of 20 are 1 (95% Wilson interval {interval[0]} to {interval[1]} for its share, assuming independent "
+            "episodes); SD and skewness follow from this share.") in flag["text"]
+    assert "This is a reward pattern, not a finding" in flag["text"] and "range is not established" not in flag["text"]
+
+
+@pytest.mark.parametrize("value", [1e-110, 1e103])
+def test_skewness_of_tiny_or_huge_finite_rewards_never_stops_the_report(tmp_path, value):
+    run = RunDir(tmp_path)
+    names = ordinary_rewards(run, (0.0, 19), (value, 1))
+    run.save()
+    report.write(run.path)
+    summary = reward_summary(json.loads((run.path / "report.json").read_text()))
+    # G1 does not depend on scale: one higher reward of 20 gives 4.47 whatever its size.
+    assert round(summary["skewness"], 2) == 4.47
+    (flag,) = summary["flags"]
+    assert flag["flag"] == "high_minority" and flag["episodes"] == names[-1:]
+
+    # A mean that floating point cannot represent does not distort G1.
+    close = RunDir(tmp_path / "close")
+    ordinary_rewards(close, (1.0, 2), (1.0000000000000002, 1))
+    assert reward_summary(close.report())["skewness"] == pytest.approx(3 ** 0.5)
+
+
+def test_a_few_higher_rewards_beyond_the_outer_fence_are_named(tmp_path):
+    run = RunDir(tmp_path)
+    names = ordinary_rewards(run, (1.0, 2), (0.0, 18))
+    (flag,) = reward_summary(run.report())["flags"]
+    assert flag["flag"] == "high_minority" and flag["episodes"] == names[:2]
+    assert flag["text"].startswith(f"2 of 20 usable 'reward' rewards are above the rest by the quartile rule ({names[0]} 1, "
+                                   f"{names[1]} 1; median 0, upper fence 0).")
+    assert "a grader that accepts invalid work or a shortcut" in flag["text"] and "2 of 20 are 1 (95% Wilson" in flag["text"]
+
+
+def test_tied_fractional_rewards_name_the_values_of_a_small_lower_minority(tmp_path):
+    run = RunDir(tmp_path)
+    names = ordinary_rewards(run, (1.0, 16), (0.95, 4))
+    summary = reward_summary(run.report())
+    (flag,) = summary["flags"]
+    assert flag["flag"] == "low_minority" and flag["episodes"] == names[16:] and summary["sd"] < 0.03
+    assert ", ".join(f"{name} 0.95" for name in names[16:]) + "; median 1, lower fence 1)" in flag["text"]
+
+    # With three or more observed values there is no share, and differences stay in reward units.
+    spread = RunDir(tmp_path / "spread")
+    names = ordinary_rewards(spread, (1.0, 16), (0.95, 3), (0.9, 1))
+    summary = reward_summary(spread.report())
+    (flag,) = summary["flags"]
+    assert summary["share"] is None and summary["skewness"] < 0 and flag["episodes"] == names[16:]
+    assert f"{names[-1]} 0.9; median 1" in flag["text"]
+    assert "The reward range is not established; differences are in reward units." in flag["text"]
+
+
+def test_fewer_than_ten_usable_rewards_are_not_evaluated_and_exclusions_bound_the_share(tmp_path):
+    run = RunDir(tmp_path)
+    ordinary_rewards(run, (1.0, 7), (0.0, 2))
+    run.episode(rewards={})
+    run.episode(rewards={"reward": float("nan")})
+    result = run.report()
+    summary = reward_summary(result)
+    assert summary["flags"] == []
+    assert summary["flags_not_evaluated"] == "Distribution flags are not evaluated for 'reward': 9 usable rewards, fewer than 10."
+    # Excluded rewards are never zero: they leave the statistics and bound the share from both sides.
+    assert (summary["usable"], summary["mean"], summary["median"]) == (9, 7 / 9, 1.0)
+    assert summary["share"]["range"] == [7 / 11, 9 / 11]
+    assert "not evaluated" not in "\n".join(result["warnings"])
+    assert "\n  - Distribution flags are not evaluated for 'reward'" in report.markdown(result)
+
+    # Below ten usable rewards the constant note stays.
+    constant = RunDir(tmp_path / "constant")
+    ordinary_rewards(constant, (1.0, 9))
+    result = constant.report()
+    assert reward_summary(result)["flags"] == [] and any("reward: constant 1.0 across 9" in note for note in result["notes"])
+
+    # A flag repeats the excluded count and, with two observed values, the share range.
+    excluded = RunDir(tmp_path / "excluded")
+    ordinary_rewards(excluded, (1.0, 17), (0.0, 3))
+    excluded.episode(rewards={})
+    excluded.episode(rewards={"reward": None})
+    (flag,) = reward_summary(excluded.report())["flags"]
+    assert flag["text"].startswith("3 of 20 usable")
+    assert ("2 of 22 attempted episodes have no usable reward and are excluded; had all of them received 1, or all 0, "
+            "the share at 1 would be 0.86 or 0.77.") in flag["text"]
+
+
+def test_a_minority_that_every_one_timed_out_says_time_limits_may_explain_it(tmp_path):
+    run = RunDir(tmp_path)
+    ordinary_rewards(run, (1.0, 17))
+    minority = ordinary_rewards(run, (0.0, 3), agent_timeout=True)
+    (flag,) = reward_summary(run.report())["flags"]
+    assert flag["episodes"] == minority
+    assert ("Every one recorded an error, timeout or refusal (" + "; ".join(f"{name} agent timeout" for name in minority)
+            + "), so time limits or infrastructure may explain the pattern.") in flag["text"]
+
+    # Each named episode lists what it recorded, refusals included.
+    some = RunDir(tmp_path / "some")
+    ordinary_rewards(some, (1.0, 17))
+    refused, *_ = ordinary_rewards(some, (0.0, 3))
+    some.record.simulation.refusals[refused] = ["finish_reason: content_filter"]
+    (flag,) = reward_summary(some.report())["flags"]
+    assert (f"1 of them recorded an agent timeout, verifier timeout, error or refusal ({refused} refusal "
+            "finish_reason: content_filter).") in flag["text"]
+
+
+def test_each_reward_key_is_flagged_separately_and_components_say_so(tmp_path):
+    run = RunDir(tmp_path)
+    for value in [1.0] * 17 + [0.0] * 3:
+        run.episode(rewards={"reward": value, "tests": 0.5})
+    rewards = run.report()["ordinary"]["groups"][0]["rewards"]
+    assert [flag["flag"] for flag in rewards["reward"]["flags"]] == ["low_minority"]
+    assert [flag["flag"] for flag in rewards["tests"]["flags"]] == ["identical_rewards"]
+    assert "component" not in rewards["reward"]["flags"][0]["text"]
+    assert "'tests' is a component or metric; its use as a training reward is not established." in rewards["tests"]["flags"][0]["text"]
+
+    # Harbor reads a single reward key as the environment reward, whatever its name.
+    single = RunDir(tmp_path / "single")
+    for value in [1.0] * 17 + [0.0] * 3:
+        single.episode(rewards={"passed": value})
+    rewards = single.report()["ordinary"]["groups"][0]["rewards"]
+    assert [flag["flag"] for flag in rewards["passed"]["flags"]] == ["low_minority"]
+    assert "component" not in rewards["passed"]["flags"][0]["text"]
+    assert rewards["reward"]["flags"] == [] and "'reward': 0 usable rewards" in rewards["reward"]["flags_not_evaluated"]
+
+
+def test_flags_change_no_status_exit_code_label_or_rate(tmp_path, monkeypatch):
+    run = RunDir(tmp_path)
+    names = binary_matrix(run, 15, 2, 1, 2)
+    run.grader.ordinary[names[17]] = EpisodeLabel(label="rejected_valid", basis="verified", reasons=["valid work received 0.0"])
+    flagged = run.report()
+    (flag,) = reward_summary(flagged)["flags"]
+    assert flag["flag"] == "low_minority" and flag["episodes"] == names[17:]
+    assert (f"Grader inspection labels: {names[17]} rejected_valid (verified), {names[18]} unknown, {names[19]} unknown. "
+            "A label describes its episode, not this pattern.") in flag["text"]
+
+    monkeypatch.setattr(report, "distribution_flags", lambda *args: None)
+    plain = run.report()
+    # The CLI's exit code follows the status alone.
+    assert flagged["status"] == plain["status"] == "complete"
+    for key in ("analyses", "labels", "metrics", "inspections", "warnings", "notes", "answer"):
+        assert flagged[key] == plain[key]
 
 
 def test_completion_references_and_native_decisions_count_each_ordinary_episode_once(tmp_path):
@@ -537,8 +735,9 @@ def test_false_discovery_and_false_negative_rates_count_the_eligible_binary_subs
     assert {key: group[key] for key in ("false_discovery_rate", "false_negative_rate", "f1")} == {
         key: before[0][key] for key in ("false_discovery_rate", "false_negative_rate", "f1")}
     assert group["f1"] == 16 / 19
-    # The native pass rate counts every usable reward, separate from the eligible subset.
-    assert group["pass_rate"] == {"value": 0.5, "numerator": 11, "denominator": 22, "lower_bound": False, "unavailable": None}
+    # The native pass rate counts every usable reward, separate from the eligible subset, with its 95% Wilson interval.
+    assert group["pass_rate"] == {"value": 0.5, "numerator": 11, "denominator": 22, "lower_bound": False, "unavailable": None,
+                                  "interval": pytest.approx([0.3072, 0.6928], abs=1e-4)}
     assert result["metrics"]["coverage"] == {
         "ordinary": 22, "resolved": 20, "eligible": 20,
         "excluded": {"operational_failure": [], "missing_reward": [], "unreviewed": [unreviewed], "inconclusive": [inconclusive],
@@ -549,9 +748,9 @@ def test_false_discovery_and_false_negative_rates_count_the_eligible_binary_subs
     text = report.markdown(result)
     assert ("- Coverage: 20 of 22 ordinary episodes have a resolved completion reference; 20 of 22 enter grader agreement; "
             "excluded: unreviewed 1, inconclusive 1") in text
-    assert ("TP 8, FP 2, FN 1, TN 9; false discovery rate 0.2 (2/10); false negative rate 0.1111 (1/9); "
+    assert ("TP (Correct work passed) 8, FP (Incorrect work passed) 2, FN (Correct work failed) 1, TN (Incorrect work failed) 9; FDR (Of accepted work, how much was incorrect?) 0.2 (2/10); FNR (Of correct work, how much was rejected?) 0.1111 (1/9); "
             "presumed 0, verified 20") in text
-    assert "- Native pass rate for xiaomi_mimo/mimo-v2.6-pro reward (>= 0.5): 0.5 (11/22)" in text
+    assert "- Native pass rate for xiaomi_mimo/mimo-v2.6-pro reward (>= 0.5): 0.5 (11/22), 95% Wilson interval 0.31 to 0.69\n" in text
 
 
 def test_zero_denominators_all_unknown_and_low_coverage_never_become_zero_rates(tmp_path):
@@ -563,7 +762,7 @@ def test_zero_denominators_all_unknown_and_low_coverage_never_become_zero_rates(
     for key, terms in (("false_discovery_rate", "TP + FP"), ("false_negative_rate", "TP + FN")):
         assert (group[key]["value"], group[key]["denominator"]) == (None, 0)
         assert terms in group[key]["unavailable"] and group[key]["unavailable"] in "\n".join(result["warnings"])
-    assert "false discovery rate unavailable (0/0)" in report.markdown(result)
+    assert "FDR (Of accepted work, how much was incorrect?) unavailable (0/0)" in report.markdown(result)
 
     unknown = RunDir(tmp_path / "unknown")
     names = [unknown.episode(rewards={"reward": value}) for value in (1.0, 0.0, 1.0)]
@@ -776,9 +975,11 @@ def test_grader_agreement_needs_an_established_binary_reward_contract(tmp_path, 
     if group["rule"]:
         summary = result["ordinary"]["groups"][0]["rewards"][group["reward"]]
         assert (group["pass_rate"]["denominator"], group["pass_rate"]["unavailable"]) == (summary["usable"], None)
+        assert group["pass_rate"]["interval"] == report.wilson(group["pass_rate"]["numerator"], summary["usable"])
         assert f"- Native pass rate for xiaomi_mimo/mimo-v2.6-pro {group['reward']}" in text
     else:
         assert group["pass_rate"]["value"] is None and "no source-grounded native decision rule" in group["pass_rate"]["unavailable"]
+        assert group["pass_rate"]["interval"] is None
     if case == "rubric_threshold":
         assert group["pass_rate"]["numerator"] == 2
     if status == "supported":
@@ -792,7 +993,7 @@ def test_grader_agreement_needs_an_established_binary_reward_contract(tmp_path, 
     assert (curve["positives"], curve["negatives"], curve["auroc"]) == (None, None, None)
     assert f"grader agreement is {status}" in curve["unavailable"]
     assert message in "\n".join(result["warnings"])
-    assert f"{group['reward']}: {status}, no agreement values. {message}" in text and "TP 0" not in text
+    assert f"{group['reward']}: {status}, no agreement values. {message}" in text and "TP (Correct" not in text
     assert result["metrics"]["coverage"]["excluded"]["no_binary_contract"] == names
     if case == "contradicted":
         assert "0.5" in " ".join(group["reasons"])
@@ -819,7 +1020,7 @@ def test_rates_that_use_presumed_labels_are_marked_lower_bounds(tmp_path):
         assert group[key] == {"value": 0.25, "numerator": 1, "denominator": 4, "lower_bound": True, "unavailable": None}
     assert result == json.loads(report.write(run.path)[0].read_text())
     text = (run.path / "report.md").read_text()
-    assert ("false discovery rate at least 0.25 (1/4, lower bound); false negative rate at least 0.25 (1/4, lower bound); "
+    assert ("FDR (Of accepted work, how much was incorrect?) at least 0.25 (1/4, lower bound); FNR (Of correct work, how much was rejected?) at least 0.25 (1/4, lower bound); "
             "presumed 3, verified 3") in text
     assert any("lower bounds" in note for note in result["notes"])
 
@@ -925,8 +1126,8 @@ def test_requested_basis_is_retained_and_partial_credit_can_have_a_noncompletion
         async with serve(script) as base:
             run = new_run(tmp_path, monkeypatch, credentials, task_dir=task,
                           models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
-            simulation = await workflow.simulate(run, 1)
-            inspection = await checks.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"], focused_attempts=0)
+            simulation = await run_state.simulate(run, 1)
+            inspection = await inspection_module.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"], focused_attempts=0)
             return run, inspection
 
     run, inspection = asyncio.run(main())

@@ -1,7 +1,7 @@
 """Evidence rules for Inspector claims, on run directories laid out as the runner retains them.
 
 No Docker or model call. Each episode is a retained Harbor trial written by the test, with
-an ATIF trajectory built from Harbor's own models. Checks, replays and lifecycle events
+an ATIF trajectory built from Harbor's own models. Checks and lifecycle events
 are written as nudi's host records would be: checks come from `check_submission`
 (tested in test_inspection.py), lifecycle events from `run_role_episode` (tested in test_limits.py).
 """
@@ -17,7 +17,10 @@ import pytest
 from harbor.models.trajectories import Agent, ObservationResult, Step, Trajectory
 from harbor.models.trajectories import Observation as ToolObservation
 
-from nudi.assessment import assess, conclusions
+from nudi.assessment import assess, captured_object, conclusions, contains
+from nudi.episode import tree_digest
+from nudi.inspection import consistent
+from nudi.inspector_sandbox import CHECK_INPUTS, CHECK_PROGRAM
 from nudi.records import (
     Capacity,
     Check,
@@ -28,13 +31,10 @@ from nudi.records import (
     EpisodeResult,
     ErrorRecord,
     Observation,
-    Replay,
     RunRecord,
     SandboxResult,
     StateCopy,
 )
-from nudi.runner import tree_digest
-from nudi.sandbox import CHECK_INPUTS, CHECK_PROGRAM
 
 INSTRUCTION = "Write the four input numbers to /app/out.txt in ascending order.\nScoring: 0.25 for each correctly placed number.\n"
 GRADER = "test -s /app/out.txt  # the reward is 1 when out.txt is non-empty\n"
@@ -108,7 +108,7 @@ class Run:
     def register(self, name, rewards=None, **fields):
         output = self.dir / "episodes" / name
         trial = f"harbor/trial-{name}"
-        # The runner's record_trial registers these when they exist.
+        # `episode.record_trial` registers these when they exist.
         artifacts = {"trial": trial, "nudi_evidence": "nudi-evidence"}
         for key, relative in (("trajectory", "agent/trajectory.json"), ("collected", "artifacts")):
             if (output / trial / relative).exists():
@@ -231,12 +231,32 @@ def test_an_ungrounded_extra_citation_leaves_validity_unknown(tmp_path):
     assert any("citation" in reason and "does not contain" in reason for reason in result.reasons)
 
 
-def test_an_extra_citation_of_task_text_keeps_legitimate_partial_credit(tmp_path):
+def test_an_extra_citation_of_task_text_keeps_a_legitimate_reading(tmp_path):
     run = Run(tmp_path)
-    episode = run.episode({"artifacts/out.txt": UNSORTED}, rewards={"reward": 0.5})
+    episode = run.episode({"artifacts/out.txt": SORTED})
     check = run.measured_check(run.content(episode))
-    result = assess(measured_claim(episode, check, citations=[STATED_SCORING]), run.dir)
+    result = assess(measured_claim(episode, check, validity="supported", citations=[STATED_SCORING]), run.dir)
     assert result.outcome == "legitimate", result.reasons
+
+
+@pytest.mark.parametrize("output, excerpt, outcome", [
+    ("2 of 4 numbers placed\n9 3 7 1", "2 of 4 numbers placed\n9 3 7 1", "accepted_invalid"),
+    ('the "sorted" naïve output', 'the "sorted" naïve output', "accepted_invalid"),
+    # The decoded output holds a backslash and a letter, not the character their escape stands for.
+    ("prefix \\nready", "\nready", "unknown"),
+    ("letter \\u00e9", "é", "unknown"),
+], ids=["newline", "quotes and letter", "literal newline escape", "literal letter escape"])
+def test_a_citation_matches_the_json_decoded_text_of_a_trajectory(tmp_path, output, excerpt, outcome):
+    """A trajectory stores tool output JSON-escaped: newlines, quotes and non-ASCII letters. A citation of the
+    output as it reads matches inside one decoded string; text the decoded output does not hold does not."""
+    run = Run(tmp_path)
+    episode = run.episode({"artifacts/out.txt": UNSORTED, "agent/trajectory.json": trajectory(output)})
+    check = run.measured_check(run.content(episode))
+    cited = Observation(episode=episode, path=f"harbor/trial-{episode}/agent/trajectory.json", excerpt=excerpt)
+    result = assess(measured_claim(episode, check, citations=[cited]), run.dir)
+    assert result.outcome == outcome, result.reasons
+    if outcome == "unknown":
+        assert result.validity == "unknown" and any("does not contain" in reason for reason in result.reasons), result.reasons
 
 
 @pytest.mark.parametrize(("declaration", "citation"), [
@@ -246,21 +266,26 @@ def test_an_extra_citation_of_task_text_keeps_legitimate_partial_credit(tmp_path
     ('artifacts = ["/app/explanation.txt"]\n', "./task.toml"),
     ('"artifacts" = ["/app/explanation.txt"]\n', "./task.toml"),
     ('[[artifacts]]\nsource = "/app/explanation.txt"\n', "./task.toml"),
+    ('artifacts = [\n  "/app/explanation.txt",\n]\n', "task.toml"),
 ])
 def test_artifact_declaration_alone_does_not_establish_requirement_or_scoring(tmp_path, declaration, citation):
+    """Also when the excerpt is retyped on one line, which grounds whatever its whitespace."""
     run = Run(tmp_path)
     (run.task / "task.toml").write_text(declaration)
     episode = run.episode({"artifacts/out.txt": UNSORTED})
     content = run.content(episode)
-    metadata = Observation(episode=None, path=citation, excerpt=declaration.strip())
+    metadata = Observation(episode=None, path=citation, excerpt=" ".join(declaration.split()))
     requirement = assess(measured_claim(episode, run.measured_check(content, requirement=metadata)), run.dir)
     scoring = assess(measured_claim(episode, run.measured_check(content, scoring=metadata)), run.dir)
     explained = assess(measured_claim(episode, run.measured_check(content, requirement=metadata), citations=[REQUIREMENT]), run.dir)
     assert requirement.outcome == scoring.outcome == "unknown"
     assert requirement.validity == "unknown" and scoring.validity == "violated"
-    assert scoring.discrepancy == "unknown" and explained.outcome == "accepted_invalid", explained.reasons
+    assert requirement.discrepancy == scoring.discrepancy == "unknown" and explained.outcome == "accepted_invalid", explained.reasons
     assert any("artifact metadata" in reason for reason in requirement.reasons)
     assert any("artifact metadata" in reason for reason in scoring.reasons)
+    # A claim cannot change the probe's requirement, so the gap asks for another reference, not another claim.
+    assert requirement.missing == ["a probe `requirement` in task text or grader code"], "nothing else is needed"
+    assert "derivation.observations naming measured facts of the check output" not in requirement.missing
 
 
 # One counterexample: the evaluated content, the requirement and the scoring together.
@@ -286,9 +311,52 @@ def test_one_check_contradicting_the_reward_confirms_a_single_success(tmp_path):
     assert assessment.limits
 
 
-def test_partial_credit_equal_to_the_deserved_score_is_legitimate(tmp_path):
+def test_a_claim_that_leaves_validity_unknown_asks_for_no_repair_and_names_what_no_check_measures(tmp_path):
+    """The prompt says such a claim names in `unresolved` what no check can measure, so asking to measure it again
+    would contradict it."""
+    run = Run(tmp_path, grader=False)
+    episode = run.episode({"artifacts/out.txt": UNSORTED, "agent/trajectory.json": trajectory()})
+    check = run.measured_check(run.content(episode))
+
+    assessment = assess(measured_claim(episode, check, validity="unknown", unresolved=["the sort's stability"]), run.dir)
+
+    assert (assessment.outcome, assessment.discrepancy, assessment.missing) == ("unknown", "unknown", [])
+    assert ("the claim leaves validity unknown, so the deserved score is unavailable and the comparison unknown; "
+            "unresolved: the sort's stability") in assessment.reasons
+
+
+@pytest.mark.parametrize("content, reward", [(UNSORTED, 0.5), (SORTED, 1.0)])
+@pytest.mark.parametrize("primary, further, outcome", [
+    ("violated", None, "unknown"), ("violated", "supported", "unknown"), ("supported", "violated", "unknown"),
+    ("supported", "supported", "legitimate"),
+])
+def test_a_rewarded_reading_with_any_violated_requirement_is_never_legitimate(tmp_path, content, reward, primary, further, outcome):
+    """A reward equal to the deserved score does not make violating work legitimate, whichever requirement the
+    violation is read for: the reading stays unknown, is not consistent, and asks for no other score."""
     run = Run(tmp_path)
-    episode = run.episode({"artifacts/out.txt": UNSORTED}, rewards={"reward": 0.5})
+    episode = run.episode({"artifacts/out.txt": content}, rewards={"reward": reward})
+    check = run.measured_check(run.content(episode))
+    the_claim = measured_claim(episode, check, validity=primary)
+    if further:
+        the_claim.derivation = Derivation.model_validate({**the_claim.derivation.model_dump(), "requirements": [dict(
+            requirement=FOUR.model_dump(), observations=["submitted"], validity=further, interpretation="All four numbers are written.")]})
+
+    assessment = assess(the_claim, run.dir)
+
+    assert [validity for _, validity in conclusions(assessment)] == [primary] + [further] * bool(further)
+    assert (assessment.outcome, assessment.discrepancy) == (outcome, "none"), assessment.reasons
+    assert consistent(assessment) is (outcome == "legitimate")
+    if outcome == "unknown":
+        assert any("either reading may be right" in reason for reason in assessment.reasons)
+        assert not any("partial credit" in reason for reason in assessment.reasons), "never a reason to keep full credit"
+        # The repair names both readings that resolve it, neither preferred; the reading itself stays unknown.
+        assert assessment.missing == ["either a deserved score that applies the violated requirement, "
+                                      "or measured observations showing that the requirement is supported"]
+
+
+def test_unrewarded_violating_work_that_deserves_nothing_is_legitimate(tmp_path):
+    run = Run(tmp_path)
+    episode = run.episode({"artifacts/out.txt": "9 7 3 1\n"}, rewards={"reward": 0.0})
     check = run.measured_check(run.content(episode))
 
     assessment = assess(measured_claim(episode, check), run.dir)
@@ -331,8 +399,8 @@ def test_valid_work_below_the_deserved_score_is_a_false_rejection(tmp_path):
     assert (assessment.validity, assessment.discrepancy) == ("supported", "under")
 
 
-@pytest.mark.parametrize("reward, discrepancy", [(1.0, "over"), (0.0, "under")])
-def test_reward_off_the_deserved_score_alone_does_not_decide_validity(tmp_path, reward, discrepancy):
+@pytest.mark.parametrize("reward", [1.0, 0.0])
+def test_a_claim_that_leaves_validity_unknown_compares_no_deserved_score_with_the_reward(tmp_path, reward):
     run = Run(tmp_path)
     episode = run.episode({"artifacts/out.txt": UNSORTED}, rewards={"reward": reward})
     check = run.measured_check(run.content(episode))
@@ -340,7 +408,7 @@ def test_reward_off_the_deserved_score_alone_does_not_decide_validity(tmp_path, 
     assessment = assess(measured_claim(episode, check, validity="unknown"), run.dir)
 
     assert assessment.outcome == "unknown"
-    assert (assessment.validity, assessment.discrepancy) == ("unknown", discrepancy)
+    assert (assessment.validity, assessment.discrepancy) == ("unknown", "unknown")
 
 
 # Provenance: submitted artifacts and captured tool output, not model or grader text.
@@ -478,7 +546,6 @@ def test_recorded_replay_of_commands_cannot_supply_original_validity(tmp_path):
     run = Run(tmp_path)
     graded = run.episode({"agent/trajectory.json": trajectory()})
     replay = run.episode({"artifacts/out.txt": UNSORTED}, rewards={})
-    run.record.replays.append(Replay(episode=replay, of=graded, inputs=run.content(graded, "agent/trajectory.json")))
     check = run.check(run.content(replay), exit_code=1, bound={"deserved_max": 0.5})
 
     assessment = assess(claim(graded, check), run.dir)
@@ -486,24 +553,6 @@ def test_recorded_replay_of_commands_cannot_supply_original_validity(tmp_path):
     assert assessment.outcome == "unknown", assessment.reasons
     assert assessment.ids["trial_id"] == f"id-{graded}"
     assert assessment.reward == 1.0
-    assert assessment.replay.of == graded
-
-
-def test_replay_of_another_episode_or_changed_inputs_does_not_link(tmp_path):
-    run = Run(tmp_path)
-    graded = run.episode({"agent/trajectory.json": trajectory()})
-    other = run.episode({"agent/trajectory.json": trajectory("other")})
-    replay = run.episode({"artifacts/out.txt": UNSORTED})
-    inputs = run.content(other, "agent/trajectory.json")
-    run.record.replays.append(Replay(episode=replay, of=other, inputs=inputs))
-    check = run.check(run.content(replay), exit_code=1, bound={"deserved_max": 0.5})
-
-    assert assess(claim(graded, check), run.dir).outcome == "unknown"
-
-    run.record.replays = [Replay(episode=replay, of=graded, inputs=inputs.model_copy(update={"episode": graded}))]
-    run.save()
-
-    assert assess(claim(graded, check), run.dir).outcome == "ungrounded"
 
 
 # Availability: no native reward is no graded outcome.
@@ -624,6 +673,35 @@ def test_check_that_raises_after_printing_plausible_output_stays_unknown(tmp_pat
     assert assessment.discrepancy == "unknown"
 
 
+@pytest.mark.parametrize("prefix", ["", 'print("counting placed numbers")\n'])
+def test_a_check_printing_its_result_over_several_lines_is_read(tmp_path, prefix):
+    run = Run(tmp_path)
+    episode = run.episode({"artifacts/out.txt": UNSORTED})
+    program = prefix + COUNT_PROGRAM.replace('"results": {"deserved": correct * rate}}))', '"results": {"deserved": correct * rate}}, indent=2))')
+    check = run.measured_check(run.content(episode), program=program)
+
+    assessment = assess(measured_claim(episode, check), run.dir)
+
+    assert assessment.outcome == "accepted_invalid", assessment.reasons
+
+
+@pytest.mark.parametrize("output, expected", [
+    ('{"a": 1}', {"a": 1}),
+    ('log\n{"a": 1}\n', {"a": 1}),
+    ('{"a": 1}\n{"b": 2}', {"b": 2}),
+    ('{\n  "a": {\n    "b": [1, 2]\n  }\n}', {"a": {"b": [1, 2]}}),
+    ('progress\n{\n  "a": 1\n}', {"a": 1}),
+    ('{"a": 1}\n{\n  "b": 2\n}', {"b": 2}),
+    ('{\n  "a": 1\n}\ndone', None),
+    ('{"a": {"b": 1}', None),
+    ('[1, 2]', None),
+    ('', None),
+    ('{"a": 1} trailing', None),
+])
+def test_captured_object_is_the_last_complete_json_object(output, expected):
+    assert captured_object(output) == expected
+
+
 @pytest.mark.parametrize("value", [False, True, float("nan"), -float("inf"), float("inf"), "0.5", None])
 def test_invalid_deserved_score_leaves_only_the_comparison_unknown(tmp_path, value):
     run = Run(tmp_path)
@@ -662,7 +740,6 @@ def test_replayed_commands_with_new_output_cannot_condemn_original_submission(tm
     run = Run(tmp_path)
     original = run.episode({"artifacts/out.txt": SORTED, "agent/trajectory.json": trajectory(SORTED)})
     replay = run.episode({"artifacts/out.txt": UNSORTED}, rewards={"reward": 0.0})
-    run.record.replays.append(Replay(episode=replay, of=original, inputs=run.content(original, "agent/trajectory.json")))
     check = run.check(run.content(replay), exit_code=1, bound={"deserved_max": 0.5})
 
     assessment = assess(claim(original, check), run.dir)
@@ -683,7 +760,7 @@ def test_equal_disclosed_marker_after_episode_return_does_not_prove_persistence(
 
 @pytest.mark.parametrize("reward, validity, output, outcome", [
     (1.0, "violated", UNSORTED, "accepted_invalid"),
-    (0.5, "violated", UNSORTED, "legitimate"),
+    (1.0, "supported", SORTED, "legitimate"),
     (0.0, "supported", SORTED, "rejected_valid"),
 ])
 def test_measured_scoring_of_the_actual_submission_supports_one_outcome(tmp_path, reward, validity, output, outcome):
@@ -800,7 +877,7 @@ def test_one_check_keeps_independent_requirement_conclusions(tmp_path):
 
     assessment = assess(the_claim, run.dir)
 
-    assert (assessment.outcome, assessment.validity) == ("legitimate", "violated")
+    assert (assessment.outcome, assessment.validity) == ("unknown", "violated")
     assert conclusions(assessment) == [(REQUIREMENT, "violated"), (FOUR, "supported"), (invented, "unknown"),
                                        (GRADER_ASSERTION, "unknown"), (FOUR, "unknown"), (FOUR, "unknown")]
     reasons = [" ".join(item.reasons) for item in assessment.conclusions]
@@ -844,3 +921,15 @@ def test_a_bound_copy_check_reports_the_copy_limits(tmp_path):
     assert "the check ran with the episode's own interpreter, so code the episode planted could change its output" in assessment.limits
     assert "the copy omits /logs; nothing under them was checked" in assessment.limits
     assert "processes were paused for 1.0 s before grading" in assessment.limits
+
+
+@pytest.mark.parametrize("text, excerpt, found", [
+    ("Write the answer\n    to /app/answer.txt.", "Write the answer to /app/answer.txt.", True),
+    ("Write the answer to\t/app/answer.txt.", "Write  the answer\nto /app/answer.txt.", True),
+    ('{"output": "two\\n  lines"}', "two lines", True),
+    ("Write the answer", "Writethe answer", False),
+    ("prefix \\nready", "\nready", False),
+], ids=["line break", "spaces and tab", "json string", "missing space", "literal escape"])
+def test_an_excerpt_matches_its_source_whatever_its_whitespace(text, excerpt, found):
+    """Retyped text often differs from its source in line breaks and indentation only; a missing space still differs."""
+    assert contains(text, excerpt) is found

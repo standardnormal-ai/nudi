@@ -1,0 +1,142 @@
+# Viewer contract
+
+`nudi-view` is a terminal viewer for nudi runs, built from [`tui/`](../tui). It reads `RUN/report.json`, and with `--follow` also `RUN/events.jsonl`, and nothing else in the run folder; a file that links outside the folder is refused. nudi decides every word, status and number in those files; the viewer lays them out and never computes a result of its own. [Usage](usage.md#viewer) says how to build and run it.
+
+## Accepted reports
+
+| Report | Viewer |
+| --- | --- |
+| nudi 0.0.1 and later | Read in full, attack problems included |
+| nudi 0.0.0 | Read in full; the attack has no problems, so none are shown |
+| Older, without `answer` | Refused: `RUN/report.json comes from a nudi older than 0.0.0, which wrote no answer` |
+| Incomplete: an empty `answer`, or a rate with a `value` but no `numerator` or `denominator` | Refused with a message naming the gap |
+
+Fields the viewer does not use are ignored. Python's nulls for statistics it cannot give are shown as unavailable, and so are a missing `known_cost`, a reward statistic that an older report lacks, such as `median`, and a missing `pass_rate`; none is shown as zero. An analysis status or category name the viewer has no words for is shown as written. Category states are not displayed. Control characters and Unicode format characters, such as bidi overrides, are dropped from every string in the report, map keys included, and from the folder name and error messages, before anything is drawn.
+
+## Fields read
+
+| Field | Shown as |
+| --- | --- |
+| `answer` | The card: the first line on the banner, the rest below it |
+| `status` | The exit code |
+| `analyses` | The phase steps: a phase missing from it was not selected; `not run` and every status are shown as given |
+| `warnings` | Counted on the card, with a pointer to `report.md`, and the first three listed by their first line, as `report.md` shows them; the card counts the rest |
+| `configuration` | `task_dir`, `models.ROLE.model` and `reasoning_effort`, `spending_cap`, `known_cost`, `unknown_cost_calls`, `cancelled_calls`, `backend`, `modal_cost.at_requests` and `at_limits` |
+| `ordinary` | `requested`, `attempted`, and per group `configuration.model` and `rewards.KEY` with `attempted`, `usable`, `mean`, `median`, `sd`, `skewness` and `distribution`, drawn as the rewards chart, then each of its `flags` by its `flag` with its `text` as written, or `flags_not_evaluated` as written, on the card and the Simulation screen. Absent or null `flags`, a null flag, or a flag without its `flag` or `text` reads flag details unavailable |
+| `labels.counts` | The grader inspector's episode labels |
+| `metrics.confusion` | Per group: `configuration.model`, `reward`, `status`, `reasons`, `rule`, `tp`, `fp`, `fn`, `tn`, and both rates with `value`, `numerator`, `denominator`, `lower_bound` and `unavailable`; and `pass_rate`, the native pass rate, with the same fields and `interval`, its 95% Wilson interval, worded as in `report.md` on the card and the Grade Simulations screen whatever the group's `status`. An older `pass_rate` without `interval` is shown without one |
+| `inspections.grader_inspector`, `inspections.hack_inspector` | `status`, `categories`, `attempts`, `experiments`, `applicability`, `limits`, and `findings.evidenced`, `inconclusive` and `legitimate` |
+| `attack` | `status`, `maximum_attempts`, `candidates` (`id`, `valid_work`, `conditions.LEVEL.status`), `problems` (`cause`, `findings`, `candidate`, `reproduced`, `reproduced_findings`, and for problems formed during the run `id`, `source`, `members`, `help_needed`, `level` and `label`), `attempts` (`level`, `candidate`, `sources`, `problem`, `episode`, `status`), `findings`, and `exploits.KIND` (`assessment`, `candidate`, `sources`) |
+| `other_episodes.attacker` | Which attempts started |
+
+Each finding is read for `index`, `superseded_by`, `execution_scope`, `category`, `claim` (`mechanism`, `episode`, `unresolved`, `limits`), `captured` (`native_reward`, `copied_grader_reward`, `check.id`, `check.requirement.excerpt` and `path`), `interpretation` (`interpretation`, `citations`) and `assessment` (`outcome`, `reasons`, `limits`).
+
+## Layout rules
+
+These rules arrange the report; none of them changes a result.
+
+- **Findings.** The list holds every evidenced finding whose `superseded_by` is null: the grader inspector's, then the hack inspector's, then the attack's, each in report order, numbered from 1. A hack inspector finding is named `hack-INDEX` and a grader inspector finding `grader-INDEX`, as the attack names its candidates, so a candidate, an attempt or a problem names the number of the finding it came from; an attack finding is named by its check id. An inspector finding without its `index` is named `grader index unavailable` or `hack index unavailable` and links to nothing.
+- **Tags.** A finding's tag comes from who found it and its outcome: `accepted_invalid` is FP, Incorrect work passed, from the grader inspector and HACK from the hack inspector or the attack; `rejected_valid` is FN, Correct work failed, from any of them, as `docs/diagrams/simulation.mmd` names them. Beside an attack finding's tag stands what its entry in `exploits`, the one whose `assessment` is its `index`, says it confirmed of the findings the attempt tested: reproduced (`reproduction`), another mechanism while testing (`other`), not confirmed as (`unattributed`), or found with no extra information (`discovery`). An attack finding with no entry confirms no tested finding. When the finding lacks its `index`, or any entry is null or lacks its `assessment`, an unmatched finding reads confirmation unavailable instead, so nothing is attributed from missing data. A report without `exploits` shows nothing there. A finding with `claim.unresolved` entries carries a yellow triangle.
+- **Attempts.** An attempt started when its `episode` is listed in `other_episodes.attacker`. An attempt that never started is shown as not tested, whatever its status.
+- **Problems.** The attack selects only a problem's `candidate`, so only it is marked selected, then attempted or not tested. The problem's other findings carry no selected, attempted or not tested mark, but they may carry a reproduced mark, since an attempt can test other findings of the problem along with the candidate. Every reproduced mark needs a started attempt that tested that finding: a finding is marked reproduced when `reproduced_findings` names it and a started attempt tested it. A report without `reproduced_findings` marks the candidate reproduced when `reproduced` is true and a started attempt tested the candidate. The hack panel counts the problems; the card adds no count to the one in `answer`.
+- **Level.** When the problems carry `help_needed`, the card and the Attack screen list them under PROBLEMS by their `level` on the exploit chart, highest first: `id` and `cause`, then the chart's `label`, such as ●●●●○ exploit executable by learner with hint, with the reason at ●●○○○ reproduced exploit, and on the line under it the sources. A report without `level` gets it from `help_needed`, and a value without a level there is a reproduced exploit. Problems the hack inspector did not reproduce (`not_reproduced`) get no line each: one dim line counts them, "N more suspected exploits, not reproduced". The sources are `source` and every other inspector whose finding is among `members`, a hack inspector experiment (`experiment-NNNN`) or a grader inspector finding (`grader-INDEX`), as in `from hack inspector + grader inspector`. A problem at level 5 that a hack or grader inspector found adds `independent attacker`. To fit the terminal, the cause is shortened first. An attempt with a `problem` is named by it on the Attack screen, and a finding's screen names the problem that holds it by its `id`. With PROBLEMS the card lists no findings, and no count of inconclusive or legitimate ones: PROBLEMS follows the answer, and each finding keeps its own screen, `nudi-view RUN P2` for the problem P2 or `nudi-view RUN N`. The card's next line, and `enter` on the screens, open the evidence for the highest problem on the list that has an evidenced finding; without one they open finding 1. Reports without `help_needed` show the problems as above and the card lists the findings.
+- **Search.** The grader and hack panels list the category names searched. Findings appear separately. The card has no category verdict counts. Search scope comes from retained attempts, experiments and findings. Exclusions, attempt summaries and incomplete-work reasons remain visible. Older reports still load; generated category warnings retain their concrete reasons without verdicts, and the safety disclaimer is omitted.
+- **Banner.** The first answer line, how the run ended, on a neutral bar. When problems are listed, red marks only their count at its right end, such as `5 problems`, leaving out the suspected exploits the hack inspector did not reproduce; a report without problems counts its evidenced findings there instead. A run with neither has no red.
+
+## Output and exit codes
+
+In a terminal the viewer opens on the card and prints it into the scrollback when it quits. In a pipe it prints the card, or finding N with its evidence and limitations, as plain text 100 columns wide.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | The run is complete, as nudi's own exit code |
+| `1` | A step failed or stopped, also at the time limit. Evidence left unresolved by a step that ran to its end does not make a run partial |
+| `2` | No `report.json`, one linked from outside the folder, a report older than nudi 0.0.0, an incomplete or unreadable report, or wrong arguments; with `--follow`, also the cases that [follow mode](#follow-mode) lists |
+
+## Event log
+
+Every run also writes `RUN/events.jsonl`, so a reader can follow the run while it goes on. `nudi send-nudis`, `send_nudis` and `send_nudis_async` all write it; the viewer reads it in [follow mode](#follow-mode). Each line is one event, a JSON object in UTF-8 that ends with a newline. The log adds a file and changes no other file or report field.
+
+Every event has these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `v` | The format version, `1` |
+| `time` | When nudi wrote the event, in UTC as ISO 8601 with microseconds, such as `2026-11-07T09:15:02.123456+00:00` |
+| `kind` | What happened, one of the kinds below |
+| `text` | The line `nudi send-nudis` prints on stderr for the event, without its newline: `nudi: `, `time` as `HH:MM:SS` in the host's time zone, and the message |
+| `known_cost`, `unknown_cost_calls`, `cancelled_calls` | The run's cost so far, as `run.json` has it when nudi writes the event: the known inference cost in US dollars, the calls of unknown cost other than cancelled ones, and the calls cancelled in flight |
+
+Each kind adds its own fields. Null means the field does not apply to that event.
+
+| Kind | Written when | Fields |
+| --- | --- | --- |
+| `run_start` | The run's settings, credentials and backend are accepted and its folder exists. It is the first event. | `run_id`; `backend`, `docker` or `modal`; `docker_cpus` and `docker_memory_mb`, null on Modal; `host_cpus` and `host_memory_mb`, the CPUs and memory of the host that runs nudi, on Modal only and null on Docker; `free_bytes`, the free space where records go; `docker_free_bytes`, the free space where Docker stores data, null on Modal and when nudi cannot measure it, as for Docker Desktop, another virtual machine or a remote daemon; `spending_cap`, in US dollars, null without one; `concurrency` and `concurrency_setting`; `reason`, why concurrency is below the setting, or the capacity warning; `pid`, nudi's process id, and `host`, the name of the host it runs on, so a reader on that host can tell whether the run still goes on; `analyses`, the selected analyses in run order, with the names `phase_start` uses |
+| `reused` | A rerun of the attack (`attack_from`) starts copying the earlier run, after `run_start` and before any analysis. A copy that fails ends the run, and `run_end` follows. | `earlier`, the earlier run directory as nudi read it; `analyses`, the analyses taken from it in run order, with the names `analyses` uses in `report.json`; `episodes` and `sandboxes`, how many episode and sandbox folders it copies |
+| `phase_start` | An analysis starts | `phase`: `simulation`, `grader`, `hack` or `attack`, the names `analyses` uses in `report.json`; `slots`, for `hack` only, how many of its inspector sessions and Attacker episodes run at once |
+| `phase_end` | An analysis ends | `phase`; `elapsed`, its duration in whole seconds; `status`, the status the analysis returned, or `stopped` when a task environment cannot start and no later analysis runs, or `failed`; `error` with `stopped` and `failed`. A returned analysis adds its counts: `episodes` and `requested` for `simulation`, `experiments` and `assessments` for `grader` and `hack`, `attacker_attempts` for `hack`, the attempts of the attack beside it, `attempts`, `findings`, and of those `exploits`, incorrect work passed, and `correct_work_failed` for `attack` |
+| `session_start` | An inspector session starts | `inspector`: `grader`, `hack`, or `attack` for the attack inspector; `session`, the session's name in its inspection record; `category`, the one category a focused session inspects; `episode`, the one episode an episode session judges; `problem`, for an attack inspector session, the problem its attempt targets |
+| `session_end` | That session ends, after a failure or a cancellation too | `inspector`, `session`, `elapsed`; `status`, the status of the session's last attempt; `category`, the one category the session inspects, a focused session's or the inspection's only one, null for a session over several; `category_status`, retained for compatibility as internal search state; it and category verdicts do not appear in the terminal line, which names the searched category and retains operational outcomes; the viewer normalizes generated legacy lines the same way for plain follow output and live recent lines |
+| `evidenced` | An inspector's assessment is evidenced | `inspector`; `outcome`, `accepted_invalid` or `rejected_valid`; `category`, when it is an approved category; `id`, the reading's check id, or its experiment id when it has no check; `index`, the assessment's position in that inspection's assessments, so a hack inspector finding is `hack-INDEX`; `episode`, the episode or package sandbox the assessment graded, for the attack inspector the Attacker episode of `attempt_start` |
+| `attempt_start` | An Attacker episode starts | `episode`; `candidate`, null for discovery; `level`, `full`, `minimal` or `none`; `number`; `problem`, the problem a hinted attempt targets |
+| `attempt_end` | That episode returned, before its attack inspector | The same fields, `elapsed`, and `rewards`: the episode's reward values in order, with null for a value that is not a finite number |
+| `attempt_result` | An attempt's status is saved, once per attempt: after its attack inspector and the judge, and also after zero reward, which needs no attack inspector, an error, a cancellation or the spending cap, also one that stopped an attempt before its episode started, with no `attempt_start` | `episode`, null when the episode never started; `number`; `problem`, the problem it targeted, or the one the judge named for a zero-info exploit, null without one; `level`; `status`, the attempt's status as `report.json` saves it, such as `evidenced_issue` for an exploit of its problem, `other_exploit` for an exploit of another mechanism, `unattributed_exploit` for an exploit nudi could not attribute, or `no_evidenced_issue`. An attack inspector session's own status is not the attempt's |
+| `judged` | The judge names the problem of a finding: a new one or one already known. A rerun of the attack first repeats the earlier run's judgements | `inspector`, `hack`, `grader` or `attack`; `finding`, a hack inspector experiment id (`experiment-NNNN`), a grader inspector finding (`grader-INDEX`) or an Attacker episode; `problem`, its id, `P`, `G` or `A` and a number, the known problem's when not new; `new`; `cause`, the problem's mechanism; `replayed`, true when a rerun repeats the earlier run's judgement for this log, with no judge call; `request`, the input the judge read, null when no call was made |
+| `reproduced` | A problem's evidence changes: the hack inspector reproduces it or does not, a grader inspector finding later evidences it, or a rerun of the attack starts from the earlier run's problems | `problem`; `result`, `evidenced` or `not_reproduced`; `replayed`, true when a rerun repeats the earlier run's evidence. A later event for the same problem replaces the earlier. This is inspector evidence; `attack.problems[].reproduced` in `report.json` says instead that an Attacker reproduced the problem |
+| `warning` | nudi records a run warning that no other kind reports; `run.json` lists it too | `message` |
+| `heartbeat` | 15 minutes passed with no other line on stderr; again after each further 15 quiet minutes | `jobs`, the inspector sessions and Attacker episodes still open, counted by job: `Attacker`, `hack inspector session`, `grader inspector session` or `attack inspector session`. The text gives the time since the analyses began and names the problems the open jobs work on, such as `still running after 3:10:00: 1 hack inspector session; 2 Attackers on P1, P2` |
+| `time_limit` | The run reaches its `time_limit` | `phase`, the analysis it stopped, and `minutes` |
+| `run_end` | The run ends after attempting cleanup and report writing, also after Ctrl-C, the time limit or an error. It is the last event, when nudi can write it. | `status`: the report's `status`, `complete`, `partial` or `time_limit`, or `cancelled`, or `stopped` with `error`; `report`, `report.json` when it was written |
+
+How to read it:
+
+- Lines are in the order nudi wrote them. A reader orders events by line, since `time` follows the host's clock, which can be set back.
+- nudi writes one event at a time and closes the file after each, so a reader sees each event as soon as nudi goes on. Sessions and attempts that run at once add whole lines, never parts of one.
+- While the run goes on, the last line can lack its newline because nudi is still writing it. A reader parses a line only once its newline is there.
+- If nudi cannot write an event, for lack of space or another storage error, it writes no more events for that run. The log is then a whole prefix of the run's events; the failed write can leave part of its event as a last line without a newline. A log without `run_end` is incomplete.
+- `status` in `phase_end`, `session_end` and `attempt_result` is an open set: later versions of nudi add values, and a reader shows a value it does not know as text.
+- A reader ignores kinds and fields it does not know: later versions of nudi add them and keep `v` at 1. A change to the meaning of a kind or field raises `v`, and a reader skips events whose `v` it does not know.
+- Event strings can hold text that a model or a task wrote, and JSON decoding restores any control character in it. Before terminal or plain-text output, a reader removes control and Unicode format characters, such as bidi overrides, from every decoded string and map key it shows, `text`, `message`, `error` and every id included, as the viewer does for the report.
+
+What the log leaves out:
+
+- The command prints every event's `text` except that of `run_end`, since it then prints the report on stdout. After Ctrl-C or a full disk it prints one more line of its own, which says whether the report was written. When an event cannot be written, the log stops silently after that first failed write. The command prints no line about it and still prints that event's text.
+- A program that starts nudi must read or discard its stderr while the run goes on. nudi writes each line there before it continues, so a full pipe pauses the run until it is read.
+- Errors before the run starts, such as invalid configuration, an output folder that is not empty or an unavailable backend, are printed only; there is no log yet.
+- Phase events, `reused` and `run_end` come from `send_nudis`, `send_nudis_async` and `nudi send-nudis`. A program that calls `start_run` and one analysis itself gets `run_start` and that analysis' own events only. `nudi cost` writes nothing to the log.
+- An analysis stopped by Ctrl-C or the time limit has no `phase_end`, and an Attacker episode that ends with an error has no `attempt_end`. `run_end` still follows.
+- The log misses every event nudi cannot write, `run_end` included, and those after it. The run goes on and ends as it would have without the log; a full disk still stops it, through its other records.
+- Model calls are not events; `run.json` lists them, and every event has the cost so far. Simulator episodes are not events either, so the simulation shows only its `phase_start` and `phase_end`, and an attack finding is in `report.json` only.
+
+## Follow mode
+
+`nudi-view --follow RUN` shows a run that is still going, from its event log, and then the card once the run is over. The folder must exist; the log need not exist yet, and until it does the screen says that it waits for it. A folder whose log has not begun after 2 minutes stops the follow.
+
+- **Reading.** Once a second the viewer reads what nudi added to `RUN/events.jsonl` since the last read. It parses whole lines only, so a last line that lacks its newline waits for the next read. Every string is cleaned as the report's strings are, before anything is drawn.
+- **Refusals.** A line that is not a JSON object, a field of the wrong type, or a `v` other than `1` stops the follow with an error that names the file and line. Unlike the general reader rule above, the viewer does not skip an event of an unknown version, since a screen that skipped it would no longer match the run.
+- **The end.** Once `report.json` reads in full, the viewer shows it as for a finished run. After `run_end` the report is final: a `run_end` without `report`, or a `report.json` that does not read, stops the follow with that error. A log without `run_end` whose `run_start` names this host and a `pid` that no longer runs stops the follow too, naming `nudi report` to write the report. A run on another host, or a log whose `run_start` has no `pid`, is followed until it ends or the viewer is quit.
+- **Modal.** The viewer follows a folder on this machine. A run whose folder is on a Modal Volume is followed from a downloaded copy, which shows the run only as far as the copy goes.
+
+The live screen lays out what the events say and computes no status of its own:
+
+| Part | From the events |
+| --- | --- |
+| Header | The time since `run_start` by this machine's clock, the latest event's `known_cost` against `spending_cap`, and `backend` |
+| Notes | `concurrency` of `concurrency_setting`; the latest event's `unknown_cost_calls` and `cancelled_calls`, when not zero; the `minutes` of `time_limit`, once it is reached; how many `warning` events there were |
+| Pieces | HACKS, the `hack` phase, and GRADER, the `simulation`, `grader` and `attack` phases as the steps Simulate, Inspect and Attack. A piece shows pending, `○`, from the start when `run_start` lists it in `analyses`: HACKS with `hack`, GRADER with `simulation` or `grader`, so an attack alone has no GRADER until its `phase_start`. Without `analyses`, a piece shows once one of its phases has had its `phase_start`. A piece turns while a phase of it runs, with the time of its phases so far from `elapsed` and the running phase's `phase_start`, then is marked complete or with its `status`. At the `hack` `phase_end`, in log order, the hacks count their P and A problems and how many an Attacker exploited at any level, by `attempt_result` or alone with no extra information. The count stays as it was then: later attacks are the grader piece's |
+| Agents | One tile per hack inspector, grader inspector and attack inspector session between its `session_start` and `session_end`, and per Attacker episode between its `attempt_start` and `attempt_end`: its `session` or `episode`, or its `problem` and level when the event names one, the time since it started, and the last event that names it. While the `hack` phase runs and its `phase_start` gives `slots`, the heading reads `N of SLOTS slots`. `phase_end` and `run_end` clear the tiles |
+| Findings | One row per problem from `judged` events with `new`, by its `problem` and `cause`: P rows, then A rows, then G rows, each in log order. The columns are the judge, the reproduction from `reproduced` (`evidenced` or `not_reproduced`), and the latest Attacker attempt on the problem with full instructions and with only a hint, from `attempt_start` with that `problem`. A cell is `·` while waiting and turns with its minutes until the attempt's `attempt_result`, in blue while its attack inspector runs. It then shows that event's `status`: exploited, exploited another way for `other_exploit`, not exploited, result unclear for `unknown` and for `unattributed_exploit`, an exploit nudi could not tie to this problem or another, or the status in words. The Attack screen reads `unattributed_exploit` as result unclear too. An attack inspector session's own status is not the attempt's, since the exploit it evidences can be another problem's. An `attempt_result` with no `attempt_start` for its episode is that attempt, ended, with no tile; the spending cap before the episode reads not tested. A cell for only a hint reads `–` once the full instructions attempt ended with any other status, since nudi then gives no hint. A grader inspector problem reads `✓ (grader)` for reproduction. An Attacker's reads `✓ (Attacker)`, found with no extra information, once the `attempt_result` of a `none` attempt names it with `evidenced_issue`; one that a rerun repeats from the earlier run reads `kept from the earlier run` until then. A `judged` event without `new` folds its `finding` under the problem, except a grader inspector finding the same as a P or A problem, which has its own row, named by its `finding`, reading `same as` that problem, and `attacked in hacks` once an Attacker attempt on it started while the `hack` phase ran. A later `reproduced` event replaces a problem's reproduction, as when a grader inspector finding evidences a problem the hack inspector did not reproduce. A no extra information row comes first once a `none` attempt started, with the latest judge call on such an exploit of this run, not a replayed one. Under 100 columns the judge column goes |
+| Last lines | The `text` of the latest three events; a `judged` event of this run is put in words instead, such as `judge: hack-7 is the same as P1 (reward reads stdout)` |
+
+The pieces, the slot count and the findings read `judged`, `reproduced` and `attempt_result`, `problem` on `attempt_start`, `attempt_end` and an attack inspector's `session_start`, `analyses` on `run_start` and `slots` on the `hack` `phase_start`. A log without them shows no problem rows; only its zero-info attempts appear, in the zero info row.
+
+The events do not carry all that the finished screens show, so the live screen leaves out the models, a limit per session or attempt, the Simulator's episodes, how the findings are later settled or superseded, and the time limit before it is reached.
+
+| Exit code with `--follow` | Meaning |
+| --- | --- |
+| As without `--follow` | The report was read in full and shown |
+| `2` | The folder does not exist, its log did not begin within 2 minutes, a log line is refused, the run ended without a readable report, nudi's process ended without `run_end`, the viewer was quit before nudi wrote the report, or a finding number was given |
+
+In a pipe, `--follow` prints the `text` of each event as the viewer reads it, then the card as plain text.
+
+Return to [Usage](usage.md).

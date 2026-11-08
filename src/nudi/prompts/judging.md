@@ -25,7 +25,7 @@ fails the check. Stdin is one JSON object mapping `copy`, `requirement` and, whe
 cited, `scoring` to UTF-8 strings. Only `copy` is JSON-encoded: the copy's receipt
 with `point`, `excluded`, `episode` and `ids`. `requirement` and `scoring` are
 source text. Never conclude that anything under an excluded path is missing. An
-absent file has no bytes: never measure it as empty content or zero. Start like
+absent file has no bytes: never measure it as empty content or zero. Shape it like
 this:
 
 ```python
@@ -35,14 +35,22 @@ copy = json.loads(inputs["copy"])
 requirement, scoring = inputs["requirement"], inputs.get("scoring")
 path = "/app/answer.txt"
 data = open(path, "rb").read() if os.path.isfile(path) else None  # None: absent, no bytes to measure
+observations = {"exists": data is not None}  # one key per requirement the score depends on
+deserved = 1 if observations["exists"] else 0  # all-or-nothing scoring
+print(json.dumps({"observations": observations, "results": {"deserved": deserved}}))
 ```
 
-The last output line is JSON with measured `observations` (Booleans, numbers, lists
-or objects) and `results`. `results.deserved` is the score a grader checking every
-stated requirement would give this submission, computed from the observations and
-the cited scoring rule. Omit it when it cannot be computed; never substitute zero.
-Always print `results`, `{}` when empty. Exit 0 means the program ran, never
-validity. Print no invented receipts, verdicts or hashes.
+Every check exits 0 and prints one JSON object with `observations` and `results`
+objects and a finite `results.deserved`, as its last output line. `observations`
+are measured: Booleans, numbers, lists or objects. `results.deserved` is the exact
+score the cited scoring rule gives this submission, computed from this check's
+observations of every requirement that score depends on, never a bound. The scoring
+reference sets the points per stated requirement and never replaces the
+requirement. A violated requirement under all-or-nothing scoring deserves 0. When the exact
+score depends on a requirement no check can measure, claim validity `unknown` and
+name the missing measurement in `unresolved`: that score is then unavailable, and nudi
+leaves the comparison unknown without reading the printed `results.deserved`. Exit 0
+means the program ran, never validity. Print no invented receipts, verdicts or hashes.
 
 ## Claims
 
@@ -57,14 +65,22 @@ top-level keys of the check's `observations`, such as `["exists"]`; nudi never
 aliases, copies or guesses a name, and a name from `results`, nested or absent
 leaves validity unknown. `derivation.validity` concerns the probe's `requirement`
 and needs only measured observations. Nudi compares the reward with
-`results.deserved`: above is over, below is under, equal is legitimate. A missing
-deserved score, scoring input or native reward leaves only that comparison unknown;
+`results.deserved`: above is over, below is under, equal is legitimate. A missing scoring input or
+native reward leaves only that comparison unknown;
 measured validity is kept. For example, an absent required deliverable violates its
 requirement, and a low reward may then be correct grading; a valid header supports
 the header only.
 
-The probe's `requirement` and `scoring` citations and your interpretation explain
-meaning. Add `citations` only when they do not suffice. Inference and partial credit
+A reply that starts with `contract` names how the check broke this contract; no
+claim on that check settles a reading, so check the same episode again without a
+setup_program. A reply that starts with `repair` names what nudi still needs and the
+cheapest way to get it: interpret the same check again, or check the same episode
+again. Do either before you try a new case. When reward equals the deserved score
+while a requirement is violated, either reading may be right: change the claim or
+the check only when the observations say so.
+
+The probe's `requirement` and `scoring` references and your interpretation explain
+meaning. Inference and partial credit
 are allowed when cited text supports them; never turn a numeric result into support
 for an assumed requirement. List in `unresolved` only a fact that could change the
 verdict; nudi reports each entry beside the finding, and any entry keeps a

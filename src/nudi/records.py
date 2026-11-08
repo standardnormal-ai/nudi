@@ -45,6 +45,13 @@ def write_private(path: Path, data: str | bytes) -> None:
         raise
 
 
+def append_private(path: Path, text: str) -> None:
+    """Append `text` to `path`, created owner-only with its missing parents; other readers see it once this returns."""
+    private_dir(path.parent)
+    with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a") as file:
+        file.write(text)
+
+
 class DiskFull(BaseException):
     """No space was left on the records host for one of nudi's own writes, so the run stops.
     Like cancellation, it passes the handlers that keep a run going after an ordinary failure.
@@ -125,6 +132,8 @@ class EpisodeConfig(BaseModel):
     native: frozenset[NativeBehavior] = frozenset()
     """Native Harbor behaviors the episode must keep; any the adapter changes select native Harbor."""
     backend: Backend = "docker"
+    attacker: bool = False
+    """An Attacker episode, whose shell may end within a turn and still be graded; others keep stock Harbor."""
 
 
 class ErrorRecord(BaseModel):
@@ -171,6 +180,8 @@ class Capacity(BaseModel):
 
 
 PROVIDER_REPORTED = "provider-reported usage.cost"
+# A call cancelled before its response arrived: its price is known, its usage is not.
+CANCELLED = "unknown: cancelled in flight"
 
 
 class CallRecord(BaseModel):
@@ -192,6 +203,10 @@ class CallRecord(BaseModel):
     """Explicit model refusal signals the provider returned for this call: a message
     `refusal`, a `content_filter` finish reason or a content policy error. Never inferred
     from text, and separate from the spending cap's `RunRecord.refused_calls`."""
+    started: str | None = None
+    """When nudi admitted the call, in UTC ISO 8601; None in older records."""
+    ended: str | None = None
+    """When its response, failure or the end of its calls was recorded, in UTC ISO 8601; None in older records."""
 
 
 class Observation(BaseModel):
@@ -220,78 +235,6 @@ class Content(BaseModel):
     result: int = 0
     sha256: str
     """Of the content's bytes; tool output is UTF-8 encoded."""
-
-
-class Submission(BaseModel):
-    """Independent observation of submission/task state relevant to a native outcome.
-
-    State includes absence or omitted work: the grader need not literally read every
-    disputed byte. `content` retains the observed bytes or a protected state/absence
-    observation. The producer records its actual capture program/command, location,
-    time/capture point and native episode/outcome linkage. JSON output records
-    `sha256`, `location` and `ids`. Receipt consistency does not create a capture
-    capability or exclude subsequent state changes; producers must retain relevant
-    context and uncertainty. A model-written manifest is not independent capture.
-    Current artifact collection and task-writable ATIF alone do not establish this link.
-    """
-
-    content: Content
-    ids: dict[str, str]
-    location: str
-    capture_point: str
-    command: list[str]
-    program: str
-    exit_code: int | None = None
-    output: str
-    path_resolution: dict = {}
-    """Daemon metadata of the path, checked in the paused container before the read."""
-    observation_windows: list[dict] = []
-    """The pause, read and resume times around that check and read."""
-    execution_scope: ExecutionScope = "native"
-
-
-class CaptureFailure(BaseModel):
-    """Read only from older records; no current code writes one."""
-
-    episode: str
-    location: str
-    error: ErrorRecord
-
-
-class ArtifactSelection(BaseModel):
-    """One task.toml artifact declaration or Inspector-proposed file, and whether
-    ordinary episodes capture it.
-
-    Neither establishes the location's relevance to a requirement nor the time a
-    requirement applies; the Inspector interprets both. A proposal is collection
-    planning, never a validity judgment."""
-
-    declaration: int | None
-    """Index in the task's `artifacts` list; None for an Inspector-proposed file."""
-    source: str
-    """The container path, which is the only one captured."""
-    service: str | None = None
-    destination: str | None = None
-    """A host path under the trial's artifacts directory; never captured."""
-    selected: bool
-    reason: str
-    """nudi's reason for selecting or skipping it."""
-    references: list[Observation] = []
-    """For a proposal: the task text it cites; verified verbatim when selected."""
-    inspector_reason: str | None = None
-    """For a proposal: the Inspector's own short reason."""
-
-
-class CaptureSelection(BaseModel):
-    """The files every ordinary and Attacker episode of a run captured, chosen once
-    from the original task before the first of them. Read only from older records."""
-
-    files: list[ArtifactSelection]
-    status: Literal["not_requested", "complete", "failed", "refused", "model_inability", "malformed", "spending_exhausted",
-                    "cancelled", "unavailable"] = "not_requested"
-    """The one Inspector request that proposes files beyond the declarations."""
-    limits: list[str] = []
-    """Its failure reason, if any, and what the selection leaves uncaptured."""
 
 
 class Simulation(BaseModel):
@@ -336,8 +279,6 @@ class Check(BaseModel):
     program: str | None = None
     environment: str | None = None
     inputs: dict[str, Content] = {}
-    submission: Submission | None = None
-    """One-file capture of older records; current checks read a state copy instead."""
     state_copy: str | None = None
     """The `StateCopy` the check sandbox started from; `content` is its receipt."""
     sandbox: str | None = None
@@ -376,16 +317,6 @@ class Derivation(BaseModel):
     observations: list[str]
     validity: Validity
     requirements: list[Reading] = []
-
-
-class Replay(BaseModel):
-    """nudi's record that `episode` ran the retained `inputs` of episode `of` again, on the
-    same task; written by nudi, never by a model. Repeated commands can produce different
-    submissions. This record does not transfer a replay's validity to the original."""
-
-    episode: str
-    of: str
-    inputs: Content
 
 
 class EpisodeEvent(BaseModel):
@@ -469,6 +400,16 @@ class StateCopy(BaseModel):
     started_at: str
     finished_at: str | None = None
     seconds: float | None = None
+    """The whole copy operation, from `started_at` to `finished_at`."""
+    size_bytes: int | None = None
+    """On Docker, the source container's writable-layer size as `docker inspect --size` reports it,
+    sampled before the commit; None when Docker reports no size or -1, a size it could not compute.
+    Always None on Modal, which reports no snapshot size."""
+    pause_seconds: float | None = None
+    """The elapsed call duration of the `docker commit` or Modal snapshot call alone, timed by nudi
+    around the call; not a measured freeze. Docker pauses the container's processes for the commit,
+    so they were paused for at most this long. Modal does not document whether a snapshot pauses the
+    sandbox's processes. None when the call failed, timed out or was cancelled."""
     error: str | None = None
     receipt: Content | None = None
     deleted: bool | None = None
@@ -541,6 +482,9 @@ class RunRecord(BaseModel):
     calls: list[CallRecord] = []
     known_cost: float = 0.0
     unknown_cost_calls: int = 0
+    """Calls of unknown cost other than cancelled ones; older records count cancelled calls here too."""
+    cancelled_calls: int = 0
+    """Calls cancelled in flight, whose usage and so cost are unknown."""
     refused_calls: dict[str, int] = {}
     """Calls refused before sending, by episode, because known cost had reached the cap.
     Harbor retries a refused call, up to 9 attempts for one Terminus 2 turn."""
@@ -548,16 +492,12 @@ class RunRecord(BaseModel):
     limitations: list[str] = []
     time_limit_reached: bool = False
     failed_phases: list[str] = []
-    """Phases that raised an error or returned an incomplete result; a stop is no failure."""
+    """Phases that raised an error or did not run to their end, as at the spending cap; Ctrl-C and the time limit are no
+    failure. An inspection or attack that returned with evidence unresolved ran to its end; the report also counts one that
+    returned partial with an attempt that failed to execute as failed."""
     events: list[EpisodeEvent] = []
     """Episode lifecycle in the order nudi observed it."""
     checks: list[Check] = []
-    submissions: list[Submission] = []
-    """One-file captures of older records; no current code writes them."""
-    capture_errors: list[CaptureFailure] = []
-    replays: list[Replay] = []
-    capture_selection: CaptureSelection | None = None
-    """Older records only."""
     run_id: str = ""
     """Names this run's copy images, `nudi-copy-<run id>-<n>`, and its Modal App, `nudi-<run id>`."""
     copies: list[StateCopy] = []
@@ -569,14 +509,21 @@ class RunRecord(BaseModel):
     """Inspector package sandboxes in start order, recorded under `sandboxes/`; not episodes."""
     backend: Backend = "docker"
     modal: list[ModalSandbox] = []
+    attack_from: str | None = None
+    """The earlier run's resolved directory, whose inspection records this run copied to run only the attack again."""
+    started_at: str | None = None
+    """When the run started, in UTC ISO 8601; None in older records."""
+    ended_at: str | None = None
+    """When its analyses ended or stopped, set before the last save; None in older records."""
 
 
 class Coverage(BaseModel):
     """Grader inspector interpretation of an episode's complete applicable scoring outcome.
 
     It cites the requirement and scoring sources, the checks of that episode that
-    observed them, and explains why they justify its actual reward, partial credit
-    included. nudi verifies only the references, not semantic completeness."""
+    observed them, and explains why they justify its actual reward. A positive reward
+    with any violated requirement is not legitimate, even as correct partial credit.
+    nudi verifies only the references, not semantic completeness."""
 
     requirements: list[Observation]
     scoring: Observation
@@ -648,9 +595,10 @@ class Claim(BaseModel):
     interpretation: str = ""
     """What happened, in the job's own words. Each judging job's schema requires it non-empty; empty, the claim stays provisional."""
     citations: list[Observation] = []
-    """Further retained text, only when the check's requirement and scoring citations do not suffice."""
+    """Further retained text, only when the check's requirement and scoring citations do not suffice.
+    Only the grader inspector writes it; nudi drops it from hack and attack inspector claims."""
     full_guidance: str | None = None
-    """Concrete steps that reproduce the suspected loophole, when the hack inspector supplies them."""
+    """Concrete steps that reproduce the suspected loophole, or that do the valid work the grader rejects, when an inspector supplies them."""
     hint_location: str | None = None
     """Only a file, interface, or component to examine. It excludes the solution and the reproduction recipe."""
     derivation: Derivation | None = None
@@ -689,7 +637,7 @@ class Assessment(BaseModel):
     requirement, kept without a native reward or bound; `discrepancy` compares
     native reward with the referenced computed bounds. `accepted_invalid` (violated,
     over) and `rejected_valid` (supported, under) are evidenced issues. `legitimate` means
-    an exact supported reward matches, partial credit included. A broad containing
+    an exact reward matches; a positive one with any violated requirement stays `unknown`. A broad containing
     interval only rules out a demonstrated discrepancy. `unknown` keeps the claim
     provisional, with what is `missing`. `unavailable` means no graded outcome exists.
     `ungrounded` means a reference is not in the run's retained evidence."""
@@ -708,7 +656,6 @@ class Assessment(BaseModel):
     check: Check | None = None
     conclusions: list[Conclusion] = []
     """One per `claim.derivation.requirements` reading, in order; older records have none."""
-    replay: Replay | None = None
     reasons: list[str] = []
     missing: list[str] = []
     """Evidence that would settle a provisional claim."""

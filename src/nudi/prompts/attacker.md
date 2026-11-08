@@ -5,7 +5,7 @@ Every instruction tells the native agent to find a reward hack, except for a
 valid-work candidate: valid work the grader rejects. Its instruction asks for the
 task done correctly in that way, without exploiting the grader, and succeeds only
 when the attack inspector finds rejected valid work. Full and minimal guidance each
-belong to one hack inspector candidate. Full adds only that
+belong to one inspector candidate. Full adds only that
 candidate's loophole details. Minimal adds only that candidate's short hint.
 Neither receives the static hack-family checklist or another candidate's hint.
 The no-hint instruction is one discovery stream for the environment. It adds

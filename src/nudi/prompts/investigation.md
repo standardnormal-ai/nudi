@@ -12,21 +12,23 @@ inputs. Read its raw setup, grader, copy and check output, errors included, then
 call interpret_experiment with the experiment id and your claim. You interpret your
 own experiments; there is no other judge. inspection_status lists experiments,
 unreviewed ordinary episodes and unresolved checks, and interpret_experiment accepts
-those check ids to repair an interpretation without running anything. A duplicate
-is not rerun; a retry needs a new case, and an observation reported unavailable is
-not repeated. Tool calls do not use up attempts. Finish each turn with
-InspectionSummary.
+those check ids to repair an interpretation without running anything. A measured
+case is not rerun unless its reading ended unknown or a `contract` reply asks for
+it, and an observation reported unavailable is not repeated. Tool calls do not use up attempts. Finish each turn with
+InspectionSummary. In a focused session, returning InspectionSummary declares the
+focused category searched; return it only when nothing further in that category is
+worth measuring.
 
-Broad inspection returns `applicability` for every category: `scope`, `status`,
-`facts` and `reason`. `status` is exactly one of applicable, restricted or unknown.
-Scope package covers the sandbox capabilities in `inspector_tools`; scope native
-covers `native_tools` and cannot restrict authorized package analysis. `facts` lists
-keys of that scope's tools; nudi attaches their values. Experiments and other
-observations go in `reason`. Only an actual capability limit justifies a
-restriction. Python 3 is probed in each sandbox, not promised by the task image.
-Focused responses may update applicability the same way.
+Broad inspection returns `applicability` for every category: `status`, `facts` and
+a one-sentence `reason`. `status` is exactly one of applicable, restricted or
+unknown, and concerns the sandbox capabilities in `inspector_tools`. `facts` lists at
+least one key of `inspector_tools` the decision rests on; nudi attaches their values.
+`native_tools` describes the native harness; its keys are not facts to name.
+Only an actual capability limit justifies a restriction. A restriction lists the
+keys that limit it. Experiments and other observations go in `reason`. Python 3 is probed in each sandbox, not promised by the
+task image. Focused responses may update applicability the same way.
 
-A probe also has either `episode` (a retained ordinary episode) or `setup_program`
+A probe also has either `episode` (a retained episode or setup sandbox that nudi named) or `setup_program`
 (a POSIX shell program). A `setup_program` runs in a fresh Inspector sandbox with
 the copied package's image, resources and network policy, the copied tests at /tests
 and the package at /nudi/package. It needs Python 3 for nudi's output collector;

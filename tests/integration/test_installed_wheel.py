@@ -105,7 +105,8 @@ class Endpoint:
         self.turn = None
 
     def proposal(self, context):
-        if context.get("mode") == "hack":
+        # A focused fork only completes its category; broad reviewed every episode.
+        if context.get("mode") == "hack" or context.get("phase") != "broad":
             return {"probes": []}
         pool = context["ordinary_episodes_read_first"]
         probes = []
@@ -169,7 +170,9 @@ class Endpoint:
             return self.tool_message("run_experiment", {"probe": turn["probes"].pop(0)})
         applicability = {category: {"scope": "package", "status": "applicable", "facts": {"package_copy": True},
                                    "reason": "The Inspector can check the copied package and retained submissions."} for category in context["categories"]}
-        return self.tool_message("InspectionSummary", {"applicability": applicability, "completed": context["categories"]})
+        # The real model writes prose here, never a bare category name.
+        completed = [f"{category}: read the package and the retained submissions; nothing further to measure." for category in context["categories"]]
+        return self.tool_message("InspectionSummary", {"applicability": applicability, "completed": completed})
 
     def tool_message(self, name, arguments):
         return {"role": "assistant", "content": None, "tool_calls": [{"id": f"call_{len(self.requests)}", "type": "function",
@@ -251,12 +254,12 @@ def test_native_cases_from_installed_wheel(case, tmp_path, monkeypatch):
     monkeypatch.setenv("XAI_API_KEY", "nudi-local-only")
     with server(endpoint) as base:
         models = {role: {"model": "xai/grok-4.7", "api_base": base, "reasoning_effort": "high"} for role in ("simulator", "inspector")}
-        options = {"output_dir": output, "analysis": "simulation", "episodes": 4 if case == "clean" else 1, "focused_attempts": 0, "models": models}
+        options = {"output_dir": output, "analysis": "simulation", "episodes": 4 if case == "clean" else 1, "focused_attempts": 1, "models": models}
         interface = {"clean": "sync", "strict": "async", "permissive": "cli", "partial": "sync", "ambiguity": "async", "infrastructure": "cli"}[case]
         if interface == "cli":
             config = retained / "config.toml"
             config.write_text("\n".join(f'[models.{role}]\nmodel = "xai/grok-4.7"\napi_base = "{base}"\nreasoning_effort = "high"\n' for role in models))
-            command = [str(Path(sys.executable).with_name("nudi")), "send-nudis", str(task), "--output", str(output), "--analysis", "simulation", "--episodes", "1", "--focused-attempts", "0", "--config", str(config)]
+            command = [str(Path(sys.executable).with_name("nudi")), "send-nudis", str(task), "--output", str(output), "--analysis", "simulation", "--episodes", "1", "--focused-attempts", "1", "--config", str(config)]
             execution = subprocess.run(command, capture_output=True, text=True)
             (retained / "cli.json").write_text(json.dumps({"command": command, "returncode": execution.returncode, "stdout": execution.stdout, "stderr": execution.stderr}, indent=2))
             assert execution.returncode == (1 if case == "infrastructure" else 0), execution.stderr
@@ -273,12 +276,12 @@ def test_native_cases_from_installed_wheel(case, tmp_path, monkeypatch):
     # every copy was deleted at run end; the one-file capture selection no longer exists.
     record = json.loads((output / "run.json").read_text())
     assert not any('"phase": "capture_selection"' in str(body["messages"][-1].get("content")) for body in endpoint.requests)
-    assert record["capture_selection"] is None and record["submissions"] == []
+    assert "capture_selection" not in record and "submissions" not in record
     copies = {copy["id"]: copy for copy in record["copies"]}
     assert copies and all(copy["deleted"] is True and copy["tag"] for copy in copies.values())
     for check in record["checks"]:
         copy = copies[check["state_copy"]]
-        assert check["submission"] is None and copy["error"] is None
+        assert "submission" not in check and copy["error"] is None
         assert check["content"] == copy["receipt"] and copy["point"] == "verification_start"
     verify_retained(case, retained, result)
 

@@ -1,7 +1,7 @@
 """Harbor's Modal environment for every Modal container of a nudi run: native agent and
 separate verifier environments and Inspector sandboxes.
 
-Only `runner.MODAL_BOX`, Harbor's import path, and `report.billed_cost` import this module, so
+Only `episode.MODAL_BOX`, Harbor's import path, and `report.billed_cost` import this module, so
 importing nudi or running on Docker never imports the Modal SDK, which reads the user's Modal profile.
 """
 
@@ -9,12 +9,13 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 from harbor.environments import modal
+from harbor.environments.base import ExecResult
 from harbor.utils.optional_import import MissingExtraError
 
+from nudi.inspector_sandbox import _now
 from nudi.records import ModalSandbox, RunRecord
 from nudi.report import MODAL_LIFETIME
-from nudi.sandbox import _now
-from nudi.workflow import current, logger
+from nudi.run_state import current, logger
 
 # Bounds each Modal call of a stop: the termination, the wait for it and each removal check.
 REMOVAL_TIMEOUT = 60
@@ -88,9 +89,12 @@ class ModalBox(modal.ModalEnvironment):
     Harbor's 24 h lifetime, or the run's time limit plus 15 minutes. The run is the one given,
     else the run whose model calls surround the trial. A run's sandboxes share the Modal App
     `nudi-<run id>`, so Modal's billing report has rows for that run alone. With `copy_image`,
-    the snapshot of a state copy, the sandbox starts from it."""
+    the snapshot of a state copy, the sandbox starts from it. A nudi sandbox, which names its run,
+    reads command output that is not UTF-8 with replacement characters, as Harbor's Docker
+    environment does; a native trial's sandbox keeps Harbor's Modal exec."""
 
     def __init__(self, *args, run=None, copy_image=None, **kwargs):
+        self.native = run is None
         run = run or (scope[0] if (scope := current.get()) else None)
         if run is not None:
             kwargs.setdefault("app_name", f"nudi-{run.record.run_id}")
@@ -119,6 +123,23 @@ class ModalBox(modal.ModalEnvironment):
 
     async def exec(self, command, cwd=None, env=None, timeout_sec=None, user=None):
         return await _guarded("exec", super().exec(command, cwd=cwd, env=env, timeout_sec=timeout_sec, user=user))
+
+    async def _sdk_exec(self, command, cwd=None, env=None, timeout_sec=None, shell="bash", login=False):
+        """Harbor's Modal exec, reading bytes: Modal's text mode raises on output that is not UTF-8."""
+        if self.native:
+            return await super()._sdk_exec(command, cwd=cwd, env=env, timeout_sec=timeout_sec, shell=shell, login=login)
+        env = self._merge_env(env)
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+        try:
+            process = await self._sandbox.exec.aio(shell, "-lc" if login else "-c", command, workdir=cwd, text=False,
+                                                   secrets=[modal._cached_env_secret(env)] if env else [], timeout=timeout_sec)
+            stdout, stderr = await process.stdout.read.aio(), await process.stderr.read.aio()
+            return_code = await process.wait.aio()
+        except Exception as error:
+            await self._raise_if_unexpected_exit_137(cause=error)
+            raise
+        return ExecResult(stdout=stdout.decode(errors="replace"), stderr=stderr.decode(errors="replace"), return_code=return_code)
 
     async def upload_file(self, source_path, target_path):
         await _guarded("upload", super().upload_file(source_path, target_path))

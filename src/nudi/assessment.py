@@ -2,7 +2,7 @@
 
 A claim is the model's interpretation. Evidence is what nudi itself recorded: episode
 records, retained artifacts resolved inside their owning episode, and the host records
-in `run.json` (checks, replays and lifecycle events). An issue is evidenced only when
+in `run.json` (checks and lifecycle events). An issue is evidenced only when
 a check of independently observed submission/task state, its requirement and scoring source, and the native
 reward contradict each other. The check's reading of the requirement stays the
 Inspector's; this module decides no task semantics.
@@ -19,10 +19,10 @@ from pathlib import Path
 from harbor.models.trajectories import Trajectory
 from pydantic import ValidationError
 
+from nudi.episode import tree_digest
+from nudi.inspector_sandbox import CHECK_INPUTS, CHECK_PROGRAM, OUTPUT_LIMIT
 from nudi.records import (Assessment, Check, Claim, Conclusion, Content, EpisodeResult, Observation,
                           PersistenceProbe, Reading, RunRecord, SandboxResult, StateCopy)
-from nudi.runner import tree_digest
-from nudi.sandbox import CHECK_INPUTS, CHECK_PROGRAM, OUTPUT_LIMIT
 
 CHECK_LIMIT = (
     "the captured program, inputs and measured facts support the Inspector's explicit "
@@ -68,12 +68,14 @@ class Evidence:
 
     def episode(self, name: str) -> EpisodeResult | SandboxResult:
         if name not in self.episodes:
-            if name in self.run.sandboxes and (self.owner(name) / "sandbox.json").is_file():
-                self.episodes[name] = SandboxResult.model_validate_json((self.owner(name) / "sandbox.json").read_text())
-            elif name in self.run.episodes and (self.owner(name) / "episode.json").is_file():
-                self.episodes[name] = EpisodeResult.model_validate_json((self.owner(name) / "episode.json").read_text())
-            else:
+            sandbox = name in self.run.sandboxes
+            record = self.owner(name) / ("sandbox.json" if sandbox else "episode.json")
+            if not (sandbox or name in self.run.episodes) or not record.is_file():
                 raise Ungrounded(f"{name} is not a retained episode or sandbox of the run")
+            # Like its other files, the record must lie inside its own directory.
+            if not record.resolve().is_relative_to(self.owner(name).resolve()):
+                raise Ungrounded(f"{name}'s {record.name} links outside its directory")
+            self.episodes[name] = (SandboxResult if sandbox else EpisodeResult).model_validate_json(record.read_text())
         return self.episodes[name]
 
     def roots(self, episode: str) -> dict[str, Path]:
@@ -83,6 +85,21 @@ class Evidence:
             return {}
         resolved = {name: (owner / relative).resolve() for name, relative in self.episode(episode).artifacts.items()}
         return {name: root for name, root in resolved.items() if root.is_relative_to(owner)}
+
+    def files(self, episode: str) -> dict[str, Path]:
+        """The episode's retained files by their paths in its directory, and its record. A file is given only when it
+        resolves inside a declared artifact, as `file` requires of a citation, and a linked file keeps its declared
+        name. A folder link is not followed: a file inside a declared artifact is given at its own path anyway, one
+        outside could not be cited, and a link loop cannot recurse."""
+        home, roots = self.owner(episode), self.roots(episode)
+        found = {}
+        for name in roots:
+            declared = home / self.episode(episode).artifacts[name]
+            for source in [declared] if declared.is_file() else sorted(declared.rglob("*")):
+                if source.is_file() and any(source.resolve().is_relative_to(root) for root in roots.values()):
+                    found[str(source.relative_to(home))] = source
+        found["episode.json"] = home / "episode.json"
+        return found
 
     def file(self, episode: str | None, path: str) -> Path:
         if episode is None:
@@ -100,7 +117,7 @@ class Evidence:
 
     def excerpt(self, observation: Observation) -> None:
         text = self.file(observation.episode, observation.path).read_text(errors="replace")
-        if not observation.excerpt or observation.excerpt not in text:
+        if not observation.excerpt or not contains(text, observation.excerpt):
             raise Ungrounded(f"{observation.path} does not contain {observation.excerpt!r}")
 
     def content(self, content: Content) -> None:
@@ -184,7 +201,7 @@ class Evidence:
                     continue
                 blocks.append("\n".join(current))
                 current = []
-        return any(source.excerpt in block for block in blocks + ["\n".join(current)])
+        return any(contains(block, source.excerpt) for block in blocks + ["\n".join(current)])
 
 
 def tool_output(trajectory: Path, step_id: int, result: int) -> bytes:
@@ -199,13 +216,46 @@ def tool_output(trajectory: Path, step_id: int, result: int) -> bytes:
     return output.encode()
 
 
+def spaced(text: str) -> str:
+    """`text` with each run of whitespace read as one space, kept at its ends."""
+    return re.sub(r"\s+", " ", text)
+
+
+def contains(text: str, excerpt: str) -> bool:
+    """Whether `text` holds `excerpt` or, for a JSON file such as a trajectory, one decoded string does, whatever the
+    whitespace between their words: retyped text often differs from its source in line breaks and indentation only."""
+    excerpt = spaced(excerpt)
+    if excerpt in spaced(text):
+        return True
+    try:
+        stack = [json.loads(text)]
+    except (ValueError, RecursionError):
+        return False
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str) and excerpt in spaced(item):
+            return True
+        stack.extend(item.values() if isinstance(item, dict) else item if isinstance(item, list) else [])
+    return False
+
+
 def captured_object(output: str) -> dict | None:
-    """A structured result from a successfully completed capture, not a verdict."""
-    lines = output.strip().splitlines()
+    """A structured result from a successfully completed capture, not a verdict: the JSON object on the last line,
+    or else the last one printed over several lines that starts a line and ends the output."""
+    text = output.strip()
+    lines = text.splitlines()
     try:
         value = json.loads(lines[-1]) if lines else None
     except json.JSONDecodeError:
-        return None
+        value = None
+        for start in reversed([match.start() for match in re.finditer(r"^\{", text, re.MULTILINE)]):
+            try:
+                found, end = json.JSONDecoder().raw_decode(text, start)
+            except json.JSONDecodeError:
+                continue
+            if end == len(text):
+                value = found
+                break
     return value if isinstance(value, dict) else None
 
 
@@ -361,13 +411,6 @@ def assess(claim: Claim, run_dir: Path) -> Assessment:
                 raise Ungrounded(f"no check {claim.check} in nudi's records")
             assessment.check = matches[0]
             evidence.check(assessment.check)
-            source = assessment.check.content.episode
-            replays = [r for r in evidence.run.replays if r.episode == source and r.of == claim.episode]
-            if source != claim.episode and replays:
-                assessment.replay = replays[0]
-                if assessment.replay.inputs.episode != claim.episode:
-                    raise Ungrounded(f"replay {source} names inputs outside {claim.episode}")
-                evidence.content(assessment.replay.inputs)
     except Ungrounded as error:
         assessment.outcome, assessment.reasons = "ungrounded", [str(error)]
         return assessment
@@ -391,6 +434,10 @@ def assess(claim: Claim, run_dir: Path) -> Assessment:
                     assessment.persistence_reasons.append(str(error))
     judge(assessment, evidence)
     return assessment
+
+
+EQUAL_REWARD = ("either a deserved score that applies the violated requirement, "
+                "or measured observations showing that the requirement is supported")
 
 
 def judge(assessment: Assessment, evidence: Evidence) -> None:
@@ -453,12 +500,14 @@ def judge(assessment: Assessment, evidence: Evidence) -> None:
         return all(evidence.artifact_metadata(item) for item in [source, *claim.citations])
 
     problems = measured(derivation.observations, observations, results) + citation_gaps
-    if not citation_gaps and metadata_alone(check.requirement):
-        problems.append("artifact metadata alone establishes no requirement")
+    # A claim cannot change the probe's requirement, so this gap asks for another reference, not another claim.
+    metadata = not citation_gaps and metadata_alone(check.requirement)
     if problems:
         provisional(f"no measured observation supports the claimed validity: {'; '.join(problems)}",
                     "derivation.observations naming measured facts of the check output")
-    else:
+    if metadata:
+        provisional("artifact metadata alone establishes no requirement", "a probe `requirement` in task text or grader code")
+    if not problems and not metadata:
         assessment.validity = derivation.validity
     assessment.conclusions = [conclude(item, check, evidence, observations, results) for item in derivation.requirements]
     if reward is None:
@@ -467,17 +516,23 @@ def judge(assessment: Assessment, evidence: Evidence) -> None:
         return provisional("the check lacks an applicable scoring input", "the cited scoring rule among the check's immutable inputs")
     if not citation_gaps and metadata_alone(check.scoring):
         return provisional("artifact metadata alone establishes no score", "a scoring rule in task text or grader code")
+    # The claim says no check can measure what it names in `unresolved`, so no repair is asked for, and the deserved
+    # score is unavailable: the comparison stays unknown and the printed `results.deserved` is not read.
+    if derivation.validity == "unknown":
+        return assessment.reasons.append("the claim leaves validity unknown, so the deserved score is unavailable and the comparison unknown"
+                                         + "".join(f"; unresolved: {item}" for item in claim.unresolved))
     score = deserved(results)
     if score is None:
         return provisional("the check output has no finite `results.deserved`, so the score comparison is unknown",
                            "a check computing the deserved score as a finite `results.deserved`")
-    if problems:
+    if problems or metadata:
         return
     if math.isclose(reward, score):
         assessment.discrepancy = "none"
     else:
         assessment.discrepancy = "over" if reward > score else "under"
 
+    violated = "violated" in [validity for _, validity in conclusions(assessment)]
     match assessment.validity, assessment.discrepancy:
         case "violated", "over":
             assessment.outcome = "accepted_invalid"
@@ -485,6 +540,10 @@ def judge(assessment: Assessment, evidence: Evidence) -> None:
         case "supported", "under":
             assessment.outcome = "rejected_valid"
             assessment.reasons.append(f"satisfying content received {reward}, below the deserved score {score}")
+        case "supported" | "violated", "none" if violated and reward > 0:
+            # The repair names both readings that resolve it, neither preferred; nothing here changes the outcome.
+            provisional(f"content with a violated requirement received {reward}, equal to the deserved score {score}; "
+                        "either reading may be right", EQUAL_REWARD)
         case "supported" | "violated", "none":
             assessment.outcome = "legitimate"
             assessment.reasons.append(f"native reward {reward} matches the deserved score {score}")

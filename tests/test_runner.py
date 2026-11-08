@@ -21,11 +21,13 @@ os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
 import pytest
 from aiohttp import web
+from harbor.models.task.config import EnvironmentConfig as TaskEnvironment, TaskConfig
 from harbor.models.task.task import Task
+from pydantic import BaseModel
 from verifiers.v1.cli.eval import runner as verifiers_runner
 
+from nudi.episode import DOCKERFILE, UnsupportedTask, check_task, compose_services, framed_instruction, run_episode, select_path
 from nudi.records import EpisodeResult, EpisodeConfig
-from nudi.runner import DOCKERFILE, UnsupportedTask, compose_services, run_episode, select_path
 
 FIXTURES = Path(__file__).parent / "integration" / "fixtures"
 CONTRACT_TASK = FIXTURES / "contract-task"
@@ -239,6 +241,7 @@ def test_native_shared_grading_request_does_not_apply_to_separate_grading():
     [
         ('[agent]\nuser = "agent"\n', "", r"\[agent\]\.user"),
         ('[verifier]\nuser = "root"\n', "", r"\[verifier\]\.user"),
+        ("verifier = false\n", "", r"\[verifier\]"),
         ('[verifier.env]\nTOKEN = "${HOST_TOKEN}"\n', "", r"\[verifier\]\.env"),
         ("", 'network_mode = "no-network"\n', r"\[environment\]\.network_mode"),
         ("", "storage_mb = 1024\n", r"\[environment\]\.storage_mb"),
@@ -273,7 +276,7 @@ def test_rejects_task_without_declared_environment(tmp_path):
     ("steps/one/tests", "docker-compose.yaml"), ("steps/one/tests", "docker-compose.yml"),
     ("environment", ".env"), ("environment", ".ENV"), ("tests", ".env"), ("steps/one/tests", ".Env")])
 def test_rejects_compose_file_in_any_environment_definition(tmp_path, directory, name):
-    from nudi.workflow import ORIGINAL_BEHAVIOR
+    from nudi.run_state import ORIGINAL_BEHAVIOR
 
     task = task_variant(tmp_path, SEPARATE_TASK)
     (task / directory).mkdir(parents=True, exist_ok=True)
@@ -548,7 +551,7 @@ def test_a_second_ctrl_c_records_the_episode_cancelled(tmp_path, monkeypatch):
     async def interrupted(*args):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr("nudi.runner.run_verifiers", interrupted)
+    monkeypatch.setattr("nudi.episode.run_verifiers", interrupted)
     config = EpisodeConfig(task_dir=CONTRACT_TASK, output_dir=tmp_path / "episode", model=MODEL, api_key_var="XAI_API_KEY")
     with pytest.raises(KeyboardInterrupt):
         asyncio.run(run_episode(config))
@@ -562,7 +565,7 @@ def test_output_overlapping_the_task_is_rejected_before_writing(tmp_path, monkey
         raise AssertionError("the episode started")
 
     # Guards against starting Docker or any model call if the check is missing.
-    monkeypatch.setattr("nudi.runner.run_verifiers", started)
+    monkeypatch.setattr("nudi.episode.run_verifiers", started)
     task = task_variant(tmp_path, CONTRACT_TASK)
     digest = tree_digest(task)
     root = task
@@ -585,6 +588,12 @@ def test_output_overlapping_the_task_is_rejected_before_writing(tmp_path, monkey
         ("[agent]\nretries = 3\n[environment]\n", r"\[agent\]\.retries"),
         # Harbor drops a numeric legacy `memory` without applying any limit.
         ("[environment]\nmemory = 512\n", r"\[environment\]\.memory"),
+        # Likewise a numeric legacy `storage`; a size Harbor cannot read fails its parsing.
+        ("[environment]\nstorage = 10240\n", r"\[environment\]\.storage"),
+        ("[environment]\nstorage = \"10X\"\n", r"\[environment\]\.storage"),
+        ("[environment]\nstorage = \"infG\"\n", r"\[environment\]\.storage"),
+        # Only Harbor's default operating system parses as if omitted.
+        ('[environment]\nos = "windows"\n', r"\[environment\]\.os"),
     ],
 )
 def test_rejects_unknown_raw_fields_that_upstream_parsing_drops(tmp_path, toml, reason):
@@ -602,6 +611,17 @@ def test_accepts_supported_legacy_aliases(tmp_path):
     )
 
     assert select_path(task, frozenset())[0] == "verifiers"
+
+
+def test_accepts_the_default_os_and_a_legacy_storage_size_as_harbor_parses_them(tmp_path):
+    """Hub copies declare Harbor's default `os = "linux"`; legacy copies declare `storage = '10G'`, which Harbor
+    renames to `storage_mb` before parsing."""
+    task = task_variant(tmp_path, CONTRACT_TASK)
+    for os in ("linux", "Linux"):  # Harbor lowercases the value before parsing.
+        (task / "task.toml").write_text(f'version = "1.4"\n[environment]\ndocker_image = "python:3.12-slim"\nos = "{os}"\n')
+        assert select_path(task, frozenset())[0] == "verifiers"
+    (task / "task.toml").write_text('version = "1.4"\n[environment]\ndocker_image = "python:3.12-slim"\nstorage = \'10G\'\n')
+    assert check_task(task) == {("environment", "storage_mb"): 10240}
 
 
 @pytest.mark.parametrize("source", [CONTRACT_TASK, DOCKERFILE_TASK, SEPARATE_TASK, SLOW_GRADER_TASK])
@@ -679,6 +699,39 @@ def task_with(tmp_path: Path, source: Path, toml: str) -> Path:
     task = task_variant(tmp_path, source)
     (task / "task.toml").write_text(toml)
     return task
+
+
+def harbor_defaults(model: type[BaseModel], table: tuple[str, ...] = ()):
+    """Every field of a Harbor task model that TOML can spell, set to Harbor's own default."""
+    for name, field in model.model_fields.items():
+        default = field.get_default(call_default_factory=True)
+        if isinstance(default, BaseModel):
+            yield from harbor_defaults(type(default), (*table, name))
+        elif default is not None:
+            yield table, name, default
+
+
+@pytest.mark.parametrize(
+    "table, name, value",
+    [*harbor_defaults(TaskConfig), *harbor_defaults(TaskEnvironment, ("verifier", "environment")),
+     # Legacy names Harbor renames before parsing.
+     ((), "version", "1.4"), (("environment",), "memory", "1G"), (("environment",), "storage", "10G")],
+)
+def test_a_field_written_out_at_harbors_default_is_admitted(tmp_path, table, name, value):
+    """Read from the installed Harbor, so a field a Harbor upgrade adds is checked too. No field is refused
+    on purpose at its default; one that must be goes in a commented exception here."""
+    header = f"[{'.'.join(table)}]\n" if table else ""
+    if table == ("verifier", "environment"):
+        header += "cpus = 1\nmemory_mb = 512\n"  # the limits nudi requires of any grader environment
+    task = task_with(tmp_path, DOCKERFILE_TASK, f"{header}{name} = {json.dumps(value)}\n")
+    assert select_path(task, frozenset())[0] == "harbor"
+
+
+@pytest.mark.parametrize("legacy, field, size", [("memory", "memory_mb", 1024), ("storage", "storage_mb", 10240)])
+def test_a_grader_environment_legacy_size_is_renamed_as_harbor_does(tmp_path, legacy, field, size):
+    limits = "cpus = 1\n" + ("" if legacy == "memory" else "memory_mb = 512\n")
+    task = task_with(tmp_path, DOCKERFILE_TASK, f'[verifier.environment]\n{limits}{legacy} = "{size // 1024}G"\n')
+    assert check_task(task)[("verifier", "environment", field)] == size
 
 
 def harbor_reads(task: Path) -> tuple:
@@ -783,7 +836,10 @@ def test_native_path_admits_and_uses_any_finite_positive_build_timeout(tmp_path,
         ("", "storage_mb = 1024.0\n", r"\[environment\]\.storage_mb"),
         ("", 'storage_mb = "1024"\n', r"\[environment\]\.storage_mb"),
         ("", "storage_mb = true\n", r"\[environment\]\.storage_mb"),
-        ("", 'storage = "10G"\n', r"\[environment\]\.storage"),
+        # Only Harbor's default network mode and operating system parse as if omitted.
+        ("", 'network_mode = "no-network"\n', r"\[environment\]\.network_mode"),
+        ('[verifier.environment]\nnetwork_mode = "allowlist"\n', "", r"\[verifier\.environment\]\.network_mode"),
+        ('[verifier.environment]\nos = "windows"\n', "", r"\[verifier\.environment\]\.os"),
         ('[environment.env]\nTOKEN = "literal"\n', "", r"\[environment\]\.env"),
         ("[environment.env.nested]\n", "", r"\[environment\]\.env"),
         ("", "env = []\n", r"\[environment\]\.env"),
@@ -847,7 +903,7 @@ mcp_servers = []
 def test_a_verifier_environment_is_admitted_natively_with_harbors_definition(tmp_path):
     from harbor.models.task.verifier_mode import resolve_verifier_environment_definition
 
-    from nudi.workflow import ORIGINAL_BEHAVIOR, declared_requirements
+    from nudi.run_state import ORIGINAL_BEHAVIOR, declared_requirements
 
     task = task_with(tmp_path, SEPARATE_TASK, VERIFIER_ENVIRONMENT)
     path, reasons = select_path(task, ORIGINAL_BEHAVIOR)
@@ -909,7 +965,7 @@ NATIVE_FIELDS = [
 
 @pytest.mark.parametrize(("tables", "environment"), [*NATIVE_FIELDS, ("", '[environment.healthcheck]\ncommand = "true"\n')])
 def test_native_harbor_admits_the_fields_it_handles_itself(tmp_path, tables, environment):
-    from nudi.workflow import ORIGINAL_BEHAVIOR
+    from nudi.run_state import ORIGINAL_BEHAVIOR
 
     image = 'docker_image = "python:3.12-slim"\ncpus = 1\n'
     if environment.startswith("["):
@@ -922,7 +978,7 @@ def test_native_harbor_admits_the_fields_it_handles_itself(tmp_path, tables, env
 
 
 def test_a_verifier_build_timeout_equal_to_the_main_one_is_admitted(tmp_path):
-    from nudi.workflow import ORIGINAL_BEHAVIOR
+    from nudi.run_state import ORIGINAL_BEHAVIOR
 
     declared = VERIFIER_ENVIRONMENT.replace("memory_mb = 512\n", "memory_mb = 512\nbuild_timeout_sec = 900\n") + "build_timeout_sec = 900.0\n"
     task = task_with(tmp_path, SEPARATE_TASK, declared)
@@ -970,8 +1026,8 @@ def compose_task(tmp_path: Path, compose: str = COMPOSE) -> Path:
 
 
 def test_a_compose_file_with_helper_services_is_admitted_natively_on_docker_only(tmp_path):
-    from nudi.runner import check_backend, compose_services
-    from nudi.workflow import ORIGINAL_BEHAVIOR, declared_requirements
+    from nudi.episode import check_backend, compose_services
+    from nudi.run_state import ORIGINAL_BEHAVIOR, declared_requirements
 
     task = compose_task(tmp_path)
     assert compose_services(task) == ["cache", "helper", "main"]
@@ -1029,7 +1085,7 @@ def test_an_escaped_dollar_stays_literal_after_yaml_decoding(tmp_path):
 ])
 def test_a_helper_service_named_outside_the_compose_file_is_refused_by_name(tmp_path, toml, service):
     """Native Harbor refuses it before the trial starts; without compose, only main exists."""
-    from nudi.workflow import ORIGINAL_BEHAVIOR
+    from nudi.run_state import ORIGINAL_BEHAVIOR
 
     plain = task_variant(tmp_path / "plain", DOCKERFILE_TASK)
     (plain / "task.toml").write_text(toml + (plain / "task.toml").read_text() if toml.startswith("artifacts") else
@@ -1048,7 +1104,7 @@ def test_a_helper_service_named_outside_the_compose_file_is_refused_by_name(tmp_
 
 @pytest.mark.parametrize("table", ["environment", "verifier.environment"])
 def test_gpus_are_admitted_on_modal_and_refused_on_docker_by_name(tmp_path, table):
-    from nudi.runner import check_backend
+    from nudi.episode import check_backend
 
     declared = VERIFIER_ENVIRONMENT.replace("gpus = 0\n", "") + "gpus = 1\n" if table == "verifier.environment" else (
         VERIFIER_ENVIRONMENT.replace("memory_mb = 512\n", "memory_mb = 512\ngpus = 1\n"))
@@ -1069,3 +1125,112 @@ def test_an_artifact_collected_onto_the_manifest_or_the_collection_directory_is_
     # Admission itself refuses it, before either path is chosen.
     with pytest.raises(UnsupportedTask, match=r"artifacts\[0\]"):
         select_path(task, frozenset())
+
+
+# Attack frame: when an attack episode supplies a reminder, the runner wraps the task's own
+# instruction in a frame that leads and a reminder that closes, instead of appending the frame.
+
+
+def test_framed_instruction_places_the_frame_then_the_task_then_the_reminder():
+    out = framed_instruction("FRAME", "TASK BODY", "REMIND")
+    assert out == "FRAME\n\nThe task the grader checks:\n<task>\nTASK BODY\n</task>\n\nREMIND\n"
+
+
+def test_framed_instruction_keeps_the_task_verbatim_between_the_markers():
+    task = "Rebuild layout.\nKeep <tags> & symbols intact\n"
+    out = framed_instruction("the frame", task, "the reminder")
+    assert out.count(task) == 1
+    assert f"<task>\n{task}\n</task>" in out
+
+
+def _wrap_fixture(monkeypatch, tmp_path):
+    captured = {}
+
+    async def fake_harbor(config, task_dir, result, queue, agent=None):
+        instruction = task_dir / "instruction.md"
+        captured["text"] = instruction.read_text()
+        captured["bytes"] = instruction.read_bytes()
+
+    monkeypatch.setattr("nudi.episode.run_harbor", fake_harbor)
+    monkeypatch.setattr("nudi.episode.select_path", lambda task_dir, native: ("harbor", []))
+    config = EpisodeConfig(task_dir=CONTRACT_TASK, output_dir=tmp_path / "out", model=MODEL, api_key_var="XAI_API_KEY")
+    return config, captured
+
+
+def test_attack_episode_wraps_the_task_when_a_reminder_is_given(tmp_path, monkeypatch):
+    config, captured = _wrap_fixture(monkeypatch, tmp_path)
+    frame = "You are testing the grader, not doing the task."
+    reminder = "Reminder: your goal is the grader test above, not the task."
+    asyncio.run(run_episode(config, instruction=frame, reminder=reminder))
+
+    original_text = (CONTRACT_TASK / "instruction.md").read_text()
+    original_bytes = (CONTRACT_TASK / "instruction.md").read_bytes()
+    expected = framed_instruction(frame, original_text, reminder)
+    assert captured["text"] == expected
+    # The task's own instruction sits once inside the markers, byte for byte.
+    assert captured["bytes"].count(original_bytes) == 1
+    assert f"<task>\n{original_text}\n</task>" in captured["text"]
+    # The frame leads and the reminder closes, so the goal is not lost at the end of a long prompt.
+    assert captured["text"].startswith(frame)
+    assert captured["text"].rstrip("\n").endswith(reminder)
+    # The retained evidence is the full wrapped prompt the Attacker received.
+    extension = (tmp_path / "out" / "nudi-evidence" / "extension.md").read_text()
+    assert extension == expected
+
+
+def test_attack_episode_appends_the_frame_when_no_reminder_is_given(tmp_path, monkeypatch):
+    config, captured = _wrap_fixture(monkeypatch, tmp_path)
+    frame = "Write these exact bytes and then stop."
+    asyncio.run(run_episode(config, instruction=frame))
+
+    original_text = (CONTRACT_TASK / "instruction.md").read_text()
+    assert captured["text"] == original_text + "\n\n" + frame
+    assert "<task>" not in captured["text"]
+    extension = (tmp_path / "out" / "nudi-evidence" / "extension.md").read_text()
+    assert extension == frame
+
+
+def test_attack_episode_keeps_crlf_task_bytes_when_wrapping(tmp_path, monkeypatch):
+    config, captured = _wrap_fixture(monkeypatch, tmp_path)
+    shutil.copytree(CONTRACT_TASK, tmp_path / "task")
+    body = b"Line one.\r\nLine two.\rLine three.\r\n"
+    (tmp_path / "task" / "instruction.md").write_bytes(body)
+    config.task_dir = tmp_path / "task"
+    asyncio.run(run_episode(config, instruction="FRAME", reminder="REMIND"))
+
+    expected = framed_instruction("FRAME", body.decode(), "REMIND").encode()
+    assert captured["bytes"] == expected
+    assert (tmp_path / "out" / "nudi-evidence" / "extension.md").read_bytes() == expected
+
+
+@pytest.mark.parametrize("alive", [False, True])
+@pytest.mark.parametrize("attacker", [True, False])
+def test_an_attacker_shell_that_ends_within_a_turn_ends_the_turn_so_the_episode_is_graded(tmp_path, alive, attacker):
+    """Harbor's Terminus checks the terminal between turns only; a key sent after the shell ended within a turn raised,
+    and Harbor then skipped the verifier. An Attacker episode ends the turn instead and is graded; a send that fails on
+    a live session still raises. A Simulator episode keeps stock Harbor and raises either way."""
+    from harbor.agents.terminus_2.terminus_2 import Command
+
+    from nudi.episode import AttackerTerminus, HostTerminus
+
+    class Session:
+        sent = []
+
+        async def send_keys(self, keys, **options):
+            if self.sent:
+                raise RuntimeError("failed to send non-blocking keys: no server running")
+            self.sent.append(keys)
+
+        async def is_session_alive(self):
+            return alive
+
+        async def get_incremental_output(self):
+            return "screen"
+
+    agent = (AttackerTerminus if attacker else HostTerminus)(tmp_path / "agent", model_name="openai/gpt-4o")
+    commands = [Command("exit\n", 0.1), Command("ls\n", 0.1)]
+    if alive or not attacker:
+        with pytest.raises(RuntimeError, match="no server running"):
+            asyncio.run(agent._execute_commands(commands, Session()))
+    else:
+        assert asyncio.run(agent._execute_commands(commands, Session())) == (False, "The terminal session has ended.")

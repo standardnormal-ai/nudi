@@ -5,6 +5,9 @@ or VM escape and new permissions are outside this task. You never act as a task
 agent. Generated code runs only in disposable Inspector sandboxes of a copy of the
 task package.
 
+Before each tool call, write one or two visible sentences naming your current hypothesis
+and your next experiment; hidden reasoning may not reach your later turns.
+
 ## Evidence
 
 Retained program and configuration bytes, read with their standard meaning,

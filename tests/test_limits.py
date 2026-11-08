@@ -4,6 +4,7 @@ Docker episodes run one at a time.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import types
@@ -16,8 +17,8 @@ from aiohttp import web
 from harbor.trial.trial import Trial
 from litellm.integrations.custom_logger import CustomLogger
 
-from nudi.records import DEFAULT_MODELS, ModelConfig, RunConfig, RunRecord
-from nudi.workflow import (
+from nudi.records import CANCELLED, DEFAULT_MODELS, ModelConfig, RunConfig, RunRecord
+from nudi.run_state import (
     CapacityError,
     MissingCredential,
     SpendingCapReached,
@@ -94,8 +95,8 @@ def credentials(tmp_path, monkeypatch):
     return path
 
 
-def new_run(tmp_path, monkeypatch, credentials, *, name="run", capacity=(8, 4096), **fields):
-    monkeypatch.setattr("nudi.workflow.docker_capacity", lambda: capacity)
+def new_run(tmp_path, monkeypatch, credentials, *, name="run", capacity=(8, 4096), docker_free=None, **fields):
+    monkeypatch.setattr("nudi.run_state.docker_capacity", lambda: (*capacity, docker_free, "/var/lib/docker"))
     fields.setdefault("task_dir", CONTRACT_TASK)
     config = RunConfig(output_dir=tmp_path / name, credentials_file=credentials, **fields)
     return start_run(config)
@@ -279,7 +280,7 @@ def test_missing_credential_fails_before_execution(tmp_path, monkeypatch, creden
 
 def test_only_the_requested_roles_need_credentials(tmp_path, monkeypatch, credentials):
     credentials.write_text(f"MERGE_GATEWAY_API_KEY={FILE_KEY}\n")
-    monkeypatch.setattr("nudi.workflow.docker_capacity", lambda: (8, 4096))
+    monkeypatch.setattr("nudi.run_state.docker_capacity", lambda: (8, 4096, None, "/var/lib/docker"))
     # The Simulator's MiMo key is absent, and only the Simulator needs it.
     config = RunConfig(task_dir=CONTRACT_TASK, output_dir=tmp_path / "run", credentials_file=credentials,
                        models={"simulator": ModelConfig(model="xiaomi_mimo/mimo-v2.6-pro")})
@@ -300,7 +301,7 @@ def test_output_overlapping_the_task_is_rejected_before_the_run_writes(
     if alias:
         root = tmp_path / "alias"
         root.symlink_to(task)
-    monkeypatch.setattr("nudi.workflow.docker_capacity", lambda: (8, 4096))
+    monkeypatch.setattr("nudi.run_state.docker_capacity", lambda: (8, 4096, None, "/var/lib/docker"))
     config = RunConfig(task_dir=task, output_dir=root / inside, credentials_file=credentials)
 
     with pytest.raises(ValueError, match="output_dir .* overlaps the task"):
@@ -557,7 +558,36 @@ def test_each_call_is_counted_once_with_a_litellm_estimate(tmp_path, monkeypatch
     assert [c.cost for c in record.calls] == [pytest.approx(expected)] * 2
     assert {c.cost_source for c in record.calls} == {"litellm.completion_cost"}
     assert (record.known_cost, record.unknown_cost_calls) == (pytest.approx(2 * expected), 0)
+    # Each call has its admission and recording times; an older call without them still loads.
+    assert all(c.started is not None and c.started <= c.ended for c in record.calls)
+    older = record.calls[0].model_dump(exclude={"started", "ended"})
+    assert (type(record.calls[0]).model_validate(older).started, type(record.calls[0]).model_validate(older).ended) == (None, None)
     assert FILE_KEY not in (run.config.output_dir / "run.json").read_text()
+
+
+def test_a_call_still_pending_when_its_calls_end_normally_is_counted_with_unknown_cost(tmp_path, monkeypatch, credentials):
+    """An agent timeout inside Harbor cancels a call and swallows the cancellation, so the calls end without an error;
+    the admitted call keeps a record and counts as a call of unknown cost, not as cancelled."""
+    run = new_run(tmp_path, monkeypatch, credentials)
+    endpoint = Endpoint(delay=1.0)
+
+    async def main():
+        async with serve(endpoint) as base_url:
+            with model_calls(run, "inspector", "probe"):
+                pending = asyncio.create_task(call(base_url))
+                while not endpoint.requests:
+                    await asyncio.sleep(0.01)
+                pending.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await pending
+
+    asyncio.run(main())
+    record = stored_run(run)
+    (recorded,) = record.calls
+    assert (recorded.role, recorded.episode, recorded.cost) == ("inspector", "probe", None)
+    assert recorded.cost_source == "unknown: no response before its calls ended"
+    assert (record.known_cost, record.unknown_cost_calls, record.cancelled_calls) == (0.0, 1, 0)
+    assert "xai/grok-4.7: a call's cost is unknown and does not count toward the spending cap" in record.warnings
 
 
 def test_provider_reported_cost_is_kept_beside_the_estimate(tmp_path, monkeypatch, credentials):
@@ -865,7 +895,7 @@ def test_compaction_summary_is_refused_once_known_cost_reaches_the_cap(tmp_path,
 
 
 def test_public_compaction_preserves_records_when_summary_spending_is_exhausted(tmp_path, monkeypatch, credentials):
-    from nudi import checks
+    from nudi import inspection
     from test_inspection import AgentScript, Sandboxes, sandbox_record
 
     Sandboxes(monkeypatch)
@@ -881,7 +911,7 @@ def test_public_compaction_preserves_records_when_summary_spending_is_exhausted(
         async with serve(script) as base:
             run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": inspector_model(base)}, spending_cap=1.0)
             runs.append(run)
-            return run, await checks.inspect_hacks(run, categories=["package_oracles"])
+            return run, await inspection.inspect_hacks(run, categories=["package_oracles"])
 
     run, result = asyncio.run(main())
     assert result.status == "spending_exhausted" and result.categories == {"package_oracles": "unknown"}
@@ -895,7 +925,7 @@ def test_public_compaction_preserves_records_when_summary_spending_is_exhausted(
 
 @pytest.mark.parametrize("phase", ["agent", "summary"])
 def test_public_cancelled_inference_retains_accounting_and_artifact_references(tmp_path, monkeypatch, credentials, phase):
-    from nudi import checks
+    from nudi import inspection
     from test_inspection import AgentScript, Sandboxes, agent_reply, sandbox_record
 
     Sandboxes(monkeypatch)
@@ -916,7 +946,7 @@ def test_public_cancelled_inference_retains_accounting_and_artifact_references(t
         script = Blocked(*[("inspection_status", {}) for _ in range(4)], "overflow") if phase == "summary" else Blocked(("inspection_status", {}))
         async with serve(script) as base:
             run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": inspector_model(base)})
-            running = asyncio.create_task(checks.inspect_hacks(run, categories=["package_oracles"]))
+            running = asyncio.create_task(inspection.inspect_hacks(run, categories=["package_oracles"]))
             await asyncio.wait_for(blocked.wait(), 20)
             running.cancel()
             try:
@@ -927,7 +957,7 @@ def test_public_cancelled_inference_retains_accounting_and_artifact_references(t
             return run, script
 
     run, script = asyncio.run(main())
-    result = checks.InspectionResult.model_validate_json((run.config.output_dir / "inspection-hack.json").read_text())
+    result = inspection.InspectionResult.model_validate_json((run.config.output_dir / "inspection-hack.json").read_text())
     assert result.status == "cancelled" and result.categories == {"package_oracles": "unknown"}
     assert len(stored_run(run).calls) == len(script.requests)
     assert stored_run(run).calls[-1].error == "CancelledError" and stored_run(run).calls[-1].cost is None
@@ -939,7 +969,7 @@ def test_public_cancelled_inference_retains_accounting_and_artifact_references(t
 def test_refused_or_failed_inference_stops_the_turn_keeps_records_and_removes_the_workspace(
     tmp_path, monkeypatch, credentials, outcome
 ):
-    from nudi import checks, inspector
+    from nudi import inspection, inspector
     from test_inspection import AgentScript, Finding, Sandboxes, sandbox_record, transcript
 
     Sandboxes(monkeypatch)
@@ -949,7 +979,7 @@ def test_refused_or_failed_inference_stops_the_turn_keeps_records_and_removes_th
         async with serve(script) as base_url:
             run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": inspector_model(base_url)})
             async with inspector.investigation(run, "hack-broad", "Inspect the copied package.", {}) as session:
-                with pytest.raises(checks.ProviderRefusal if outcome != "error" else checks.InferenceFailure) as raised:
+                with pytest.raises(inspection.ProviderRefusal if outcome != "error" else inspection.InferenceFailure) as raised:
                     await session.ask("Investigate.", Finding)
             return run, session, raised.value
 
@@ -1027,8 +1057,11 @@ def test_cancelled_sdk_inference_is_accounted_once(tmp_path, monkeypatch, creden
     assert {(call.role, call.episode) for call in calls} == {("inspector", "cancelled-inference")}
     if phase == "completed":
         assert len(calls) == 1 and calls[0].error is None and calls[0].cost is not None
-        assert stored_run(run).unknown_cost_calls == 0
+        assert (stored_run(run).unknown_cost_calls, stored_run(run).cancelled_calls) == (0, 0)
     else:
-        assert calls[-1].error == "CancelledError" and calls[-1].cost is None
-        assert stored_run(run).unknown_cost_calls == (2 if phase == "summary" else 1)
+        # The price is known; the cancelled call has no usage, so it is labelled cancelled, not unpriced.
+        assert calls[-1].error == "CancelledError" and calls[-1].cost is None and calls[-1].cost_source == CANCELLED
+        assert (stored_run(run).unknown_cost_calls, stored_run(run).cancelled_calls) == ((1, 1) if phase == "summary" else (0, 1))
+        assert ("xai/grok-4.7: a call was cancelled in flight; its cost is unknown and does not count toward the spending cap"
+                in stored_run(run).warnings)
     assert sandbox_record(run, session.box.record.name)["cleanup"]["removed"] is True

@@ -24,9 +24,10 @@ from harbor.models.trial.paths import TrialPaths
 from harbor.verifier.factory import VerifierFactory
 from harbor.verifier.verifier import VerifierOutputParseError
 
-from nudi import checks, runner, workflow
+import nudi.episode as episode_module
+from nudi import inspection, run_state
+from nudi.episode import UnsupportedTask
 from nudi.records import EpisodeConfig
-from nudi.runner import UnsupportedTask
 from test_inspection import Sandboxes, SandboxEnvironment, explained_task, no_native_actor, sandbox_record
 from test_limits import FILE_KEY, credentials, new_run  # noqa: F401  (pytest fixture)
 from test_inspection import AgentScript, Finding, inspector_run
@@ -68,7 +69,7 @@ def malicious_grader(monkeypatch, plant) -> Sandboxes:
 
 
 def probe(run) -> str:
-    return asyncio.run(checks.package_probe(run, "true\n"))
+    return asyncio.run(inspection.package_probe(run, "true\n"))
 
 
 # Rewards: read without following links, bounded, invalid values kept out of errors.
@@ -121,7 +122,7 @@ def test_invalid_reward_values_stay_out_of_the_whole_error_chain(tmp_path, name,
     paths = TrialPaths(tmp_path / "trial")
     paths.mkdir()
     (paths.verifier_dir / name).write_text(content)
-    verifier = runner.RewardVerifier(task=Task(CONTRACT_TASK), trial_paths=paths, environment=SimpleNamespace())
+    verifier = episode_module.RewardVerifier(task=Task(CONTRACT_TASK), trial_paths=paths, environment=SimpleNamespace())
     parse = verifier._parse_reward_json if name == "reward.json" else verifier._parse_reward_text
     with pytest.raises(VerifierOutputParseError) as caught:
         parse()
@@ -141,12 +142,12 @@ def test_native_trials_grade_through_the_reward_verifier(tmp_path):
             submitted.append(config)
 
     config = EpisodeConfig(task_dir=CONTRACT_TASK, output_dir=tmp_path, model="xai/grok-4.7", api_key_var="XAI_API_KEY")
-    asyncio.run(runner.run_harbor(config, CONTRACT_TASK, None, Queue()))
+    asyncio.run(episode_module.run_harbor(config, CONTRACT_TASK, None, Queue()))
     trial, = submitted
     paths = TrialPaths(tmp_path / "trial")
     verifier = VerifierFactory.create_verifier_from_config(
         trial.verifier, task=Task(CONTRACT_TASK), trial_paths=paths, environment=SimpleNamespace())
-    assert isinstance(verifier, runner.RewardVerifier)
+    assert isinstance(verifier, episode_module.RewardVerifier)
 
 
 def test_native_grader_symlink_to_host_json_is_refused(tmp_path, docker_env):
@@ -228,7 +229,7 @@ def test_snapshot_refuses_what_it_must_not_copy(tmp_path, case, expected):
     else:
         credentials = task / "tests" / "test.sh"
     with pytest.raises(UnsupportedTask, match=expected):
-        runner.snapshot(task, tmp_path / "copy", credentials)
+        episode_module.snapshot(task, tmp_path / "copy", credentials)
 
 
 def test_snapshot_keeps_links_inside_the_task_as_regular_files(tmp_path, monkeypatch, credentials):
@@ -236,7 +237,7 @@ def test_snapshot_keeps_links_inside_the_task_as_regular_files(tmp_path, monkeyp
     (task / "tests" / "same.sh").symlink_to(task / "tests" / "test.sh")
     (task / "linked-tests").symlink_to(task / "tests", target_is_directory=True)
     copied = tmp_path / "copy"
-    runner.snapshot(task, copied)
+    episode_module.snapshot(task, copied)
     assert not any(path.is_symlink() for path in copied.rglob("*"))
     assert (copied / "tests" / "same.sh").read_bytes() == (task / "tests" / "test.sh").read_bytes()
     assert (copied / "linked-tests" / "test.sh").read_bytes() == (task / "tests" / "test.sh").read_bytes()
@@ -248,7 +249,7 @@ def test_snapshot_streams_large_files(tmp_path):
     (task / "tests" / "dataset.bin").write_bytes(os.urandom(2**24))
     tracemalloc.start()
     try:
-        runner.snapshot(task, tmp_path / "copy")
+        episode_module.snapshot(task, tmp_path / "copy")
         peak = tracemalloc.get_traced_memory()[1]
     finally:
         tracemalloc.stop()
@@ -307,7 +308,7 @@ def test_an_excluded_convention_artifacts_directory_is_refused(tmp_path):
         refused, CONTRACT_TASK, '\n[[artifacts]]\nsource = "/logs/artifacts"\nexclude = ["*.txt"]\n'
     )
     with pytest.raises(UnsupportedTask, match="exclude"):
-        runner.check_task(task)
+        episode_module.check_task(task)
     mounted = tmp_path / "mounted"
     mounted.mkdir()
     redirected = task_variant(
@@ -316,14 +317,14 @@ def test_an_excluded_convention_artifacts_directory_is_refused(tmp_path):
         '\n[[artifacts]]\nsource = "/logs/artifacts"\nexclude = ["*.txt"]\ndestination = "logs/artifacts"\n',
     )
     with pytest.raises(UnsupportedTask, match="exclude"):
-        runner.check_task(redirected)
+        episode_module.check_task(redirected)
 
     accepted = tmp_path / "accepted"
     accepted.mkdir()
     plain = task_variant(accepted, CONTRACT_TASK)
     toml = plain / "task.toml"
     toml.write_text('artifacts = ["/app/answer.txt"]\n' + toml.read_text())
-    runner.check_task(plain)
+    episode_module.check_task(plain)
 
 
 def test_a_credentials_file_inside_the_task_is_refused_before_the_run(tmp_path, monkeypatch):
@@ -374,10 +375,10 @@ def test_raw_evidence_is_owner_only_under_a_permissive_umask(tmp_path, monkeypat
     no_native_actor(monkeypatch)
     run = new_run(tmp_path, monkeypatch, credentials)
     probe(run)
-    monkeypatch.setattr(workflow, "run_episode", runner.run_episode)
-    monkeypatch.setattr(runner, "run_harbor", harbor_tree)
-    monkeypatch.setattr(runner, "select_path", lambda task_dir, native: ("harbor", []))
-    asyncio.run(workflow.run_role_episode(run, "simulator", instruction="Also explain the answer."))
+    monkeypatch.setattr(run_state, "run_episode", episode_module.run_episode)
+    monkeypatch.setattr(episode_module, "run_harbor", harbor_tree)
+    monkeypatch.setattr(episode_module, "select_path", lambda task_dir, native: ("harbor", []))
+    asyncio.run(run_state.run_role_episode(run, "simulator", instruction="Also explain the answer."))
     assert (run.config.output_dir / "episodes" / run.record.episodes[0] / "nudi-evidence" / "extension.md").is_file()
     assert modes(run.config.output_dir) == {}
 
@@ -423,7 +424,7 @@ def bundled_task(tmp_path: Path, host_script: bool) -> Path:
 def test_bundled_verifier_tests_are_not_uploaded(tmp_path, host_script):
     task = Task(bundled_task(tmp_path, host_script))
     verifier = VerifierFactory.create_verifier_from_config(
-        VerifierConfig(import_path="nudi.runner:RewardVerifier"), task=task,
+        VerifierConfig(import_path="nudi.episode:RewardVerifier"), task=task,
         trial_paths=TrialPaths(tmp_path / "trial"), environment=SimpleNamespace(os=task.config.environment.os))
     assert verifier._resolve_tests()[0] == []
 

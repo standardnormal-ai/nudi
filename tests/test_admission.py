@@ -22,11 +22,11 @@ from harbor.models.task.verifier_mode import resolve_verifier_environment_defini
 from harbor.trial.trial import Trial
 from harbor.verifier.verifier import Verifier
 
-from nudi import checks, copies, sandbox
+from nudi import checks, copies, episode, inspection, inspector_sandbox
+from nudi.episode import HELPER_STATE, UnsupportedTask
 from nudi.records import StateCopy
-from nudi.runner import HELPER_STATE, UnsupportedTask
-from nudi.workflow import CapacityUnavailable
-from test_backend import Modal, modal_run, trial_config
+from nudi.run_state import CapacityUnavailable
+from test_backend import needs_modal, Modal, modal_run, trial_config
 from test_inspection import SandboxEnvironment, Sandboxes, no_native_actor, retained_copy, sandbox_record
 from test_limits import credentials, new_run  # noqa: F401  (pytest fixture)
 from test_runner import CONTRACT_TASK, SEPARATE_TASK, VERIFIER_ENVIRONMENT, compose_task, docker_env, task_variant, task_with  # noqa: F401
@@ -79,7 +79,7 @@ def test_a_sandbox_of_the_task_environment_merges_its_compose_file_as_harbors_tr
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
 
     async def main():
-        async with sandbox.sandbox(run, "probe") as box:
+        async with inspector_sandbox.sandbox(run, "probe") as box:
             # The sandbox's package copy is removed with it.
             mine = harbor[box.record.name]
             assert mine._uses_compose and mine._environment_docker_compose_path in mine._docker_compose_paths
@@ -95,7 +95,7 @@ def test_a_sandbox_of_the_task_environment_merges_its_compose_file_as_harbors_tr
         return trial.agent_environment
 
     agent = asyncio.run(native())
-    assert type(agent) is type(mine) is DockerEnvironment
+    assert type(mine) is DockerEnvironment and type(agent) is episode.NativeDocker
     compose = (task / "environment" / "docker-compose.yaml").read_text()
     assert merged == [path.read_text() for path in agent._user_compose_paths()] == [compose]
 
@@ -106,10 +106,10 @@ def test_a_run_counts_helper_services_as_undeclared_and_keeps_compose_off_modal(
     assert any("for every container" in warning and "helper containers can exceed the concurrency setting" in warning
                for warning in run.record.warnings)
     assert run.record.limitations[-1] == HELPER_STATE.strip()
-    assert checks.task_context(run)["check_input_contract"] == checks.CHECK_INPUT_CONTRACT + HELPER_STATE
+    assert inspection.task_context(run)["check_input_contract"] == checks.CHECK_INPUT_CONTRACT + HELPER_STATE
     plain = new_run(tmp_path / "plain", monkeypatch, credentials, capacity=(8, 16384))
     assert HELPER_STATE.strip() not in plain.record.limitations
-    assert checks.task_context(plain)["check_input_contract"] == checks.CHECK_INPUT_CONTRACT
+    assert inspection.task_context(plain)["check_input_contract"] == checks.CHECK_INPUT_CONTRACT
     with pytest.raises(UnsupportedTask, match="docker-compose.yaml is not verified on Modal"):
         modal_run(tmp_path, monkeypatch, task_dir=compose_task(tmp_path / "modal"))
 
@@ -121,11 +121,11 @@ def test_a_held_workspace_admits_one_unchecked_experiment_on_an_undeclared_task_
     assert run.record.capacity.concurrency == 1 and not unchecked
 
     async def main():
-        async with sandbox.sandbox(run, "workspace"):
+        async with inspector_sandbox.sandbox(run, "workspace"):
             for purpose in ("probe", "check"):
-                async with sandbox.sandbox(run, purpose):
+                async with inspector_sandbox.sandbox(run, purpose):
                     with pytest.raises(CapacityUnavailable, match="concurrency of 1"):
-                        async with sandbox.sandbox(run, "probe"):
+                        async with inspector_sandbox.sandbox(run, "probe"):
                             pass
 
     asyncio.run(main())
@@ -151,9 +151,9 @@ def test_the_healthcheck_runs_in_sandboxes_of_the_task_environment_only(tmp_path
     copy = retained_copy(run, sandboxes)
 
     async def main():
-        async with sandbox.sandbox(run, "probe") as probe:
+        async with inspector_sandbox.sandbox(run, "probe") as probe:
             pass
-        async with sandbox.sandbox(run, "check", copy=copy) as check:
+        async with inspector_sandbox.sandbox(run, "check", copy=copy) as check:
             pass
         return probe.record.name, check.record.name
 
@@ -172,7 +172,7 @@ def test_a_separate_verifier_sandbox_runs_no_healthcheck(tmp_path, monkeypatch, 
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
 
     async def main():
-        async with sandbox.sandbox(run, "probe", definition=True) as box:
+        async with inspector_sandbox.sandbox(run, "probe", definition=True) as box:
             return box.record.name
 
     name = asyncio.run(main())
@@ -189,10 +189,10 @@ def test_collect_hooks_run_before_the_shared_grader_in_its_sandbox(tmp_path, mon
     task = task_variant(tmp_path, CONTRACT_TASK, HOOKS)
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
 
-    name = asyncio.run(checks.package_probe(run, "true\n"))
+    name = asyncio.run(inspection.package_probe(run, "true\n"))
     order = [event[2] for event in commands(sandboxes, name)]
     hook = order.index("nudi-main-hook")
-    assert any(sandbox.SETUP in command for command in order[:hook])
+    assert any(inspector_sandbox.SETUP in command for command in order[:hook])
     assert any("/tests/test.sh" in command and "chmod" not in command for command in order[hook:])
     assert sandbox_record(run, name)["rewards"] == {"reward": 1.0}
 
@@ -207,7 +207,7 @@ def test_a_failed_collect_hook_is_a_run_warning_and_the_probe_still_grades(tmp_p
 
     monkeypatch.setattr(Services, "exec", exec)
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=task_variant(tmp_path, CONTRACT_TASK, HOOKS))
-    name = asyncio.run(checks.package_probe(run, "true\n"))
+    name = asyncio.run(inspection.package_probe(run, "true\n"))
     assert sandbox_record(run, name)["rewards"] == {"reward": 1.0}
     assert [warning for warning in run.record.warnings if "Collect hook" in warning] == [
         f"{name}: Collect hook in service 'main' exited with code 7: 'nudi-main-hook'. stdout: partial export stderr: disk full"]
@@ -224,7 +224,7 @@ def test_separate_mode_collects_the_main_service_then_stops_it_before_helper_hoo
     (task / "tests" / "Dockerfile").write_text("FROM python:3.12-slim\n")
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
 
-    name = asyncio.run(checks.package_probe(run, "true\n"))
+    name = asyncio.run(inspection.package_probe(run, "true\n"))
     setup = sandbox_record(run, name)["setup"]
     collection = [event for event in commands(sandboxes, setup) if event[0] != "exec" or "nudi-" in event[2]]
     assert collection == [("exec", setup, "nudi-main-hook", None, 60), ("stop_service", setup, "main"),
@@ -251,7 +251,7 @@ def test_the_grader_gets_verifier_env_as_harbors_verifier_gives_it(tmp_path, mon
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
 
     async def main():
-        async with sandbox.sandbox(run, "probe") as box:
+        async with inspector_sandbox.sandbox(run, "probe") as box:
             await box.grade()
             await Verifier(task=box.task, trial_paths=box.paths, environment=box.environment).verify()
 
@@ -262,6 +262,7 @@ def test_the_grader_gets_verifier_env_as_harbors_verifier_gives_it(tmp_path, mon
 # GPUs, on Modal only, requested as Harbor's trial requests them.
 
 
+@needs_modal
 def test_a_modal_sandbox_requests_the_gpus_harbors_trial_requests(tmp_path, monkeypatch):
     modal = Modal(monkeypatch)
     task = task_variant(tmp_path, CONTRACT_TASK, 'gpus = 1\ngpu_types = ["H100"]\n')
@@ -269,7 +270,7 @@ def test_a_modal_sandbox_requests_the_gpus_harbors_trial_requests(tmp_path, monk
     config = trial_config(tmp_path, "modal", task)
 
     async def main():
-        async with sandbox.sandbox(run, "probe"):
+        async with inspector_sandbox.sandbox(run, "probe"):
             pass
         trial = await Trial.create(config)
         trial._init_agent_environment()
@@ -281,6 +282,7 @@ def test_a_modal_sandbox_requests_the_gpus_harbors_trial_requests(tmp_path, monk
     assert mine.kwargs["gpu"] == native.kwargs["gpu"] == "H100:1"
 
 
+@needs_modal
 def test_a_copy_sandbox_requests_the_gpus_of_the_environment_it_copies(tmp_path, monkeypatch):
     """Harbor's trial requests the agent environment's GPUs from task.config.environment and the
     separate verifier's from definition.config; a check of either copy requests the same."""
@@ -297,7 +299,7 @@ def test_a_copy_sandbox_requests_the_gpus_of_the_environment_it_copies(tmp_path,
 
     async def main():
         for copy in copies.values():
-            async with sandbox.sandbox(run, "check", copy=copy):
+            async with inspector_sandbox.sandbox(run, "check", copy=copy):
                 pass
         trial = await Trial.create(config)
         trial._init_agent_environment()
@@ -330,7 +332,7 @@ def test_a_real_docker_probe_reaches_a_helper_service(tmp_path, docker_env, monk
              "        urllib.request.urlopen('http://helper:8080'); break\n    except OSError: time.sleep(1)\n"
              "\" && mkdir -p /app && echo 42 > /app/answer.txt\n")
 
-    name = asyncio.run(checks.package_probe(run, setup))
+    name = asyncio.run(inspection.package_probe(run, setup))
     asyncio.run(copies.delete(run))
     record = sandbox_record(run, name)
     assert record["rewards"]["reward"] == 1.0 and record["cleanup"]["removed"] is True

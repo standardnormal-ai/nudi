@@ -9,7 +9,7 @@
   <a href="docs/installation.md#optional-modal-backend"><img src="https://img.shields.io/badge/Integration-Modal-09AF58?style=flat" alt="Integration: Modal"></a>
 </p>
 
-`nudi` is an open source CLI tool for red-teaming and simulating RL environments before training. It uses agent swarms to find flaws in grading.
+`nudi` is an open source CLI tool for red-teaming and simulating RL environments before training. It uses agent swarms to find flaws in grading. And answers how likely they are.
 
 This readme is written by humans, for humans.
 The boring stuff for your coding agents is here:  

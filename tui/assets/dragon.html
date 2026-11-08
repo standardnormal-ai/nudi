@@ -1,0 +1,73 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nudi startup raster generator</title>
+<h1>Blue dragon startup rasters</h1>
+<p>Open this file in a modern browser, click Generate, and replace the downloaded
+<code>dragon.bin.gz</code> beside this file. No packages or server are needed.
+Generation uses Canvas 2D and CompressionStream. The Go viewer needs neither.</p>
+<button onclick="generate()">Generate</button> <a id="download"></a>
+<p id="status"></p>
+<script>
+// Selected authored drawing from approved preview a1feea067, 2026-11-07.
+// Only the blue dragon is retained. No reference photographs or gallery code.
+// Frame-major layout: 96 frames at 24 fps, solid then contour, 176 by 96 pixels.
+// Each byte is 0 for empty or 1 through 6 for the six palette indices.
+const W=176,H=96,FPS=24,FRAMES=96;
+const cvs=document.createElement('canvas');cvs.width=W;cvs.height=H;
+const ctx=cvs.getContext('2d',{willReadFrequently:true});
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
+const fill=(n,out)=>out?'#080d10':n;
+function ink(c){return c==='#080d10'?'#000':`rgb(${32*(c+1)},0,0)`;}
+function warp(x,y,s){let dx=x-105,dy=y-18,l=(-.48*dx+.88*dy)/1.0048,n=(.88*dx+.48*dy)/1.0048;let tail=clamp(l/83,0,1);n+=(.35+3.4*tail*tail)*Math.sin(s*2.4-l*.075);let xx=105-.48*l+.88*n,yy=18+.88*l+.48*n;let a=.045*Math.sin(s*1.2);dx=xx-88;dy=yy-49;return [88+dx*Math.cos(a)-dy*Math.sin(a)+2*Math.sin(s*.8),49+dx*Math.sin(a)+dy*Math.cos(a)+.8*Math.sin(s*1.6)];}
+function path(coords,s,leaf,f,stroke,line=1){ctx.beginPath();for(const row of coords){let pts=[];for(let i=1;i<row.length;i+=2)pts.push(...warp(row[i],row[i+1],s,leaf));if(row[0]==='M')ctx.moveTo(...pts);if(row[0]==='L')ctx.lineTo(...pts);if(row[0]==='C')ctx.bezierCurveTo(...pts);if(row[0]==='Q')ctx.quadraticCurveTo(...pts);if(row[0]==='Z')ctx.closePath();}if(f!==null){ctx.fillStyle=ink(f);ctx.fill();}if(stroke!==null){ctx.strokeStyle=ink(stroke);ctx.lineWidth=line;ctx.lineCap='round';ctx.lineJoin='round';ctx.stroke();}}
+function dragon(s,out){
+ const P=(l,n)=>[105-l*.48+n*.88,18+l*.88+n*.48];
+ const localPath=(rows,side,f,stroke,width=1)=>path(rows.map(row=>{let r=[row[0]];for(let i=1;i<row.length;i+=2)r.push(...P(row[i],row[i+1]*side));return r;}),s,0,f,stroke,width);
+ for(let pair=0;pair<3;pair++)for(const side of [-1,1]){
+  const l=[20,41,57][pair],hub=[15,12,9][pair],size=[23,17,11][pair],root=[4.4,3.5,2.6][pair];
+  // Build one arm in body coordinates, then reflect every point and curve.
+  localPath([['M',l-root,3],['C',l-root,7,l-3,hub-5,l-3,hub],['Q',l,hub+4,l+3,hub],['C',l+3,hub-5,l+root,7,l+root,3],['Z']],side,fill(1,out),2,.85);
+  for(let j=0;j<9;j++){
+   const angle=(j-4)*.265*(1+.15*Math.sin(s*2.4-pair*.7));
+   const len=size*(.78+.22*Math.cos(angle))*(.94+.06*Math.sin(s*2.4-pair*.7));
+   const bx=l+Math.sin(angle)*1.2,by=hub+Math.cos(angle)*1.2;
+   const dx=Math.sin(angle)*len,dy=Math.cos(angle)*len;
+   const tx=bx+dx,ty=by+dy,nx=-dy/len,ny=dx/len,w=pair===2?.75:1.05;
+   localPath([['M',bx-nx*w,by-ny*w],['C',bx+dx*.3-nx*w,by+dy*.3-ny*w,tx-nx*.3,ty-ny*.3,tx,ty],['C',tx+nx*.3,ty+ny*.3,bx+dx*.3+nx*w,by+dy*.3+ny*w,bx+nx*w,by+ny*w],['Z']],side,fill(1,out),2,.65);
+   localPath([['M',bx+dx*.8,by+dy*.8],['L',tx,ty]],side,null,4,1.1);
+  }
+  // Rounded hubs cover only the crowded finger origins.
+  localPath([['M',l-2.8,hub],['C',l-2.8,hub-2.5,l+2.8,hub-2.5,l+2.8,hub],['C',l+2.8,hub+2.5,l-2.8,hub+2.5,l-2.8,hub],['Z']],side,fill(2,out),2,.8);
+ }
+ // The waist narrows between the arm pairs; both flanks share one profile.
+ const flank=[['C',-3,4.5,1,5.2,5,4.6],['C',10,3.8,14,6.2,20,6.2],['C',26,6.1,30,4.1,35,4.2],['C',42,4.5,49,3.8,57,2.8],['C',65,2,73,1.1,83,0]];
+ let outline=[['M',-4,0],...flank];
+ for(let i=flank.length-1;i>=0;i--){let row=flank[i];let end=i===0?[-4,0]:flank[i-1].slice(-2);outline.push(['C',row[3],-row[4],row[1],-row[2],end[0],-end[1]]);}
+ outline.push(['Z']);localPath(outline,1,fill(1,out),2,.9);
+ localPath([['M',1,0],['C',20,0,43,0,59,0],['Q',72,0,81,0]],1,null,5,2.2);
+ for(const side of [-1,1])localPath([['M',7,2.8],['C',20,4.3,34,2.7,49,2.1],['Q',61,1.5,73,.6]],side,null,2,.7);
+ for(const side of [-1,1])localPath([['M',0,3.6],['Q',-3,5.4,-5,3.1]],side,null,4,1.5);
+}
+function sample(data,x,y){x=Math.floor(x);y=Math.floor(y);if(x<0||y<0||x>=W||y>=H)return null;let n=(y*W+x)*4;if(data[n+3]<80||data[n]<23)return null;return clamp(Math.round(data[n]/32)-1,0,5);}
+function rasters(){
+ const data=new Uint8Array(FRAMES*2*W*H);let offset=0;
+ for(let frame=0;frame<FRAMES;frame++)for(const out of [false,true]){
+  ctx.clearRect(0,0,W,H);dragon(frame/FPS,out);
+  const rgba=ctx.getImageData(0,0,W,H).data;
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+   const c=sample(rgba,x,y);data[offset++]=c===null?0:c+1;
+  }
+ }
+ return data;
+}
+async function asset(){
+ const stream=new Blob([rasters()]).stream().pipeThrough(new CompressionStream('gzip'));
+ return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+async function generate(){
+ const data=await asset(),link=document.getElementById('download');
+ link.href=URL.createObjectURL(new Blob([data],{type:'application/gzip'}));
+ link.download='dragon.bin.gz';link.textContent='Download dragon.bin.gz';link.click();
+ document.getElementById('status').textContent=`${FRAMES} frames, ${data.length} compressed bytes`;
+}
+</script>

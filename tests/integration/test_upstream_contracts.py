@@ -33,7 +33,7 @@ from verifiers.v1.tasksets.harbor.taskset import HarborConfig, parse_task
 from verifiers.v1.utils.loaders import environment_class, load_taskset, taskset_config_type
 
 VERIFIERS_VERSION = "0.4.1.dev12"
-# Package entries of the verified wheel's RECORD (SHA256 74d0a324..., source commit e888a719...).
+# Package entries of the verified wheel's RECORD.
 VERIFIERS_RECORD_DIGEST = "4130103379da1031c9aa9363299df083d453532aea733ade831fcf9c450e1f09"
 HARBOR_VERSION = "0.24.0"
 LITELLM_VERSION = "1.106.0"
@@ -792,7 +792,7 @@ def test_deep_agents_workspace_offers_only_file_search_and_shell_tools(tmp_path,
 
     from nudi import inspector
     from nudi.records import ModelConfig, RunConfig
-    from nudi.workflow import start_run
+    from nudi.run_state import start_run
 
     class Finding(BaseModel):
         summary: str
@@ -832,9 +832,9 @@ def test_deep_agents_workspace_offers_only_file_search_and_shell_tools(tmp_path,
 def test_workspace_memory_override_reaches_docker_beside_an_experiment_at_task_limits(tmp_path):
     """Docker enforces the recorded limits: Harbor's override sets the held workspace's memory,
     a fresh experiment beside it keeps the task's declaration, and both are removed."""
-    from nudi import sandbox
+    from nudi import inspector_sandbox
     from nudi.records import RunConfig
-    from nudi.workflow import start_run
+    from nudi.run_state import start_run
 
     credentials = tmp_path / "credentials.env"
     credentials.write_text(f"MERGE_GATEWAY_API_KEY={PROVIDER_KEY}\n")
@@ -848,8 +848,8 @@ def test_workspace_memory_override_reaches_docker_beside_an_experiment_at_task_l
         return {"cpus": int(cpus) // 10**9, "memory_mb": int(memory) // 2**20}
 
     async def main():
-        async with sandbox.sandbox(run, "workspace") as workspace:
-            async with sandbox.sandbox(run, "check") as check:
+        async with inspector_sandbox.sandbox(run, "workspace") as workspace:
+            async with inspector_sandbox.sandbox(run, "check") as check:
                 return [(box.record, enforced(box)) for box in (workspace, check)]
 
     (workspace, held), (check, fresh) = asyncio.run(main())

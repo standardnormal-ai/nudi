@@ -9,14 +9,20 @@ filesystem is snapshotted.
 A copy is read by checks of its own episode or sandbox and as an attack inspector's workspace.
 The grader inspector reads Simulator copies and its own probes' copies; the hack inspector's
 experiments may name any retained episode or sandbox, so every copy stays through the hack phase.
-An attack inspector reads only its own Attacker attempt's copies, so `discard` deletes every copy
-taken so far before each attempt. `delete` at run end removes everything left, also after a failure.
+In the full analysis the attack runs last, so the copies of the hack, Simulator and grader inspector
+phases all stay until the attack phase's first Attacker attempt, also those of the Attacker attempts
+that ran during the hack phase. An attack inspector reads only its own Attacker
+attempt's copies, so `discard` deletes every copy taken so far, except those of attempts still
+running, before each attempt. `delete` at run end, right after the attack, removes everything left,
+also after a failure. Both leave the copies an attack rerun carries from an earlier run, listed first,
+as that run recorded them.
 """
 
 import asyncio
 import contextlib
 import hashlib
 import json
+import time
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
@@ -24,9 +30,9 @@ from harbor.environments.docker.docker import _sanitize_docker_compose_project_n
 from harbor.models.task.config import VerifierEnvironmentMode
 from harbor.models.task.verifier_mode import resolve_task_verifier_mode
 
+from nudi.episode import COPY_TIMEOUT
+from nudi.inspector_sandbox import _now
 from nudi.records import Content, StateCopy, write_private
-from nudi.runner import COPY_TIMEOUT
-from nudi.sandbox import _now
 
 # Harbor bind-mounts its log directories on Docker; Modal keeps them in the copy, but they
 # are excluded on both backends so checks behave the same.
@@ -53,7 +59,7 @@ UNPAUSE_TIMEOUT = 10
 def excluded():
     """The paths no copy keeps: Harbor's logs and the runtime's own files. On Docker the
     container's mounts, tmpfs paths and image volumes are added."""
-    from nudi.checks import RUNTIME_FILES, RUNTIME_ROOTS
+    from nudi.persistence import RUNTIME_FILES, RUNTIME_ROOTS
 
     return sorted({LOGS, *map(str, RUNTIME_ROOTS), *map(str, RUNTIME_FILES)})
 
@@ -101,12 +107,15 @@ async def _copy(run, environment, copy: StateCopy, owner: Path) -> None:
         if status:
             raise RuntimeError(f"docker inspect of the mounts failed: {error.strip()}")
         mounts = json.loads(output)
-        if (mounts.get("size") or 0) > COPY_BYTES:
-            raise RuntimeError(f"the container's writable layer is {mounts['size']} bytes, over the {COPY_BYTES}-byte copy bound")
+        # Docker reports -1 for a size it could not compute.
+        copy.size_bytes = None if (mounts.get("size") or 0) < 0 else mounts.get("size")
+        if (copy.size_bytes or 0) > COPY_BYTES:
+            raise RuntimeError(f"the container's writable layer is {copy.size_bytes} bytes, over the {COPY_BYTES}-byte copy bound")
         copy.excluded = sorted({*copy.excluded, *(mount["Destination"] for mount in mounts["mounts"] or []), *(mounts["tmpfs"] or {})})
         # Recorded before the commit starts, so run-end deletion knows an image may come late.
         copy.tag = f"nudi-copy-{run.record.run_id}-{copy.id.removeprefix('copy-')}"
         run.save()
+        started = time.monotonic()
         try:
             status, output, error = await host_command(["docker", "commit", *COMMIT_CHANGES, container, copy.tag], timeout=COPY_TIMEOUT)
         except BaseException:
@@ -117,15 +126,19 @@ async def _copy(run, environment, copy: StateCopy, owner: Path) -> None:
             raise
         if status:
             raise RuntimeError(f"docker commit failed: {error.strip()}")
+        copy.pause_seconds = time.monotonic() - started
         copy.image = output.strip()
         status, output, error = await host_command(["docker", "image", "inspect", "--format", "{{json .Config.Volumes}}", copy.tag])
         if status:
             raise RuntimeError(f"docker image inspect failed: {error.strip()}")
         copy.excluded = sorted({*copy.excluded, *(json.loads(output) or {})})
     else:
-        from nudi.modal_box import _guarded
+        from nudi.modal_env import _guarded
 
+        # Modal reports no snapshot size, so `size_bytes` stays None.
+        started = time.monotonic()
         image = await _guarded("snapshot", environment._sandbox.snapshot_filesystem.aio(timeout=COPY_TIMEOUT, ttl=SNAPSHOT_TTL))
+        copy.pause_seconds = time.monotonic() - started
         run.images[copy.id] = image
         copy.image = image.object_id
     copy.finished_at = _now()
@@ -140,12 +153,13 @@ def _seconds(copy: StateCopy) -> float:
     return (datetime.fromisoformat(copy.finished_at) - datetime.fromisoformat(copy.started_at)).total_seconds()
 
 
-async def discard(run) -> None:
-    """Delete every finished copy not yet deleted, each by its own tag on Docker or its snapshot on
-    Modal, and mark it deleted. A failed copy, and one whose deletion fails, is left to `delete`."""
+async def discard(run, keep=()) -> None:
+    """Delete every finished copy not yet deleted, except those of the episodes in `keep`, each by its
+    own tag on Docker or its snapshot on Modal, and mark it deleted. A failed copy, and one whose
+    deletion fails, is left to `delete`. Copies taken meanwhile stay, since they may be a running attempt's."""
     from nudi.checks import host_command
 
-    for copy in run.record.copies:
+    for copy in [copy for copy in run.record.copies[run.imported_copies:] if copy.episode not in keep]:
         if copy.receipt is None or copy.deleted:
             continue
         with contextlib.suppress(Exception):
@@ -156,7 +170,7 @@ async def discard(run) -> None:
             else:
                 from modal.experimental import image_delete
 
-                from nudi.modal_box import _guarded
+                from nudi.modal_env import _guarded
 
                 await asyncio.wait_for(_guarded("image delete", image_delete.aio(copy.image)), COPY_TIMEOUT)
                 copy.deleted = True
@@ -170,7 +184,8 @@ async def delete(run) -> None:
     so is a failed copy whose image was not listed: the daemon may still commit it later."""
     from nudi.checks import host_command
 
-    if not run.record.copies:
+    own = run.record.copies[run.imported_copies:]
+    if not own:
         return
     if run.record.backend == "docker":
         prefix = f"nudi-copy-{run.record.run_id}-"
@@ -185,8 +200,8 @@ async def delete(run) -> None:
             remaining = None if status else set(output.split())
         except Exception:
             pass
-        late = [copy.id for copy in run.record.copies if copy.tag and copy.error and copy.tag not in listed]
-        for copy in run.record.copies:
+        late = [copy.id for copy in own if copy.tag and copy.error and copy.tag not in listed]
+        for copy in own:
             copy.deleted = copy.deleted or (None if remaining is None or copy.tag is None or copy.id in late else copy.tag not in remaining)
         if remaining != set():
             run.warn(f"copy images named {prefix}* may remain: {sorted(remaining or [])}; remove them with `docker image rm`")
@@ -197,9 +212,9 @@ async def delete(run) -> None:
     else:
         from modal.experimental import image_delete
 
-        from nudi.modal_box import _guarded
+        from nudi.modal_env import _guarded
 
-        for copy in run.record.copies:
+        for copy in own:
             if copy.image is None or copy.deleted:
                 continue
             try:

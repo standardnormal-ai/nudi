@@ -12,6 +12,7 @@ A sandbox result establishes what the copied package did, not native accessibili
 """
 
 import asyncio
+import functools
 import hashlib
 import os
 import secrets
@@ -19,6 +20,7 @@ import shlex
 import stat
 import tempfile
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,13 +32,16 @@ from harbor.models.task.verifier_mode import resolve_verifier_environment_defini
 from harbor.models.trial.config import ServiceVolumeBind, ServiceVolumeConfig
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 
+from nudi.episode import (RewardVerifier, UnsupportedTask, compose_command, environment_config, grading_bound, named, snapshot,
+                          tree_digest)
 from nudi.records import EnvironmentUnavailable, ErrorRecord, SandboxResult, private_dir, write_private
-from nudi.runner import RewardVerifier, UnsupportedTask, environment_config, grading_bound, named, snapshot, tree_digest
 
 # Failed starts in a row of one task environment that stop the run. One or two can be a flaky backend;
 # a successful start of that environment resets the count. Error texts are not compared: Docker's
 # names each sandbox's compose project and includes its build output.
 START_FAILURES = 3
+# The names of the sandboxes the current experiment opened. Experiments run at once, so each reads only its own.
+opened: ContextVar[list[str] | None] = ContextVar("nudi_opened", default=None)
 PACKAGE = "/nudi/package"
 RUNNER = "/nudi/run.py"
 SETUP = "/nudi/setup.sh"
@@ -152,20 +157,6 @@ def _protect_subprocesses(environment) -> None:
     environment._platform._engine_cp = engine_cp
 
 
-def _remove_at_once(environment) -> None:
-    """Bring a Docker sandbox down with a stop timeout of 0. Its PID 1, `sh -c "sleep infinity"`,
-    ignores SIGTERM, so a plain `down` waits Docker's 10 s stop timeout for a sandbox nudi no
-    longer needs. Harbor's ownership fix still runs first; native episodes keep Harbor's stop."""
-    original = environment._run_docker_compose_command
-
-    async def run(command, *args, **kwargs):
-        if command[:1] == ["down"]:
-            command = ["down", "--timeout", "0", *command[1:]]
-        return await original(command, *args, **kwargs)
-
-    environment._run_docker_compose_command = run
-
-
 class Sandbox:
     """One started sandbox. Every call is recorded before it runs and saved after."""
 
@@ -226,7 +217,7 @@ class Sandbox:
         following links."""
         verifier = self.task.config.verifier
         grader = RewardVerifier(task=self.task, trial_paths=self.paths, environment=self.environment)
-        self.record.grader = {"runner": "nudi.runner.RewardVerifier", "skip_tests_upload": grader._skip_tests_upload,
+        self.record.grader = {"runner": "nudi.episode.RewardVerifier", "skip_tests_upload": grader._skip_tests_upload,
                               "timeout_sec": verifier.timeout_sec, "user": verifier.user, "test_stdout": None}
         self.save()
         try:
@@ -279,7 +270,7 @@ async def sandbox(run, purpose: str, *, copy=None, definition: bool = False, art
     Harbor's artifact collection reads it.
 
     The third failed start in a row of the task's environment, or of its separate verifier environment,
-    raises `EnvironmentUnavailable` instead of the error. The spending cap and the run's container admission are checked first. Removal is
+    raises `EnvironmentUnavailable` instead of the error, and so does every later sandbox of it, without a start. The spending cap and the run's container admission are checked first. Removal is
     shielded from cancellation and then verified, because upstream stop logs its failures:
     on Docker the project's containers are listed, on Modal `ModalBox` asks Modal."""
     from nudi import checks
@@ -331,9 +322,15 @@ async def sandbox(run, purpose: str, *, copy=None, definition: bool = False, art
     private_dir(box.directory.parent)
     box.directory.mkdir(mode=0o700)
     run.record.sandboxes.append(name)
+    if (names := opened.get()) is not None:
+        names.append(name)
     run.save()
     box.save()
     try:
+        # Sessions running at once finish after one raised; none of them starts the environment again.
+        if kind is not None and run.failed_starts.get(kind, 0) >= START_FAILURES:
+            raise EnvironmentUnavailable(f"the task's {kind} already failed to start {START_FAILURES} times in a row; "
+                                         "no later sandbox or episode can use it, so the run stops")
         if not own and (compose := named(directory, "docker-compose.yaml", "docker-compose.yml")):
             raise UnsupportedTask(f"{compose[0].name} in the sandbox's environment directory is not verified")
         extra = {}
@@ -359,7 +356,9 @@ async def sandbox(run, purpose: str, *, copy=None, definition: bool = False, art
             enable_environment_dir_upload=upload, **extra)
         if backend == "docker":
             _protect_subprocesses(box.environment)
-            _remove_at_once(box.environment)
+            # As in a native episode, the sandbox is removed at once.
+            box.environment._run_docker_compose_command = functools.partial(
+                compose_command, box.environment._run_docker_compose_command)
         try:
             # As in Harbor's trial, a verifier definition also starts within the main environment's bound.
             await asyncio.wait_for(box.environment.start(force_build=False), task.config.environment.build_timeout_sec)

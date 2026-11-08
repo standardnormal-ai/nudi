@@ -24,10 +24,10 @@ from harbor.trial.trial import Trial
 from harbor.trial.errors import VerifierTimeoutError
 from harbor.verifier.verifier import DownloadVerifierDirError
 
-from nudi import api, checks, copies, runner, sandbox, workflow
-from nudi.records import Observation, RunRecord, StateCopy, write_private
-from nudi.runner import COPY_TIMEOUT, UnsupportedTask, grading_bound
-from test_backend import Aio, Modal, leak, modal_run, stored, trial_config, TOKEN_SECRET
+from nudi import checks, copies, episode, inspection, inspector_sandbox, run_state, send
+from nudi.episode import COPY_TIMEOUT, UnsupportedTask, grading_bound
+from nudi.records import Assessment, Check, Observation, RunRecord, StateCopy, write_private
+from test_backend import needs_modal, Aio, Modal, leak, modal_run, stored, trial_config, TOKEN_SECRET
 from test_inspection import Images, Sandboxes, explained_task, no_native_actor, retained_copy
 from test_limits import credentials, new_run  # noqa: F401  (pytest fixture)
 from test_runner import CONTRACT_TASK, SEPARATE_TASK, docker_env  # noqa: F401  (pytest fixture)
@@ -35,13 +35,13 @@ from test_runner import CONTRACT_TASK, SEPARATE_TASK, docker_env  # noqa: F401  
 
 class Snapshots(Modal):
     """Modal fakes whose sandboxes take filesystem snapshots. The snapshot calls numbered in
-    `fail` raise grpclib's credential-quoting error, those in `hang` never return. With
-    `slow_grader`, the copied grader's command never returns."""
+    `fail` raise grpclib's credential-quoting error, those in `hang` never return; each moves
+    `clock`, when given, by 2 s. With `slow_grader`, the copied grader's command never returns."""
 
-    def __init__(self, monkeypatch, *, fail=(), hang=(), slow_grader=False):
+    def __init__(self, monkeypatch, *, fail=(), hang=(), slow_grader=False, clock=None):
         super().__init__(monkeypatch)
         self.snapshots, self.fail_at, self.hang_at, self.slow_grader = [], set(fail), set(hang), slow_grader
-        self.graded = []
+        self.graded, self.clock = [], clock
 
         async def download(environment, source_dir, target_dir):
             # Modal's file copy: the copied grader's reward reaches the host.
@@ -62,6 +62,8 @@ class Snapshots(Modal):
 
         async def snapshot(timeout, *, ttl):
             self.snapshots.append((box.object_id, timeout, ttl))
+            if self.clock:
+                self.clock.now += 2
             number = len(self.snapshots)
             if number in self.fail_at:
                 leak()
@@ -71,6 +73,14 @@ class Snapshots(Modal):
 
         box.exec, box.snapshot_filesystem = Aio(exec), Aio(snapshot)
         return box
+
+
+class Clock:
+    """The monotonic clock `copies` times calls with, which moves only when a fake moves `now`."""
+
+    def __init__(self, monkeypatch):
+        self.now = 0.0
+        monkeypatch.setattr(copies, "time", SimpleNamespace(monotonic=lambda: self.now))
 
 
 def taking(run, owner):
@@ -95,6 +105,7 @@ async def verify(trial, separate, tmp_path):
 
 
 @pytest.mark.parametrize("separate", [False, True])
+@needs_modal
 def test_the_real_verifier_copies_the_environment_it_grades_in(tmp_path, monkeypatch, separate):
     """Shared mode copies the agent's sandbox, separate mode the verifier's, before grading
     and after the grader. Each snapshot is bounded and kept 24 h at most; its receipt is
@@ -103,16 +114,16 @@ def test_the_real_verifier_copies_the_environment_it_grades_in(tmp_path, monkeyp
     task = SEPARATE_TASK if separate else CONTRACT_TASK
     run = modal_run(tmp_path, monkeypatch, task_dir=task)
     config = trial_config(tmp_path, "modal", task)
-    assert config.verifier.override_timeout_sec == grading_bound(60.0) == 60 + 2 * COPY_TIMEOUT + runner.COPY_MARGIN
+    assert config.verifier.override_timeout_sec == grading_bound(60.0) == 60 + 2 * COPY_TIMEOUT + episode.COPY_MARGIN
     owner = tmp_path / "episode"
 
     async def main():
-        token = runner.state_copy.set(taking(run, owner))
+        token = episode.state_copy.set(taking(run, owner))
         try:
-            with workflow.model_calls(run, "simulator", "0000-simulator"):
+            with run_state.model_calls(run, "simulator", "0000-simulator"):
                 return await verify(await Trial.create(config), separate, tmp_path)
         finally:
-            runner.state_copy.reset(token)
+            episode.state_copy.reset(token)
 
     result = asyncio.run(main())
     assert result.rewards == {"reward": 1}
@@ -131,6 +142,40 @@ def test_the_real_verifier_copies_the_environment_it_grades_in(tmp_path, monkeyp
     assert list(run.images) == ["copy-0000", "copy-0001"]
 
 
+@needs_modal
+def test_a_modal_copy_records_the_snapshot_call_duration_and_no_size(tmp_path, monkeypatch):
+    """The pause is the snapshot call's own duration, without the copy's other work, here its record
+    saves; a failed snapshot's pause is null, not 0. Modal reports no snapshot size and nudi runs
+    nothing in the sandbox to measure one, so the size is null."""
+    clock = Clock(monkeypatch)
+    modal = Snapshots(monkeypatch, fail=[2], clock=clock)
+    run = modal_run(tmp_path, monkeypatch)
+    config = trial_config(tmp_path, "modal")
+    save = run.save
+
+    def saving():
+        clock.now += 3
+        save()
+
+    monkeypatch.setattr(run, "save", saving)
+
+    async def main():
+        token = episode.state_copy.set(taking(run, tmp_path / "episode"))
+        try:
+            with run_state.model_calls(run, "simulator", "0000-simulator"):
+                return await verify(await Trial.create(config), False, tmp_path)
+        finally:
+            episode.state_copy.reset(token)
+
+    assert asyncio.run(main()).rewards == {"reward": 1}
+    box, = modal.created
+    assert len(modal.snapshots) == 2 and not any("du " in command for command in box.commands)
+    start, end = stored(run).copies
+    assert (start.size_bytes, start.error, start.pause_seconds) == (None, None, 2)
+    assert end.size_bytes is None and end.pause_seconds is None and end.error.startswith("ModalFailure")
+
+
+@needs_modal
 def test_a_grader_past_its_limit_times_out_as_harbor_reports_it(tmp_path, monkeypatch):
     """The grader keeps the task's own limit inside the longer outer one, so Harbor still
     records VerifierTimeoutError; the second copy is still taken."""
@@ -142,12 +187,12 @@ def test_a_grader_past_its_limit_times_out_as_harbor_reports_it(tmp_path, monkey
     config = trial_config(tmp_path, "modal", task)
 
     async def main():
-        token = runner.state_copy.set(taking(run, tmp_path / "episode"))
+        token = episode.state_copy.set(taking(run, tmp_path / "episode"))
         try:
-            with workflow.model_calls(run, "simulator", "0000-simulator"):
+            with run_state.model_calls(run, "simulator", "0000-simulator"):
                 return await verify(await Trial.create(config), False, tmp_path)
         finally:
-            runner.state_copy.reset(token)
+            episode.state_copy.reset(token)
 
     started = time.monotonic()
     with pytest.raises(VerifierTimeoutError):
@@ -156,6 +201,7 @@ def test_a_grader_past_its_limit_times_out_as_harbor_reports_it(tmp_path, monkey
     assert [copy.point for copy in stored(run).copies] == ["verification_start", "grading_end"]
 
 
+@needs_modal
 def test_a_grader_error_still_copies_grading_end_and_names_its_cause(tmp_path, monkeypatch):
     """A failed verifier-directory download must not skip grading_end or keep only Harbor's
     own text; otherwise malformed_rewards and resource_exhaustion probes read unobservable."""
@@ -169,12 +215,12 @@ def test_a_grader_error_still_copies_grading_end_and_names_its_cause(tmp_path, m
     config = trial_config(tmp_path, "modal", CONTRACT_TASK)
 
     async def main():
-        token = runner.state_copy.set(taking(run, tmp_path / "episode"))
+        token = episode.state_copy.set(taking(run, tmp_path / "episode"))
         try:
-            with workflow.model_calls(run, "simulator", "0000-simulator"):
+            with run_state.model_calls(run, "simulator", "0000-simulator"):
                 return await verify(await Trial.create(config), False, tmp_path)
         finally:
-            runner.state_copy.reset(token)
+            episode.state_copy.reset(token)
 
     with pytest.raises(DownloadVerifierDirError) as raised:
         asyncio.run(main())
@@ -186,6 +232,7 @@ def test_a_grader_error_still_copies_grading_end_and_names_its_cause(tmp_path, m
 
 @pytest.mark.parametrize("failure", ["error", "timeout"])
 @pytest.mark.parametrize("number", [1, 2])
+@needs_modal
 def test_a_failed_copy_is_recorded_and_grading_keeps_its_reward(tmp_path, monkeypatch, failure, number):
     """A copy that fails or passes COPY_TIMEOUT is recorded on the copy and as a warning,
     without the Modal credential; grading goes on and its reward stays."""
@@ -195,12 +242,12 @@ def test_a_failed_copy_is_recorded_and_grading_keeps_its_reward(tmp_path, monkey
     config = trial_config(tmp_path, "modal")
 
     async def main():
-        token = runner.state_copy.set(taking(run, tmp_path / "episode"))
+        token = episode.state_copy.set(taking(run, tmp_path / "episode"))
         try:
-            with workflow.model_calls(run, "simulator", "0000-simulator"):
+            with run_state.model_calls(run, "simulator", "0000-simulator"):
                 return await verify(await Trial.create(config), False, tmp_path)
         finally:
-            runner.state_copy.reset(token)
+            episode.state_copy.reset(token)
 
     assert asyncio.run(main()).rewards == {"reward": 1}
     record = stored(run)
@@ -212,22 +259,23 @@ def test_a_failed_copy_is_recorded_and_grading_keeps_its_reward(tmp_path, monkey
     assert TOKEN_SECRET not in (run.config.output_dir / "run.json").read_text()
 
 
+@needs_modal
 def test_cancelling_a_copy_records_it_and_propagates(tmp_path, monkeypatch):
     Snapshots(monkeypatch, hang=[1])
     run = modal_run(tmp_path, monkeypatch)
     config = trial_config(tmp_path, "modal")
 
     async def main():
-        token = runner.state_copy.set(taking(run, tmp_path / "episode"))
+        token = episode.state_copy.set(taking(run, tmp_path / "episode"))
         try:
-            with workflow.model_calls(run, "simulator", "0000-simulator"):
+            with run_state.model_calls(run, "simulator", "0000-simulator"):
                 grading = asyncio.create_task(verify(await Trial.create(config), False, tmp_path))
                 while not run.record.copies:
                     await asyncio.sleep(0.01)
                 grading.cancel()
                 await grading
         finally:
-            runner.state_copy.reset(token)
+            episode.state_copy.reset(token)
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(main())
@@ -259,7 +307,7 @@ def test_a_docker_copy_runs_no_startup_code_and_omits_what_it_does_not_contain(t
     sandboxes.images.volumes[prefix + "0000"] = {"/var/lib/data": {}}
     sandboxes.images.mounts = [{"Type": "bind", "Source": "/host/data", "Destination": "/srv/shared"}]
     sandboxes.images.tmpfs = {"/run/scratch": "size=64m"}
-    name = asyncio.run(checks.package_probe(run, "true\n"))
+    name = asyncio.run(inspection.package_probe(run, "true\n"))
     session = sandboxes.environments[name].session_id
     commits = [command for command in commands if command[:2] == ["docker", "commit"]]
     assert commits == [["docker", "commit", "--change", "ENTRYPOINT []", "--change", 'CMD ["sh","-c","sleep infinity"]',
@@ -275,7 +323,7 @@ def test_a_docker_copy_runs_no_startup_code_and_omits_what_it_does_not_contain(t
     assert hashlib.sha256(receipt.read_bytes()).hexdigest() == start.receipt.sha256
 
     async def check():
-        async with sandbox.sandbox(run, "check", copy=start) as box:
+        async with inspector_sandbox.sandbox(run, "check", copy=start) as box:
             return box.record
 
     assert asyncio.run(check()).state_copy == start.id
@@ -292,7 +340,7 @@ def test_a_copy_whose_mounts_cannot_be_listed_fails(tmp_path, monkeypatch, crede
     sandboxes = Sandboxes(monkeypatch)
     sandboxes.images.mounts = None
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
-    asyncio.run(checks.package_probe(run, "true\n"))
+    asyncio.run(inspection.package_probe(run, "true\n"))
     assert all("mounts failed" in copy.error and copy.receipt is None for copy in run.record.copies)
     assert sandboxes.images.commits == []
 
@@ -303,11 +351,34 @@ def test_a_copy_over_the_size_bound_is_not_committed(tmp_path, monkeypatch, cred
     sandboxes = Sandboxes(monkeypatch)
     sandboxes.images.size = copies.COPY_BYTES + 1
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
-    asyncio.run(checks.package_probe(run, "true\n"))
+    asyncio.run(inspection.package_probe(run, "true\n"))
     assert run.record.copies and all(
         f"over the {copies.COPY_BYTES}-byte copy bound" in copy.error and copy.receipt is None and copy.tag is None
+        and copy.size_bytes == copies.COPY_BYTES + 1 and copy.pause_seconds is None
         for copy in run.record.copies)
     assert sandboxes.images.commits == []
+
+
+@pytest.mark.parametrize("reported, recorded", [(4096, 4096), (0, 0), (-1, None)])
+def test_a_docker_copy_records_its_writable_layer_and_the_commit_call_duration(tmp_path, monkeypatch, credentials,
+                                                                                 reported, recorded):
+    """The size is the writable layer `docker inspect --size` reports before the commit; Docker's -1,
+    a size it could not compute, is null, and a reported 0 stays 0. The pause is the `docker commit`
+    call's own duration, during which Docker pauses the container, without the inspections around it."""
+    clock = Clock(monkeypatch)
+    sandboxes = Sandboxes(monkeypatch)
+    sandboxes.images.size = reported
+    docker = sandboxes.docker
+
+    async def host(command, **kwargs):
+        clock.now += {("docker", "inspect"): 3, ("docker", "commit"): 2, ("docker", "image"): 5}.get(tuple(command[:2]), 0)
+        return await docker(command, **kwargs)
+
+    monkeypatch.setattr(checks, "host_command", host)
+    run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
+    asyncio.run(inspection.package_probe(run, "true\n"))
+    copied = stored(run).copies
+    assert [(copy.error, copy.size_bytes, copy.pause_seconds) for copy in copied] == [(None, recorded, 2)] * 2
 
 
 def hung_commit(monkeypatch, sandboxes):
@@ -320,7 +391,7 @@ def hung_commit(monkeypatch, sandboxes):
         return await docker(command, **kwargs)
 
     monkeypatch.setattr(checks, "host_command", host)
-    monkeypatch.setattr(runner, "COPY_TIMEOUT", 0.05)
+    monkeypatch.setattr(episode, "COPY_TIMEOUT", 0.05)
     monkeypatch.setattr(copies, "COPY_TIMEOUT", 0.05)
 
 
@@ -340,13 +411,13 @@ def test_a_timed_out_commit_unpauses_the_container_before_grading(tmp_path, monk
         return unpause(command, *args)
 
     sandboxes.images.handle = failing
-    name = asyncio.run(checks.package_probe(run, "true\n"))
+    name = asyncio.run(inspection.package_probe(run, "true\n"))
     session = sandboxes.environments[name].session_id
     assert sandboxes.images.unpaused == [session, session]
     start, end = stored(run).copies
     assert [copy.tag for copy in (start, end)] == [f"nudi-copy-{run.record.run_id}-{n:04d}" for n in (0, 1)]
-    assert all(copy.error and copy.image is None and copy.receipt is None for copy in (start, end))
-    actions = [event[0] if event[0] != "exec" or "/tests/test.sh" not in event[2] else "grade" for event in sandboxes.events]
+    assert all(copy.error and copy.image is None and copy.receipt is None and copy.pause_seconds is None for copy in (start, end))
+    actions =[event[0] if event[0] != "exec" or "/tests/test.sh" not in event[2] else "grade" for event in sandboxes.events]
     assert actions.index("unpause") < actions.index("grade")
 
 
@@ -381,7 +452,7 @@ def test_a_failed_docker_commit_is_redacted(tmp_path, monkeypatch, credentials):
         return await docker(command, **kwargs)
 
     monkeypatch.setattr(checks, "host_command", host)
-    asyncio.run(checks.package_probe(run, "true\n"))
+    asyncio.run(inspection.package_probe(run, "true\n"))
     assert all(copy.error and "[redacted]" in copy.error for copy in run.record.copies)
     assert key not in (run.config.output_dir / "run.json").read_text()
 
@@ -432,26 +503,26 @@ def test_the_run_deletes_its_copies_after_a_failure_or_cancellation(tmp_path, mo
                                            started_at="2026-01-01T00:00:00+00:00"))
         raise failure
 
-    original = api.start_run
+    original = send.start_run
 
-    def start(settings, roles):
-        run = original(settings, roles)
+    def start(settings, roles, analyses):
+        run = original(settings, roles, analyses)
         monkeypatch.setattr(checks, "host_command", host)
         return run
 
-    monkeypatch.setattr(api, "start_run", start)
-    monkeypatch.setattr(api, "simulate", simulate)
+    monkeypatch.setattr(send, "start_run", start)
+    monkeypatch.setattr(send, "simulate", simulate)
 
     async def unused(run, *args, **kwargs):
         raise RuntimeError("not run in this test")
 
-    monkeypatch.setattr(api, "inspect_grader", unused)
+    monkeypatch.setattr(send, "inspect_grader", unused)
     new_run(tmp_path / "unused", monkeypatch, credentials)  # the docker capacity and credential setup
     if isinstance(failure, asyncio.CancelledError):
         with pytest.raises(asyncio.CancelledError):
-            asyncio.run(api.send_nudis_async(CONTRACT_TASK, output_dir=tmp_path / "run", analysis="simulation", credentials_file=credentials))
+            asyncio.run(send.send_nudis_async(CONTRACT_TASK, output_dir=tmp_path / "run", analysis="simulation", credentials_file=credentials))
     else:
-        asyncio.run(api.send_nudis_async(CONTRACT_TASK, output_dir=tmp_path / "run", analysis="simulation", credentials_file=credentials))
+        asyncio.run(send.send_nudis_async(CONTRACT_TASK, output_dir=tmp_path / "run", analysis="simulation", credentials_file=credentials))
     assert images.files == {}
     record = RunRecord.model_validate_json((tmp_path / "run" / "run.json").read_text())
     assert record.copies[0].deleted is True
@@ -468,8 +539,8 @@ def test_a_run_cancelled_while_deleting_its_copies_keeps_its_reports(tmp_path, m
     async def unused(run, *args, **kwargs):
         raise RuntimeError("not run in this test")
 
-    monkeypatch.setattr(api, "simulate", simulate)
-    monkeypatch.setattr(api, "inspect_grader", unused)
+    monkeypatch.setattr(send, "simulate", simulate)
+    monkeypatch.setattr(send, "inspect_grader", unused)
     new_run(tmp_path / "unused", monkeypatch, credentials)  # the docker capacity and credential setup
 
     async def main():
@@ -480,7 +551,7 @@ def test_a_run_cancelled_while_deleting_its_copies_keeps_its_reports(tmp_path, m
             await release.wait()
 
         monkeypatch.setattr(copies, "delete", slow_delete)
-        task = asyncio.create_task(api.send_nudis_async(CONTRACT_TASK, output_dir=tmp_path / "run", analysis="simulation",
+        task = asyncio.create_task(send.send_nudis_async(CONTRACT_TASK, output_dir=tmp_path / "run", analysis="simulation",
                                                         credentials_file=credentials))
         await started.wait()
         task.cancel()
@@ -496,6 +567,7 @@ def test_a_run_cancelled_while_deleting_its_copies_keeps_its_reports(tmp_path, m
 
 
 @pytest.mark.parametrize("fails", [False, True])
+@needs_modal
 def test_modal_snapshots_are_deleted_at_run_end(tmp_path, monkeypatch, fails):
     from modal.experimental import image_delete
 
@@ -550,6 +622,7 @@ def test_a_finished_docker_copy_is_deleted_mid_run_by_its_own_tag(tmp_path, monk
     assert [copy.deleted for copy in stored(run).copies] == [True, True, True] and sandboxes.images.files == {}
 
 
+@needs_modal
 def test_a_finished_modal_snapshot_is_deleted_mid_run_and_not_again_at_run_end(tmp_path, monkeypatch):
     from modal.experimental import image_delete
 
@@ -591,7 +664,7 @@ def test_a_copy_sandbox_starts_from_the_copy_alone(tmp_path, monkeypatch, creden
         sentinel_compose(task)
 
     async def main():
-        async with sandbox.sandbox(run, "check", copy=copy) as box:
+        async with inspector_sandbox.sandbox(run, "check", copy=copy) as box:
             return box, sandboxes.environments[box.record.name].config
 
     box, config = asyncio.run(main())
@@ -600,7 +673,7 @@ def test_a_copy_sandbox_starts_from_the_copy_alone(tmp_path, monkeypatch, creden
     assert list(Path(config["environment_dir"]).parts)[-1] == "environment"
     assert config["environment_dir"] != run.config.task_dir / "environment"
     assert (box.record.state_copy, box.record.image) == (copy.id, copy.image)
-    assert not any(event[0] == "upload_dir" and event[2] == sandbox.PACKAGE for event in sandboxes.events)
+    assert not any(event[0] == "upload_dir" and event[2] == inspector_sandbox.PACKAGE for event in sandboxes.events)
 
 
 def test_a_copy_sandbox_on_another_image_is_refused(tmp_path, monkeypatch, credentials):
@@ -609,7 +682,7 @@ def test_a_copy_sandbox_on_another_image_is_refused(tmp_path, monkeypatch, crede
     copy = retained_copy(run, sandboxes, image="sha256:" + "f" * 64)
 
     async def main():
-        async with sandbox.sandbox(run, "check", copy=copy):
+        async with inspector_sandbox.sandbox(run, "check", copy=copy):
             raise AssertionError("the sandbox started")
 
     with pytest.raises(RuntimeError, match="not copy-0000's image"):
@@ -624,11 +697,11 @@ def test_a_definition_sandbox_never_merges_a_task_compose_file(tmp_path, monkeyp
     shutil.copytree(SEPARATE_TASK, task)
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
     sentinel_compose(task)
-    definition = resolve_verifier_environment_definition(runner.Task(task).config, runner.Task(task).paths)
-    assert definition.directory == runner.Task(task).paths.tests_dir
+    definition = resolve_verifier_environment_definition(episode.Task(task).config, episode.Task(task).paths)
+    assert definition.directory == episode.Task(task).paths.tests_dir
 
     async def main():
-        async with sandbox.sandbox(run, "probe", definition=True):
+        async with inspector_sandbox.sandbox(run, "probe", definition=True):
             raise AssertionError("the sandbox started")
 
     with pytest.raises(UnsupportedTask, match="docker-compose.yaml"):
@@ -636,6 +709,7 @@ def test_a_definition_sandbox_never_merges_a_task_compose_file(tmp_path, monkeyp
     assert sandboxes.environments == {}
 
 
+@needs_modal
 def test_a_modal_copy_sandbox_starts_from_the_snapshot(tmp_path, monkeypatch):
     modal = Snapshots(monkeypatch)
     run = modal_run(tmp_path, monkeypatch)
@@ -644,7 +718,7 @@ def test_a_modal_copy_sandbox_starts_from_the_snapshot(tmp_path, monkeypatch):
     run.images[copy.id] = snapshot = SimpleNamespace(object_id="im-1")
 
     async def main():
-        async with sandbox.sandbox(run, "check", copy=copy) as box:
+        async with inspector_sandbox.sandbox(run, "check", copy=copy) as box:
             return box.record
 
     record = asyncio.run(main())
@@ -672,7 +746,7 @@ def test_a_location_under_an_excluded_path_is_unavailable_not_absent(tmp_path, m
     probe = {"category": "package_oracles", "setup_program": "true\n", "location": location,
              "timing": "at verification start", "program": "print(1)",
              "requirement": {"episode": None, "path": "instruction.md", "excerpt": "Write the number 42"}}
-    receipt = asyncio.run(checks.measure_experiment(run, probe))
+    receipt = asyncio.run(inspection.measure_experiment(run, probe))
     assert "check" not in receipt
     assert receipt["missing"] == [f"{location} lies under {root}, which copy-0000 omits; it is unavailable, not absent"]
     assert list(sandboxes.environments) == [receipt["episode"]]
@@ -687,15 +761,15 @@ def test_a_location_no_copy_keeps_is_refused_before_anything_runs(tmp_path, monk
     probe = {"category": "package_oracles", "setup_program": "true\n", "location": location,
              "timing": "at verification start", "program": "print(1)",
              "requirement": {"episode": None, "path": "instruction.md", "excerpt": "Write the number 42"}}
-    with pytest.raises(checks.InvalidProbe, match=f"{location} lies under {root}, which no state copy keeps"):
-        asyncio.run(checks.measure_experiment(run, probe))
+    with pytest.raises(inspection.InvalidProbe, match=f"{location} lies under {root}, which no state copy keeps"):
+        asyncio.run(inspection.measure_experiment(run, probe))
     assert not sandboxes.environments and run.record.sandboxes == []
 
 
 @pytest.mark.parametrize("location", ["app/answer.txt", "/app/../etc/passwd", "/app//answer.txt", "//app", "/app/*.txt",
                                       "/app/answer.txt/", "/app/\x00", None, 3])
 def test_a_location_is_one_normalized_absolute_path(location):
-    assert checks.location_problem(location) is not None
+    assert inspection.location_problem(location) is not None
 
 
 def test_excluded_paths_cover_the_path_and_its_children_only():
@@ -703,11 +777,12 @@ def test_excluded_paths_cover_the_path_and_its_children_only():
                      excluded=["/logs", "/data"], started_at="now")
     assert [copies.excluded_by(copy.excluded, path) for path in ("/logs", "/logs/verifier/reward.txt", "/data/x", "/datafile", "/app")] == [
         "/logs", "/logs", "/data", None, None]
-    assert checks.location_problem("/app/answer.txt") is None
+    assert inspection.location_problem("/app/answer.txt") is None
 
 
 def test_records_from_before_state_copies_still_load_and_report(tmp_path, monkeypatch, credentials):
-    """A one-file capture record, with its selection and submissions, loads with no copies."""
+    """A one-file capture record, with its selection, submissions and replays, loads with no copies. Those fields
+    are no longer written."""
     from nudi import report
 
     run = new_run(tmp_path, monkeypatch, credentials)
@@ -718,9 +793,12 @@ def test_records_from_before_state_copies_still_load_and_report(tmp_path, monkey
     raw["submissions"] = [{"content": {"episode": "0000-simulator", "path": "nudi-evidence/state.json", "sha256": "a" * 64},
                            "ids": {}, "location": "/app/answer.txt", "capture_point": "verification_start",
                            "command": ["python3", "-c", "capture"], "program": "capture", "exit_code": 0, "output": "{}"}]
+    raw["capture_errors"], raw["replays"] = [], []
     (run.config.output_dir / "run.json").write_text(json.dumps(raw))
     record = RunRecord.model_validate_json((run.config.output_dir / "run.json").read_text())
-    assert record.copies == [] and record.run_id == "" and len(record.submissions) == 1
+    assert record.copies == [] and record.run_id == ""
+    assert not {"capture_selection", "submissions", "capture_errors", "replays"} & set(record.model_dump())
+    assert "submission" not in Check.model_fields and "replay" not in Assessment.model_fields
     report.write(run.config.output_dir, (), ["simulation"])
     assert (run.config.output_dir / "report.md").is_file()
 
@@ -737,7 +815,7 @@ def test_a_real_docker_copy_is_checked_in_place_and_deleted(tmp_path, docker_env
         return set(output.split())
 
     async def main():
-        await checks.package_probe(run, "mkdir -p /app && echo 42 > /app/answer.txt\n")
+        await inspection.package_probe(run, "mkdir -p /app && echo 42 > /app/answer.txt\n")
         copy = run.record.copies[0]
         _, health, _ = await checks.host_command(["docker", "image", "inspect", "--format", "{{json .Config.Healthcheck}}", copy.tag])
         assert json.loads(health)["Test"] == ["CMD", "sh", "-c", "exit 0"]
@@ -747,7 +825,7 @@ def test_a_real_docker_copy_is_checked_in_place_and_deleted(tmp_path, docker_env
         await copies.discard(run)
         first = [copy.tag for copy in run.record.copies]
         after_discard = await listed()
-        await checks.package_probe(run, "true\n")
+        await inspection.package_probe(run, "true\n")
         later = await listed()
         await copies.delete(run)
         return check, first, after_discard, later, await listed()
@@ -812,7 +890,7 @@ def test_copies_of_a_directory_a_large_file_and_a_grader_written_file_reach_judg
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=task)
 
     async def main():
-        name = await checks.package_probe(run, ACCEPTANCE_SETUP)
+        name = await inspection.package_probe(run, ACCEPTANCE_SETUP)
         scoring = Observation(episode=None, path="tests/test.sh", excerpt=ACCEPTANCE_SCORING)
         found = {}
         for case, (point, excerpt, program) in ACCEPTANCE_CHECKS.items():
@@ -845,7 +923,7 @@ def test_a_docker_sandbox_is_removed_without_waiting_for_its_stop_timeout(tmp_pa
     run = new_run(tmp_path, monkeypatch, credentials)
 
     async def main():
-        async with sandbox.sandbox(run, "probe"):
+        async with inspector_sandbox.sandbox(run, "probe"):
             pass
 
     asyncio.run(main())
@@ -854,13 +932,14 @@ def test_a_docker_sandbox_is_removed_without_waiting_for_its_stop_timeout(tmp_pa
     assert list((state / "projects").iterdir()) == []
 
 
+@needs_modal
 def test_a_modal_sandbox_keeps_harbor_removal(tmp_path, monkeypatch):
     """The Docker removal change is skipped on Modal, whose sandbox is terminated, not brought down."""
     modal = Modal(monkeypatch)
     run = modal_run(tmp_path, monkeypatch)
 
     async def main():
-        async with sandbox.sandbox(run, "probe") as box:
+        async with inspector_sandbox.sandbox(run, "probe") as box:
             return box.environment
 
     environment = asyncio.run(main())
@@ -869,13 +948,14 @@ def test_a_modal_sandbox_keeps_harbor_removal(tmp_path, monkeypatch):
     assert json.loads((run.config.output_dir / "sandboxes" / "sandbox-0000" / "sandbox.json").read_text())["cleanup"]["removed"] is True
 
 
+@needs_modal
 def test_a_sandbox_names_its_nudi_evidence_directory_only_when_it_was_written(tmp_path, monkeypatch):
     """390 of 616 sandbox records and all 38 inspector sessions named a missing `nudi-evidence` directory."""
     Modal(monkeypatch)
     run = modal_run(tmp_path, monkeypatch)
 
     async def main(write):
-        async with sandbox.sandbox(run, "probe") as box:
+        async with inspector_sandbox.sandbox(run, "probe") as box:
             if write:
                 write_private(box.directory / "nudi-evidence" / "copy-0000.json", "{}")
             return box.directory

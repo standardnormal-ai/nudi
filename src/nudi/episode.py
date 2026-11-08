@@ -23,11 +23,12 @@ from pathlib import Path
 
 import yaml
 from harbor.agents.terminus_2.terminus_2 import Terminus2
+from harbor.environments.docker.docker import DockerEnvironment
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.job.config import RetryConfig
 from harbor.constants import MAIN_SERVICE_NAME
 from harbor.models.task.artifacts import is_convention_entry, sidecar_services, source_host_path
-from harbor.models.task.config import ArtifactConfig
+from harbor.models.task.config import ArtifactConfig, EnvironmentConfig as TaskEnvironment, NetworkMode, TaskOS
 from harbor.models.task.task import Task
 from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 from harbor.trial.artifact_handler import artifact_host_path
@@ -67,10 +68,17 @@ VERIFIED_FIELDS = {
     ("environment", "cpus"),
     ("environment", "memory_mb"),
 }
-# Harbor 0.24.0 parses these exactly as if they were omitted, on both paths.
+# Harbor 0.24.0 parses these exactly as if they were omitted, on both paths. Harbor's defaults written out
+# differ only in model_fields_set: a set network_mode overrides the legacy allow_internet, which nudi admits
+# only as true, and a set verifier os overrides the main one, which nudi admits only as the default.
 OMITTED = {
     ("verifier", "env"): lambda value: value == {},
     ("solution", "env"): lambda value: value == {},
+    # Harbor lowercases `os` before parsing.
+    ("environment", "os"): lambda value: isinstance(value, str) and value.lower() == TaskOS.LINUX,
+    ("verifier", "environment", "os"): lambda value: isinstance(value, str) and value.lower() == TaskOS.LINUX,
+    ("environment", "network_mode"): lambda value: value == NetworkMode.PUBLIC,
+    ("verifier", "environment", "network_mode"): lambda value: value == NetworkMode.PUBLIC,
 }
 # Native Harbor 0.24.0 treats these as omitted, except that it waits build_timeout_sec for an
 # environment to start, its Docker environment never reads storage_mb, and it requests declared
@@ -345,12 +353,19 @@ def check_task(task_dir: Path) -> dict[tuple[str, ...], object]:
     if excluded_convention_artifact(raw.get("artifacts")):
         raise UnsupportedTask("the conventional artifacts directory with exclude is not verified")
     # The legacy names Harbor renames before parsing (harbor/models/task/config.py).
-    # It drops a non-string `memory` instead, so that stays unverified.
+    # It drops a non-string `memory` or `storage` instead, so those stay unverified, as does a size it cannot read.
     if "version" in raw and "schema_version" not in raw:
         raw["schema_version"] = raw.pop("version")
-    environment = raw.get("environment", {})
-    if isinstance(environment.get("memory"), str) and "memory_mb" not in environment:
-        environment["memory_mb"] = environment.pop("memory")
+    # A table of another type is left to the field check below, which refuses it.
+    verifier = raw.get("verifier")
+    for environment in (raw.get("environment"), verifier.get("environment") if isinstance(verifier, dict) else None):
+        if not isinstance(environment, dict):
+            continue
+        for legacy in ("memory", "storage"):
+            if isinstance(environment.get(legacy), str) and f"{legacy}_mb" not in environment:
+                with contextlib.suppress(ValueError, OverflowError):
+                    environment[f"{legacy}_mb"] = TaskEnvironment._parse_size_to_mb(environment[legacy])
+                    del environment[legacy]
     native_only = {}
     for path, value in unverified_fields(raw):
         if path in NATIVE_ONLY and NATIVE_ONLY[path](value):
@@ -719,7 +734,39 @@ class HostTerminus(Terminus2):
         super().__init__(host_logs, *args, **kwargs)
 
 
-MODAL_BOX = "nudi.modal_box:ModalBox"
+class AttackerTerminus(HostTerminus):
+    """HostTerminus for Attacker episodes: a shell that ends within a turn ends the turn, as one that
+    ended between turns does, so the episode is graded. Simulator episodes keep stock Harbor."""
+
+    async def _execute_commands(self, commands, session):
+        try:
+            return await super()._execute_commands(commands, session)
+        except RuntimeError:
+            if await session.is_session_alive():
+                raise
+            # The shell ended within this turn; the next turn's liveness check ends the loop and the verifier grades the state.
+            return False, "The terminal session has ended."
+
+
+MODAL_BOX = "nudi.modal_env:ModalBox"
+NATIVE_DOCKER = "nudi.episode:NativeDocker"
+
+
+async def compose_command(run, command: list[str], *args, **kwargs):
+    """Run one Compose command of Harbor's Docker environment through `run`, Harbor's own runner,
+    with `down` stopping the containers at once. PID 1 of the main service, `sh -c "sleep infinity"`
+    unless the task sets a command, ignores SIGTERM, so Docker's 10 s stop timeout only delays the
+    kill; every grade and copy is taken by then, and the project is removed with its volumes."""
+    if command[:1] == ["down"]:
+        command = ["down", "--timeout", "0", *command[1:]]
+    return await run(command, *args, **kwargs)
+
+
+class NativeDocker(DockerEnvironment):
+    """Harbor's Docker environment for native episodes, its Compose commands run by `compose_command`."""
+
+    async def _run_docker_compose_command(self, command, *args, **kwargs):
+        return await compose_command(super()._run_docker_compose_command, command, *args, **kwargs)
 
 
 def environment_config(backend: Backend, cpus: int | None, memory_mb: int | None) -> EnvironmentConfig:
@@ -742,14 +789,17 @@ async def run_harbor(config: EpisodeConfig, task_dir: Path, result: EpisodeResul
         kwargs["llm_call_kwargs"] = {"extra_body": {"thinking": {"type": "enabled"}}}
     # Harbor builds a separate verifier environment from the same settings.
     declared = Task(task_dir).config
+    environment = environment_config(config.backend, declared.environment.cpus, declared.environment.memory_mb)
+    if config.backend == "docker":
+        environment = environment.model_copy(update={"type": None, "import_path": NATIVE_DOCKER})
     trial_config = TrialConfig(
         task=TaskConfig(path=task_dir),
         trials_dir=config.output_dir / "harbor",
-        environment=environment_config(config.backend, declared.environment.cpus, declared.environment.memory_mb),
-        verifier=VerifierConfig(import_path="nudi.runner:RewardVerifier",
+        environment=environment,
+        verifier=VerifierConfig(import_path="nudi.episode:RewardVerifier",
                                 override_timeout_sec=grading_bound(declared.verifier.timeout_sec)),
         agent=agent or AgentConfig(
-            import_path="nudi.runner:HostTerminus",
+            import_path="nudi.episode:AttackerTerminus" if config.attacker else "nudi.episode:HostTerminus",
             model_name=config.model,
             kwargs={key: value for key, value in kwargs.items() if value is not None},
         ),
@@ -785,14 +835,25 @@ def check_output(output_dir: Path, task_dir: Path) -> None:
         raise ValueError(f"output_dir {output_dir} overlaps the task {task_dir}")
 
 
+def framed_instruction(frame: str, task: str, reminder: str) -> str:
+    """Wrap an attack frame around the task's own instruction.
+
+    The frame leads, the task sits unchanged between markers, and the reminder of the goal
+    closes. An attacker reads why it is here before the task, and the goal is not lost at the
+    end of a long prompt."""
+    return f"{frame}\n\nThe task the grader checks:\n<task>\n{task}\n</task>\n\n{reminder}\n"
+
+
 async def run_episode(config: EpisodeConfig, queue: TrialQueue | None = None, *, instruction: str | None = None,
                       agent: AgentConfig | None = None, copy=None, on_verification=None, on_agent_start=None,
-                      on_trial_end=None, credentials: Path | None = None) -> EpisodeResult:
+                      on_trial_end=None, credentials: Path | None = None, reminder: str | None = None) -> EpisodeResult:
     """Run one episode on a disposable task snapshot; the record is written even on failure.
 
     Native Harbor episodes run through `queue`, shared by a run, or a queue of their own.
     `copy` is the `state_copy` callback of a native episode; the hooks run at Harbor's
-    lifecycle events. `credentials` is the run's credentials file, which the snapshot refuses."""
+    lifecycle events. `credentials` is the run's credentials file, which the snapshot refuses.
+    With `reminder`, `instruction` is treated as an attack frame and wrapped around the task;
+    without it, `instruction` is appended to the task."""
     check_output(config.output_dir, config.task_dir)
     path, reasons = select_path(config.task_dir, config.native)
     check_backend(config.task_dir, config.backend)
@@ -817,9 +878,15 @@ async def run_episode(config: EpisodeConfig, queue: TrialQueue | None = None, *,
             task_dir = Path(temp) / config.task_dir.name
             snapshot(config.task_dir, task_dir, credentials)
             if instruction is not None:
-                write_private(config.output_dir / "nudi-evidence" / "extension.md", instruction)
-                with (task_dir / "instruction.md").open("a") as file:
-                    file.write("\n\n" + instruction)
+                target = task_dir / "instruction.md"
+                if reminder is not None:
+                    wrapped = framed_instruction(instruction, target.read_bytes().decode("utf-8"), reminder)
+                    target.write_text(wrapped)
+                    write_private(config.output_dir / "nudi-evidence" / "extension.md", wrapped)
+                else:
+                    write_private(config.output_dir / "nudi-evidence" / "extension.md", instruction)
+                    with target.open("a") as file:
+                        file.write("\n\n" + instruction)
             if path == "verifiers":
                 await run_verifiers(config, task_dir, result)
             else:
