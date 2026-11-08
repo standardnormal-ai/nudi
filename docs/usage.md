@@ -252,7 +252,7 @@ tui/nudi-view runs/first 3
 
 A problem id, P, G or A with its number as the report names it, opens the finding that shows the problem: the one the attack tested, else its first finding, else for a problem an Attacker found the attack finding of its episode.
 
-Use `←` and `→`, or `h` and `l`, to move between phases or findings, `↑` and `↓` to scroll, `enter` to open the evidence, `tab` to switch between evidence and limitations, `esc` or backspace to go back and `q` or Ctrl-C to quit. Pass `--no-intro` to skip the opening animation, which is also skipped when `CI` is set. In a pipe the viewer prints plain text, the card, or the finding a problem id or N names, for scripts and agents. It exits `0` for a complete run, whose steps all ran, or one that reached its time limit, `1` for a partial run, in which a step failed or stopped, and `2` when the folder holds no readable report.
+Use `←` and `→`, or `h` and `l`, to move between phases or findings, `↑` and `↓` to scroll, `enter` to open the evidence, `tab` to switch between evidence and limitations, `esc` or backspace to go back and `q` or Ctrl-C to quit. Pass `--no-intro` to skip the opening animation, which is also skipped when `CI` is set. In a pipe the viewer prints plain text, the card, or the finding a problem id or N names, for scripts and agents. It exits `0` for a complete run, whose steps all ran, `1` for any other run, such as one in which a step failed or stopped or one that reached its time limit, and `2` when the folder holds no readable report.
 
 A run with `--backend modal` keeps its folder on the machine that ran nudi. If nudi itself ran on Modal and wrote to a Modal Volume, download the folder first:
 

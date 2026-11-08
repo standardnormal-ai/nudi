@@ -29,6 +29,8 @@ nudi --help
 
 `nudi --version` prints the installed version, from the package metadata.
 
+`python -m nudi` runs the same command without the `nudi` script on PATH, such as `python -m nudi --version`.
+
 Without `python3.12`, install Python 3.12 first, for example with `uv python install 3.12`, `brew install python@3.12` or from python.org.
 
 Only the direct dependencies are pinned, in [pyproject.toml](../pyproject.toml); the packages they depend on resolve at install time, so two installs can differ in those.
