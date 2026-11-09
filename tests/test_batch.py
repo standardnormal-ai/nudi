@@ -241,10 +241,10 @@ def test_each_environment_names_itself_in_its_events_and_stderr(tmp_path, monkey
     for name in ("task-a", "task-b"):
         texts = [item["text"] for item in events(batch / name)]
         assert texts and all(f" {name}: " in text for text in texts)
-        assert f"nudi: {name}: hack inspector and its Attackers started" in lines
+        assert f"nudi: {name}: hack inspector started" in lines
     assert lines and all(line.startswith(("nudi: task-a: ", "nudi: task-b: ")) for line in lines)
     assert command(tmp_path / "tasks" / "task-a", "--output", tmp_path / "one", "--analysis", "hacking") == 0
-    assert "nudi: hack inspector and its Attackers started" in logged(capsys.readouterr().err)
+    assert "nudi: hack inspector started" in logged(capsys.readouterr().err)
     assert not any("task-a:" in item["text"] for item in events(tmp_path / "one"))
 
 
@@ -313,7 +313,7 @@ def test_a_stop_writes_running_reports_marks_waiting_ones_and_prints_the_summary
     assert summary(batch)["status"] == stop and summary(batch)["exit_code"] == code
     assert [row["exit_code"] for row in summary(batch)["environments"]] == [code, code, None]
     for name in ("task-a", "task-b"):
-        assert f"run: {warning} during hack" in json.loads((batch / name / "report.json").read_text())["warnings"]
+        assert f"run: {warning} during hack and attack" in json.loads((batch / name / "report.json").read_text())["warnings"]
     assert not (batch / "task-c").exists()
 
 

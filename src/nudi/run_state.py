@@ -130,8 +130,8 @@ class BackendUnavailable(RuntimeError):
 
 
 class CapacityUnavailable(RuntimeError):
-    """A held Inspector sandbox leaves no room under the run's concurrency, so another
-    container does not start; it is refused at once rather than queued."""
+    """Another container cannot fit beside the one held Inspector workspace, the only container in flight, so it
+    does not start; while other containers are in flight, admission waits for one to end instead."""
 
 
 def docker_capacity() -> tuple[int, int, int | None, str]:
@@ -242,7 +242,7 @@ class Run:
         if cap is not None and self.record.known_cost >= cap:
             raise SpendingCapReached(f"known cost ${self.record.known_cost:.6f} reached the spending cap ${cap}")
 
-    def admit_container(self, purpose: str) -> None:
+    async def admit_container(self, purpose: str) -> None:
         """Admit another container, a sandbox `purpose` or "native", only after every closed
         Inspector sandbox was removed. Native episodes alone keep waiting in the run's queue;
         a held sandbox would make them wait on itself. Otherwise held sandboxes and native
@@ -253,7 +253,20 @@ class Run:
         Undeclared resources keep one container for each slot of the run's concurrency, and a
         held workspace still admits one fresh experiment, unchecked, with a warning. Only a held
         workspace and one fresh experiment may use every CPU, still within the memory
-        allowance, with a warning. Sandboxes carried from an earlier run are not this run's and are not counted."""
+        allowance, with a warning. Sandboxes carried from an earlier run are not this run's and are not counted.
+
+        Without room it waits, checking every `ADMISSION_POLL` seconds, until another container ends. When the
+        only container in flight is one held workspace, nothing can make room, so it raises `CapacityUnavailable`."""
+        while (refusal := self._refusal(purpose)) is not None:
+            reason, alone = refusal
+            if alone:
+                whose = "its own workspace" if purpose in ("probe", "check") else "the one held workspace"
+                raise CapacityUnavailable(f"{reason}; this {purpose} container cannot fit beside {whose} and is refused, "
+                                          "since waiting cannot make room")
+            await asyncio.sleep(ADMISSION_POLL)
+
+    def _refusal(self, purpose: str) -> tuple[str, bool] | None:
+        """None when another container fits now, else why not and whether one held workspace is all in flight."""
         held = []
         for name in self.record.sandboxes[self.imported_sandboxes:]:
             path = self.config.output_dir / "sandboxes" / name / "sandbox.json"
@@ -263,23 +276,23 @@ class Run:
             elif box.cleanup["removed"] is not True:
                 raise InfrastructureAbort(f"{name}: sandbox removal is unverified; another container cannot start")
         if not held and (purpose == "native" or not self.native_episodes):
-            return
+            return None
+        alone = [box.purpose for box in held] == ["workspace"] and not self.native_episodes
+        counted = f"{len(held)} held sandboxes and {self.native_episodes} native episodes"
         capacity = self.record.capacity
-        pair = [box.purpose for box in held] == ["workspace"] and not self.native_episodes and purpose in ("probe", "check")
+        pair = alone and purpose in ("probe", "check")
         setting = capacity.concurrency_setting
         if setting is not None and len(held) + self.native_episodes >= setting and not pair:
-            raise CapacityUnavailable(f"{len(held)} held sandboxes and {self.native_episodes} native episodes fill the "
-                                      f"run's concurrency of {setting}; another container cannot start")
+            return f"{counted} fill the run's concurrency of {setting}", alone
         if self.record.backend == "modal":
-            return
+            return None
         if capacity.episode_cpus is None or capacity.episode_memory_mb is None:
             if len(held) + self.native_episodes >= capacity.concurrency and not pair:
-                raise CapacityUnavailable(f"{len(held)} held sandboxes and {self.native_episodes} native episodes fill the "
-                                          f"run's concurrency of {capacity.concurrency}; another container cannot start")
+                return f"{counted} fill the run's concurrency of {capacity.concurrency}", alone
             if pair:
                 self.warn("a held workspace and one fresh experiment run without a resource check: the task's resources "
                           "are undeclared, helper services included")
-            return
+            return None
         memory_mb = capacity.workspace_memory_mb if purpose == "workspace" else capacity.episode_memory_mb
         limits = ([(box.environment["cpus"], box.environment["memory_mb"]) for box in held]
                   + [(capacity.episode_cpus, capacity.episode_memory_mb)] * self.native_episodes
@@ -287,12 +300,16 @@ class Run:
         cpus, memory_mb = map(sum, zip(*limits))
         headroom = 10 * cpus <= 9 * capacity.docker_cpus
         if 10 * memory_mb > 9 * capacity.docker_memory_mb or not (headroom or pair and cpus <= capacity.docker_cpus):
-            raise CapacityUnavailable(f"{len(held)} held sandboxes and {self.native_episodes} native episodes leave no room "
-                                      f"for another container within 90% of Docker's {capacity.docker_cpus} CPUs and "
-                                      f"{capacity.docker_memory_mb} MiB; it cannot start")
+            return (f"{counted} leave no room for another container within 90% of Docker's {capacity.docker_cpus} CPUs and "
+                    f"{capacity.docker_memory_mb} MiB"), alone
         if not headroom:
             self.warn(f"a held Inspector workspace and one fresh experiment use all {capacity.docker_cpus} of Docker's "
                       "CPUs: no CPU headroom remains for Docker, image builds or host processes")
+        return None
+
+
+# Seconds between checks of an admission that waits for another container to end.
+ADMISSION_POLL = 1.0
 
 
 # The share of a bound left at which an agent is told, so it can still finish before the bound stops it.
@@ -615,7 +632,7 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
     if role == "inspector":
         raise ValueError("the Inspector never runs as a native task actor; use an Inspector sandbox")
     run.check_cap()
-    run.admit_container("native")
+    await run.admit_container("native")
     model = run.record.models[role]
     name = f"{len(run.record.episodes):04d}-{role}"
     run.record.episodes.append(name)
@@ -672,11 +689,12 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
         run.save()
 
 
-async def simulate(run: Run, episodes: int = 12) -> Simulation:
+async def simulate(run: Run, episodes: int = 12, *, gate: asyncio.Semaphore | None = None) -> Simulation:
     """Run `episodes` ordinary Simulator episodes of the original task and harness.
 
     Every count takes this path. As many workers as the run's queue runs at once admit
-    an episode only while the spending cap allows; admitted episodes finish. Failed
+    an episode only while the spending cap allows; admitted episodes finish. With `gate`
+    each episode holds one of its slots, which other work shares, from before admission to its end. Failed
     episodes stay recorded and are not retried; the pool is partial only when one has no
     usable reward. Each episode's state copies serve grader inspection, which reuses this pool."""
     from nudi.checks import finish_cleanup, redacted
@@ -691,28 +709,33 @@ async def simulate(run: Run, episodes: int = 12) -> Simulation:
     async def worker():
         # Harbor's shielded environment stop consumes a cancellation and the trial returns normally.
         while not asyncio.current_task().cancelling() and len(simulation.episodes) < episodes:
-            try:
-                run.check_cap()
-            except SpendingCapReached:
-                simulation.status = "spending_exhausted"
-                return
-            # run_role_episode assigns this name before its first await.
-            name = f"{len(run.record.episodes):04d}-simulator"
-            simulation.episodes.append(name)
-            try:
-                result = await run_role_episode(run, "simulator")
-                if result.errors:
-                    simulation.failures[name] = [error.model_copy(update={"message": redacted(run, error.message)})
-                                                 for error in result.errors]
-                if not any(value is not None and math.isfinite(value) for value in result.rewards.values()):
+            async with gate or contextlib.nullcontext():
+                # Other workers may have started the last episodes while this one waited for its slot.
+                if len(simulation.episodes) >= episodes:
+                    return
+                try:
+                    run.check_cap()
+                except SpendingCapReached:
+                    simulation.status = "spending_exhausted"
+                    return
+                # Waits for room here, so run_role_episode admits at once and assigns this name before its first await.
+                await run.admit_container("native")
+                name = f"{len(run.record.episodes):04d}-simulator"
+                simulation.episodes.append(name)
+                try:
+                    result = await run_role_episode(run, "simulator")
+                    if result.errors:
+                        simulation.failures[name] = [error.model_copy(update={"message": redacted(run, error.message)})
+                                                     for error in result.errors]
+                    if not any(value is not None and math.isfinite(value) for value in result.rewards.values()):
+                        unusable.add(name)
+                except Exception as error:
+                    simulation.failures[name] = [ErrorRecord(type=type(error).__name__, message=redacted(run, str(error)))]
                     unusable.add(name)
-            except Exception as error:
-                simulation.failures[name] = [ErrorRecord(type=type(error).__name__, message=redacted(run, str(error)))]
-                unusable.add(name)
-            finally:
-                if refusals := [signal for call in run.record.calls if call.episode == name for signal in call.refusals]:
-                    simulation.refusals[name] = refusals
-                run.save()
+                finally:
+                    if refusals := [signal for call in run.record.calls if call.episode == name for signal in call.refusals]:
+                        simulation.refusals[name] = refusals
+                    run.save()
 
     workers = [asyncio.create_task(worker()) for _ in range(min(episodes, run.record.capacity.concurrency))]
 

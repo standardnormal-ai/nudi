@@ -495,7 +495,7 @@ def test_the_run_deletes_its_copies_after_a_failure_or_cancellation(tmp_path, mo
     async def host(command, **kwargs):
         return images.handle(command, lambda container: {}, None)
 
-    async def simulate(run, episodes):
+    async def simulate(run, episodes, gate=None):
         tag = f"nudi-copy-{run.record.run_id}-0000"
         images.files[tag] = {}
         run.record.copies.append(StateCopy(id="copy-0000", episode="0000-simulator", point="verification_start",
@@ -532,7 +532,7 @@ def test_the_run_deletes_its_copies_after_a_failure_or_cancellation(tmp_path, mo
 
 
 def test_a_run_cancelled_while_deleting_its_copies_keeps_its_reports(tmp_path, monkeypatch, credentials):
-    async def simulate(run, episodes):
+    async def simulate(run, episodes, gate=None):
         run.record.copies.append(StateCopy(id="copy-0000", episode="0000-simulator", point="verification_start",
                                            environment="agent", backend="docker", ids={}, started_at="2026-01-01T00:00:00+00:00"))
 
@@ -592,9 +592,9 @@ def test_modal_snapshots_are_deleted_at_run_end(tmp_path, monkeypatch, fails):
 
 
 def test_a_finished_docker_copy_is_deleted_mid_run_by_its_own_tag(tmp_path, monkeypatch, credentials):
-    """`discard` removes each finished copy by its own tag and marks it deleted; a failed copy, whose
-    image the daemon may still commit, and a copy whose removal fails stay for run-end deletion,
-    which keeps the mid-run result and removes the rest."""
+    """`discard` removes each finished copy of the named episodes by its own tag and marks it deleted; a copy of
+    another episode, a failed copy, whose image the daemon may still commit, and a copy whose removal fails stay for
+    run-end deletion, which keeps the mid-run result and removes the rest."""
     sandboxes = Sandboxes(monkeypatch)
     commands = recording(monkeypatch, sandboxes)
     run = new_run(tmp_path, monkeypatch, credentials)
@@ -610,12 +610,15 @@ def test_a_finished_docker_copy_is_deleted_mid_run_by_its_own_tag(tmp_path, monk
         return await docker(command, **kwargs)
 
     monkeypatch.setattr(checks, "host_command", host)
-    asyncio.run(copies.discard(run))
+    asyncio.run(copies.discard(run, set()))
+    assert not [command for command in commands if command[:3] == ["docker", "image", "rm"]]
+    episodes = {copy.episode for copy in run.record.copies}
+    asyncio.run(copies.discard(run, episodes))
     assert [command for command in commands if command[:3] == ["docker", "image", "rm"]] == [
         ["docker", "image", "rm", done.tag], ["docker", "image", "rm", refused.tag]]
     assert [copy.deleted for copy in stored(run).copies] == [True, None, None]
     assert done.tag not in sandboxes.images.files and {refused.tag, failed.tag} <= set(sandboxes.images.files)
-    asyncio.run(copies.discard(run))
+    asyncio.run(copies.discard(run, episodes))
     assert sum(command == ["docker", "image", "rm", done.tag] for command in commands) == 1, "a deleted copy is not removed again"
     monkeypatch.setattr(checks, "host_command", docker)
     asyncio.run(copies.delete(run))
@@ -637,7 +640,7 @@ def test_a_finished_modal_snapshot_is_deleted_mid_run_and_not_again_at_run_end(t
     run.record.copies = [StateCopy(id="copy-0000", episode="0000-simulator", point="verification_start", environment="agent",
                                    backend="modal", ids={}, image="im-1", receipt=receipt, started_at="2026-01-01T00:00:00+00:00")]
     run.images["copy-0000"] = SimpleNamespace(object_id="im-1")
-    asyncio.run(copies.discard(run))
+    asyncio.run(copies.discard(run, {"0000-simulator"}))
     assert deleted == ["im-1"] and stored(run).copies[0].deleted is True and run.images == {}
     asyncio.run(copies.delete(run))
     assert deleted == ["im-1"] and stored(run).copies[0].deleted is True and stored(run).warnings == []
@@ -822,7 +825,7 @@ def test_a_real_docker_copy_is_checked_in_place_and_deleted(tmp_path, docker_env
         program = "import json; print(json.dumps({'observations': {'answer': open('/app/answer.txt').read().strip()}}))"
         check = await checks.check_submission(run, copy, Observation(episode=None, path="instruction.md", excerpt="Write the number 42"),
                                               None, program, timing="at verification start")
-        await copies.discard(run)
+        await copies.discard(run, {copy.episode for copy in run.record.copies})
         first = [copy.tag for copy in run.record.copies]
         after_discard = await listed()
         await inspection.package_probe(run, "true\n")

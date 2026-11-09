@@ -219,6 +219,47 @@ def test_hack_inspector_receives_the_static_checklist_shared_with_no_hint_attack
     assert "not exhaustive" in inspection_module.HACK_CHECKLIST
 
 
+def test_the_grader_inspector_takes_the_shared_gate(tmp_path, monkeypatch, credentials, unit_sandboxes):
+    """While other work holds the run's one slot, no grader inspector session starts; broad and then its focused fork
+    each take the slot once it is released."""
+    requests = inspector_responses(monkeypatch, [{"probes": []}] * 2)
+    run = new_run(tmp_path, monkeypatch, credentials)
+
+    async def main():
+        gate = asyncio.Semaphore(1)
+        async with gate:  # a Simulator episode
+            grading = asyncio.create_task(inspection_module.inspect_grader(run, [], categories=["accepted_invalid"],
+                                                                           focused_attempts=1, gate=gate))
+            done, _ = await asyncio.wait({grading}, timeout=0.2)
+            assert not done and requests == [] and run.record.sandboxes == []
+        return await asyncio.wait_for(grading, 30)
+
+    result = asyncio.run(main())
+    assert [item.phase for item in result.attempts] == ["broad", "focused"] and len(requests) == 2
+
+
+def test_an_experiment_that_cannot_fit_beside_its_own_workspace_says_so_in_its_reply(tmp_path, monkeypatch, credentials, unit_sandboxes):
+    """At concurrency one nothing but the session's own workspace is in flight, so its experiment is refused at once,
+    and the reply tells the inspector why."""
+    requirement = {"episode": None, "path": "instruction.md", "excerpt": "Write the number 42"}
+    inspector_responses(monkeypatch, [{"probes": [{"category": "accepted_invalid", "case": "no answer", "requirement": requirement,
+                                                                   "setup_program": "mkdir -p /app"}]}])
+    scripted_call, bodies = inspector.litellm.acompletion, []
+
+    async def recording(**request):
+        bodies.append(json.loads(json.dumps(request)))
+        return await scripted_call(**request)
+
+    monkeypatch.setattr(inspector.litellm, "acompletion", recording)
+    run = new_run(tmp_path, monkeypatch, credentials, capacity=(2, 1024))
+    assert run.record.capacity.concurrency == 1
+    result = asyncio.run(asyncio.wait_for(inspection_module.inspect_grader(run, [], categories=["accepted_invalid"], focused_attempts=0), 30))
+    replies = [message["content"] for body in bodies for message in body["messages"] if message["role"] == "tool"]
+    assert any("CapacityUnavailable" in reply and "cannot fit beside its own workspace and is refused" in reply for reply in replies)
+    assert result.categories["accepted_invalid"] == "unknown"
+    assert [sandbox_record(run, name)["purpose"] for name in run.record.sandboxes] == ["workspace"]
+
+
 def test_the_grader_inspector_reads_listed_hack_findings_and_its_record_names_them(tmp_path, monkeypatch, credentials, unit_sandboxes):
     """Hack findings join the first grader inspector request only. The record names which were given, and from what
     hack inspection; without any, the request is as before and the record says none."""
@@ -733,11 +774,9 @@ def test_a_focused_hack_inspector_is_asked_again_while_its_failure_stays_open(tm
     assert result.categories == {"grader_tampering": "no_evidenced_issue"} and result.open == []
 
 
-def test_the_evidence_hook_is_awaited_once_for_each_evidenced_hack_reading(tmp_path, monkeypatch, credentials, unit_sandboxes):
-    """The hack inspector awaits `on_evidence` with the report and the index of each evidenced reading as it records it,
-    never for a legitimate one. Only the hack inspector takes the hook."""
-    import inspect
-
+def test_the_evidence_hook_is_awaited_once_for_each_evidenced_reading_of_either_inspector(tmp_path, monkeypatch, credentials, unit_sandboxes):
+    """The hack inspector and the grader inspector await `on_evidence` with the report and the index of each evidenced
+    reading as they record it, never for a legitimate one, so the attack can start on it before the inspection ends."""
     probe = lambda case: {"category": "grader_tampering", "case": case, "setup_program": case}
     inspector_responses(monkeypatch, [
         {"probes": [probe("forge"), probe("honest")]},
@@ -759,7 +798,12 @@ def test_the_evidence_hook_is_awaited_once_for_each_evidenced_hack_reading(tmp_p
     result = asyncio.run(inspection_module.inspect_hacks(run, categories=["grader_tampering"], focused_attempts=1, on_evidence=on_evidence))
     assert [item.outcome for item in result.assessments] == ["accepted_invalid", "legitimate", "accepted_invalid"]
     assert heard == [("hack", 0), ("hack", 2)]
-    assert "on_evidence" not in inspect.signature(inspection_module.inspect_grader).parameters
+    grader = lambda case: {**probe(case), "category": "accepted_invalid"}
+    inspector_responses(monkeypatch, [{"probes": [grader("honest"), grader("forge")]}])
+    result = asyncio.run(inspection_module.inspect_grader(run, [], categories=["accepted_invalid"], focused_attempts=0,
+                                                          on_evidence=on_evidence))
+    assert [item.outcome for item in result.assessments] == ["legitimate", "accepted_invalid"]
+    assert heard[2:] == [("grader", 1)]
 
 
 def test_a_probe_runs_without_a_mechanism_and_nothing_is_judged_before_it_is_measured(tmp_path, monkeypatch, credentials, unit_sandboxes):
@@ -5117,6 +5161,7 @@ def test_cancelled_investigation_keeps_its_transcript_and_removes_the_workspace(
 
 
 def recording_native(monkeypatch) -> list[str]:
+    monkeypatch.setattr(run_state, "ADMISSION_POLL", 0.01)
     native = []
 
     async def native_episode(config, queue, **kwargs):
@@ -5129,8 +5174,9 @@ def recording_native(monkeypatch) -> list[str]:
 
 @pytest.mark.parametrize("experiment", ["probe", "check", "attacker"])
 def test_held_workspace_refuses_another_container_promptly_at_concurrency_one(tmp_path, monkeypatch, credentials, experiment):
-    """At concurrency one the held workspace fills the run: a fresh experiment is refused at
-    once, never queued behind the workspace, and admitted after the workspace is removed."""
+    """At concurrency one the held workspace fills the run and is the only container in flight, so nothing can make
+    room: a fresh experiment is refused at once, saying why, never queued behind the workspace, and admitted after the
+    workspace is removed."""
     from nudi import inspector
 
     Sandboxes(monkeypatch)
@@ -5147,7 +5193,8 @@ def test_held_workspace_refuses_another_container_promptly_at_concurrency_one(tm
 
     async def main():
         async with inspector.investigation(run, "hack-broad", "Inspect the copied package.", {}):
-            with pytest.raises(run_state.CapacityUnavailable):
+            whose = "the one held workspace" if experiment == "attacker" else "its own workspace"
+            with pytest.raises(run_state.CapacityUnavailable, match=f"cannot fit beside {whose} and is refused"):
                 await asyncio.wait_for(start(), 5)
         await start()
 
@@ -5158,7 +5205,9 @@ def test_held_workspace_refuses_another_container_promptly_at_concurrency_one(tm
     assert (native, later) == ((["0000-attacker"], []) if experiment == "attacker" else ([], ["sandbox-0001"]))
 
 
-def test_workspace_and_one_experiment_fill_concurrency_two_without_overcommit(tmp_path, monkeypatch, credentials):
+def test_a_blocked_native_episode_starts_after_a_sandbox_is_removed_without_overcommit(tmp_path, monkeypatch, credentials):
+    """A workspace and one experiment fill concurrency two. Another container waits rather than being refused, and
+    starts once the experiment's sandbox is removed."""
     from nudi import inspector
 
     sandboxes = Sandboxes(monkeypatch)
@@ -5166,20 +5215,24 @@ def test_workspace_and_one_experiment_fill_concurrency_two_without_overcommit(tm
     run = new_run(tmp_path, monkeypatch, credentials, capacity=(3, 1200))
     assert run.record.capacity.concurrency == 2
 
+    async def probe():
+        async with inspector_sandbox.sandbox(run, "probe"):
+            assert len(sandboxes.running) == 2
+
     async def main():
         async with inspector.investigation(run, "hack-broad", "Inspect the copied package.", {}):
             async with inspector_sandbox.sandbox(run, "check"):
                 assert len(sandboxes.running) == 2
-                with pytest.raises(run_state.CapacityUnavailable):
-                    await asyncio.wait_for(run_state.run_role_episode(run, "attacker"), 5)
-                with pytest.raises(run_state.CapacityUnavailable):
-                    async with inspector_sandbox.sandbox(run, "probe"):
-                        pass
-            async with inspector_sandbox.sandbox(run, "probe"):
-                assert len(sandboxes.running) == 2
+                attacker = asyncio.create_task(run_state.run_role_episode(run, "attacker"))
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(probe(), 0.2)
+                assert not attacker.done() and native == [] and run.record.episodes == []
+            await asyncio.wait_for(attacker, 5)
+            await asyncio.wait_for(probe(), 5)
 
     asyncio.run(main())
-    assert native == [] and run.record.episodes == [] and len(run.record.sandboxes) == 3
+    assert native == run.record.episodes == ["0000-attacker"]
+    assert [sandbox_record(run, name)["purpose"] for name in run.record.sandboxes] == ["workspace", "check", "probe"]
 
 
 # The measured exe.dev VM: Docker reports 2 CPUs and 3909 MiB.
@@ -5203,7 +5256,7 @@ def test_workspace_and_one_full_size_experiment_fit_the_measured_two_cpu_vm(tmp_
     """A 1-CPU, 2 GiB task gives concurrency one on the measured VM. The held workspace is
     limited to 512 MiB, so one full-size experiment fits beside it within memory headroom
     and the physical CPUs, with a warning that no CPU headroom remains. Any further
-    container is refused, and the task's declaration and files stay unchanged."""
+    container waits, and the task's declaration and files stay unchanged."""
     sandboxes = Sandboxes(monkeypatch)
     native = recording_native(monkeypatch)
     task = resource_task(tmp_path)
@@ -5211,15 +5264,19 @@ def test_workspace_and_one_full_size_experiment_fit_the_measured_two_cpu_vm(tmp_
     run = new_run(tmp_path, monkeypatch, credentials, capacity=MEASURED_VM, task_dir=task)
     assert (run.record.capacity.concurrency, run.record.capacity.workspace_memory_mb) == (1, 512)
 
+    async def probe():
+        async with inspector_sandbox.sandbox(run, "probe"):
+            pass
+
     async def main():
         async with inspector.investigation(run, "hack-broad", "Inspect the copied package.", {}):
             async with inspector_sandbox.sandbox(run, "check"):
                 assert len(sandboxes.running) == 2
-                with pytest.raises(run_state.CapacityUnavailable):
-                    async with inspector_sandbox.sandbox(run, "probe"):
-                        pass
-                with pytest.raises(run_state.CapacityUnavailable):
-                    await asyncio.wait_for(run_state.run_role_episode(run, "attacker"), 5)
+                # Both wait for the experiment to end; the bound cancels them first.
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(probe(), 0.2)
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(run_state.run_role_episode(run, "attacker"), 0.2)
 
     asyncio.run(main())
     assert native == [] and run.record.episodes == []
@@ -5237,18 +5294,22 @@ def test_workspace_and_one_full_size_experiment_fit_the_measured_two_cpu_vm(tmp_
 
 @pytest.mark.parametrize(("held", "experiment"), [("check", "probe"), ("workspace", "attacker"), ("check", "attacker")])
 def test_cpu_exception_admits_only_a_workspace_and_one_fresh_experiment(tmp_path, monkeypatch, credentials, held, experiment):
+    """Beside one held workspace nothing can make room, so the container is refused; beside a held check it waits."""
     Sandboxes(monkeypatch)
     native = recording_native(monkeypatch)
     run = new_run(tmp_path, monkeypatch, credentials, capacity=MEASURED_VM, task_dir=resource_task(tmp_path))
 
+    async def start():
+        if experiment == "attacker":
+            await run_state.run_role_episode(run, "attacker")
+        else:
+            async with inspector_sandbox.sandbox(run, experiment):
+                pass
+
     async def main():
         async with inspector_sandbox.sandbox(run, held):
-            with pytest.raises(run_state.CapacityUnavailable):
-                if experiment == "attacker":
-                    await asyncio.wait_for(run_state.run_role_episode(run, "attacker"), 5)
-                else:
-                    async with inspector_sandbox.sandbox(run, experiment):
-                        pass
+            with pytest.raises(run_state.CapacityUnavailable if held == "workspace" else TimeoutError):
+                await asyncio.wait_for(start(), 0.2 if held == "check" else 5)
 
     asyncio.run(main())
     assert native == [] and len(run.record.sandboxes) == 1
@@ -5280,12 +5341,15 @@ def test_undeclared_resources_admit_only_the_workspace_pair_with_a_warning(tmp_p
     run = new_run(tmp_path, monkeypatch, credentials, capacity=(8, 16384), task_dir=resource_task(tmp_path, environment))
     assert run.record.capacity.concurrency == 1
 
+    async def probe():
+        async with inspector_sandbox.sandbox(run, "probe"):
+            pass
+
     async def main():
         async with inspector_sandbox.sandbox(run, "workspace"):
             async with inspector_sandbox.sandbox(run, "check"):
-                with pytest.raises(run_state.CapacityUnavailable):
-                    async with inspector_sandbox.sandbox(run, "probe"):
-                        pass
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(probe(), 0.2)
 
     asyncio.run(main())
     assert run.record.sandboxes == ["sandbox-0000", "sandbox-0001"]
@@ -5341,10 +5405,11 @@ def test_cancelled_workspace_and_experiment_release_both_containers(tmp_path, mo
     assert all(record["cleanup"]["removed"] is True for record in records)
 
 
-def test_native_episode_in_flight_refuses_the_workspace_promptly_at_concurrency_one(tmp_path, monkeypatch, credentials):
+def test_a_workspace_waits_for_the_native_episode_in_flight_at_concurrency_one(tmp_path, monkeypatch, credentials):
     from nudi import inspector
 
     sandboxes = Sandboxes(monkeypatch)
+    monkeypatch.setattr(run_state, "ADMISSION_POLL", 0.01)
     run = new_run(tmp_path, monkeypatch, credentials, capacity=(2, 1024))
 
     async def main():
@@ -5363,11 +5428,12 @@ def test_native_episode_in_flight_refuses_the_workspace_promptly_at_concurrency_
 
         running = asyncio.create_task(run_state.run_role_episode(run, "attacker"))
         await started.wait()
-        with pytest.raises(run_state.CapacityUnavailable):
-            await asyncio.wait_for(enter(), 5)
+        entering = asyncio.create_task(enter())
+        done, _ = await asyncio.wait({entering}, timeout=0.2)
+        assert not done and run.record.sandboxes == []
         release.set()
-        await running
-        await enter()
+        await asyncio.wait_for(running, 5)
+        await asyncio.wait_for(entering, 5)
 
     asyncio.run(main())
     assert run.record.episodes == ["0000-attacker"] and len(run.record.sandboxes) == 1 and sandboxes.running == set()

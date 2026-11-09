@@ -262,20 +262,24 @@ def test_backend_and_concurrency_come_from_the_cli_the_api_and_the_file(tmp_path
 
 
 def test_docker_admission_also_respects_the_concurrency_setting(tmp_path, monkeypatch, credentials):
-    """Docker's capacity fits seven episodes; a setting of one caps the queue and the containers."""
+    """Docker's capacity fits seven episodes; a setting of one caps the queue and the containers: the second waits for
+    the first to end, and the bound cancels it first."""
     Sandboxes(monkeypatch)
 
-    async def nested(run):
+    async def probe(run):
+        async with inspector_sandbox.sandbox(run, "probe"):
+            pass
+
+    async def nested(run, bound):
         async with inspector_sandbox.sandbox(run, "check"):
-            async with inspector_sandbox.sandbox(run, "probe"):
-                pass
+            await asyncio.wait_for(probe(run), bound)
 
     free = new_run(tmp_path, monkeypatch, credentials, name="free", capacity=(8, 16384))
-    asyncio.run(nested(free))
+    asyncio.run(nested(free, 5))
     capped = new_run(tmp_path, monkeypatch, credentials, name="capped", capacity=(8, 16384), concurrency=1)
     assert (free.record.capacity.concurrency, capped.record.capacity.concurrency) == (7, 1)
-    with pytest.raises(run_state.CapacityUnavailable, match="concurrency of 1"):
-        asyncio.run(nested(capped))
+    with pytest.raises(TimeoutError):
+        asyncio.run(nested(capped, 0.2))
     assert (len(free.record.sandboxes), len(capped.record.sandboxes)) == (2, 1)
 
 
@@ -403,7 +407,7 @@ def test_modal_sandbox_has_hard_limits_and_verified_removal(tmp_path, monkeypatc
     assert len(warnings) == (0 if removed else 1) and all("24 h" in warning for warning in warnings)
     if not removed:
         with pytest.raises(run_state.InfrastructureAbort, match="unverified"):
-            run.admit_container("probe")
+            asyncio.run(run.admit_container("probe"))
     report.write(run.config.output_dir, (), ["simulation"])
     assert_no_modal_credential(run.config.output_dir)
 
@@ -613,18 +617,21 @@ def test_modal_admission_counts_containers_against_concurrency(tmp_path, monkeyp
     Modal(monkeypatch)
     run = modal_run(tmp_path, monkeypatch, concurrency=2)
 
+    async def start(purpose):
+        async with inspector_sandbox.sandbox(run, purpose):
+            pass
+
     async def main():
+        # A third container waits for one to end; the bound cancels it first.
         async with inspector_sandbox.sandbox(run, "check"):
             async with inspector_sandbox.sandbox(run, "probe"):
-                with pytest.raises(run_state.CapacityUnavailable, match="concurrency of 2"):
-                    async with inspector_sandbox.sandbox(run, "probe"):
-                        pass
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(start("probe"), 0.2)
         run.record.capacity = run.record.capacity.model_copy(update={"concurrency_setting": 1})
         async with inspector_sandbox.sandbox(run, "workspace"):
             async with inspector_sandbox.sandbox(run, "probe"):
-                with pytest.raises(run_state.CapacityUnavailable, match="concurrency of 1"):
-                    async with inspector_sandbox.sandbox(run, "check"):
-                        pass
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(start("check"), 0.2)
 
     asyncio.run(main())
     assert len(run.record.sandboxes) == 4

@@ -1,12 +1,13 @@
 """The public workflow. `send_nudis`, `send_nudis_async` and `nudi send-nudis` share this
 one implementation over the existing analyses.
 
-Full analysis runs two pieces. The first, the hack phase, is the hack inspector with the attack beside it: its no-hint
-attempts start at once, and each problem the hack inspector evidences is attacked as soon as it is. A judge, one call of
-the inspector model, names the problem of each evidenced finding as it is recorded. The second piece is the Simulator, the
-grader inspector and the attack of each new problem the grader inspector found. `simulation` runs the Simulator and the
-grader inspector only, `hacking` the first piece only. A failed analysis is recorded and the independent ones still run,
-unless a task environment cannot start: then none runs after it.
+Full analysis starts the Simulator, the hack inspector and the attack together, all sharing one set of slots. The attack's
+no-hint attempts start at once. The grader inspector starts when the simulation ends, with the hack findings saved so far.
+A judge, one call of the inspector model, names the problem of each evidenced finding of either inspector as it is
+recorded, and a problem's first evidenced finding with full guidance is attacked as soon as it is. The attack ends after
+both inspections and its attempts have. `simulation` runs the Simulator and the grader inspector only, `hacking` the hack
+inspector and the attack only. A failed analysis is recorded and the others still run, unless a task environment cannot
+start or the disk is full: then every other analysis stops.
 The report covers the selected analyses only, and resolved credentials never reach it.
 `attack_from` runs only the attack again, on an earlier run's inspections.
 """
@@ -42,8 +43,7 @@ from nudi.run_state import (ORIGINAL_BEHAVIOR, BackendUnavailable, CapacityError
                             simulate, start_run)
 
 Analysis = Literal["full", "simulation", "hacking"]
-# The hack inspector first, so the grader inspector reads its findings; the attack last, so it attacks the grader's new problems.
-# The hack phase runs its own attack beside the hack inspector and ends only after it (`run_analyses`).
+# Each analysis's steps, in the order the report lists them; `run_analyses` starts each when what it reads exists.
 SELECTED = {"full": ("hack", "simulation", "grader", "attack"), "simulation": ("simulation", "grader"),
             "hacking": ("hack", "attack")}
 # Each step's name on stderr, and what it produced: its counts and the words that show them.
@@ -62,8 +62,7 @@ PHASES = {
     "simulation": ("Simulator", "{episodes} of {requested} episodes",
                    lambda result: {"episodes": len(result.episodes), "requested": result.requested}),
     "grader": ("grader inspector", *INSPECTED),
-    # Its Attackers' attempts are those of the attack beside it, counted from attack.json (`run_analyses`).
-    "hack": ("hack inspector and its Attackers", "{experiments}, {attacker_attempts}", INSPECTED[1]),
+    "hack": ("hack inspector", *INSPECTED),
     "attack": ("attack", "{attempts}, {found}", attacked),
 }
 # A step's status in the words of its line on stderr; its event keeps the status, and a complete step adds none.
@@ -72,7 +71,7 @@ ENDED = {"partial": "some results unclear", "not run": "nothing to attack", "can
 
 
 # The noun of each count that PHASES' words name bare.
-COUNTED = {"experiments": "experiment", "assessments": "assessment", "attacker_attempts": "Attacker attempt", "attempts": "attempt"}
+COUNTED = {"experiments": "experiment", "assessments": "assessment", "attempts": "attempt"}
 
 
 def counted(number: int, noun: str) -> str:
@@ -143,7 +142,7 @@ def _supplied(value: str | None) -> str | None:
     return None
 
 
-def guidance(hack: InspectionResult | None, grader: InspectionResult | None = None) -> dict:
+def guidance(hack: InspectionResult | None = None, grader: InspectionResult | None = None) -> dict:
     """One candidate per evidenced or suspected hack finding, and per evidenced grader finding, accepted invalid or
     rejected valid, composed without a model call. `hack-N` is the hack inspector's assessment N, `grader-N` the grader inspector's.
 
@@ -199,12 +198,14 @@ def assessment_of(inspections: dict, item: Candidate) -> Assessment:
 
 def hack_context(run, hack: InspectionResult | None) -> dict | None:
     """The grader inspector's read-only view of the hack candidate findings: each one's id, category, outcome,
-    mechanism and where to look, never its full guidance, and whether that hack inspection completed. After a hack
-    phase that raised, the findings its `inspection-hack.json` saved before the error, from a `failed` hack inspection.
+    mechanism and where to look, never its full guidance, and whether that hack inspection completed. While the hack
+    inspection still runs, the findings its `inspection-hack.json` saved so far, from a `running` one; after one that
+    raised, those it saved before the error, from a `failed` one.
     None without a finding, so the grader inspector then runs as without a hack inspection."""
     saved, status = run.config.output_dir / "inspection-hack.json", None
     if hack is None and saved.is_file():
-        hack, status = InspectionResult.model_validate_json(saved.read_text()), "failed"
+        hack = InspectionResult.model_validate_json(saved.read_text())
+        status = "running" if hack.status == "running" else "failed"
     found = guidance(hack)["candidates"]
     if not found:
         return None
@@ -432,18 +433,19 @@ HEARTBEAT = 15 * 60
 STOP_WAIT = 30
 
 
-async def wait_stopping(run, work: asyncio.Future, name: str) -> None:
-    """Wait for `work` at most `STOP_WAIT` seconds, also through a further cancellation; work still running then is a
-    warning and is left."""
+async def wait_stopping(run, work: dict[str, asyncio.Future]) -> None:
+    """Wait for each named piece of `work` at most `STOP_WAIT` seconds in all, also through a further cancellation; each
+    one still running then is a warning and is left."""
     end = time.monotonic() + STOP_WAIT
-    while not work.done() and time.monotonic() < end:
+    while (left := {item for item in work.values() if not item.done()}) and time.monotonic() < end:
         try:
-            await asyncio.wait({work}, timeout=end - time.monotonic())
+            await asyncio.wait(left, timeout=end - time.monotonic())
         except asyncio.CancelledError:
             pass  # The stop under way already ends the run.
-    if not work.done():
-        run.record.warnings.append(f"{name} was still running {STOP_WAIT:g} seconds after the stop and was left; a Modal "
-                                   "sandbox it holds ends at its lifetime, a Docker container stays until removed")
+    for name, item in work.items():
+        if not item.done():
+            run.record.warnings.append(f"{name} was still running {STOP_WAIT:g} seconds after the stop and was left; a Modal "
+                                       "sandbox it holds ends at its lifetime, a Docker container stays until removed")
 
 
 async def heartbeat(run, started: float) -> None:
@@ -466,11 +468,17 @@ async def heartbeat(run, started: float) -> None:
 
 
 async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -> dict:
-    """Run the `selected` analyses in order, except those already in `results`, write the report after cleanup, and
-    return it."""
+    """Run the `selected` analyses, except those already in `results`, each as soon as what it reads exists, write the
+    report after cleanup, and return it. The Simulator, the hack inspector and the attack start at once; the grader
+    inspector starts when the simulation has ended. A task environment that cannot start, or a full disk, in one analysis
+    stops the others."""
 
     problems = []
     judge = judging(run, problems)
+    # One set of slots for the run: each Simulator episode, inspector session and Attacker attempt holds one.
+    gate = asyncio.Semaphore(at_once(run))
+    # The attack's one feed of candidates, a problem's first evidenced finding with full guidance, until None.
+    feed, queued = asyncio.Queue(), set()
 
     async def exploit(attempt, assessment, case) -> str:
         check = next((check for check in run.record.checks if check.id == assessment.claim.check), None)
@@ -493,53 +501,33 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
             event(run, "reproduced", f"{SOURCES[inspector][1]} found {problem.id}", problem=problem.id, result="evidenced")
         return problem
 
-    async def hack():
-        """The hack inspector, with the attack beside it sharing its slots: its no-hint attempts start at once, and a
-        problem's first evidenced finding with full guidance starts its attack as soon as it is recorded. Ends when both have."""
-        feed, queued, gate = asyncio.Queue(), set(), asyncio.Semaphore(at_once(run))
+    def attack_on(item, problem) -> None:
+        """Feed a problem's first finding with full guidance to the attack."""
+        if problem.id not in queued and item.guidance["full"]:
+            queued.add(problem.id)
+            feed.put_nowait(item)
 
-        async def found(report, index):
+    def found(inspector: str):
+        """`inspector`'s evidence hook while the attack runs: each evidenced reading is judged as it is recorded."""
+        if "attack" not in phases:
+            return None
+
+        async def hook(report, index):
             # A control's reading is no candidate, so it makes no problem.
-            item = next((item for item in guidance(report)["candidates"] if item.id == f"hack-{index}"), None)
-            problem = item and await evidence("hack", report, item)
-            if problem and problem.id not in queued and item.guidance["full"]:
-                queued.add(problem.id)
-                feed.put_nowait(item)
+            item = next((item for item in guidance(**{inspector: report})["candidates"] if item.id == f"{inspector}-{index}"), None)
+            if item:
+                attack_on(item, await evidence(inspector, report, item))
 
-        async def beside():
-            try:
-                await attack(run, maximum_attempts=settings.attacker_tries, discovery_attempts=settings.discovery_attempts, feed=feed,
-                             gate=gate, problems=problems, judge=exploit, deadline=limit.when(), minimal_hints=settings.minimal_hints)
-            except asyncio.CancelledError:
-                pass  # Its record says so; the hack phase's stop goes on.
-            except Exception as error:
-                run.record.failed_phases.append("attack")
-                run.warn(f"the attack during the hack inspection stopped: {type(error).__name__}: {redacted(run, str(error))}")
+        return hook
 
-        attacking = asyncio.create_task(beside())
-        try:
-            report = await inspect_hacks(run, focused_attempts=settings.focused_attempts, on_evidence=found, gate=gate)
-            # Nothing new starts; running attempts end before the hack phase does.
-            feed.put_nowait(None)
-            await asyncio.wait({attacking})
-            return report
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            attacking.cancel()  # A stop, also during that wait, ends them now.
-            raise
-        finally:
-            feed.put_nowait(None)
-            await finish_cleanup(attacking)
-
-    async def attack_problems():
-        """Each grader finding, and each hack finding no problem holds, as in a rerun of a run from before problems were
-        judged, is judged against every problem. Each evidenced problem no attempt tried is attacked with its first
-        finding, the first with full guidance when there is one, continuing the hack phase's attack. A rerun starts from
-        the earlier run's judged problems that were evidenced or that an Attacker found, each with that run and the least
-        information an Attacker exploited it with there; their judgements and evidence its log repeats. It copies no attack record."""
-        saved, before = run.config.output_dir / "attack.json", settings.attack_from and settings.attack_from / "attack.json"
-        earlier = AttackResult.model_validate_json(saved.read_text()) if saved.is_file() else None
-        carried.append(len(earlier.attempts) if earlier else 0)
-        if before and before.is_file() and not problems:
+    async def earlier_targets():
+        """A rerun's targets in the feed. Each grader finding, and each hack finding no problem holds, as in a rerun of a
+        run from before problems were judged, is judged against every problem. Each evidenced problem is attacked with its
+        first finding with full guidance. A rerun starts from the earlier run's judged problems that were evidenced or that
+        an Attacker found, each with that run and the least information an Attacker exploited it with there; their
+        judgements and evidence its log repeats. It copies no attack record."""
+        before = settings.attack_from / "attack.json"
+        if before.is_file():
             older = AttackResult.model_validate_json(before.read_text())
             problems.extend(item.model_copy(update={"origin": str(settings.attack_from), "earlier_exploited_with": report.exploited_with(item, older, set())})
                             for item in older.problems if item.id and (item.evidence == "evidenced" or any(name.endswith("-attacker") for name in item.members)))
@@ -556,91 +544,129 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
             if item.outcome != "unknown" and not any(item.id in problem.findings for problem in problems):
                 inspector = item.id.split("-")[0]
                 await evidence(inspector, results.get(inspector), item)
-        tried = {attempt.problem for attempt in earlier.attempts if attempt.level != "none"} if earlier else set()
-        by_id, targets = {item.id: item for item in candidates}, []
+        by_id = {item.id: item for item in candidates}
         for problem in problems:
-            members = [by_id[name] for name in problem.findings if name in by_id]
-            if members and problem.evidence == "evidenced" and problem.id not in tried:
-                targets.append(next((item for item in members if item.guidance["full"]), members[0]))
-        return await attack(run, maximum_attempts=settings.attacker_tries, discovery_attempts=settings.discovery_attempts,
-                            candidates=targets, problems=problems, judge=exploit, deadline=limit.when(),
-                            minimal_hints=settings.minimal_hints, earlier=earlier)
+            if problem.evidence == "evidenced":
+                for name in problem.findings:
+                    if name in by_id:
+                        attack_on(by_id[name], problem)
 
-    carried = []  # The attempts the attack continues from the hack phase.
+    async def closing():
+        """None in the feed once the inspections that feed it have ended."""
+        if inspections := {tasks[name] for name in ("hack", "grader") if name in tasks}:
+            await asyncio.wait(inspections)
+        feed.put_nowait(None)
+
+    async def attacking():
+        if settings.attack_from:
+            await earlier_targets()
+        closed = asyncio.create_task(closing())
+        try:
+            return await attack(run, maximum_attempts=settings.attacker_tries, discovery_attempts=settings.discovery_attempts, feed=feed,
+                                gate=gate, problems=problems, judge=exploit, deadline=limit.when(), minimal_hints=settings.minimal_hints)
+        finally:
+            closed.cancel()
+
     steps = {
-        "simulation": lambda: simulate(run, settings.episodes),
+        "simulation": lambda: simulate(run, settings.episodes, gate=gate),
         "grader": lambda: inspect_grader(run, run.record.simulation.episodes if run.record.simulation else [],
-                                         focused_attempts=settings.focused_attempts,
-                                         isolated_inspections=settings.isolated_inspections, request=hack_context(run, results.get("hack"))),
-        "hack": hack,
-        "attack": attack_problems,
+                                         focused_attempts=settings.focused_attempts, isolated_inspections=settings.isolated_inspections,
+                                         request=hack_context(run, results.get("hack")), gate=gate, on_evidence=found("grader")),
+        "hack": lambda: inspect_hacks(run, focused_attempts=settings.focused_attempts, on_evidence=found("hack"), gate=gate),
+        "attack": attacking,
     }
-    # A rerun of the attack has the earlier results already, and runs no earlier analysis that failed. The hacking
-    # analysis reports the attack its hack phase ran.
-    phases = [name for name in selected if name not in results and name not in run.record.failed_phases
-              and not (name == "attack" and settings.analysis == "hacking" and not settings.attack_from)]
+    begun = {}  # Each started analysis's start on the monotonic clock.
+
+    async def step(name):
+        """One analysis with its events; its result goes in `results`. A task environment that cannot start and a full
+        disk raise, so the others stop; another error fails this analysis only."""
+        if name == "grader" and "simulation" in tasks:
+            await asyncio.wait({tasks["simulation"]})  # The grader inspector reads the Simulator's episodes.
+        phase, _, produced = PHASES[name]
+        started = begun[name] = time.monotonic()
+        event(run, "phase_start", f"{phase} started", phase=name, **({"slots": at_once(run)} if name == "hack" else {}))
+        try:
+            results[name] = await steps[name]()
+            took, counts, status = elapsed(started), produced(results[name]), results[name].status
+            ended = "some episodes have no reward" if (name, status) == ("simulation", "partial") else ENDED.get(status, status)
+            event(run, "phase_end", f"{phase} done after {took}: {phase_words(name, counts)}" + f"; {ended}" * (status != "complete"),
+                  phase=name, elapsed=took, status=status, **counts)
+            # An inspection or attack that returned ran to its end, also with evidence left unresolved (`partial`)
+            # or nothing it could attack (`not run`); a stop such as the spending cap, or episodes without a reward, did not.
+            if status not in (("complete",) if name == "simulation" else ("complete", "partial", "not run")):
+                run.record.failed_phases.append(name)
+        except DiskFull as error:
+            run.record.warnings.append(f"{name} stopped: {error}")
+            run.record.failed_phases.append(name)
+            raise
+        except EnvironmentUnavailable as error:
+            reason, took = redacted(run, str(error)), elapsed(started)
+            run.record.warnings.append(f"{name} stopped: {reason}")
+            run.record.failed_phases.append(name)
+            event(run, "phase_end", f"{phase} stopped after {took}: {reason}", logging.WARNING,
+                  phase=name, elapsed=took, status="stopped", error=reason)
+            raise
+        except Exception as error:
+            failure, took = f"{name} failed: {type(error).__name__}: {redacted(run, str(error))}", elapsed(started)
+            run.record.warnings.append(failure)
+            run.record.failed_phases.append(name)
+            event(run, "phase_end", f"{phase} ended after {took}: {failure}", logging.WARNING,
+                  phase=name, elapsed=took, status="failed", error=failure)
+
+    def running() -> list[str]:
+        """The started analyses that have not ended, in the report's order; one that a stop ended has not."""
+        return [name for name in phases if name in begun and (not tasks[name].done() or tasks[name].cancelled()
+                                                             or isinstance(tasks[name].exception(), KeyboardInterrupt))]
+
+    def stopped():
+        """What one analysis raised to stop the run: a cancellation, a task environment that cannot start or a full disk."""
+        ended = [task for task in tasks.values() if task.done()]
+        return next((asyncio.CancelledError() if task.cancelled() else task.exception() for task in ended
+                     if task.cancelled() or task.exception()), None)
+
+    # A rerun of the attack has the earlier results already, and runs no earlier analysis that failed.
+    phases = [name for name in selected if name not in results and name not in run.record.failed_phases]
+    tasks = {}
     beating, stopping = asyncio.create_task(heartbeat(run, time.monotonic())), False
     try:
         # The time limit cancels the run as Ctrl-C does, so it stops and cleans up the same way.
         async with asyncio.timeout(settings.time_limit and settings.time_limit * 60) as limit:
             run.time_limit = settings.time_limit and (limit.when(), settings.time_limit * 60)
-            for name in phases:
-                phase, _, produced = PHASES[name]
-                started = time.monotonic()
-                event(run, "phase_start", f"{phase} started", phase=name, **({"slots": at_once(run)} if name == "hack" else {}))
-                work = asyncio.ensure_future(steps[name]())
-                try:
-                    # Shielded, so a stop reaches this task at once and waits for the cancelled phase with a bound.
-                    results[name] = await asyncio.shield(work)
-                    took, counts, status = elapsed(started), produced(results[name]), results[name].status
-                    ended = "some episodes have no reward" if (name, status) == ("simulation", "partial") else ENDED.get(status, status)
-                    if name == "hack":
-                        saved = run.config.output_dir / "attack.json"
-                        counts["attacker_attempts"] = len(AttackResult.model_validate_json(saved.read_text()).attempts) if saved.is_file() else 0
-                    said = phase_words(name, counts)
-                    if name == "attack" and carried and carried[0]:
-                        # The attack continues the hack phase's: its status and counts include those attempts.
-                        counts["new_attempts"] = new = counts["attempts"] - carried[0]
-                        said = f"{new} new attempt{'s' * (new != 1)}, {counts['attempts']} in all, {found(counts)}" if new else "nothing new to attack"
-                        if not new and status == "partial":
-                            ended = f"the {carried[0]} attempt{'s' * (carried[0] != 1)} during the hack inspection left some results unclear"
-                    event(run, "phase_end", f"{phase} done after {took}: {said}" + f"; {ended}" * (status != "complete"),
-                          phase=name, elapsed=took, status=status, **counts)
-                    # An inspection or attack that returned ran to its end, also with evidence left unresolved (`partial`)
-                    # or nothing it could attack (`not run`); a stop such as the spending cap, or episodes without a reward, did not.
-                    if results[name].status not in (("complete",) if name == "simulation" else ("complete", "partial", "not run")):
-                        run.record.failed_phases.append(name)
-                # A caller's own loop may raise a second Ctrl-C as KeyboardInterrupt, past a CancelledError handler.
-                except (asyncio.CancelledError, KeyboardInterrupt):
-                    stopping = True
-                    work.cancel()
-                    await wait_stopping(run, work, name)
-                    if limit.expired():
-                        stopped = f"the run stopped at its time limit of {settings.time_limit:g} minutes during {name}"
-                        run.record.warnings.append(stopped)
-                        event(run, "time_limit", stopped, phase=name, minutes=settings.time_limit)
-                    else:
-                        # Recorded without a stderr line: the command prints one cancellation message.
-                        terminated = stopped_by() == "terminated"
-                        run.record.warnings.append(f"{'stopped by a termination signal' if terminated else 'cancelled'} during {name}")
-                    raise
-                except DiskFull as error:
-                    run.record.warnings.append(f"{name} stopped: {error}")
-                    run.record.failed_phases.append(name)
-                    raise
-                except EnvironmentUnavailable as error:
-                    reason, took = redacted(run, str(error)), elapsed(started)
-                    run.record.warnings.append(f"{name} stopped: {reason}")
-                    run.record.failed_phases.append(name)
-                    event(run, "phase_end", f"{phase} stopped after {took}: {reason}", logging.WARNING,
-                          phase=name, elapsed=took, status="stopped", error=reason)
-                    break
-                except Exception as error:
-                    failure, took = f"{name} failed: {type(error).__name__}: {redacted(run, str(error))}", elapsed(started)
-                    run.record.warnings.append(failure)
-                    run.record.failed_phases.append(name)
-                    event(run, "phase_end", f"{phase} ended after {took}: {failure}", logging.WARNING,
-                          phase=name, elapsed=took, status="failed", error=failure)
+            tasks.update({name: asyncio.create_task(step(name)) for name in phases})
+            try:
+                # Each analysis ends on its own; a stop reaches this task at once and waits for them with a bound.
+                while not (stop := stopped()) and not all(task.done() for task in tasks.values()):
+                    await asyncio.wait({task for task in tasks.values() if not task.done()}, return_when=asyncio.FIRST_COMPLETED)
+                if isinstance(stop, asyncio.CancelledError):
+                    raise stop
+            # A caller's own loop may raise a second Ctrl-C as KeyboardInterrupt, past a CancelledError handler.
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                stopping, names = True, running()
+                during = " and ".join(names) or "the start"
+                for task in tasks.values():
+                    task.cancel()
+                await wait_stopping(run, {name: tasks[name] for name in names})
+                if limit.expired():
+                    said = f"the run stopped at its time limit of {settings.time_limit:g} minutes during {during}"
+                    run.record.warnings.append(said)
+                    event(run, "time_limit", said, phases=names, minutes=settings.time_limit)
+                else:
+                    # Recorded without a stderr line: the command prints one cancellation message.
+                    terminated = stopped_by() == "terminated"
+                    run.record.warnings.append(f"{'stopped by a termination signal' if terminated else 'cancelled'} during {during}")
+                raise
+            if stop:
+                # Another analysis's task environment cannot start either, and a full disk stops the run.
+                stopping, others = True, running()
+                for task in tasks.values():
+                    task.cancel()
+                await wait_stopping(run, {name: tasks[name] for name in others})
+                for name in others:
+                    took = elapsed(begun[name])
+                    event(run, "phase_end", f"{PHASES[name][0]} stopped after {took}: another analysis stopped the run", logging.WARNING,
+                          phase=name, elapsed=took, status="cancelled")
+                if not isinstance(stop, EnvironmentUnavailable):
+                    raise stop
         # A phase that caught the limit's cancellation and returned ends the block normally.
         run.record.time_limit_reached = limit.expired()
     except TimeoutError:
@@ -650,17 +676,9 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
         beating.cancel()
         try:
             deleting = asyncio.create_task(copies.delete(run))
-            await (wait_stopping(run, deleting, "the deletion of state copies") if stopping else finish_cleanup(deleting))
+            await (wait_stopping(run, {"the deletion of state copies": deleting}) if stopping else finish_cleanup(deleting))
         finally:
             try:
-                saved = settings.output_dir / "attack.json"
-                # The hack phase's attack alone, without the attack phase that continues it, is unfinished: the run
-                # stopped before that phase. An attack phase that raised is already a failed phase.
-                if "attack" in phases and "attack" not in results and saved.is_file():
-                    unfinished = AttackResult.model_validate_json(saved.read_text())
-                    if unfinished.status in ("complete", "partial", "not run"):
-                        unfinished.status = "partial" if "attack" in run.record.failed_phases else "cancelled"
-                        write_private(saved, unfinished.model_dump_json(indent=2))
                 run.record.ended_at = datetime.now(timezone.utc).isoformat()
                 run.save()
             finally:

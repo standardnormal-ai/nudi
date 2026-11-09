@@ -292,7 +292,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                  minimal: str | None = None, unavailable_reasons: dict[str, str] | None = None,
                  candidates: list[Candidate] | None = None, problems: list[Problem] | None = None,
                  deadline: float | None = None, minimal_hints: bool = True, feed: asyncio.Queue | None = None,
-                 gate: asyncio.Semaphore | None = None, earlier: AttackResult | None = None, judge=None) -> AttackResult:
+                 gate: asyncio.Semaphore | None = None, judge=None) -> AttackResult:
     """Reproduce each candidate and search the environment with no hint.
 
     `discovery_attempts` is the total no-hint attempts, default one. `maximum_attempts` is the
@@ -331,11 +331,11 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
     Without `minimal_hints` neither the minimal hint level nor the aimed no-hint level is attempted, and their
     conditions are `not_requested`.
 
-    With `feed` the attack runs beside the hack inspector: it takes candidates from the queue until None, every attempt
-    holding a slot of `gate`, which the hack inspector's sessions share. The closed feed adds no candidate; planned attempts
-    still run. It deletes no copy and saves nothing before its first attempt or problem. With `earlier`, that result, the
-    attack continues it: its candidates, attempts and discovery come first and get no new attempt, except the no-hint
-    attempts it has not run yet.
+    With `feed` the attack runs beside the inspections: it takes candidates from the queue until None, which adds no
+    candidate; planned attempts still run. With `gate` every attempt holds one of its slots, which other work shares.
+
+    An attempt's own copies, of its Attacker episode and of its attack inspector's experiments, are deleted when it ends,
+    unless it was cancelled; no other session reads them (`copies`).
     """
     from nudi.run_state import SpendingCapReached, elapsed, event, notice, run_role_episode
 
@@ -369,11 +369,6 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
     # mechanism, so exact duplicates still do.
     causes = {finding: problem.cause for problem in result.problems for finding in problem.findings}
     candidate_groups = _candidate_groups(result.candidates, causes)
-    if earlier:
-        copied = earlier.model_copy(deep=True)
-        result.candidates = copied.candidates + result.candidates
-        result.attempts, result.assessments, result.findings, result.limits, result.discovery = (
-            copied.attempts, copied.assessments, copied.findings, copied.limits, copied.discovery)
 
     # The case of each check the attack inspector measured, for the judge.
     cases = {}
@@ -420,15 +415,6 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
         for item in members:
             item.conditions[level] = settle(item.conditions.get(level, "unattempted"), status)
 
-    hinted = maximum_attempts > 0 and any(item.conditions["full"] != "unavailable" for item in result.candidates)
-    if feed is None and earlier is None and discovery_attempts == 0 and not hinted:
-        # Nothing requested is complete; requested attempts that no candidate's guidance allowed are not run.
-        prevented = maximum_attempts > 0 and bool(result.candidates)
-        result.status = "not run" if prevented else "complete"
-        result.limits.append(UNGUIDED_LIMIT if prevented else DISABLED_LIMIT)
-        save()
-        return result
-
     def instruction_for(level: str, text: str | None, valid_work: bool) -> str:
         if level == "none":
             detail = "No extra hint. " + HACK_CHECKLIST
@@ -438,11 +424,8 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
             detail = "The hint marks where one specific flaw is; only an exploit of that flaw counts.\nHint:\n" + (text or "")
         return (VALID_WORK_INSTRUCTION if valid_work else EXPLOIT_INSTRUCTION) + "\n" + detail
 
-    # Each attempt's place in the plan, earlier ones first, and the attempt of each assessment. An earlier record lists each
-    # attempt's assessments together, ending at its `assessment`.
-    positions = [-1] * len(result.attempts)
-    owners = [next(number for number, item in enumerate(result.attempts) if item.assessment is not None and item.assessment >= index)
-              for index in range(len(result.assessments))]
+    # Each attempt's place in the plan, and the attempt of each assessment.
+    positions, owners = [], []
 
     def retain(attempt: AttackAttempt, index: int, assessment: Assessment) -> None:
         """Retain one interpreted result of attempt `index`; every reading stays in the record."""
@@ -521,11 +504,8 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
         result.attempts.append(attempt)
         positions.append(position)
         save()
+        own = set()  # The episodes and sandboxes whose copies are this attempt's.
         try:
-            # The attack phase reads only each attempt's own copies, so those of ended attempts go now (`copies`).
-            # Inside the try, so a cancel during the deletion marks this attempt cancelled.
-            if feed is None:
-                await copies.discard(run, {item.episode for item in result.attempts if item.status == "running" and item.episode})
             run.check_cap()
             # Other attempts' failed starts can trip the latch before their attempts end and stop the attack.
             # The native episode builds the same task environments, so it does not start.
@@ -541,7 +521,10 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                 mark(level, members, "insufficient_time")
                 save()
                 return
+            # Admitted first, so no other episode can take this name while the admission waits for room.
+            await run.admit_container("native")
             name = f"{len(run.record.episodes):04d}-attacker"
+            own.add(name)
             attempt.episode = name
             save()
             started, attempted = time.monotonic(), {"episode": name, "candidate": identity, "level": level, "number": number,
@@ -595,6 +578,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                     request["check_rerun"] = await rerun_check(run, check, name, members[0].source)
                 session = await inspect(run, "attack", [name], 0, ["rejected_valid" if valid_work else "accepted_invalid"],
                                         title=f"attack_inspector-{context}", workspace=found[-1] if found else None, request=request)
+                own.update(row["episode"] for row in session.experiments if row.get("episode"))
                 cases.update({row["check"]: {key: row.get(key) for key in ("category", "location", "capture_point")}
                               for row in session.experiments if row.get("check")})
                 # Every interpretation is retained, also one made before the spending cap stopped the session.
@@ -680,6 +664,9 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                     "step_limit": attempt.error}.get(attempt.status, attempt.status)
             event(run, "attempt_result", f"Attacker {attempt.episode or context} result: {said}", episode=attempt.episode,
                   problem=attempt.problem, level=level, number=attempt.number, status=attempt.status)
+            # A stop leaves its copies to the run's end.
+            if own and result.status != "cancelled" and not asyncio.current_task().cancelling():
+                await copies.discard(run, own)
 
     def settled() -> bool:
         needed = []
@@ -692,8 +679,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                           and (before is None or item.conditions[before] == "evidenced_issue"))
         return bool(needed) and all(state in ("evidenced_issue", "no_evidenced_issue") for state in needed)
 
-    done = sum(item.level == "none" and item.candidate is None for item in result.attempts)
-    plan = [(None, ("none", number, [], None)) for number in range(done + 1, discovery_attempts + 1)]
+    plan = [(None, ("none", number, [], None)) for number in range(1, discovery_attempts + 1)]
     for suspected in (False, True):
         for number in range(1, maximum_attempts + 1):
             for group, members in enumerate(candidate_groups):
@@ -751,6 +737,10 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
             raise stops[0]
     except SpendingCapReached:
         pass
+    except (asyncio.CancelledError, KeyboardInterrupt):  # KeyboardInterrupt: a second Ctrl-C
+        if result.status == "running":
+            result.status = "cancelled"
+        raise
     finally:
         for task in {*running, getter} - {None}:
             task.cancel()
@@ -768,8 +758,13 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
             for before, level in (("full", "minimal"), ("minimal", "none")):
                 if item.conditions.get(before) in ("no_evidenced_issue", "not_needed") and item.conditions.get(level) == "unattempted":
                     item.conditions[level] = "not_needed"
+        hinted = maximum_attempts > 0 and any(item.conditions["full"] != "unavailable" for item in result.candidates)
+        if result.status == "running" and discovery_attempts == 0 and not hinted:
+            # Nothing requested is complete; requested attempts that no candidate's guidance allowed are not run.
+            prevented = maximum_attempts > 0 and bool(result.candidates)
+            result.status = "not run" if prevented else "complete"
+            result.limits.append(UNGUIDED_LIMIT if prevented else DISABLED_LIMIT)
         if result.status == "running":
             result.status = "complete" if settled() else "partial"
-        if feed is None or result.attempts or result.problems:
-            save()
+        save()
     return result

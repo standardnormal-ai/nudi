@@ -319,6 +319,36 @@ def consuming(events, started):
     return episode
 
 
+def test_simulate_starts_nothing_while_a_hack_session_holds_the_only_slot(tmp_path, monkeypatch, credentials):
+    """With the run's one slot held by a hack inspector session, no Simulator episode starts; once released, its two
+    workers take the slot in turn, one episode at a time."""
+    run = new_run(tmp_path, monkeypatch, credentials, capacity=(3, 4096))
+    assert run.record.capacity.concurrency == 2
+    started, running, peak = [], [0], [0]
+
+    async def episode(run, role):
+        started.append(role)
+        running[0] += 1
+        peak[0] = max(peak[0], running[0])
+        await asyncio.sleep(0.02)
+        running[0] -= 1
+        return SimpleNamespace(errors=[], rewards={"reward": 1.0})
+
+    monkeypatch.setattr(run_state, "run_role_episode", episode)
+
+    async def main():
+        gate = asyncio.Semaphore(1)
+        async with gate:  # a hack inspector session
+            simulating = asyncio.create_task(run_state.simulate(run, 3, gate=gate))
+            done, _ = await asyncio.wait({simulating}, timeout=0.2)
+            assert not done and started == []
+        return await asyncio.wait_for(simulating, 5)
+
+    simulation = asyncio.run(main())
+    assert simulation.status == "complete" and len(simulation.episodes) == 3
+    assert started == ["simulator"] * 3 and peak == [1]
+
+
 def test_a_worker_whose_cancellation_harbor_consumes_starts_no_episode_after_a_full_disk(tmp_path, monkeypatch, credentials):
     """Such a worker must not go back to its loop and start a third episode."""
     run = new_run(tmp_path, monkeypatch, credentials, capacity=(3, 4096))

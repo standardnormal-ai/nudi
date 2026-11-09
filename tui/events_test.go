@@ -234,3 +234,42 @@ func TestEventNormalizationLeavesOtherTextAlone(t *testing.T) {
 		}
 	}
 }
+
+// Analyses overlap, so a phase's end takes only its own sessions and attempts off the tiles.
+func TestAPhaseEndKeepsTheOtherAnalysesAgents(t *testing.T) {
+	log := ev("00:00", "phase_start", `, "phase": "hack", "slots": 2`) +
+		ev("00:00", "phase_start", `, "phase": "simulation"`) +
+		ev("00:00", "phase_start", `, "phase": "attack"`) +
+		ev("00:01", "attempt_start", `, "episode": "0000-attacker", "candidate": null, "level": "none", "number": 1`) +
+		ev("00:01", "session_start", `, "inspector": "hack", "session": "hack-broad"`) +
+		ev("01:00", "phase_end", `, "phase": "simulation", "status": "complete", "elapsed": 60`) +
+		ev("01:00", "phase_start", `, "phase": "grader"`) +
+		ev("01:01", "session_start", `, "inspector": "grader", "session": "grader-broad"`) +
+		ev("02:00", "phase_end", `, "phase": "hack", "status": "complete", "elapsed": 120`)
+	var l Live
+	running := func() string {
+		var names []string
+		for _, a := range l.Agents {
+			names = append(names, a.Who+" "+a.Name)
+		}
+		return strings.Join(names, ", ")
+	}
+	for _, e := range readAll(t, log) {
+		l.apply(e)
+	}
+	if got := running(); got != "attacker 0000-attacker, grader grader-broad" {
+		t.Fatalf("after the hack inspector: %s", got)
+	}
+	for _, e := range readAll(t, ev("03:00", "phase_end", `, "phase": "grader", "status": "complete", "elapsed": 119`)) {
+		l.apply(e)
+	}
+	if got := running(); got != "attacker 0000-attacker" {
+		t.Fatalf("after the grader inspector: %s", got)
+	}
+	for _, e := range readAll(t, ev("04:00", "phase_end", `, "phase": "attack", "status": "complete", "elapsed": 240, "attempts": 1`)) {
+		l.apply(e)
+	}
+	if got := running(); got != "" {
+		t.Fatalf("after the attack: %s", got)
+	}
+}

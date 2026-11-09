@@ -962,7 +962,7 @@ def _separated_attack(result: AttackResult, record: RunRecord, warnings: list[st
     # so it confirms only that problem. Of its findings, only those the reproducing attempt tested are reproduced.
     reproduced = {name for finding in result.findings if finding.kind == "reproduction" for name in finding.sources or [finding.candidate]}
     tested, valid = {item.id for item in result.candidates}, {item.id for item in result.candidates if item.valid_work}
-    # Findings without full guidance: the hacking analysis gives the attack none of them as a candidate.
+    # Findings without full guidance: the attack gets none of them as a candidate.
     unguided = {name for name, item in inspected.items() if not (item.claim.full_guidance or "").strip()}
     # The current readings: each check's latest, by inspector, as the attack's candidates are. A problem whose findings
     # the inspections hold all lost their evidence, as when a stop came after a later reading withdrew them, is not evidenced.
@@ -1060,8 +1060,8 @@ def exploited_with(problem, result: AttackResult, unguided: set[str]) -> str:
         return found
     if any(item.get("full") == "no_evidenced_issue" for item in states):
         return "not_exploited"
-    # Its findings gave the Attacker no guidance, so nothing was attacked. Without an attack candidate, as in the hacking
-    # analysis, which attacks no finding without guidance, its retained findings say so.
+    # Its findings gave the Attacker no guidance, so nothing was attacked. Without an attack candidate, since the attack
+    # takes no finding without guidance, its retained findings say so.
     if states and all(item.get("full") == "unavailable" for item in states) or not states and set(problem.findings or [None]) <= unguided:
         return "no_guidance"
     return "unknown"

@@ -236,7 +236,8 @@ func (l *Live) apply(e Event) {
 				l.Phases[i] = e
 			}
 		}
-		l.Agents = nil // an analysis ends after its sessions and attempts
+		// An analysis ends after its own sessions and attempts; the others run on beside it.
+		l.Agents = slices.DeleteFunc(l.Agents, func(a Agent) bool { return slices.Contains(phaseAgents[e.Phase], a.Who) })
 		if e.Phase == "hack" {
 			problems, exploited := l.hackCounts()
 			l.Hacked = []int{problems, exploited}
@@ -315,6 +316,9 @@ func (l *Live) apply(e Event) {
 		l.Agents = nil
 	}
 }
+
+// phaseAgents are the Agent kinds each analysis runs; the Simulator's episodes are no tiles.
+var phaseAgents = map[string][]string{"hack": {"hack"}, "grader": {"grader"}, "attack": {"attacker", "attack"}}
 
 // judgedWords say what the judge decided, with the problem's cause.
 func judgedWords(e Event) string {

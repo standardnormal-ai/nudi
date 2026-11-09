@@ -6,7 +6,6 @@ host records stay outside every mounted directory.
 """
 
 import asyncio
-import contextlib
 import logging
 import json
 import operator
@@ -781,18 +780,22 @@ async def inspect_hacks(run, *, focused_attempts: int = 2, categories=None, on_e
 
 
 async def inspect_grader(run, ordinary_pool: list[str], *, focused_attempts: int = 2, categories=None,
-                         isolated_inspections: bool = False, request: dict | None = None) -> InspectionResult:
+                         isolated_inspections: bool = False, request: dict | None = None, on_evidence=None,
+                         gate: asyncio.Semaphore | None = None) -> InspectionResult:
     """Off, `holistic_inspection`: the grader inspector skims every ordinary episode and names normal ones,
     which get presumed labels. On, `inspector_swarm`: each ordinary episode then gets its own fork of broad.
-    `request`, the hack findings when there are any (`send.hack_context`), joins its first request."""
+    `request`, the hack findings when there are any (`send.hack_context`), joins its first request. `await
+    on_evidence(report, index)` hears each evidenced reading as it is recorded. With `gate` every session, broad
+    included, holds one of its slots, which other work shares."""
     return await inspect(run, "grader", ordinary_pool, focused_attempts, list(categories or GRADER_CATEGORIES), isolated_inspections,
-                         request=request)
+                         request=request, on_evidence=on_evidence, gate=gate)
 
 
 def at_once(run) -> int:
-    """Inspection sessions, or Attacker attempts, that run at once. Each holds at most a workspace and one experiment,
-    so twice as many sandboxes fit the run's concurrency. Docker's concurrency counts episodes, so a workspace larger
-    than an episode might leave no room for an experiment, and then one runs at a time."""
+    """Inspection sessions, Attacker attempts and Simulator episodes that run at once, the slots of a run's one gate.
+    A session holds at most a workspace and one experiment, so twice as many sandboxes fit the run's concurrency.
+    Docker's concurrency counts episodes, so a workspace larger than an episode might leave no room for an experiment,
+    and then one runs at a time."""
     capacity = run.record.capacity
     larger = run.record.backend != "modal" and (capacity.workspace_memory_mb or 0) > (capacity.episode_memory_mb or 0)
     return 1 if larger else max(1, capacity.concurrency // 2)
@@ -1418,8 +1421,10 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
             settling = True
             await session_turns(title, "episode", None, 1, None, pool[0])
             return report
-        # Beside other holders of the gate, broad holds a slot too, also through its deferred native persistence episodes.
-        async with gate or contextlib.nullcontext():
+        # Every session holds a slot of the gate, which other work may share, or else of this inspection's own; broad holds
+        # its slot also through its deferred native persistence episodes.
+        free, stops = gate or asyncio.Semaphore(slots), []
+        async with free:
             source = await session_turns(f"{mode}-broad", "broad", None, 1)
             for location in deferred:
                 report.assessments.append(await persistence_assessment(run, location))
@@ -1427,7 +1432,6 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
         # A broad conversation without any model reply, or whose files were not all retained, leaves nothing to continue.
         if source is None or not source.retained or not any(message.type == "ai" for message in source.state["messages"]):
             source = None
-        free, stops = gate or asyncio.Semaphore(slots), []
 
         async def turn(name, phase, category, count, episode=None):
             """One fork of broad once a slot is free. None starts after another raised, nor a focused one

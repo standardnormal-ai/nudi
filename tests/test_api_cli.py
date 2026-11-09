@@ -49,7 +49,7 @@ class Analyses:
     def __init__(self, monkeypatch, *, candidates=(), fail=None, rewards=(), assessments=(), ordinary=None, judging=False):
         """`judging` keeps the real judge call, whose provider IO a test replaces; otherwise each finding is a new problem."""
         self.calls, self.candidates, self.fail, self.rewards = [], list(candidates), fail or {}, list(rewards)
-        self.assessments, self.ordinary, self.early = list(assessments), ordinary or {}, []
+        self.assessments, self.ordinary, self.early, self.gates = list(assessments), ordinary or {}, [], {}
         for name in ("start_run", "simulate", "inspect_grader", "inspect_hacks", "attack") + (() if judging else ("verdict",)):
             monkeypatch.setattr(send, name, getattr(self, name))
 
@@ -74,8 +74,9 @@ class Analyses:
         self.run = run
         return run
 
-    async def simulate(self, run, episodes):
+    async def simulate(self, run, episodes, gate=None):
         self.calls.append(("simulate", episodes))
+        self.gates["simulate"] = gate
         self.raise_if("simulation")
         run.record.simulation = Simulation(requested=episodes, status="complete")
         for index, value in enumerate(self.rewards):
@@ -96,14 +97,23 @@ class Analyses:
         (run.config.output_dir / f"inspection-{mode}.json").write_text(result.model_dump_json())
         return result
 
-    async def inspect_grader(self, run, ordinary_pool, *, focused_attempts, isolated_inspections, request=None):
+    async def inspect_grader(self, run, ordinary_pool, *, focused_attempts, isolated_inspections, request=None, gate=None,
+                             on_evidence=None):
         self.calls.append(("inspect_grader", ordinary_pool, focused_attempts, isolated_inspections))
-        self.grader_request = request
+        self.grader_request, self.gates["inspect_grader"] = request, gate
         self.raise_if("grader")
-        return self.inspection(run, "grader", self.assessments, self.ordinary)
+        result = self.inspection(run, "grader", (), self.ordinary)
+        # As the grader inspector does: it awaits the evidence hook for each evidenced reading as it records it.
+        for index, item in enumerate(self.assessments):
+            result.assessments.append(item)
+            if inspection.evidenced(item) and on_evidence:
+                await on_evidence(result, index)
+        (run.config.output_dir / "inspection-grader.json").write_text(result.model_dump_json())
+        return result
 
     async def inspect_hacks(self, run, *, focused_attempts, on_evidence=None, gate=None):
         self.calls.append(("inspect_hacks", focused_attempts))
+        self.gates["inspect_hacks"] = gate
         self.raise_if("hack")
         result = self.inspection(run, "hack")
         # As the hack inspector does: it awaits the evidence hook for each evidenced reading as it records it.
@@ -114,23 +124,17 @@ class Analyses:
         (run.config.output_dir / "inspection-hack.json").write_text(result.model_dump_json())
         return result
 
-    async def attack(self, run, *, maximum_attempts, discovery_attempts, candidates=(), problems=(), deadline=None, minimal_hints=True,
-                     feed=None, gate=None, earlier=None, judge=None):
-        """Records each candidate tested without evidence. The attack beside the hack inspector, given `feed`, tests what
-        it is fed; the attack phase's records its call."""
-        self.deadline = deadline
-        if feed is not None:
-            self.beside = (maximum_attempts, discovery_attempts, minimal_hints)
-            while (item := await feed.get()) is not None:
-                self.early.append(item)
-            candidates = self.early
-        else:
-            self.earlier = earlier
-            self.calls.append(("attack", maximum_attempts, discovery_attempts, len(candidates)))
-            self.minimal_hints = minimal_hints
-            self.problems_sent = list(problems)
-            self.raise_if("attack")
-        self.candidates_sent = candidates
+    async def attack(self, run, *, maximum_attempts, discovery_attempts, feed, problems=(), deadline=None, minimal_hints=True,
+                     gate=None, judge=None):
+        """The run's one attack: it records the candidates it is fed, then its call once the feed closes, and tests each
+        without evidence."""
+        self.deadline, self.minimal_hints, self.gates["attack"] = deadline, minimal_hints, gate
+        while (item := await feed.get()) is not None:
+            self.early.append(item)
+        self.calls.append(("attack", maximum_attempts, discovery_attempts, len(self.early)))
+        self.problems_sent = list(problems)
+        self.raise_if("attack")
+        candidates = self.candidates_sent = self.early
         tested = [item.model_copy(update={"conditions": {level: "unavailable" if item.guidance.get(level) is None else "no_evidenced_issue"
                                                          for level in ("full", "minimal")}}) for item in candidates]
         result = AttackResult(status="complete", maximum_attempts=maximum_attempts, discovery_attempts=discovery_attempts,
@@ -140,13 +144,13 @@ class Analyses:
         return result
 
 
-def final_only(fake):
-    """`fake` as the attack phase's attack; the attack beside the hack inspector only drains its feed."""
-    async def attack(run, *, feed=None, gate=None, earlier=None, judge=None, **options):
-        if feed is None:
-            return await fake(run, **options)
-        while await feed.get() is not None:
-            pass
+def after_feed(fake):
+    """`fake` as the attack, called with the candidates it was fed once its feed closes."""
+    async def attack(run, *, feed, gate=None, judge=None, **options):
+        candidates = []
+        while (item := await feed.get()) is not None:
+            candidates.append(item)
+        return await fake(run, candidates=candidates, **options)
 
     return attack
 
@@ -209,11 +213,11 @@ def test_default_is_full_analysis_with_default_counts(tmp_path, monkeypatch, cap
     analyses = Analyses(monkeypatch)
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
 
-    # The hack inspector first, with its attack beside it, so the grader inspector can read its findings; the attack last, so it
-    # attacks the grader inspector's new problems. One try, one no-hint attempt, and the minimal hint after a reproduction.
+    # The hack inspector, the Simulator and the attack start together; the grader inspector when the simulation ends; the
+    # attack's call ends after both inspections. One try, one no-hint attempt, and the minimal hint after a reproduction.
     assert analyses.calls == [("start_run", ALL_ROLES), ("inspect_hacks", 2), ("simulate", 12), ("inspect_grader", [], 2, False),
                               ("attack", 1, 1, 0)]
-    assert analyses.beside == (1, 1, True) and analyses.minimal_hints is True
+    assert analyses.minimal_hints is True
     assert analyses.analyses == ("hack", "simulation", "grader", "attack")
     assert list(report["analyses"]) == ["hack", "simulation", "grader", "attack"]
     assert report["analyses"] == {"simulation": "complete", "grader": "complete", "hack": "complete", "attack": "complete"}
@@ -225,20 +229,98 @@ def test_default_is_full_analysis_with_default_counts(tmp_path, monkeypatch, cap
 
 @pytest.mark.parametrize("analysis, roles, called, selected", [
     ("simulation", ["inspector", "simulator"], ["simulate", "inspect_grader"], ["simulation", "grader"]),
-    ("hacking", ["attacker", "inspector"], ["inspect_hacks"], ["hack", "attack"]),
+    ("hacking", ["attacker", "inspector"], ["inspect_hacks", "attack"], ["hack", "attack"]),
 ])
 def test_selection_runs_and_completes_only_selected_analyses(tmp_path, monkeypatch, analysis, roles, called, selected):
     analyses = Analyses(monkeypatch)
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis=analysis)
 
     assert analyses.calls[0] == ("start_run", roles)
-    # The hacking analysis is the hack phase alone; it reports the attack that phase ran.
     assert [call[0] for call in analyses.calls[1:]] == called
     assert list(report["analyses"]) == selected
     # Deliberately leaving an analysis out is not incomplete coverage.
     assert sorted(report["analyses"]) == sorted(selected) and report["status"] == "complete"
     # Without a hack inspection the grader inspector's request is as before.
     assert getattr(analyses, "grader_request", None) is None
+
+
+def test_the_simulator_starts_beside_the_hack_inspector_and_the_attack(tmp_path, monkeypatch):
+    """The Simulator reads only the task and a no-hint attempt needs no finding, so the Simulator and the attack start
+    while the hack inspection still runs."""
+    analyses = Analyses(monkeypatch)
+    simulating, attacking = asyncio.Event(), asyncio.Event()
+    inspect_hacks, simulate, attack_fake = analyses.inspect_hacks, analyses.simulate, analyses.attack
+
+    async def hacks(run, **options):
+        await asyncio.wait_for(asyncio.gather(simulating.wait(), attacking.wait()), 2)
+        return await inspect_hacks(run, **options)
+
+    async def simulation(run, episodes, gate=None):
+        simulating.set()
+        return await simulate(run, episodes, gate)
+
+    async def attacked(run, **options):
+        attacking.set()
+        return await attack_fake(run, **options)
+
+    monkeypatch.setattr(send, "inspect_hacks", hacks)
+    monkeypatch.setattr(send, "simulate", simulation)
+    monkeypatch.setattr(send, "attack", attacked)
+    built = send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
+    # The grader inspector, too, starts before the hack inspection ends, with the hack findings saved so far.
+    assert [call[0] for call in analyses.calls] == ["start_run", "simulate", "inspect_grader", "inspect_hacks", "attack"]
+    assert built["analyses"] == {"hack": "complete", "simulation": "complete", "grader": "complete", "attack": "complete"}
+
+
+def test_the_grader_inspector_starts_while_an_attempt_still_runs(tmp_path, monkeypatch):
+    """The grader inspector reads no Attacker result, so it starts when the simulation ends, while an attempt runs."""
+    analyses = Analyses(monkeypatch)
+    grading = asyncio.Event()
+    inspect_grader, attack_fake = analyses.inspect_grader, analyses.attack
+
+    async def grader(run, pool, **options):
+        grading.set()
+        return await inspect_grader(run, pool, **options)
+
+    async def attempting(run, **options):
+        # An attempt that ends only after the grader inspector started.
+        await asyncio.wait_for(grading.wait(), 2)
+        return await attack_fake(run, **options)
+
+    monkeypatch.setattr(send, "inspect_grader", grader)
+    monkeypatch.setattr(send, "attack", attempting)
+    built = send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
+    assert built["analyses"] == {"hack": "complete", "simulation": "complete", "grader": "complete", "attack": "complete"}
+
+
+def test_a_grader_findings_full_hint_attempt_starts_while_the_grader_inspection_runs(tmp_path, monkeypatch):
+    """Each evidenced grader finding is judged and fed to the attack as it is recorded, so its full-hint attempt starts
+    before the grader inspection ends."""
+    analyses = Analyses(monkeypatch, assessments=[
+        candidate("accepted forged output", INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION)])
+    fed, inspect_grader = asyncio.Event(), analyses.inspect_grader
+
+    async def grader(run, pool, *, on_evidence, **options):
+        async def heard(report, index):
+            await on_evidence(report, index)
+            await asyncio.wait_for(fed.wait(), 2)  # The attack has the finding before the inspection returns.
+
+        return await inspect_grader(run, pool, on_evidence=heard, **options)
+
+    async def attacking(run, *, feed, **options):
+        tried = []
+        while (item := await feed.get()) is not None:
+            tried.append(item.id)
+            fed.set()
+        assert tried == ["grader-0"]
+        result = AttackResult(status="complete")
+        (run.config.output_dir / "attack.json").write_text(result.model_dump_json())
+        return result
+
+    monkeypatch.setattr(send, "inspect_grader", grader)
+    monkeypatch.setattr(send, "attack", attacking)
+    built = send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
+    assert built["analyses"] == {"hack": "complete", "simulation": "complete", "grader": "complete", "attack": "complete"}
 
 
 def test_python_async_and_cli_share_configuration_and_report(tmp_path, monkeypatch, capsys):
@@ -292,11 +374,11 @@ def test_the_minimal_hint_level_and_one_no_hint_attempt_are_on_by_default_and_fl
     task, config = tmp_path / "task", tmp_path / "nudi.toml"
     analyses = Analyses(monkeypatch)
     assert cli.main(["send-nudis", str(task), "--output", str(tmp_path / "default")]) == 0
-    assert analyses.calls[-1] == ("attack", 1, 1, 0) and analyses.minimal_hints is True and analyses.beside == (1, 1, True)
+    assert analyses.calls[-1] == ("attack", 1, 1, 0) and analyses.minimal_hints is True
     analyses = Analyses(monkeypatch)
     assert cli.main(["send-nudis", str(task), "--output", str(tmp_path / "flags"), "--no-minimal-hints",
                      "--attacker-tries", "2", "--discovery-attempts", "0"]) == 0
-    assert analyses.calls[-1] == ("attack", 2, 0, 0) and analyses.minimal_hints is False and analyses.beside == (2, 0, False)
+    assert analyses.calls[-1] == ("attack", 2, 0, 0) and analyses.minimal_hints is False
     config.write_text("minimal_hints = false\n")
     analyses = Analyses(monkeypatch)
     send_nudis(task, config, output_dir=tmp_path / "file")
@@ -458,8 +540,8 @@ def test_each_inspector_candidate_composes_its_own_guidance_without_a_model_call
     ])
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
 
-    # Each evidenced finding is a problem of its own here, attacked beside the hack inspector.
-    assert analyses.calls[-1] == ("inspect_hacks", 2)
+    # Each evidenced finding is a problem of its own here, each fed to the one attack.
+    assert analyses.calls[-1] == ("attack", 1, 1, 3)
     first, second, third = analyses.candidates_sent
     # Ids are assessment indices in inspection-hack.json; the legitimate outcome supplies nothing.
     assert [item.id for item in analyses.candidates_sent] == ["hack-0", "hack-2", "hack-3"]
@@ -504,11 +586,11 @@ def test_missing_or_blank_guidance_field_leaves_that_condition_unavailable(tmp_p
                                                            hint_location=hint_location)])
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
 
-    # Without full guidance a problem's finding is never fed, so the attack phase of a full analysis tries it.
+    # Without full guidance a problem's finding is never fed, so no Attacker tries it; the report says it had no guidance.
     if not (isinstance(full_guidance, str) and full_guidance.strip()):
-        assert analyses.candidates_sent == []
-        report = send_nudis(tmp_path / "task", output_dir=tmp_path / "full")
-        assert analyses.calls[-1] == ("attack", 1, 1, 1)
+        assert analyses.candidates_sent == [] and report["attack"]["candidates"] == []
+        assert report["attack"]["problems"][0]["exploited_with"] == "no_guidance"
+        return
     (sent,) = analyses.candidates_sent
     assert sent.id == "hack-0"
     rendered = json.dumps(sent.guidance)
@@ -518,12 +600,8 @@ def test_missing_or_blank_guidance_field_leaves_that_condition_unavailable(tmp_p
     assert evidenced[0]["claim"]["mechanism"] == MECHANISM
     assert evidenced[0]["interpretation"]["interpretation"] == INTERPRETATION
     conditions = report["attack"]["candidates"][0]["conditions"]
-    if isinstance(full_guidance, str) and full_guidance.strip():
-        assert sent.guidance["full"] == REPRODUCTION and "full" not in sent.unavailable
-        assert conditions["full"]["status"] == "no_evidenced_issue"
-    else:
-        assert sent.guidance["full"] is None and conditions["full"]["status"] == "unavailable"
-        assert sent.unavailable["full"] == conditions["full"]["unavailable"] == FULL_UNAVAILABLE
+    assert sent.guidance["full"] == REPRODUCTION and "full" not in sent.unavailable
+    assert conditions["full"]["status"] == "no_evidenced_issue"
     if isinstance(hint_location, str) and hint_location.strip():
         assert sent.guidance["minimal"] == f"{WHERE_TO_LOOK}\n{LOCATION}" and "minimal" not in sent.unavailable
         assert conditions["minimal"]["status"] == "no_evidenced_issue"
@@ -753,10 +831,10 @@ GRADER_STEPS, GRADER_LOCATION = "Write the answer in the documented format.", "t
 
 
 def test_each_grader_finding_is_judged_against_every_problem_and_only_new_ones_are_attacked(tmp_path, monkeypatch):
-    """The attack phase runs last. Each evidenced grader inspector finding is judged against the problems of both
-    inspectors: grader-0 is the hack inspector's P1, which its attack beside the hack inspector already tried, so it is
-    not attacked again; grader-1 is new, G1, and attacked. An id names its inspector and assessment, so a hack and a
-    grader finding of one index stay distinct."""
+    """Each evidenced grader inspector finding is judged against the problems of both inspectors as it is recorded:
+    grader-0 is the hack inspector's P1, which the attack was already fed, so it is not fed again; grader-1 is new, G1,
+    and fed to the same attack. An id names its inspector and assessment, so a hack and a grader finding of one index
+    stay distinct."""
     judge_replies(monkeypatch, [{"same_as": "P1"}, {"same_as": None}])
     analyses = Analyses(monkeypatch, judging=True, candidates=[
         candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION)], assessments=[
@@ -765,25 +843,11 @@ def test_each_grader_finding_is_judged_against_every_problem_and_only_new_ones_a
                   hint_location=GRADER_LOCATION),
         candidate("legitimate work", INTERPRETATION, "legitimate", full_guidance=GRADER_STEPS, hint_location=GRADER_LOCATION),
     ])
-    tried = analyses.attack
-
-    async def beside(run, **options):
-        # The attack beside the hack inspector tries what it is fed.
-        if options.get("feed") is None:
-            return await tried(run, **options)
-        await tried(run, **options)
-        result = AttackResult.model_validate_json((run.config.output_dir / "attack.json").read_text())
-        result.attempts = [attack.AttackAttempt(level="full", number=1, candidate=item.id, context="c", problem="P1",
-                                               status="no_evidenced_issue")
-                           for item in result.candidates]
-        (run.config.output_dir / "attack.json").write_text(result.model_dump_json())
-
-    monkeypatch.setattr(send, "attack", beside)
     send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
 
-    assert [item.id for item in analyses.early] == ["hack-0"]
-    assert analyses.calls[-1] == ("attack", 1, 1, 1)
-    (grader,) = analyses.candidates_sent
+    assert analyses.calls[-1] == ("attack", 1, 1, 2)
+    hack, grader = analyses.candidates_sent
+    assert hack.id == "hack-0"
     assert (grader.id, grader.source, grader.valid_work) == ("grader-1", "grader_inspector", True)
     assert grader.guidance == {"full": GRADER_STEPS, "minimal": f"{WHERE_TO_LOOK}\n{GRADER_LOCATION}"}
     assert [(item.id, item.source, item.members, item.findings) for item in analyses.problems_sent] == [
@@ -987,7 +1051,7 @@ def test_a_time_limit_during_the_attack_still_reports_its_untested_attempts_as_n
             path.write_text(result.model_dump_json())
             raise
 
-    monkeypatch.setattr(send, "attack", final_only(slow))
+    monkeypatch.setattr(send, "attack", after_feed(slow))
     assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run"), "--time-limit", "0.01"]) == 1
     output, error = capsys.readouterr()
     assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks", "simulate", "inspect_grader", "attack"]
@@ -1007,7 +1071,7 @@ def test_no_candidate_leaves_guidance_unavailable_and_still_attacks(tmp_path, mo
     analyses = Analyses(monkeypatch)
     report = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
 
-    assert analyses.calls[-1] == ("inspect_hacks", 2) and analyses.beside == (1, 1, True) and analyses.deadline is None
+    assert analyses.calls[-1] == ("attack", 1, 1, 0) and analyses.deadline is None
     assert report["attack"]["candidates"] == []
     assert report["attack"]["unavailable"] == {"full": NO_CANDIDATE, "minimal": NO_CANDIDATE}
     assert "candidate exists" not in report["attack"]["unavailable"]["full"]
@@ -1045,10 +1109,10 @@ def test_cancellation_writes_the_partial_report_and_propagates(tmp_path, monkeyp
 
     assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks", "simulate"]
     report = json.loads((tmp_path / "run" / "report.json").read_text())
-    # The attack beside the hack inspector ran, and the attack phase that continues it did not, so the attack is unfinished.
-    assert report["analyses"] == {"simulation": "not run", "grader": "not run", "hack": "complete", "attack": "cancelled"}
-    assert report["status"] == "partial" and report["unfinished"]["attack"] == "cancelled" and report["unresolved"] == []
-    assert "run: cancelled during simulation" in report["warnings"]
+    # The attack started with the hack inspector; it is cancelled before its feed closed, with no record saved.
+    assert report["analyses"] == {"simulation": "not run", "grader": "not run", "hack": "complete", "attack": "not run"}
+    assert report["status"] == "partial" and report["unresolved"] == []
+    assert "run: cancelled during simulation and attack" in report["warnings"]
 
 
 def test_a_second_ctrl_c_still_records_the_cancellation_and_writes_the_report(tmp_path, monkeypatch):
@@ -1070,21 +1134,22 @@ def test_the_command_reports_each_phase_on_stderr_with_its_clock_time_duration_a
     assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run"), "--episodes", "2"]) == 0
     error = capsys.readouterr().err
     assert all(CLOCK.match(line) for line in error.splitlines())
+    # The attack starts with the hack inspector and the Simulator; the grader inspector when the simulation ends.
     assert logged(error) == [
-        "nudi: hack inspector and its Attackers started",
-        "nudi: hack inspector and its Attackers done after 0:00:00: 0 experiments, 0 Attacker attempts",
+        "nudi: hack inspector started",
+        "nudi: hack inspector done after 0:00:00: 0 experiments, 0 assessments",
         "nudi: Simulator started",
         "nudi: Simulator done after 0:00:00: 2 of 2 episodes",
+        "nudi: attack started",
         "nudi: grader inspector started",
         "nudi: grader inspector done after 0:00:00: 0 experiments, 0 assessments",
-        "nudi: attack started",
         "nudi: attack done after 0:00:00: 0 attempts, 0 exploits",
     ]
     Analyses(monkeypatch, fail={"hack": RuntimeError(f"provider echoed {SECRET}")})
     assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "failed")]) == 1
     error = logged(capsys.readouterr().err)
-    assert error[0:2] == ["nudi: hack inspector and its Attackers started",
-                          "nudi: hack inspector and its Attackers ended after 0:00:00: hack failed: RuntimeError: provider echoed [redacted]"]
+    assert error[0:2] == ["nudi: hack inspector started",
+                          "nudi: hack inspector ended after 0:00:00: hack failed: RuntimeError: provider echoed [redacted]"]
     assert error[-1].startswith("nudi: attack done after ")
 
 
@@ -1115,26 +1180,26 @@ def test_each_progress_line_is_an_event_and_stderr_prints_its_text(tmp_path, mon
         assert item["text"].startswith(f"nudi: {moment.astimezone():%H:%M:%S} ")
     assert fields(log) == [
         {"kind": "phase_start", "phase": "hack", "slots": 2},
-        {"kind": "phase_end", "phase": "hack", "elapsed": 86401, "status": "complete", "experiments": 0, "assessments": 0, "attacker_attempts": 0},
+        {"kind": "phase_end", "phase": "hack", "elapsed": 86401, "status": "complete", "experiments": 0, "assessments": 0},
         {"kind": "phase_start", "phase": "simulation"},
         {"kind": "phase_end", "phase": "simulation", "elapsed": 86401, "status": "complete", "episodes": 2, "requested": 2},
+        {"kind": "phase_start", "phase": "attack"},
         {"kind": "phase_start", "phase": "grader"},
         {"kind": "phase_end", "phase": "grader", "elapsed": 86401, "status": "complete", "experiments": 0, "assessments": 0},
-        {"kind": "phase_start", "phase": "attack"},
         {"kind": "phase_end", "phase": "attack", "elapsed": 86401, "status": "complete", "attempts": 0, "findings": 0, "exploits": 0,
          "correct_work_failed": 0},
         {"kind": "run_end", "status": "complete", "report": "report.json"},
     ]
     assert log[-1]["text"].endswith(" run ended: complete")
     # A duration is whole seconds, and the text shows it as the terminal always did.
-    assert log[1]["text"].endswith(" hack inspector and its Attackers done after 1 day, 0:00:01: 0 experiments, 0 Attacker attempts")
+    assert log[1]["text"].endswith(" hack inspector done after 1 day, 0:00:01: 0 experiments, 0 assessments")
 
 
 def test_failed_phases_and_run_warnings_are_events_and_stderr_prints_their_text(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(send, "elapsed", lambda started: timedelta(0))
     analyses = Analyses(monkeypatch, fail={"hack": RuntimeError(f"provider echoed {SECRET}")})
 
-    async def warned(run, episodes):
+    async def warned(run, episodes, gate=None):
         run.record.known_cost, run.record.unknown_cost_calls, run.record.cancelled_calls = 0.25, 1, 2
         run.warn("a model call's cost is unknown")
         return await analyses.simulate(run, episodes)
@@ -1161,7 +1226,7 @@ def test_the_python_api_writes_the_event_log(tmp_path, monkeypatch):
     Analyses(monkeypatch)
     asyncio.run(send_nudis_async(tmp_path / "task", output_dir=tmp_path / "async", analysis="hacking"))
     for name in ("sync", "async"):
-        assert [item["kind"] for item in events(tmp_path / name)] == ["phase_start", "phase_end", "run_end"]
+        assert [item["kind"] for item in events(tmp_path / name)] == ["phase_start", "phase_end"] * 2 + ["run_end"]
         assert (tmp_path / name / "events.jsonl").stat().st_mode & 0o777 == 0o600
 
 
@@ -1176,8 +1241,8 @@ def test_the_log_is_readable_while_the_run_goes_on(tmp_path, monkeypatch):
 
     monkeypatch.setattr(send, "inspect_grader", reading)
     send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
-    assert [item["kind"] for item in seen] == ["phase_start", "phase_end"] * 2 + ["phase_start"]
-    assert seen[-1]["phase"] == "grader" and seen == events(tmp_path / "run")[:5]
+    assert [item["kind"] for item in seen] == ["phase_start", "phase_end"] * 2 + ["phase_start"] * 2
+    assert seen[-1]["phase"] == "grader" and seen == events(tmp_path / "run")[:6]
 
 
 def test_events_written_at_once_stay_whole_lines(tmp_path):
@@ -1211,7 +1276,7 @@ def test_ctrl_c_prints_the_report_and_one_line_naming_it_and_exits_130(tmp_path,
     assert error[error.index("nudi: grader inspector started") + 1:] == [
         "nudi: stopping: saving what was found", f"nudi: stopped by you; report written to {tmp_path / 'run' / 'report.md'}"]
     assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks", "simulate"]
-    assert "run: cancelled during grader" in json.loads((tmp_path / "run" / "report.json").read_text())["warnings"]
+    assert "run: cancelled during grader and attack" in json.loads((tmp_path / "run" / "report.json").read_text())["warnings"]
     # The cancelled run still ends its log; the command's own last line is not an event.
     log = events(tmp_path / "run")
     assert log[-2]["kind"] == "phase_start" and log[-2]["phase"] == "grader"
@@ -1241,10 +1306,10 @@ def test_a_termination_signal_or_an_ignored_ctrl_c_stops_the_run_as_ctrl_c_does(
     built = json.loads((tmp_path / "run" / "report.json").read_text())
     answer = (tmp_path / "run" / "report.md").read_text().split("## Answer\n\n", 1)[1]
     if signum == signal.SIGTERM:
-        assert "run: stopped by a termination signal during grader" in built["warnings"]
+        assert "run: stopped by a termination signal during grader and attack" in built["warnings"]
         assert answer.startswith("- Stopped by a termination signal. Results below are what was found so far.")
     else:
-        assert "run: cancelled during grader" in built["warnings"] and answer.startswith("- Stopped by you. ")
+        assert "run: cancelled during grader and attack" in built["warnings"] and answer.startswith("- Stopped by you. ")
     assert fields(events(tmp_path / "run"))[-1] == {"kind": "run_end", "status": "cancelled", "report": "report.json"}
 
 
@@ -1356,7 +1421,7 @@ def test_ctrl_c_saves_the_report_and_exits_130_when_cancelled_work_never_returns
     warnings = json.loads((tmp_path / "run" / "report.json").read_text())["warnings"]
     assert ("run: grader was still running 0.3 seconds after the stop and was left; a Modal sandbox it holds ends at "
             "its lifetime, a Docker container stays until removed") in warnings
-    assert "run: cancelled during grader" in warnings
+    assert "run: cancelled during grader and attack" in warnings
     assert fields(events(tmp_path / "run"))[-1] == {"kind": "run_end", "status": "cancelled", "report": "report.json"}
 
 
@@ -1374,14 +1439,14 @@ def test_a_time_limit_ends_the_run_as_a_stop_does_and_exits_1(tmp_path, monkeypa
     output, error = capsys.readouterr()
     assert output == (tmp_path / "run" / "report.md").read_text()
     assert "- Stopped at your time limit. Results below are what was found so far.\n" in output
-    assert logged(error)[-1] == "nudi: the run stopped at its time limit of 0.01 minutes during grader"
+    assert logged(error)[-1] == "nudi: the run stopped at its time limit of 0.01 minutes during grader and attack"
     assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks", "simulate"]
     report = json.loads((tmp_path / "run" / "report.json").read_text())
     assert report["status"] == "time_limit"
-    assert "run: the run stopped at its time limit of 0.01 minutes during grader" in report["warnings"]
+    assert "run: the run stopped at its time limit of 0.01 minutes during grader and attack" in report["warnings"]
     log = events(tmp_path / "run")
     assert log[-2]["text"] == error.splitlines()[-1]
-    assert fields(log)[-2:] == [{"kind": "time_limit", "phase": "grader", "minutes": 0.01},
+    assert fields(log)[-2:] == [{"kind": "time_limit", "phases": ["grader", "attack"], "minutes": 0.01},
                                    {"kind": "run_end", "status": "time_limit", "report": "report.json"}]
 
 
@@ -1400,7 +1465,7 @@ def test_a_failed_phase_before_the_time_limit_still_exits_1(tmp_path, monkeypatc
             (run.config.output_dir / "inspection-hack.json").write_text(result.model_dump_json())
             return result
         monkeypatch.setattr(send, "inspect_hacks", incomplete)
-    monkeypatch.setattr(send, "attack", final_only(sleeping))
+    monkeypatch.setattr(send, "attack", after_feed(sleeping))
     assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run"), "--time-limit", "0.01"]) == 1
     report = json.loads((tmp_path / "run" / "report.json").read_text())
     assert report["status"] == "partial"
@@ -1433,15 +1498,17 @@ def test_ctrl_c_before_any_report_says_none_was_written(tmp_path, monkeypatch, c
 
 
 def test_no_space_on_the_records_host_stops_the_run_with_one_message(tmp_path, monkeypatch, capsys):
-    """The analyses after the full disk do not run; the report is still written once space allows it."""
+    """The full disk stops every other analysis; the report is still written once space allows it."""
     full = DiskFull(f"no space left on the records host to write {tmp_path / 'run' / 'inspection-hack.json'}")
     analyses = Analyses(monkeypatch, fail={"hack": full})
     assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run")]) == 1
     error = logged(capsys.readouterr().err)
-    assert error == ["nudi: hack inspector and its Attackers started", f"nudi: stopped: {full}; report written to {tmp_path / 'run' / 'report.md'}"]
+    assert error == ["nudi: hack inspector started", "nudi: Simulator started", "nudi: Simulator done after 0:00:00: 0 of 12 episodes",
+                     "nudi: attack started", "nudi: attack stopped after 0:00:00: another analysis stopped the run",
+                     f"nudi: stopped: {full}; report written to {tmp_path / 'run' / 'report.md'}"]
     assert fields(events(tmp_path / "run"))[-1] == {"kind": "run_end", "status": "stopped", "error": f"DiskFull: {full}",
                                                     "report": "report.json"}
-    assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks"]
+    assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks", "simulate"]
     assert f"run: hack stopped: {full}" in json.loads((tmp_path / "run" / "report.json").read_text())["warnings"]
 
 
@@ -1638,7 +1705,8 @@ def test_a_handler_that_raises_on_an_ordinary_line_stops_the_run_with_its_error(
         logger.setLevel(level)
     assert raised.value.errno == errno.EIO
     log = events(tmp_path / "run")
-    assert [item["kind"] for item in log] == ["phase_start", "run_end"] and log[-1]["status"] == "stopped"
+    # The hack inspector, the Simulator and the attack each log their start before the first error stops the run.
+    assert [item["kind"] for item in log] == ["phase_start"] * 3 + ["run_end"] and log[-1]["status"] == "stopped"
     assert [call[0] for call in analyses.calls] == ["start_run"]
 
 
@@ -1712,8 +1780,8 @@ def test_a_failed_append_at_the_time_limit_still_ends_the_run_at_its_time_limit(
     assert output == (tmp_path / "run" / "report.md").read_text()
     assert json.loads((tmp_path / "run" / "report.json").read_text())["status"] == "time_limit"
     assert logged(error)[-2:] == ["nudi: grader inspector started",
-                                  "nudi: the run stopped at its time limit of 0.01 minutes during grader"]
-    assert [item["kind"] for item in events(tmp_path / "run")] == ["phase_start", "phase_end"] * 2 + ["phase_start"]
+                                  "nudi: the run stopped at its time limit of 0.01 minutes during grader and attack"]
+    assert [item["kind"] for item in events(tmp_path / "run")] == ["phase_start", "phase_end"] * 2 + ["phase_start"] * 2
     assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks", "simulate"]
 
 
@@ -1728,10 +1796,12 @@ def test_a_phase_that_fails_on_a_full_disk_still_prints_why(tmp_path, monkeypatc
     monkeypatch.setattr(send, "inspect_hacks", failing)
     assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run")]) == 1
     error = logged(capsys.readouterr().err)
-    assert error[:3] == ["nudi: hack inspector and its Attackers started",
-                         "nudi: hack inspector and its Attackers ended after 0:00:00: hack failed: RuntimeError: hack broke",
+    assert error[:3] == ["nudi: hack inspector started",
+                         "nudi: hack inspector ended after 0:00:00: hack failed: RuntimeError: hack broke",
                          "nudi: Simulator started"]
-    assert error[3:] == [f"nudi: stopped: no space left on the records host to write {tmp_path / 'run' / 'report.json'}; "
+    # The Simulator's save finds the disk full, which stops the attack beside it.
+    assert error[3:] == ["nudi: attack started", "nudi: attack stopped after 0:00:00: another analysis stopped the run",
+                         f"nudi: stopped: no space left on the records host to write {tmp_path / 'run' / 'report.json'}; "
                          "no report was written"]
     assert [item["kind"] for item in events(tmp_path / "run")] == ["phase_start"]
     assert [call[0] for call in analyses.calls] == ["start_run", "simulate"]
@@ -1750,7 +1820,7 @@ def test_a_disk_that_stays_full_from_the_time_limit_on_still_stops_the_run(tmp_p
     monkeypatch.setattr(send, "inspect_grader", slow)
     assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run"), "--time-limit", "0.01"]) == 1
     error = logged(capsys.readouterr().err)
-    assert error[-2:] == ["nudi: the run stopped at its time limit of 0.01 minutes during grader",
+    assert error[-2:] == ["nudi: the run stopped at its time limit of 0.01 minutes during grader and attack",
                           f"nudi: stopped: no space left on the records host to write {tmp_path / 'run' / 'report.json'}; "
                           "no report was written"]
     assert error[-3] == "nudi: grader inspector started"
@@ -1759,7 +1829,7 @@ def test_a_disk_that_stays_full_from_the_time_limit_on_still_stops_the_run(tmp_p
 
 def test_a_task_environment_that_cannot_start_stops_the_run_with_its_reason(tmp_path, monkeypatch, capsys):
     """A verifier image that never builds must not keep the run going for hours. Once the hack inspector stops
-    environment_unavailable, no later analysis runs; stderr, the report's analyses and its warnings say why."""
+    environment_unavailable, every other analysis stops; stderr, the report's analyses and its warnings say why."""
     from nudi.records import EnvironmentUnavailable
 
     analyses = Analyses(monkeypatch)
@@ -1775,13 +1845,16 @@ def test_a_task_environment_that_cannot_start_stops_the_run_with_its_reason(tmp_
     monkeypatch.setattr(send, "inspect_hacks", inspect_hacks)
     assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run")]) == 1
     error = logged(capsys.readouterr().err)
-    assert error == ["nudi: hack inspector and its Attackers started", f"nudi: hack inspector and its Attackers stopped after 0:00:00: {reason}"]
-    assert fields(events(tmp_path / "run"))[1:] == [
-        {"kind": "phase_end", "phase": "hack", "elapsed": 0, "status": "stopped", "error": reason},
+    # The Simulator beside it ended first here; the attack stops, and the grader inspector never starts.
+    assert error == ["nudi: hack inspector started", f"nudi: hack inspector stopped after 0:00:00: {reason}", "nudi: Simulator started",
+                     "nudi: Simulator done after 0:00:00: 0 of 12 episodes", "nudi: attack started",
+                     "nudi: attack stopped after 0:00:00: another analysis stopped the run"]
+    assert fields(events(tmp_path / "run"))[-2:] == [
+        {"kind": "phase_end", "phase": "attack", "elapsed": 0, "status": "cancelled"},
         {"kind": "run_end", "status": "partial", "report": "report.json"}]
-    assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks"]
+    assert [call[0] for call in analyses.calls] == ["start_run", "inspect_hacks", "simulate"]
     built = json.loads((tmp_path / "run" / "report.json").read_text())
-    assert built["analyses"] == {"hack": "environment_unavailable", "attack": "cancelled", "simulation": "not run", "grader": "not run"}
+    assert built["analyses"] == {"hack": "environment_unavailable", "attack": "not run", "simulation": "complete", "grader": "not run"}
     assert f"run: hack stopped: {reason}" in built["warnings"]
 
 
@@ -1797,7 +1870,7 @@ def test_a_full_disk_at_the_final_save_still_writes_the_smaller_report(tmp_path,
         monkeypatch.setattr(run, "save", no_space)
         raise full
 
-    monkeypatch.setattr(send, "attack", final_only(attack))
+    monkeypatch.setattr(send, "attack", after_feed(attack))
     assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run")]) == 1
     assert capsys.readouterr().err.splitlines()[-1] == f"nudi: stopped: {full}; report written to {tmp_path / 'run' / 'report.md'}"
     assert json.loads((tmp_path / "run" / "report.json").read_text())["analyses"]["attack"] == "not run"
@@ -1940,7 +2013,8 @@ def test_a_rerun_whose_copy_fails_still_ends_its_event_log(tmp_path, monkeypatch
 
 def test_attack_from_a_full_run_keeps_its_simulation_and_attacks_the_grader_findings_too(tmp_path, monkeypatch):
     """Each evidenced grader finding, accepted cheats and rejected valid work alike, is a candidate beside the hack
-    findings, as when the attack follows both inspectors. The ordinary episodes, labels and metrics read the copied records. TOML paths are relative to the file.
+    findings, all fed to the run's one attack call, as when the attack runs beside both inspectors. The ordinary
+    episodes, labels and metrics read the copied records. TOML paths are relative to the file.
     The run's start names only the attack, which is all that runs."""
     earlier = earlier_run(tmp_path, monkeypatch, "full", rewards=[1.0, 0.0], candidates=[
         candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION)], assessments=[
@@ -1952,7 +2026,7 @@ def test_attack_from_a_full_run_keeps_its_simulation_and_attacks_the_grader_find
     (tmp_path / "rerun.toml").write_text('attack_from = "run-1"\noutput_dir = "run-2"\n')
     built = send_nudis(tmp_path / "task", tmp_path / "rerun.toml")
 
-    assert [call[0] for call in analyses.calls] == ["start_run", "attack"]
+    assert analyses.calls[1:] == [("attack", 1, 1, 3)]
     assert [(item.id, item.source, item.valid_work) for item in analyses.candidates_sent] == [
         ("hack-0", "hack_inspector", False), ("grader-0", "grader_inspector", False), ("grader-1", "grader_inspector", True)]
     # Only the attack runs, so the start event names only it; the report still lists the reused analyses.
@@ -2123,7 +2197,7 @@ def test_attack_from_the_current_directory_or_a_link_keeps_the_earlier_run_name(
 
 def rerun_with(monkeypatch, backend, before_attack):
     """The `Analyses` fake on `backend`, whose attack first awaits `before_attack(run)`, as the real attack admits
-    sandboxes and deletes earlier attempts' copies before each attempt."""
+    sandboxes and deletes an attempt's own copies when it ends."""
     analyses = Analyses(monkeypatch)
     start, attack_fake = analyses.start_run, analyses.attack
 
@@ -2169,7 +2243,8 @@ def test_attack_from_never_deletes_or_marks_the_earlier_runs_state_copies(tmp_pa
     async def take_and_discard(run):
         tag = f"nudi-copy-{run.record.run_id}-0001"
         run.record.copies.append(StateCopy.model_validate(stored_copy("copy-0001", "0001-attacker", backend, tag, "im-new")))
-        await copies.discard(run)
+        # Also named, the earlier run's copy of the same episode name stays.
+        await copies.discard(run, {"0000-inspector", "0001-attacker"})
 
     monkeypatch.setattr(checks, "host_command", host)
     if backend == "modal":
@@ -2192,7 +2267,7 @@ def test_attack_from_admits_containers_past_the_earlier_runs_sandbox_cleanup(tmp
     (earlier / "sandboxes" / "sandbox-0000" / "sandbox.json").write_text(box)
 
     async def admit(run):
-        run.admit_container("check")
+        await run.admit_container("check")
 
     rerun_with(monkeypatch, "docker", admit)
     built = send_nudis(tmp_path / "task", output_dir=tmp_path / "run-2", attack_from=earlier)
@@ -2218,9 +2293,9 @@ async def evidence_each(report, on_evidence, readings):
         await on_evidence(report, index)
 
 
-def real_early_attack(monkeypatch, analyses, judge):
-    """The real attack beside the hack inspector, with each Attacker episode rewarded and its attack inspector session
-    `judge(target, episode)`, with target `none` for a no-hint attempt; the attack phase keeps the `Analyses` fake."""
+def real_early_attack(monkeypatch, judge):
+    """The real attack, with each Attacker episode rewarded and its attack inspector session `judge(target, episode)`, with
+    target `none` for a no-hint attempt."""
     from test_attack import judged
 
     async def native(run, role, instruction, reminder=None):
@@ -2235,12 +2310,9 @@ def real_early_attack(monkeypatch, analyses, judge):
         outcome = await judge((request["target_candidate"] or {"id": "none"})["id"], pool[0])
         return judged(pool[0], outcome)
 
-    async def attacking(run, **options):
-        return await (attack.attack if options.get("feed") else analyses.attack)(run, **options)
-
     monkeypatch.setattr(run_state, "run_role_episode", native)
     monkeypatch.setattr(attack, "inspect", inspect)
-    monkeypatch.setattr(send, "attack", attacking)
+    monkeypatch.setattr(send, "attack", attack.attack)
 
 
 def test_an_attacker_exploit_is_judged_with_its_case_and_becomes_a_case_of_its_problem(tmp_path, monkeypatch):
@@ -2255,7 +2327,7 @@ def test_an_attacker_exploit_is_judged_with_its_case_and_becomes_a_case_of_its_p
     async def judge(target, episode):
         return "accepted_invalid"
 
-    real_early_attack(monkeypatch, analyses, judge)
+    real_early_attack(monkeypatch, judge)
     send_nudis(CONTRACT_TASK, output_dir=tmp_path / "run", analysis="hacking", minimal_hints=False)
     (request,) = [json.loads(item["messages"][-1]["content"]) for item in requests]
     where = {"location": "/app/answer.txt", "capture_point": "verification_start"}
@@ -2278,7 +2350,7 @@ def test_a_later_reading_that_withdraws_a_finding_leaves_its_problem_a_lead(tmp_
     async def judge(target, episode):
         return "legitimate"
 
-    real_early_attack(monkeypatch, analyses, judge)
+    real_early_attack(monkeypatch, judge)
 
     async def inspect_hacks(run, *, focused_attempts, on_evidence, gate):
         report = hack_findings(("accepted_invalid", "grader_tampering", REPRODUCTION))
@@ -2310,7 +2382,7 @@ def test_a_time_limit_during_the_hack_inspection_keeps_the_early_reproduction(tm
             await asyncio.sleep(30)
         return "accepted_invalid"
 
-    real_early_attack(monkeypatch, analyses, judge)
+    real_early_attack(monkeypatch, judge)
 
     async def inspect_hacks(run, *, focused_attempts, on_evidence, gate):
         report = hack_findings(("accepted_invalid", "grader_tampering", REPRODUCTION), ("accepted_invalid", "package_oracles", REPRODUCTION))
@@ -2341,7 +2413,7 @@ def test_a_time_limit_after_the_hack_inspection_returned_cancels_the_early_attem
             await asyncio.sleep(30)
         return "accepted_invalid"
 
-    real_early_attack(monkeypatch, analyses, judge)
+    real_early_attack(monkeypatch, judge)
 
     async def inspect_hacks(run, *, focused_attempts, on_evidence, gate):
         report = hack_findings(("accepted_invalid", "grader_tampering", REPRODUCTION), ("accepted_invalid", "package_oracles", REPRODUCTION))
@@ -2377,17 +2449,15 @@ def test_a_run_with_a_time_limit_lets_its_agents_be_told_how_much_of_it_is_left(
     assert length == 5400 and 5390 < left <= 5400
 
 
-def test_a_raising_early_attack_is_one_warning_and_the_hack_phase_keeps_its_status(tmp_path, monkeypatch):
-    analyses = Analyses(monkeypatch)
+def test_a_raising_attack_is_one_warning_and_the_hack_phase_keeps_its_status(tmp_path, monkeypatch):
+    Analyses(monkeypatch)
 
     async def attacking(run, **options):
-        if options.get("feed"):
-            raise RuntimeError("attack broke")
-        return await analyses.attack(run, **options)
+        raise RuntimeError("attack broke")
 
     monkeypatch.setattr(send, "attack", attacking)
     built = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
-    assert built["warnings"].count("run: the attack during the hack inspection stopped: RuntimeError: attack broke") == 1
+    assert built["warnings"].count("run: attack failed: RuntimeError: attack broke") == 1
     assert built["analyses"]["hack"] == "complete"
     # The attack failed, so not every step ran.
     assert built["status"] == "partial" and "attack" in built["unfinished"]
@@ -2414,7 +2484,7 @@ def test_hack_sessions_and_early_attempts_share_the_slots_of_the_run(tmp_path, m
         await hold(target)
         return "accepted_invalid"
 
-    real_early_attack(monkeypatch, analyses, judge)
+    real_early_attack(monkeypatch, judge)
 
     async def inspect_hacks(run, *, focused_attempts, on_evidence, gate):
         report = hack_findings(("accepted_invalid", "grader_tampering", REPRODUCTION))
@@ -2437,13 +2507,32 @@ def test_hack_sessions_and_early_attempts_share_the_slots_of_the_run(tmp_path, m
         ("hack-0", "none", "evidenced_issue")]
 
 
+def test_simulation_hack_and_grader_inspection_share_one_gate_of_the_runs_slots(tmp_path, monkeypatch):
+    """One gate for the run: the Simulator, the hack inspector with the attack beside it and the grader inspector all
+    take its slots, half of the concurrency."""
+    analyses = Analyses(monkeypatch)
+    send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
+    gate = analyses.gates["simulate"]
+    assert set(analyses.gates) == {"simulate", "inspect_hacks", "attack", "inspect_grader"}
+    assert isinstance(gate, asyncio.Semaphore) and all(other is gate for other in analyses.gates.values())
+
+    async def slots():
+        taken = 0
+        while not gate.locked():
+            await gate.acquire()
+            taken += 1
+        return taken
+
+    assert asyncio.run(slots()) == inspection.at_once(analyses.run) == 2
+
+
 def test_an_attack_only_rerun_continues_no_earlier_attack(tmp_path, monkeypatch):
     """The earlier run's `attack.json` is not copied, so the rerun's attack starts fresh from the full level."""
     earlier = earlier_run(tmp_path, monkeypatch, "hacking")
     assert (earlier / "attack.json").is_file()
     analyses = Analyses(monkeypatch)
     send_nudis(tmp_path / "task", output_dir=tmp_path / "run-2", attack_from=earlier)
-    assert analyses.calls[-1][0] == "attack" and analyses.earlier is None
+    assert [call[0] for call in analyses.calls].count("attack") == 1 and "earlier" not in inspect.signature(attack.attack).parameters
 
 
 def test_library_warnings_go_to_a_log_in_the_run_folder_and_nudi_warnings_stay_on_stderr(tmp_path, monkeypatch, capsys):
@@ -2471,32 +2560,26 @@ def test_library_warnings_go_to_a_log_in_the_run_folder_and_nudi_warnings_stay_o
     assert len(closed) == 1 and not any(getattr(item, "baseFilename", "").endswith("library.log") for item in logging.getLogger().handlers)
 
 
-@pytest.mark.parametrize("new", [0, 1])
-def test_the_attack_line_counts_only_its_new_attempts_apart_from_the_hack_phase(tmp_path, monkeypatch, capsys, new):
-    """The attack phase continues the attack of the hack phase, so its record holds those attempts and their status.
-    Its line on stderr says what it added; its event keeps the status and all the attempts."""
+def test_the_run_has_one_attack_with_one_line_and_the_hack_line_counts_no_attempt(tmp_path, monkeypatch, capsys):
+    """One attack runs for the whole run, fed by both inspections: it ends once, with one line and one event holding its
+    status and all its attempts, and the hack inspector's line counts no Attacker attempt."""
     from nudi.attack import AttackAttempt
 
     monkeypatch.setattr(send, "elapsed", lambda started: "0:00:00")
     Analyses(monkeypatch)
     unclear = AttackAttempt(level="none", number=1, context="attacker-none-1", status="unknown")
 
-    async def attacking(run, *, feed=None, earlier=None, **options):
-        if feed is not None:
-            while await feed.get() is not None:
-                pass
-            (run.config.output_dir / "attack.json").write_text(AttackResult(status="partial", attempts=[unclear]).model_dump_json())
-            return
-        added = [AttackAttempt(level="full", number=1, context="attacker-hack-0-full-1", status="no_evidenced_issue")] * new
-        return AttackResult(status="partial", attempts=[*earlier.attempts, *added])
+    async def attacking(run, **options):
+        return AttackResult(status="partial", attempts=[unclear])
 
-    monkeypatch.setattr(send, "attack", attacking)
+    monkeypatch.setattr(send, "attack", after_feed(attacking))
     cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run")])
-    line = logged(capsys.readouterr().err)[-1]
-    assert line == ("nudi: attack done after 0:00:00: 1 new attempt, 2 in all, 0 exploits; some results unclear" if new else
-                    "nudi: attack done after 0:00:00: nothing new to attack; the 1 attempt during the hack inspection left some results unclear")
-    end = [item for item in events(tmp_path / "run") if item["kind"] == "phase_end" and item["phase"] == "attack"][0]
-    assert (end["status"], end["attempts"], end["new_attempts"]) == ("partial", 1 + new, new)
+    lines = logged(capsys.readouterr().err)
+    assert lines[-1] == "nudi: attack done after 0:00:00: 1 attempt, 0 exploits; some results unclear"
+    assert "nudi: hack inspector done after 0:00:00: 0 experiments, 0 assessments" in lines
+    ends = [item for item in events(tmp_path / "run") if item["kind"] == "phase_end" and item["phase"] in ("hack", "attack")]
+    assert [(item["phase"], item["status"]) for item in ends] == [("hack", "complete"), ("attack", "partial")]
+    assert ends[1]["attempts"] == 1 and "new_attempts" not in ends[1] and "attacker_attempts" not in ends[0]
 
 
 def test_the_attack_line_counts_exploits_apart_from_cases_where_correct_work_failed():
@@ -2532,5 +2615,5 @@ def test_a_litellm_close_that_never_ends_does_not_hold_the_exit(monkeypatch):
 
 def test_a_count_of_one_on_a_step_line_is_singular():
     assert send.phase_words("attack", {"attempts": 1, "findings": 0, "exploits": 0, "correct_work_failed": 0}) == "1 attempt, 0 exploits"
-    assert send.phase_words("hack", {"experiments": 1, "assessments": 2, "attacker_attempts": 1}) == "1 experiment, 1 Attacker attempt"
+    assert send.phase_words("hack", {"experiments": 1, "assessments": 1}) == "1 experiment, 1 assessment"
     assert send.phase_words("grader", {"experiments": 2, "assessments": 1}) == "2 experiments, 1 assessment"

@@ -270,13 +270,13 @@ async def sandbox(run, purpose: str, *, copy=None, definition: bool = False, art
     Harbor's artifact collection reads it.
 
     The third failed start in a row of the task's environment, or of its separate verifier environment,
-    raises `EnvironmentUnavailable` instead of the error, and so does every later sandbox of it, without a start. The spending cap and the run's container admission are checked first. Removal is
+    raises `EnvironmentUnavailable` instead of the error, and so does every later sandbox of it, without a start. The spending cap and the run's container admission, which may wait for room, are checked first. Removal is
     shielded from cancellation and then verified, because upstream stop logs its failures:
     on Docker the project's containers are listed, on Modal `ModalBox` asks Modal."""
     from nudi import checks
 
     run.check_cap()
-    run.admit_container(purpose)
+    await run.admit_container(purpose)
     name = f"sandbox-{len(run.record.sandboxes):04d}"
     session_id = f"nudi-{secrets.token_hex(4)}-{name}"
     # Its cleanup also removes copied read-only directories.

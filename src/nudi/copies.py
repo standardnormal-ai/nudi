@@ -8,14 +8,11 @@ filesystem is snapshotted.
 
 A copy is read by checks of its own episode or sandbox and as an attack inspector's workspace.
 The grader inspector reads Simulator copies and its own probes' copies; the hack inspector's
-experiments may name any retained episode or sandbox, so every copy stays through the hack phase.
-In the full analysis the attack runs last, so the copies of the hack, Simulator and grader inspector
-phases all stay until the attack phase's first Attacker attempt, also those of the Attacker attempts
-that ran during the hack phase. An attack inspector reads only its own Attacker
-attempt's copies, so `discard` deletes every copy taken so far, except those of attempts still
-running, before each attempt. `delete` at run end, right after the attack, removes everything left,
-also after a failure. Both leave the copies an attack rerun carries from an earlier run, listed first,
-as that run recorded them.
+experiments may name any retained episode or sandbox except an Attacker's. An Attacker attempt's
+copies, of its episode and of its attack inspector's experiments, are read by that attack inspector
+only, so `discard` deletes them when the attempt ends, while the other analyses still run.
+`delete` at run end removes everything left, also after a failure. Both leave the copies an attack
+rerun carries from an earlier run, listed first, as that run recorded them.
 """
 
 import asyncio
@@ -153,13 +150,13 @@ def _seconds(copy: StateCopy) -> float:
     return (datetime.fromisoformat(copy.finished_at) - datetime.fromisoformat(copy.started_at)).total_seconds()
 
 
-async def discard(run, keep=()) -> None:
-    """Delete every finished copy not yet deleted, except those of the episodes in `keep`, each by its
+async def discard(run, episodes) -> None:
+    """Delete every finished copy not yet deleted of the episodes and sandboxes named in `episodes`, each by its
     own tag on Docker or its snapshot on Modal, and mark it deleted. A failed copy, and one whose
-    deletion fails, is left to `delete`. Copies taken meanwhile stay, since they may be a running attempt's."""
+    deletion fails, is left to `delete`."""
     from nudi.checks import host_command
 
-    for copy in [copy for copy in run.record.copies[run.imported_copies:] if copy.episode not in keep]:
+    for copy in [copy for copy in run.record.copies[run.imported_copies:] if copy.episode in episodes]:
         if copy.receipt is None or copy.deleted:
             continue
         with contextlib.suppress(Exception):

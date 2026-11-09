@@ -55,7 +55,7 @@ Create `nudi.toml` using the [model configuration example](usage.md#models), and
 docker info
 ```
 
-Docker needs enough CPU and memory for the task's declared resources and inspection containers. nudi checks available capacity at startup. A run keeps up to `--concurrency` sandboxes alive at once, including inspection workspaces and experiments. One inspection workspace may still admit one experiment, even at `--concurrency 1`, and a task's helper containers can exceed the setting.
+Docker needs enough CPU and memory for the task's declared resources and inspection containers. nudi checks available capacity at startup. A run keeps up to `--concurrency` sandboxes alive at once, including inspection workspaces and experiments; a container that does not fit waits until another ends. One inspection workspace may still admit one experiment, even at `--concurrency 1`, and a task's helper containers can exceed the setting.
 
 ## Optional Modal backend
 

@@ -120,13 +120,17 @@ def test_a_held_workspace_admits_one_unchecked_experiment_on_an_undeclared_task_
     unchecked = [warning for warning in run.record.warnings if "without a resource check" in warning]
     assert run.record.capacity.concurrency == 1 and not unchecked
 
+    async def probe():
+        async with inspector_sandbox.sandbox(run, "probe"):
+            pass
+
     async def main():
         async with inspector_sandbox.sandbox(run, "workspace"):
             for purpose in ("probe", "check"):
                 async with inspector_sandbox.sandbox(run, purpose):
-                    with pytest.raises(CapacityUnavailable, match="concurrency of 1"):
-                        async with inspector_sandbox.sandbox(run, "probe"):
-                            pass
+                    # A second experiment waits for the first to end; the bound cancels it first.
+                    with pytest.raises(TimeoutError):
+                        await asyncio.wait_for(probe(), 0.2)
 
     asyncio.run(main())
     assert [sandbox_record(run, name)["purpose"] for name in run.record.sandboxes] == ["workspace", "probe", "check"]
