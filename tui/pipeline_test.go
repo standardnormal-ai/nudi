@@ -332,18 +332,6 @@ func TestPipelinePendingPieces(t *testing.T) {
 	}
 }
 
-// A problem whose findings later readings withdrew says so in its reproduction column.
-func TestPipelineWithdrawnProblem(t *testing.T) {
-	l := liveFrom(t, ev("00:00", "run_start", `, "backend": "docker", "analyses": ["hack"]`)+
-		ev("00:00", "phase_start", `, "phase": "hack", "slots": 6`)+
-		ev("00:01", "judged", `, "inspector": "hack", "finding": "hack-0", "problem": "P1", "new": true, "cause": "c1"`)+
-		ev("00:02", "reproduced", `, "problem": "P1", "result": "evidenced"`)+
-		ev("00:03", "reproduced", `, "problem": "P1", "result": "withdrawn"`))
-	if s := plainText(renderLive(l, at9("00:04"), 100, 0)); !strings.Contains(row(s, "P1 c1"), "✗ withdrawn") {
-		t.Errorf("P1 row:\n%s", s)
-	}
-}
-
 // The hacks' counts are those of their own end: later attacks, and an Attacker's problem judged later, belong to the grader piece.
 func TestPipelineHackCountsFreeze(t *testing.T) {
 	l := liveFrom(t, ev("00:00", "run_start", `, "backend": "docker", "analyses": ["hack", "simulation", "grader", "attack"]`)+

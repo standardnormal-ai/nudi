@@ -964,10 +964,15 @@ def _separated_attack(result: AttackResult, record: RunRecord, warnings: list[st
     tested, valid = {item.id for item in result.candidates}, {item.id for item in result.candidates if item.valid_work}
     # Findings without full guidance: the hacking analysis gives the attack none of them as a candidate.
     unguided = {name for name, item in inspected.items() if not (item.claim.full_guidance or "").strip()}
+    # The current readings: each check's latest, by inspector, as the attack's candidates are. A problem whose findings
+    # the inspections hold all lost their evidence, as when a stop came after a later reading withdrew them, is not evidenced.
+    latest = {(name.split("-")[0], item.claim.check or name): name for name, item in inspected.items()}
+    current = {name for name in latest.values() if evidenced(inspected[name])}
     problems, leads = [], []
     for problem in result.problems:
         needed, valid_work = exploited_with(problem, result, unguided), any(name in valid for name in problem.findings)
-        if (problem.id and problem.evidence != "evidenced" and needed not in LEVELS
+        withdrawn = bool(problem.findings) and set(problem.findings) <= inspected.keys() and not current & set(problem.findings)
+        if (problem.id and (problem.evidence != "evidenced" or withdrawn) and needed not in LEVELS
                 and not any(name.endswith("-attacker") for name in problem.members)):
             leads.append({"id": problem.id, "cause": problem.cause})
             continue

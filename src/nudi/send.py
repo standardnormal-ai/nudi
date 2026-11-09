@@ -493,16 +493,6 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
             event(run, "reproduced", f"{SOURCES[inspector][1]} found {problem.id}", problem=problem.id, result="evidenced")
         return problem
 
-    def withdraw(report: InspectionResult) -> None:
-        """Each problem of this run none of whose findings is still evidenced, as when a later reading of its check read
-        it legitimate or unknown, is no longer evidenced; its cases stay as receipts."""
-        current = {item.id for item in guidance(report)["candidates"] if item.outcome != "unknown"}
-        for problem in problems:
-            if problem.evidence == "evidenced" and not problem.origin and not current & set(problem.findings):
-                problem.evidence = None
-                event(run, "reproduced", f"{problem.id} is no longer evidenced: a later reading withdrew its findings",
-                      problem=problem.id, result="withdrawn")
-
     async def hack():
         """The hack inspector, with the attack beside it sharing its slots: its no-hint attempts start at once, and a
         problem's first evidenced finding with full guidance starts its attack as soon as it is recorded. Ends when both have."""
@@ -529,7 +519,6 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
         attacking = asyncio.create_task(beside())
         try:
             report = await inspect_hacks(run, focused_attempts=settings.focused_attempts, on_evidence=found, gate=gate)
-            withdraw(report)
             # Nothing new starts; running attempts end before the hack phase does.
             feed.put_nowait(None)
             await asyncio.wait({attacking})

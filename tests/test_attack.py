@@ -1075,6 +1075,43 @@ def test_an_exploit_the_judge_puts_in_the_target_problem_reproduces_it(tmp_path,
     assert "route" not in inspection.inspector_prompt("attack")
 
 
+def test_a_cancel_while_another_exploit_is_judged_keeps_the_reproduction(tmp_path, monkeypatch, credentials):
+    """One reading reproduced the target and another found something else. A cancel while the judge reads the other
+    keeps the reproduction and the attempt's status, saved before any judging, and leaves the other exploit unjudged."""
+    found = attack_module.Candidate(id="hack-0", mechanism="unchecked output", outcome="accepted_invalid",
+                                    guidance={"full": "Exploit the unchecked output.", "minimal": None})
+
+    async def judge(attempt, assessment, case):
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        scripted_readings(tmp_path, monkeypatch, credentials, found, lambda check_of, episode: [
+            reading(check_of("check-0"), episode, "accepted_invalid", attribution={"relation": "target"}),
+            reading(check_of("check-1"), episode, "accepted_invalid", 1, attribution={"relation": "other"})], judge=judge,
+            problems=[attack_module.Problem(id="P1", cause="unchecked output", findings=["hack-0"])])
+    saved = attack_module.AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text())
+    assert [(item.kind, item.problem) for item in saved.findings] == [("reproduction", None), ("other", None)]
+    assert saved.candidates[0].conditions["full"] == "evidenced_issue"
+    assert (saved.status, saved.attempts[0].status) == ("cancelled", "evidenced_issue")
+
+
+def test_the_spending_cap_while_another_exploit_is_judged_keeps_the_attempt_evidenced(tmp_path, monkeypatch, credentials):
+    """The spending cap reached while the judge reads another exploit keeps the attempt's saved reproduction."""
+    from nudi.run_state import SpendingCapReached
+    found = attack_module.Candidate(id="hack-0", mechanism="unchecked output", outcome="accepted_invalid",
+                                    guidance={"full": "Exploit the unchecked output.", "minimal": None})
+
+    async def judge(attempt, assessment, case):
+        raise SpendingCapReached("cap")
+
+    scripted_readings(tmp_path, monkeypatch, credentials, found, lambda check_of, episode: [
+        reading(check_of("check-0"), episode, "accepted_invalid", attribution={"relation": "target"}),
+        reading(check_of("check-1"), episode, "accepted_invalid", 1, attribution={"relation": "other"})], judge=judge,
+        problems=[attack_module.Problem(id="P1", cause="unchecked output", findings=["hack-0"])])
+    saved = attack_module.AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text())
+    assert (saved.status, saved.attempts[0].status) == ("spending_exhausted", "evidenced_issue")
+
+
 def test_a_problem_saved_before_cases_keeps_its_measured_evidence():
     """An older record's `measured` findings, or without them its first member's `case`, load as its cases, so a rerun
     and its judge still read them."""

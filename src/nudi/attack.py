@@ -70,7 +70,8 @@ class Problem(BaseModel):
     probe's experiment."""
     evidence: str | None = None
     """`evidenced` once an inspector finding evidenced it; older records also have `not_reproduced`, which the report
-    shows as a lead."""
+    shows as a lead. The report reads the inspections' current readings, so later readings that withdrew every finding
+    make it a lead too."""
     cases: list[dict] = []
     """Each case as the judge reads it: the finding or Attacker episode id, check, outcome, mechanism, location and
     capture point. Empty in older records."""
@@ -476,6 +477,20 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                 kind=kind, candidate=None if kind == "discovery" else members[0].id, sources=[item.id for item in members],
                 attempt=index, assessment=position, relation=None if kind == "discovery" else relation,
                 rationale=None if kind == "discovery" else rationale))
+        result.findings += mine
+
+        def recorded() -> str | None:
+            kinds = {item.kind for item in mine}
+            status = ("evidenced_issue" if kinds & {"discovery", "reproduction"} else "unattributed_exploit" if "unattributed" in kinds
+                      else "other_exploit" if "other" in kinds else None)
+            if status:
+                attempt.status = status
+                mark(level, members, {"unattributed_exploit": "unknown", "other_exploit": "no_evidenced_issue"}.get(status, status))
+            save()
+            return status
+
+        # Saved before any judging, so a stop while the judge reads leaves the other exploits unjudged and keeps the rest.
+        status = recorded()
         if judge:
             # A no-hint exploit is a problem of its own; an exploit of another problem is judged as one is, and the
             # attempt keeps its target's problem. The judge's problem is the one identity: an exploit it puts in the
@@ -491,14 +506,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                     item.problem = await judged(item)
                     if attempt.problem and item.problem == attempt.problem:
                         item.kind, item.problem = "reproduction", None
-        result.findings += mine
-        kinds = {item.kind for item in mine}
-        status = ("evidenced_issue" if kinds & {"discovery", "reproduction"} else "unattributed_exploit" if "unattributed" in kinds
-                  else "other_exploit" if "other" in kinds else None)
-        if status:
-            attempt.status = status
-            mark(level, members, {"unattributed_exploit": "unknown", "other_exploit": "no_evidenced_issue"}.get(status, status))
-        save()
+            status = recorded()
         return status == "evidenced_issue"
 
     async def one(level: str, number: int, members: list[Candidate], text: str | None, position: int) -> None:
@@ -623,13 +631,15 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                 mark(level, members, "no_evidenced_issue")
             save()
         except SpendingCapReached:
-            attempt.status = "spending_exhausted"
+            if attempt.status != "evidenced_issue":  # an exploit saved before the stop stays evidenced
+                attempt.status = "spending_exhausted"
             result.status = "spending_exhausted"
             mark(level, members, "spending_exhausted")
             save()
             raise
         except (asyncio.CancelledError, KeyboardInterrupt):  # KeyboardInterrupt: a second Ctrl-C
-            attempt.status = "cancelled"
+            if attempt.status != "evidenced_issue":  # an exploit saved before the stop stays evidenced
+                attempt.status = "cancelled"
             result.status = "cancelled"
             mark(level, members, "cancelled")
             save()

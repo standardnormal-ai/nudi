@@ -2269,7 +2269,8 @@ def test_an_attacker_exploit_is_judged_with_its_case_and_becomes_a_case_of_its_p
 
 def test_a_later_reading_that_withdraws_a_finding_leaves_its_problem_a_lead(tmp_path, monkeypatch):
     """hack-0 evidenced P1 and its full hint was attacked without an exploit; a later reading of the same check found it
-    legitimate. P1 is no longer evidenced, the log says so, and the report lists it as a lead; its case stays as a receipt."""
+    legitimate, and then the time limit stopped the hack inspection. The report lists P1 as a lead; its case stays as a
+    receipt."""
     from test_runner import CONTRACT_TASK
 
     analyses = Analyses(monkeypatch)
@@ -2286,14 +2287,15 @@ def test_a_later_reading_that_withdraws_a_finding_leaves_its_problem_a_lead(tmp_
         later.assessments[0].claim.check = later.experiments[0]["check"] = "check-0"
         report.assessments += later.assessments
         (run.config.output_dir / "inspection-hack.json").write_text(report.model_dump_json())
-        return report
+        await asyncio.sleep(30)
 
     monkeypatch.setattr(send, "inspect_hacks", inspect_hacks)
-    built = send_nudis(CONTRACT_TASK, output_dir=tmp_path / "run", analysis="hacking", discovery_attempts=0, minimal_hints=False)
+    built = send_nudis(CONTRACT_TASK, output_dir=tmp_path / "run", analysis="hacking", discovery_attempts=0, minimal_hints=False,
+                       time_limit=0.02)
     (problem,) = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text()).problems
-    assert (problem.id, problem.evidence, [case["id"] for case in problem.cases]) == ("P1", None, ["hack-0"])
+    assert (problem.id, [case["id"] for case in problem.cases]) == ("P1", ["hack-0"])
+    assert built["status"] == "time_limit"
     assert built["attack"]["problems"] == [] and built["attack"]["leads"] == [{"id": "P1", "cause": "way 0"}]
-    assert [item["result"] for item in events(tmp_path / "run") if item["kind"] == "reproduced"] == ["evidenced", "withdrawn"]
 
 
 def test_a_time_limit_during_the_hack_inspection_keeps_the_early_reproduction(tmp_path, monkeypatch):

@@ -1203,6 +1203,21 @@ def test_an_attacker_problem_is_unaided_only_when_a_no_hint_attempt_found_it(tmp
         {"condition": "independent", "attempts": 1, "exploited": 0, "model": model, "status": "no_evidenced_issue"}]
 
 
+def test_a_problem_whose_findings_later_readings_withdrew_is_a_lead(tmp_path):
+    """hack-0 evidenced P1, and a later reading of its check read it legitimate, as a run stopped during its hack phase
+    may leave it; P2's finding still stands. The report reads the current readings, so P1 is a lead."""
+    run = RunDir(tmp_path)
+    first, other = evidenced("sandbox-0000", "check-0"), evidenced("sandbox-0000", "check-1")
+    run.hack = InspectionResult(mode="hack", status="partial", categories={}, applicability={},
+                                assessments=[first, other, first.model_copy(update={"outcome": "legitimate"})])
+    run.attack = AttackResult(status="cancelled", discovery={"none": "no_evidenced_issue"}, problems=[
+        Problem(id="P1", source="hack inspector", cause="Skip the test.", members=["hack-0"], findings=["hack-0"], evidence="evidenced"),
+        Problem(id="P2", source="hack inspector", cause="Forge the digest.", members=["hack-1"], findings=["hack-1"], evidence="evidenced")])
+    built = run.report(selected=["hack", "attack"])
+    assert [item["id"] for item in built["attack"]["problems"]] == ["P2"]
+    assert built["attack"]["leads"] == [{"id": "P1", "cause": "Skip the test."}]
+
+
 def test_a_problem_whose_finding_was_withdrawn_keeps_its_attacker_exploit(tmp_path):
     """Later readings withdrew the findings of P1 and P2, so neither is evidenced. An Attacker's full-hint exploit of P1
     still stands, so P1 stays at full information; P2 is a lead."""

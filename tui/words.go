@@ -143,7 +143,7 @@ var reasonWords = map[string]string{
 }
 
 // reproducedWords say how the hack inspector's reproduction of a problem ended.
-var reproducedWords = map[string]string{"evidenced": "✓", "not_reproduced": "✗ not reproduced", "withdrawn": "✗ withdrawn"}
+var reproducedWords = map[string]string{"evidenced": "✓", "not_reproduced": "✗ not reproduced"}
 
 // evidencedWords say where a level-2 problem's findings were evidenced, after its label.
 var evidencedWords = map[string]string{"package": "evidenced in a package sandbox", "native": "evidenced in a native episode"}
