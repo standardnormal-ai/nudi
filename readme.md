@@ -2,7 +2,7 @@
   <img src="docs/assets/nudi-startup.png" alt="nudi startup animation" width="683">
 </p>
 <p align="center">
-  <a href="pyproject.toml"><img src="https://img.shields.io/badge/version-0.0.0-555?style=flat" alt="Version"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/version-0.0.2-555?style=flat" alt="Version"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.12-3776AB?style=flat" alt="Python"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-555?style=flat" alt="License: MIT"></a>
   <a href="docs/usage.md#run-an-analysis"><img src="https://img.shields.io/badge/Integration-Harbor-171717?style=flat" alt="Integration: Harbor"></a>
@@ -30,8 +30,8 @@ We try to answer two questions about a selected (harbor format) environment.
 
 2. **Simulations** "What are expectable agent submissions, and how well does the grader judge them?"
 	1. Agents complete the training tasks (without any extra hack instruction) in isolated sandboxes. The submissions of those "simulations" are inspected by an agent. Such that we can...
-	   ... compute error rates: how often grader would make flawed decisions in practice?
-	   ... find new overseen flaws: coming from natural behavior, instead of directed exploit hunting.
+		- ... compute error rates: how often grader would make flawed decisions in practice?
+		- ... find new overseen flaws: coming from natural behavior, instead of directed exploit hunting.
 
 ### Pre-Hacking
 
@@ -51,12 +51,11 @@ Secondly, (cyber) reward hacks, known from prior research, are accounted for:
 - Tampering with tests, helper packages, or reward files.
 - Timing tricks or persistent state that interfere with grading.
 
-Every found flaw is executed in another isolated sandbox, which upgrades the suspected flaw into a reproduced flaw.
-
+Every found flaw is executed in another isolated sandbox, so a suspected flaw can be "reproduced".
 #### b. Could agents in execute the flaw in realistic training-like situations?
 
 Loophole existence does not imply exploitability through the original environment harness.
-So, for every flaw found by an `hack_inspector`, `attacker` agents instructed to exploit the environment are dispatched.
+So, for every flaw found by a `hack_inspector`, `attacker` agents instructed to exploit the environment are dispatched.
 
 Each `attacker` gets a fresh sandbox with the original environment tools and permissions. We add a meta system prompt with the goal to solely exploit the environment.
 
@@ -70,6 +69,7 @@ The nuanced exploit report is more informative than binary claims (hackable / no
 ### Simulation
 
 <img src="docs/diagrams/simulation.svg" alt="Simulation and grader classification" width="681">
+
 #### a. Generate realistic trajectories
 A set of `simulator` agents (default: `n=20`) execute the task in isolated containers with real environment configurations.
 Their trajectories are then assessed.
