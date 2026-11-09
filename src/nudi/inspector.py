@@ -10,6 +10,7 @@ import base64
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import stat
 import sys
@@ -20,7 +21,7 @@ from uuid import uuid4
 import litellm
 from deepagents import create_deep_agent
 from deepagents.backends import sandbox as sdk_sandbox
-from deepagents.backends.protocol import ExecuteResponse, FileDownloadResponse, FileUploadResponse
+from deepagents.backends.protocol import DeleteResult, ExecuteResponse, FileDownloadResponse, FileUploadResponse
 from deepagents.backends.sandbox import BaseSandbox
 from deepagents.backends.utils import EMPTY_CONTENT_WARNING
 from deepagents.middleware import filesystem as sdk_filesystem
@@ -112,6 +113,17 @@ class HarborBackend(BaseSandbox):
                                           "at most 3600 s, for a command that needs longer.")
         result = execution.result()
         return ExecuteResponse(output=result["output"], exit_code=result["exit_code"], truncated=result["truncated"])
+
+    async def adelete(self, file_path):
+        # The SDK's sandbox delete, through aexecute: its default async delete calls the sync execute.
+        quoted = shlex.quote(file_path)
+        exists = await self.aexecute(f"test -e {quoted} || test -L {quoted}")
+        if exists.exit_code not in (0, None):
+            return DeleteResult(error=f"Error: '{file_path}' not found")
+        result = await self.aexecute(f"rm -rf {quoted}")
+        if result.exit_code == 0:
+            return DeleteResult(path=file_path)
+        return DeleteResult(error=f"Error deleting file '{file_path}': {result.output.strip() or 'unknown error'}")
 
     async def aupload_files(self, files):
         results = []

@@ -5324,6 +5324,27 @@ def test_inspector_searches_wait_120_seconds(monkeypatch):
     assert len(backend.interrupted) == 2
 
 
+def test_the_inspector_deletes_through_its_async_workspace(tmp_path):
+    """The SDK's async delete tool awaits `adelete`, which runs its probe and `rm` through `aexecute`, not the sync
+    `execute` this backend refuses."""
+    class Box:
+        async def exec(self, argv, **kwargs):
+            done = subprocess.run(argv, capture_output=True, text=True)
+            return {"output": done.stdout + done.stderr, "exit_code": done.returncode, "truncated": False}
+
+    target = tmp_path / "notes"
+    target.mkdir()
+    (target / "a.txt").write_text("a")
+    backend = inspector.HarborBackend(Box())
+
+    async def main():
+        return await backend.adelete(str(target)), await backend.adelete(str(target))
+
+    deleted, missing = asyncio.run(main())
+    assert deleted.path == str(target) and deleted.error is None and not target.exists()
+    assert missing.error == f"Error: '{target}' not found"
+
+
 def test_a_workspace_call_still_stuck_after_sandbox_removal_lets_the_session_end(tmp_path, monkeypatch, credentials):
     """A timed-out call stays owned until sandbox removal. A client whose transport stays stuck after
     removal is cancelled within a bound, so the session ends and its command's outcome is recorded as unknown."""
