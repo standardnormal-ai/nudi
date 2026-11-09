@@ -29,16 +29,18 @@ Each entry of `attack.problems`:
 | --- | --- | --- |
 | `id` | string or null | `P1`, `P2` ... from the hack inspector, `G1` ... from the grader inspector, `A1` ... from an Attacker with no hint; null in older reports |
 | `source` | string or null | `hack inspector`, `grader inspector` or `Attacker` |
-| `level` | integer | 2 to 5, the exploit level in [Usage](usage.md#reports) |
+| `level` | integer | 2 to 5, which orders the problems, as in [Usage](usage.md#reports) |
 | `label` | string | The level's words, such as `●●●○○ exploit executable by learner with full information`, or `Correct work failed` and how an Attacker reproduced it; for a problem a rerun kept and did not find again, `evidenced in run DIR at LABEL; not found again here` |
-| `help_needed` | string | `found_alone`, `single_hint`, `full_info`, `full_info_or_less`, `not_exploited`, `no_guidance` or `unknown` |
+| `exploited_with` | string | The least information under which an Attacker exploit was observed, `none`, `minimal` or `full`, an order and not the help needed; otherwise `not_exploited`, `no_guidance` or `unknown`. Older reports have `help_needed` |
+| `conditions` | list of objects | Each condition an Attacker tried it under, in order: `condition` (`full`, `minimal`, `none` aimed at it; `elsewhere_full`, `elsewhere_minimal`, `elsewhere_none` aimed at another problem, listed only when one of those attempts exploited it; or `independent`, the no-hint search), `attempts` started, how many `exploited` it, the Attacker `model` and the `status` |
+| `scope` | string or null | Where its findings were evidenced, `package` or `native` (native when any is); null without the inspections. At level 2 `report.md` and the viewer give it after the label |
 | `cause` | string | One line |
 | `findings` | list of strings | The inspector findings this cause explains, as `hack-INDEX` or `grader-INDEX` |
 | `candidate` | string or null | The finding the attack tested |
 | `reproduced` | boolean | An Attacker reproduced it |
 | `cases` | list of objects | Each finding or Attacker exploit as the judge read it: `id`, `check`, `outcome`, `mechanism`, `location`, `capture_point` |
 | `origin` | string or null | The earlier run a rerun took the problem from |
-| `earlier_help` | string or null | Its `help_needed` in that earlier run |
+| `earlier_exploited_with` | string or null | Its `exploited_with` in that earlier run |
 
 `attack.leads` lists the problems of an older record that no evidence confirmed, each with its `id` and `cause`; they have no level.
 

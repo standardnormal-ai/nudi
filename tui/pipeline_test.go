@@ -332,6 +332,18 @@ func TestPipelinePendingPieces(t *testing.T) {
 	}
 }
 
+// A problem whose findings later readings withdrew says so in its reproduction column.
+func TestPipelineWithdrawnProblem(t *testing.T) {
+	l := liveFrom(t, ev("00:00", "run_start", `, "backend": "docker", "analyses": ["hack"]`)+
+		ev("00:00", "phase_start", `, "phase": "hack", "slots": 6`)+
+		ev("00:01", "judged", `, "inspector": "hack", "finding": "hack-0", "problem": "P1", "new": true, "cause": "c1"`)+
+		ev("00:02", "reproduced", `, "problem": "P1", "result": "evidenced"`)+
+		ev("00:03", "reproduced", `, "problem": "P1", "result": "withdrawn"`))
+	if s := plainText(renderLive(l, at9("00:04"), 100, 0)); !strings.Contains(row(s, "P1 c1"), "✗ withdrawn") {
+		t.Errorf("P1 row:\n%s", s)
+	}
+}
+
 // The hacks' counts are those of their own end: later attacks, and an Attacker's problem judged later, belong to the grader piece.
 func TestPipelineHackCountsFreeze(t *testing.T) {
 	l := liveFrom(t, ev("00:00", "run_start", `, "backend": "docker", "analyses": ["hack", "simulation", "grader", "attack"]`)+
@@ -387,9 +399,9 @@ func TestProblemsByHelpNeeded(t *testing.T) {
 		" P8 c10    ●●●●○ exploit executable by learner with hint\n   from hack inspector\n" +
 		" P3 c5     ●●●○○ exploit executable by learner with full information\n   from hack inspector\n" +
 		" P7 c9     ●●●○○ exploit executable by learner with full information\n   from hack inspector\n" +
-		" P2 c2     ●●○○○ evidenced exploit\n   from hack inspector\n" +
-		" G1 c3     ●●○○○ evidenced exploit, no clear Attacker result\n   from grader inspector\n" +
-		" P6 c8     ●●○○○ evidenced exploit, Attackers did not exploit it\n   from hack inspector\n" +
+		" P2 c2     ●●○○○ reproduced exploit\n   from hack inspector\n" +
+		" G1 c3     ●●○○○ reproduced exploit, no clear Attacker result\n   from grader inspector\n" +
+		" P6 c8     ●●○○○ reproduced exploit, Attackers did not exploit it\n   from hack inspector\n" +
 		" 1 lead, which no evidence confirmed\n"
 	for _, s := range []string{card(r, 100, false), plainPhase(r, 3)} {
 		if !strings.Contains(s, want) {
@@ -398,6 +410,33 @@ func TestProblemsByHelpNeeded(t *testing.T) {
 	}
 	if s := card(r, 60, true); strings.Contains(s, "\n\n\n") {
 		t.Errorf("at 60 columns:\n%s", s)
+	}
+}
+
+// A problem exploited only by a no-hint attempt aimed at it or at another problem names no independent attacker; one
+// the independent no-hint search exploited does. Without an exploit, the scope of its evidence and `exploited_with`
+// follow the label.
+func TestOnlyAnUnaimedNoHintExploitNamesTheIndependentAttacker(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "attack": {"problems": [
+		{"id": "P1", "cause": "c1", "source": "hack inspector", "exploited_with": "none", "level": 5, "label": "●●●●● exploit executable by unaided learner",
+		 "conditions": [{"condition": "none", "exploited": 1}, {"condition": "independent", "exploited": 0}]},
+		{"id": "P2", "cause": "c2", "source": "hack inspector", "exploited_with": "none", "level": 5, "label": "●●●●● exploit executable by unaided learner",
+		 "conditions": [{"condition": "independent", "exploited": 1}]},
+		{"id": "P3", "cause": "c3", "source": "hack inspector", "exploited_with": "not_exploited", "level": 2, "label": "●●○○○ reproduced exploit",
+		 "scope": "native", "findings": ["hack-3"], "conditions": []},
+		{"id": "P4", "cause": "c4", "source": "hack inspector", "exploited_with": "none", "level": 5, "label": "●●●●● exploit executable by unaided learner",
+		 "conditions": [{"condition": "elsewhere_none", "exploited": 1}, {"condition": "independent", "exploited": 0}]}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := card(r, 100, false)
+	for _, want := range []string{" P1 c1     ●●●●● exploit executable by unaided learner\n   from hack inspector\n",
+		" P2 c2     ●●●●● exploit executable by unaided learner\n   from hack inspector + independent attacker\n",
+		" P3 c3     ●●○○○ reproduced exploit, evidenced in a native episode, Attackers did not exploit it\n",
+		" P4 c4     ●●●●● exploit executable by unaided learner\n   from hack inspector\n"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("lacks %q in:\n%s", want, s)
+		}
 	}
 }
 
@@ -418,7 +457,7 @@ func TestCardProblemsFollowTheAnswer(t *testing.T) {
 		t.Errorf("sources:\n%s", s)
 	}
 	// A problem whose finding gave no guidance was not attacked, and says so.
-	if !strings.Contains(s, "  ●●○○○ evidenced exploit, not attacked: no guidance\n   from grader inspector\n") {
+	if !strings.Contains(s, "  ●●○○○ reproduced exploit, not attacked: no guidance\n   from grader inspector\n") {
 		t.Errorf("no guidance:\n%s", s)
 	}
 	// A problem no evidence confirmed is a lead, counted, not listed.

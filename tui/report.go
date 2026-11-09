@@ -220,9 +220,35 @@ type Problem struct {
 	ID         string   `json:"id"`          // P1, G1 or A1
 	Source     string   `json:"source"`      // hack inspector, grader inspector or Attacker
 	Members    []string `json:"members"`     // the finding ids the judge found the same
-	HelpNeeded string   `json:"help_needed"` // the least help an Attacker needed
-	Level      int      `json:"level"`       // the step on the exploit chart, 1 to 5; 0 in older reports
-	Label      string   `json:"label"`       // that step's chart text
+	HelpNeeded string   `json:"help_needed"` // in older reports, the least help an Attacker needed
+	Level      int      `json:"level"`       // the problem's place in the list, 1 to 5; 0 in older reports
+	Label      string   `json:"label"`       // that place's text
+	Scope      string   `json:"scope"`       // where its findings were evidenced, package or native; absent in older reports
+	// The least information under which an Attacker exploit was observed, or why none was; absent in older reports.
+	ExploitedWith string      `json:"exploited_with"`
+	Conditions    []Condition `json:"conditions"` // nil in older reports
+}
+
+// Condition is one condition an Attacker tried a problem under.
+type Condition struct {
+	Condition string `json:"condition"` // full, minimal, none (aimed at the problem), elsewhere_LEVEL (aimed at another) or independent
+	Exploited int    `json:"exploited"` // how many of its attempts exploited the problem
+}
+
+// why is the problem's `exploited_with`, or in older reports its `help_needed`.
+func (p Problem) why() string {
+	if p.ExploitedWith != "" {
+		return p.ExploitedWith
+	}
+	return p.HelpNeeded
+}
+
+// independent says whether a no-hint Attacker not aimed at the problem exploited it; in older reports, level 5 says so.
+func (p Problem) independent() bool {
+	if p.Conditions == nil {
+		return p.ladder() == 5
+	}
+	return slices.ContainsFunc(p.Conditions, func(c Condition) bool { return c.Condition == "independent" && c.Exploited > 0 })
 }
 
 // lead says whether a problem is a lead, one no evidence confirmed: level 1 in reports written before leads.
@@ -230,15 +256,15 @@ func (p Problem) lead() bool {
 	return p.ladder() == 1
 }
 
-// ladder is the problem's step on the exploit chart, from `help_needed` in reports written before `level`.
+// ladder is the problem's place in the list, from `help_needed` in reports written before `level`.
 func (p Problem) ladder() int {
 	if p.Level > 0 {
 		return p.Level
 	}
-	if l, ok := helpLevels[p.HelpNeeded]; ok {
+	if l, ok := helpLevels[p.why()]; ok {
 		return l
 	}
-	if p.HelpNeeded == "no_guidance" || len(p.Findings) > 0 {
+	if p.why() == "no_guidance" || len(p.Findings) > 0 {
 		return 2
 	}
 	return 1
@@ -518,8 +544,8 @@ func evidenceOf(found []Finding, p Problem) int {
 	return slices.IndexFunc(found, func(f Finding) bool { return f.Source == "attack" && slices.Contains(p.Members, f.Claim.Episode) }) + 1
 }
 
-// topProblem is the problem highest on the exploit chart whose evidence is on the list, and that evidence's number;
-// nil and 1 without one, as in reports whose problems lack help_needed.
+// topProblem is the problem highest on the list whose evidence is on the list of findings, and that evidence's number;
+// nil and 1 without one, as in reports whose problems lack exploited_with and help_needed.
 func (r Report) topProblem(found []Finding) (*Problem, int) {
 	if !r.helpNeeded() {
 		return nil, 1
@@ -534,7 +560,8 @@ func (r Report) topProblem(found []Finding) (*Problem, int) {
 	return nil, 1
 }
 
-// helpNeeded says whether the report's problems carry the help an Attacker needed, as problems formed during the run do.
+// helpNeeded says whether the report's problems carry `exploited_with`, or `help_needed` in older reports, as problems
+// formed during the run do.
 func (r Report) helpNeeded() bool {
-	return r.Attack != nil && slices.ContainsFunc(r.Attack.Problems, func(p Problem) bool { return p.HelpNeeded != "" })
+	return r.Attack != nil && slices.ContainsFunc(r.Attack.Problems, func(p Problem) bool { return p.why() != "" })
 }

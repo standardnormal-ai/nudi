@@ -117,7 +117,7 @@ var levelWords = map[string]string{"none": "no extra information", "full": "full
 
 // ladderWords are the exploit chart's steps, 2 to 5; level 1 in older reports is a lead.
 var ladderWords = map[int]string{
-	2: "●●○○○ evidenced exploit",
+	2: "●●○○○ reproduced exploit",
 	3: "●●●○○ exploit executable by learner with full information",
 	4: "●●●●○ exploit executable by learner with hint",
 	5: "●●●●● exploit executable by unaided learner",
@@ -125,7 +125,8 @@ var ladderWords = map[int]string{
 
 // helpLevels give a problem's step from the least help an Attacker needed, for reports written before `level`;
 // any other value is a reproduced exploit.
-var helpLevels = map[string]int{"found_alone": 5, "single_hint": 4, "full_info": 3, "full_info_or_less": 3, "not_reproduced": 1}
+var helpLevels = map[string]int{"none": 5, "minimal": 4, "full": 3,
+	"found_alone": 5, "single_hint": 4, "full_info": 3, "full_info_or_less": 3, "not_reproduced": 1}
 
 // validWorkWords say how an Attacker reproduced correct work the grader fails, after the simulation chart's FN words.
 var validWorkWords = map[int]string{
@@ -142,7 +143,10 @@ var reasonWords = map[string]string{
 }
 
 // reproducedWords say how the hack inspector's reproduction of a problem ended.
-var reproducedWords = map[string]string{"evidenced": "✓", "not_reproduced": "✗ not reproduced"}
+var reproducedWords = map[string]string{"evidenced": "✓", "not_reproduced": "✗ not reproduced", "withdrawn": "✗ withdrawn"}
+
+// evidencedWords say where a level-2 problem's findings were evidenced, after its label.
+var evidencedWords = map[string]string{"package": "evidenced in a package sandbox", "native": "evidenced in a native episode"}
 
 // Result is how one attack attempt ended, as the attack panel draws it.
 type Result int

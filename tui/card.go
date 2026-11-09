@@ -96,7 +96,8 @@ func banner(r Report, found, w int) string {
 }
 
 // problemLines list the problems by their step on the exploit chart, highest first, each with its source. Leads, the
-// problems no evidence confirmed, are counted on one line. Reports whose problems lack `help_needed` have none.
+// problems no evidence confirmed, are counted on one line. Reports whose problems lack `exploited_with` and
+// `help_needed` have none.
 func problemLines(r Report, w int) []string {
 	if !r.helpNeeded() {
 		return nil
@@ -107,7 +108,7 @@ func problemLines(r Report, w int) []string {
 	name := func(p Problem) string {
 		return strings.TrimSpace(p.ID + " " + strings.Join(strings.Fields(p.Cause), " "))
 	}
-	// The report's label, or in reports before `label` the chart's words, and at level 2 the reason.
+	// The report's label, or in reports before `label` the chart's words, and at level 2 where it was evidenced and the reason.
 	label := func(p Problem) string {
 		l, text := p.ladder(), p.Label
 		if text == "" && r.validWork(p) {
@@ -115,12 +116,12 @@ func problemLines(r Report, w int) []string {
 		} else if text == "" {
 			text = ladderWords[l]
 		}
-		reason := reasonWords[p.HelpNeeded]
-		if r.validWork(p) && p.HelpNeeded == "not_exploited" {
+		reason := reasonWords[p.why()]
+		if r.validWork(p) && p.why() == "not_exploited" {
 			reason = "Attackers did not reproduce it"
 		}
-		if l == 2 && reason != "" {
-			return text + ", " + reason
+		if l == 2 {
+			return strings.Join(slices.DeleteFunc([]string{text, evidencedWords[p.Scope], reason}, func(s string) bool { return s == "" }), ", ")
 		}
 		return text
 	}
@@ -133,7 +134,7 @@ func problemLines(r Report, w int) []string {
 				out = append(out, s)
 			}
 		}
-		if p.ladder() == 5 && p.Source != "Attacker" {
+		if p.independent() && p.Source != "Attacker" {
 			out = append(out, "independent attacker")
 		}
 		return slices.DeleteFunc(out, func(s string) bool { return s == "" })

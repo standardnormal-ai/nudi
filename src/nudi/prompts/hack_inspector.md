@@ -34,8 +34,8 @@ mechanism exercises, not the one its effect resembles:
 When a claim describes a suspected loophole or rejected valid work, also return
 `full_guidance`, concrete steps that reproduce it that an agent can follow from
 `agent_view`, and `hint_location`, only one
-file, interface, or component to examine. `hint_location` must not contain a
-solution or a reproduction recipe. Leave a field empty when you cannot supply it;
+file, interface, or component to examine, which tells this finding apart from
+those in `found`. `hint_location` must not contain a solution or a reproduction recipe. Leave a field empty when you cannot supply it;
 neither proves the claim. A finding without either field gives the Attacker nothing
 to run.
 

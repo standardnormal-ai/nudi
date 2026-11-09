@@ -6,7 +6,7 @@ import math
 import time
 
 from harbor.models.task.task import Task
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from nudi import copies
 from nudi.checks import check_submission, redacted
@@ -76,8 +76,16 @@ class Problem(BaseModel):
     capture point. Empty in older records."""
     origin: str | None = None
     """The earlier run a rerun took this problem from; None for a problem of this run."""
-    earlier_help: str | None = None
-    """The least help an Attacker needed for it in the `origin` run, as `report.help_needed` names it."""
+    earlier_exploited_with: str | None = None
+    """The least information under which an Attacker exploited it in the `origin` run, as `report.exploited_with` names it."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _older_cases(cls, data):
+        """Older records keep each finding's case in `measured`, or only the first member's in `case`."""
+        if isinstance(data, dict) and "cases" not in data and (data.get("measured") or data.get("case")):
+            data = {**data, "cases": data.get("measured") or [data["case"]]}
+        return data
 
 
 class AttackAttempt(BaseModel):
@@ -250,6 +258,8 @@ def _normalize_candidate(item: Candidate) -> None:
                 reason = NOT_SUPPLIED
             unavailable[level] = reason.strip()
             conditions[level] = "unavailable"
+    # A no-hint attempt aimed at the candidate follows its single hint's reproduction; it needs no guidance.
+    conditions["none"] = "unattempted"
     item.guidance, item.unavailable, item.conditions = guidance, unavailable, conditions
 
 
@@ -301,7 +311,10 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
     level. Each next one is the earliest in that order whose stream has none running, so a
     stream's attempts run one after another and an evidenced one still ends its stream. The
     record lists attempts, and their assessments and findings, in that order, not as they ended.
-    A candidate's minimal hint is tried only after its full hint reproduced it; otherwise its minimal level is `not_needed`.
+    A candidate's minimal hint is tried only after its full hint reproduced it, and a no-hint attempt aimed at it, with
+    the independent attempts' instruction, only after its minimal hint reproduced it; otherwise each later level is
+    `not_needed`. Only that attempt's attack inspector is told its target. Another exploit, an unattributed one or an
+    unclear result stops the cascade.
 
     Each rewarded attempt, and every valid-work attempt, is judged by one attack inspector
     session of `inspect`, bound to its episode; each interpreted claim's attribution is its
@@ -314,7 +327,8 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
     `deadline` is the run's time limit on the event loop's clock. A valid-work attempt whose task
     agent timeout is longer than the time left does not start and is `insufficient_time`.
 
-    Without `minimal_hints` the minimal hint level is not attempted, and its condition is `not_requested`.
+    Without `minimal_hints` neither the minimal hint level nor the aimed no-hint level is attempted, and their
+    conditions are `not_requested`.
 
     With `feed` the attack runs beside the hack inspector: it takes candidates from the queue until None, every attempt
     holding a slot of `gate`, which the hack inspector's sessions share. The closed feed adds no candidate; planned attempts
@@ -332,16 +346,16 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                                     unavailable=dict(unavailable_reasons or {}))]
         else:
             candidates = []
-    levels = ("full", "minimal") if minimal_hints else ("full",)
+    levels = ("full", "minimal", "none") if minimal_hints else ("full",)
 
     def prepare(item: Candidate) -> Candidate:
         item = item.model_copy(deep=True)
         _normalize_candidate(item)
         if not minimal_hints:
-            item.conditions["minimal"] = "not_requested"
+            item.conditions.update(minimal="not_requested", none="not_requested")
         elif item.valid_work:
-            # From a location alone the Attacker would have to redo the whole task.
-            item.conditions["minimal"] = "not_applicable"
+            # From a location alone, or from nothing, the Attacker would have to redo the whole task.
+            item.conditions.update(minimal="not_applicable", none="not_applicable")
         return item
 
     prepared = [prepare(item) for item in candidates]
@@ -420,7 +434,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
         elif level == "full":
             detail = "Details:\n" + (text or "")
         else:
-            detail = "Hint:\n" + (text or "")
+            detail = "The hint marks where one specific flaw is; only an exploit of that flaw counts.\nHint:\n" + (text or "")
         return (VALID_WORK_INSTRUCTION if valid_work else EXPLOIT_INSTRUCTION) + "\n" + detail
 
     # Each attempt's place in the plan, earlier ones first, and the attempt of each assessment. An earlier record lists each
@@ -462,16 +476,10 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                 kind=kind, candidate=None if kind == "discovery" else members[0].id, sources=[item.id for item in members],
                 attempt=index, assessment=position, relation=None if kind == "discovery" else relation,
                 rationale=None if kind == "discovery" else rationale))
-        result.findings += mine
-        kinds = {item.kind for item in mine}
-        status = ("evidenced_issue" if kinds & {"discovery", "reproduction"} else "unattributed_exploit" if "unattributed" in kinds
-                  else "other_exploit" if "other" in kinds else None)
-        if status:
-            attempt.status = status
-            mark(level, members, {"unattributed_exploit": "unknown", "other_exploit": "no_evidenced_issue"}.get(status, status))
         if judge:
             # A no-hint exploit is a problem of its own; an exploit of another problem is judged as one is, and the
-            # attempt keeps its target's problem.
+            # attempt keeps its target's problem. The judge's problem is the one identity: an exploit it puts in the
+            # target's problem reproduces the target.
             def judged(item):
                 assessment = result.assessments[item.assessment]
                 return judge(attempt, assessment, cases.get(assessment.claim.check, {}))
@@ -481,6 +489,15 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
             for item in mine:
                 if item.kind == "other":
                     item.problem = await judged(item)
+                    if attempt.problem and item.problem == attempt.problem:
+                        item.kind, item.problem = "reproduction", None
+        result.findings += mine
+        kinds = {item.kind for item in mine}
+        status = ("evidenced_issue" if kinds & {"discovery", "reproduction"} else "unattributed_exploit" if "unattributed" in kinds
+                  else "other_exploit" if "other" in kinds else None)
+        if status:
+            attempt.status = status
+            mark(level, members, {"unattributed_exploit": "unknown", "other_exploit": "no_evidenced_issue"}.get(status, status))
         save()
         return status == "evidenced_issue"
 
@@ -659,11 +676,13 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
         if discovery_attempts > 0:
             needed.append(result.discovery.get("none"))
         if maximum_attempts > 0:
-            needed.extend(item.conditions[level] for item in result.candidates for level in levels if item.conditions.get(level) not in ("unavailable", "not_applicable")
-                          and (level == "full" or item.conditions["full"] == "evidenced_issue"))
+            # Each step counts once the one before it reproduced the candidate.
+            needed.extend(item.conditions[level] for item in result.candidates for before, level in zip((None, *levels), levels)
+                          if item.conditions.get(level) not in ("unavailable", "not_applicable")
+                          and (before is None or item.conditions[before] == "evidenced_issue"))
         return bool(needed) and all(state in ("evidenced_issue", "no_evidenced_issue") for state in needed)
 
-    done = sum(item.level == "none" for item in result.attempts)
+    done = sum(item.level == "none" and item.candidate is None for item in result.attempts)
     plan = [(None, ("none", number, [], None)) for number in range(done + 1, discovery_attempts + 1)]
     for suspected in (False, True):
         for number in range(1, maximum_attempts + 1):
@@ -677,7 +696,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
     closed, getter, followed = False, None, set()
 
     def add(stream, level: str, members: list[Candidate]) -> None:
-        plan.extend((stream, (level, number, members, members[0].guidance[level])) for number in range(1, maximum_attempts + 1))
+        plan.extend((stream, (level, number, members, members[0].guidance.get(level))) for number in range(1, maximum_attempts + 1))
         waiting.extend(range(len(plan) - maximum_attempts, len(plan)))
 
     async def attempt(*entry) -> None:
@@ -686,11 +705,12 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
 
     try:
         while True:
-            # The minimal hint follows its full hint's reproduction.
+            # Each step follows the reproduction of the one before it: full hint, single hint, no hint.
             for group, members in enumerate(candidate_groups):
-                if group not in followed and members[0].conditions["full"] == "evidenced_issue" and members[0].conditions["minimal"] == "unattempted":
-                    followed.add(group)
-                    add((group, "minimal"), "minimal", members)
+                for before, level in (("full", "minimal"), ("minimal", "none")):
+                    if (group, level) not in followed and members[0].conditions[before] == "evidenced_issue" and members[0].conditions.get(level) == "unattempted":
+                        followed.add((group, level))
+                        add((group, level), level, members)
             # After a stop no attempt starts; running ones end on their own, as an inspection's sessions do.
             while not stops and len(running) < slots:
                 position = next((place for place in waiting if plan[place][0] not in running.values()), None)
@@ -735,8 +755,9 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
             item.attempt, item.assessment = order.index(item.attempt), judged.index(item.assessment)
         result.findings.sort(key=lambda item: (item.attempt, item.assessment))
         for item in result.candidates:
-            if item.conditions["full"] == "no_evidenced_issue" and item.conditions.get("minimal") == "unattempted":
-                item.conditions["minimal"] = "not_needed"
+            for before, level in (("full", "minimal"), ("minimal", "none")):
+                if item.conditions.get(before) in ("no_evidenced_issue", "not_needed") and item.conditions.get(level) == "unattempted":
+                    item.conditions[level] = "not_needed"
         if result.status == "running":
             result.status = "complete" if settled() else "partial"
         if feed is None or result.attempts or result.problems:

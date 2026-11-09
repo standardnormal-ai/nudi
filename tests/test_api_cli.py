@@ -999,7 +999,7 @@ def test_a_time_limit_during_the_attack_still_reports_its_untested_attempts_as_n
     assert [tested["conditions"][level]["tested"] for level in ("full", "minimal")] == [False, False]
     assert "- attempt 1 on hack-0 (no category, none) with full instructions did not start: cancelled" in output
     assert "- Not attempted: hack-0 (no category, none) with only a hint" in output
-    assert (f"- P1 from the hack inspector, ●●○○○ exploit evidenced in a native episode, no clear Attacker result: {MECHANISM.rstrip('.')}; "
+    assert (f"- P1 from the hack inspector, ●●○○○ reproduced exploit, evidenced in a native episode, no clear Attacker result: {MECHANISM.rstrip('.')}; "
             "findings hack-0 (no category, none).") in output
 
 
@@ -1919,7 +1919,7 @@ def test_a_rerun_keeps_only_evidenced_earlier_problems_each_with_the_run_and_lev
     assert [item.id for item in analyses.problems_sent] == ["P1", "A1"]
     kept = next(item for item in built["attack"]["problems"] if item["id"] == "A1")
     where = str(earlier.resolve())
-    assert (kept["origin"], kept["earlier_help"], kept["level"]) == (where, "found_alone", 5)
+    assert (kept["origin"], kept["earlier_exploited_with"], kept["level"]) == (where, "none", 5)
     assert kept["label"] == f"evidenced in run {where} at ●●●●● exploit executable by unaided learner; not found again here"
 
 
@@ -2267,6 +2267,35 @@ def test_an_attacker_exploit_is_judged_with_its_case_and_becomes_a_case_of_its_p
     assert found.cases == [{"id": episode, "check": f"check-{episode}", "outcome": "accepted_invalid", "mechanism": "scripted", **where}]
 
 
+def test_a_later_reading_that_withdraws_a_finding_leaves_its_problem_a_lead(tmp_path, monkeypatch):
+    """hack-0 evidenced P1 and its full hint was attacked without an exploit; a later reading of the same check found it
+    legitimate. P1 is no longer evidenced, the log says so, and the report lists it as a lead; its case stays as a receipt."""
+    from test_runner import CONTRACT_TASK
+
+    analyses = Analyses(monkeypatch)
+
+    async def judge(target, episode):
+        return "legitimate"
+
+    real_early_attack(monkeypatch, analyses, judge)
+
+    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate):
+        report = hack_findings(("accepted_invalid", "grader_tampering", REPRODUCTION))
+        await evidence_each(report, on_evidence, [0])
+        later = hack_findings(("legitimate", "grader_tampering", REPRODUCTION))
+        later.assessments[0].claim.check = later.experiments[0]["check"] = "check-0"
+        report.assessments += later.assessments
+        (run.config.output_dir / "inspection-hack.json").write_text(report.model_dump_json())
+        return report
+
+    monkeypatch.setattr(send, "inspect_hacks", inspect_hacks)
+    built = send_nudis(CONTRACT_TASK, output_dir=tmp_path / "run", analysis="hacking", discovery_attempts=0, minimal_hints=False)
+    (problem,) = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text()).problems
+    assert (problem.id, problem.evidence, [case["id"] for case in problem.cases]) == ("P1", None, ["hack-0"])
+    assert built["attack"]["problems"] == [] and built["attack"]["leads"] == [{"id": "P1", "cause": "way 0"}]
+    assert [item["result"] for item in events(tmp_path / "run") if item["kind"] == "reproduced"] == ["evidenced", "withdrawn"]
+
+
 def test_a_time_limit_during_the_hack_inspection_keeps_the_early_reproduction(tmp_path, monkeypatch):
     """hack-0's full and single hint attempts reproduced and hack-1's was still judged when the time limit stopped the
     hack inspection. The attack record is cancelled and keeps the reproductions."""
@@ -2292,9 +2321,10 @@ def test_a_time_limit_during_the_hack_inspection_keeps_the_early_reproduction(tm
     saved = json.loads((tmp_path / "run" / "attack.json").read_text())
     assert saved["status"] == "cancelled"
     assert [(item["candidate"], item["level"], item["status"]) for item in saved["attempts"]] == [
-        ("hack-0", "full", "evidenced_issue"), ("hack-1", "full", "cancelled"), ("hack-0", "minimal", "evidenced_issue")]
+        ("hack-0", "full", "evidenced_issue"), ("hack-1", "full", "cancelled"), ("hack-0", "minimal", "evidenced_issue"),
+        ("hack-0", "none", "evidenced_issue")]
     assert built["status"] == "time_limit" and built["analyses"]["attack"] == "cancelled"
-    assert [item["candidate"] for item in built["attack"]["exploits"]["reproduction"]] == ["hack-0", "hack-0"]
+    assert [item["candidate"] for item in built["attack"]["exploits"]["reproduction"]] == ["hack-0"] * 3
 
 
 def test_a_time_limit_after_the_hack_inspection_returned_cancels_the_early_attempt_it_waits_for(tmp_path, monkeypatch):
@@ -2324,7 +2354,8 @@ def test_a_time_limit_after_the_hack_inspection_returned_cancels_the_early_attem
     saved = json.loads((tmp_path / "run" / "attack.json").read_text())
     assert saved["status"] == "cancelled"
     assert [(item["candidate"], item["level"], item["status"]) for item in saved["attempts"]] == [
-        ("hack-0", "full", "evidenced_issue"), ("hack-1", "full", "cancelled"), ("hack-0", "minimal", "evidenced_issue")]
+        ("hack-0", "full", "evidenced_issue"), ("hack-1", "full", "cancelled"), ("hack-0", "minimal", "evidenced_issue"),
+        ("hack-0", "none", "evidenced_issue")]
     assert built["status"] == "time_limit" and built["analyses"]["hack"] == "complete"
 
 
@@ -2400,7 +2431,8 @@ def test_hack_sessions_and_early_attempts_share_the_slots_of_the_run(tmp_path, m
     assert peak[0] == 1
     saved = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text())
     assert [(item.candidate, item.level, item.status) for item in saved.attempts] == [
-        (None, "none", "evidenced_issue"), ("hack-0", "full", "evidenced_issue"), ("hack-0", "minimal", "evidenced_issue")]
+        (None, "none", "evidenced_issue"), ("hack-0", "full", "evidenced_issue"), ("hack-0", "minimal", "evidenced_issue"),
+        ("hack-0", "none", "evidenced_issue")]
 
 
 def test_an_attack_only_rerun_continues_no_earlier_attack(tmp_path, monkeypatch):

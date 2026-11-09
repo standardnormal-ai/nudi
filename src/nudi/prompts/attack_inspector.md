@@ -30,8 +30,7 @@ id when it measures what your verdict needs; otherwise measure with run_experime
 `executed_instruction` is what the Attacker received. When `target_candidate` is
 present, compare the observed exploit with its `mechanism` and `full_guidance`;
 they serve this comparison only. The exploit is the target's problem when the two
-match in all three: same outcome, same thing the grader reads, same condition. A
-different route to a flaw the grader shares is a different problem. For an exploit
+match in all three: same outcome, same thing the grader reads, same condition. For an exploit
 or rejected-valid reading, put the result on `claim.attribution`: `relation`
 `target` when it is the target's problem; `relation` `other` when it is a different
 problem. Omit attribution when the link is unknown. A short `rationale` is shown in the report and decides

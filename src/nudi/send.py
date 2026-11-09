@@ -493,6 +493,16 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
             event(run, "reproduced", f"{SOURCES[inspector][1]} found {problem.id}", problem=problem.id, result="evidenced")
         return problem
 
+    def withdraw(report: InspectionResult) -> None:
+        """Each problem of this run none of whose findings is still evidenced, as when a later reading of its check read
+        it legitimate or unknown, is no longer evidenced; its cases stay as receipts."""
+        current = {item.id for item in guidance(report)["candidates"] if item.outcome != "unknown"}
+        for problem in problems:
+            if problem.evidence == "evidenced" and not problem.origin and not current & set(problem.findings):
+                problem.evidence = None
+                event(run, "reproduced", f"{problem.id} is no longer evidenced: a later reading withdrew its findings",
+                      problem=problem.id, result="withdrawn")
+
     async def hack():
         """The hack inspector, with the attack beside it sharing its slots: its no-hint attempts start at once, and a
         problem's first evidenced finding with full guidance starts its attack as soon as it is recorded. Ends when both have."""
@@ -519,6 +529,7 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
         attacking = asyncio.create_task(beside())
         try:
             report = await inspect_hacks(run, focused_attempts=settings.focused_attempts, on_evidence=found, gate=gate)
+            withdraw(report)
             # Nothing new starts; running attempts end before the hack phase does.
             feed.put_nowait(None)
             await asyncio.wait({attacking})
@@ -534,14 +545,14 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
         """Each grader finding, and each hack finding no problem holds, as in a rerun of a run from before problems were
         judged, is judged against every problem. Each evidenced problem no attempt tried is attacked with its first
         finding, the first with full guidance when there is one, continuing the hack phase's attack. A rerun starts from
-        the earlier run's judged problems that were evidenced or that an Attacker found, each with that run and the help
-        an Attacker needed there; their judgements and evidence its log repeats. It copies no attack record."""
+        the earlier run's judged problems that were evidenced or that an Attacker found, each with that run and the least
+        information an Attacker exploited it with there; their judgements and evidence its log repeats. It copies no attack record."""
         saved, before = run.config.output_dir / "attack.json", settings.attack_from and settings.attack_from / "attack.json"
         earlier = AttackResult.model_validate_json(saved.read_text()) if saved.is_file() else None
         carried.append(len(earlier.attempts) if earlier else 0)
         if before and before.is_file() and not problems:
             older = AttackResult.model_validate_json(before.read_text())
-            problems.extend(item.model_copy(update={"origin": str(settings.attack_from), "earlier_help": report.help_needed(item, older, set())})
+            problems.extend(item.model_copy(update={"origin": str(settings.attack_from), "earlier_exploited_with": report.exploited_with(item, older, set())})
                             for item in older.problems if item.id and (item.evidence == "evidenced" or any(name.endswith("-attacker") for name in item.members)))
             for problem in problems:  # Replayed for this log alone, with no judge call.
                 for index, name in enumerate(problem.members):
