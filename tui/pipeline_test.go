@@ -362,8 +362,8 @@ func TestPipelineHackCountsFreeze(t *testing.T) {
 }
 
 // The card lists the problems by their step on the exploit chart, highest first, from `level`, or from the help an
-// Attacker needed in older reports, where an unknown value is a reproduced exploit; suspicions the hack inspector did
-// not reproduce are counted after them.
+// Attacker needed in older reports, where an unknown value is an evidenced exploit; leads, problems no evidence
+// confirmed, are counted after them.
 func TestProblemsByHelpNeeded(t *testing.T) {
 	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "attack": {"problems": [
 		{"id": "P1", "cause": "c1", "source": "hack inspector", "help_needed": "not_reproduced"},
@@ -387,10 +387,10 @@ func TestProblemsByHelpNeeded(t *testing.T) {
 		" P8 c10    ●●●●○ exploit executable by learner with hint\n   from hack inspector\n" +
 		" P3 c5     ●●●○○ exploit executable by learner with full information\n   from hack inspector\n" +
 		" P7 c9     ●●●○○ exploit executable by learner with full information\n   from hack inspector\n" +
-		" P2 c2     ●●○○○ reproduced exploit\n   from hack inspector\n" +
-		" G1 c3     ●●○○○ reproduced exploit, no clear Attacker result\n   from grader inspector\n" +
-		" P6 c8     ●●○○○ reproduced exploit, Attackers did not exploit it\n   from hack inspector\n" +
-		" 1 more suspected exploit, not reproduced\n"
+		" P2 c2     ●●○○○ evidenced exploit\n   from hack inspector\n" +
+		" G1 c3     ●●○○○ evidenced exploit, no clear Attacker result\n   from grader inspector\n" +
+		" P6 c8     ●●○○○ evidenced exploit, Attackers did not exploit it\n   from hack inspector\n" +
+		" 1 lead, which no evidence confirmed\n"
 	for _, s := range []string{card(r, 100, false), plainPhase(r, 3)} {
 		if !strings.Contains(s, want) {
 			t.Errorf("lacks\n%s\nin:\n%s", want, s)
@@ -418,12 +418,12 @@ func TestCardProblemsFollowTheAnswer(t *testing.T) {
 		t.Errorf("sources:\n%s", s)
 	}
 	// A problem whose finding gave no guidance was not attacked, and says so.
-	if !strings.Contains(s, "  ●●○○○ reproduced exploit, not attacked: no guidance\n   from grader inspector\n") {
+	if !strings.Contains(s, "  ●●○○○ evidenced exploit, not attacked: no guidance\n   from grader inspector\n") {
 		t.Errorf("no guidance:\n%s", s)
 	}
-	// A suspicion the hack inspector did not reproduce is counted, not listed.
-	if !strings.Contains(s, "\n 1 more suspected exploit, not reproduced\n") || strings.Contains(s, "P4 timeout") {
-		t.Errorf("suspected problems:\n%s", s)
+	// A problem no evidence confirmed is a lead, counted, not listed.
+	if !strings.Contains(s, "\n 1 lead, which no evidence confirmed\n") || strings.Contains(s, "P4 timeout") {
+		t.Errorf("leads:\n%s", s)
 	}
 	if !strings.Contains(s, "See report.md for the evidence and limits.\n\n PROBLEMS") || strings.Contains(s, "FP  ") ||
 		strings.Contains(s, "HACK ") || strings.Contains(s, "inconclusive") || !strings.Contains(s, "next › nudi-view testdata/pipeline-full P1") {
@@ -460,8 +460,8 @@ func TestCardShowsEverySourceAtTerminalWidth(t *testing.T) {
 }
 
 // A problem of correct work the grader fails is named with the simulation chart's FN words, never an exploit step;
-// an older problem without findings or levels is only suspected.
-func TestCardNamesCorrectWorkFailedAndKeepsOlderPendingProblemsSuspected(t *testing.T) {
+// an older problem without findings or levels is a lead.
+func TestCardNamesCorrectWorkFailedAndCountsOlderPendingProblemsAsLeads(t *testing.T) {
 	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "attack": {
 		"candidates": [{"id": "grader-0", "valid_work": true}],
 		"problems": [{"id": "G1", "cause": "rejects zeros", "source": "grader inspector", "findings": ["grader-0"], "help_needed": "full_info"},
@@ -473,7 +473,7 @@ func TestCardNamesCorrectWorkFailedAndKeepsOlderPendingProblemsSuspected(t *test
 	if !strings.Contains(s, "Correct work failed, reproduced by an Attacker with full instructions") || strings.Contains(s, "●●●○○") {
 		t.Errorf("correct work failed:\n%s", s)
 	}
-	if !strings.Contains(s, "●○○○○ suspected exploit") || strings.Contains(s, "●●○○○") {
+	if !strings.Contains(s, " 1 lead, which no evidence confirmed") || strings.Contains(s, "pending") {
 		t.Errorf("older pending problem:\n%s", s)
 	}
 }

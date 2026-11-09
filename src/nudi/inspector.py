@@ -26,19 +26,19 @@ from deepagents.backends.sandbox import BaseSandbox
 from deepagents.backends.utils import EMPTY_CONTENT_WARNING
 from deepagents.middleware import filesystem as sdk_filesystem
 from deepagents.profiles import GeneralPurposeSubagentProfile, HarnessProfile, register_harness_profile
-from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.structured_output import ToolStrategy
 from langchain_core.callbacks import AsyncCallbackHandler
-from langchain_core.messages import BaseMessage, HumanMessage, message_to_dict
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage, message_to_dict
 from langchain_litellm import ChatLiteLLM
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
-from langgraph.errors import NodeCancelledError
+from langgraph.errors import GraphRecursionError, NodeCancelledError
+from langgraph.prebuilt.tool_node import TOOL_INVOCATION_ERROR_TEMPLATE
 from langsmith import tracing_context
 
 from nudi import checks, inspection, inspector_sandbox
 from nudi.records import ErrorRecord, InfrastructureAbort, write_private
-from nudi.run_state import SpendingCapReached, model_calls
+from nudi.run_state import SpendingCapReached, model_calls, notice
 
 # The profile identity is private to nudi; LiteLLM still receives the configured route.
 register_harness_profile("nudi-inspector", HarnessProfile(
@@ -55,6 +55,10 @@ COMMAND_TIMEOUT = 600
 # Seconds a workspace call still waiting after sandbox removal gets, and again once cancelled; removal ends a call
 # whose transport works, and a stuck one must not hold the session and its final report.
 DRAIN_TIMEOUT = 10
+# Deep Agents' own graph step limit for each request, the default of deepagents 0.7.32, passed explicitly so nudi knows the
+# bound it tells the inspector about. A model turn takes two graph steps, the model and then its tools, so a request has
+# RECURSION_LIMIT // 2 model turns, the last of which can only return the summary.
+RECURSION_LIMIT = 9_999
 
 
 class InspectorModel(ChatLiteLLM):
@@ -172,6 +176,8 @@ class Transcript(AsyncCallbackHandler):
 
     def __init__(self, run, directory, backend):
         self.run, self.directory, self.backend, self.seen, self.keys = run, directory, backend, set(), set()
+        # Model requests of the current `ask`.
+        self.turns = 0
         write_private(directory / "transcript.jsonl", "")
         write_private(directory / "inference-messages.jsonl", "")
 
@@ -197,6 +203,7 @@ class Transcript(AsyncCallbackHandler):
         return key
 
     async def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
+        self.turns += 1
         with (self.directory / "inferences.jsonl").open("a") as output:
             output.write(json.dumps({"id": str(run_id), "messages": [[self.stored(message) for message in batch] for batch in messages]}) + "\n")
         # Restore protected history/results before inference, including summaries. Tools
@@ -237,7 +244,6 @@ class Transcript(AsyncCallbackHandler):
                     write_private(retained, captured.content)
                 output.artifact.update(retained_output=relative, sha256=digest)
                 output.content = f"{output.content}\nRetained captured bytes: /nudi/evidence/tool-results/{digest}"
-            self.save([output])
 
     async def on_llm_end(self, response, **kwargs):
         messages = [generation.message for batch in response.generations for generation in batch]
@@ -250,26 +256,31 @@ class Transcript(AsyncCallbackHandler):
                 raise inspection.ProviderRefusal(checks.redacted(self.run, str(refusal)))
 
 
-class ToolOwnership(AgentMiddleware):
+class ToolOwnership(sdk_filesystem.FilesystemMiddleware):
     """Join SDK tool tasks before a failed turn can close its workspace.
 
     The SDK runs one reply's tool calls together. This investigation's experiments take turns,
     since admission may leave room for only one beside the workspace; other tools stay
     parallel. Larger hosts are also limited to one experiment at a time per investigation.
+    It replaces the SDK's filesystem middleware, the outermost tool wrapper, so every reply goes
+    through `answered` as the model receives it: also the SDK's own refusals and previews.
     """
 
-    def __init__(self):
-        self.pending, self.experiments, self.failed = set(), asyncio.Lock(), None
+    name = "FilesystemMiddleware"  # The SDK replaces its middleware of the same name in place.
+
+    def __init__(self, answered, backend):
+        super().__init__(backend=backend)
+        self.pending, self.experiments, self.failed, self.answered = set(), asyncio.Lock(), None, answered
 
     async def awrap_tool_call(self, request, handler):
         task = asyncio.current_task()
         self.pending.add(task)
         task.add_done_callback(self.pending.discard)
         if request.tool_call["name"] != "run_experiment":
-            return await handler(request)
+            return self.answered(await super().awrap_tool_call(request, handler))
         async with self.experiments:
             try:
-                return await handler(request)
+                return self.answered(await super().awrap_tool_call(request, handler))
             except BaseException as error:
                 # A raised experiment ends the turn; stop queued experiments before they start.
                 self.failed = error
@@ -285,6 +296,17 @@ class ToolOwnership(AgentMiddleware):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def leading(entries, text: str) -> str:
+    """`open` first: as the first key of a JSON object reply, else as a JSON line above the reply's text."""
+    try:
+        body = json.loads(text)
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        return json.dumps({"open": entries, **body}, ensure_ascii=False)
+    return f"{json.dumps({'open': entries}, ensure_ascii=False)}\n\n{text}"
+
+
 class Investigation:
     """One conversation and workspace. `ask` continues it and returns a validated schema."""
 
@@ -294,7 +316,9 @@ class Investigation:
         # The checkpoint keeps the structured response, the one nudi type in its state; LangGraph blocks an unregistered type
         # under LANGGRAPH_STRICT_MSGPACK and warns otherwise.
         self.checkpointer = InMemorySaver(serde=JsonPlusSerializer(allowed_msgpack_modules=[inspection.InspectionSummary]))
-        self.ownership = ToolOwnership()
+        self.ownership, self.notice, self.tool_errors = ToolOwnership(self.answered, backend), lambda: None, []
+        # What the caller's own tools' replies lead with, such as what keeps an inspection session open, and those tools' names.
+        self.open, self.own = lambda: None, set()
         (box.directory / "tool-outputs").mkdir(mode=0o700)
         (box.directory / "workspace").mkdir(mode=0o700)
         self.transcript = Transcript(run, box.directory, backend)
@@ -316,11 +340,33 @@ class Investigation:
             subagents=[], skills=None, memory=None, interrupt_on=None, checkpointer=self.checkpointer, store=None,
         )
 
+    def answered(self, reply):
+        """A tool's reply: its own text is classified, then a reply of the caller's tools, the SDK's refusal of its arguments
+        included, starts with `open`; it ends with the session's notice and is saved."""
+        if isinstance(reply, ToolMessage):
+            text = str(reply.content)
+            # A filesystem tool's answer that a path does not exist is an answer, not a broken tool, and so is the
+            # SDK's reply to arguments the tool's schema rejects, which asks the model to fix them.
+            if reply.status == "error" and not (reply.name in ("ls", "read_file", "glob", "grep") and text.endswith(
+                    (": path_not_found", ": file_not_found"))) and not text.startswith(TOOL_INVOCATION_ERROR_TEMPLATE.split("{")[0]):
+                self.tool_errors.append(text)
+            if reply.name in self.own and isinstance(reply.content, str) and (entries := self.open()) is not None:
+                reply.content = leading(entries, reply.content)
+            if isinstance(reply.content, str) and (line := self.notice()):
+                reply.content = f"{reply.content}\n\n{line}"
+            self.transcript.save([reply])
+        return reply
+
     async def ask(self, context: str, schema, *, tools=()):
         if self.closed or self.busy:
             raise RuntimeError("An investigation must be open and have only one active turn")
         self.run.check_cap()
-        self.busy, self.ownership.failed = True, None
+        # Only this request's tool calls reach `answered`; the SDK's answer to an earlier turn's unfinished call, as one a
+        # fork inherits, is no error of this request.
+        self.busy, self.ownership.failed, self.tool_errors, self.own = True, None, [], {item.name for item in tools}
+        self.transcript.turns = 0
+        self.notice = lambda: notice(self.run, f"Interpret what you have and return {schema.__name__} now.",
+                                     turns=(self.transcript.turns, RECURSION_LIMIT // 2))
         message = HumanMessage(content=context, id=uuid4().hex)
         self.transcript.save([message])
         try:
@@ -328,7 +374,8 @@ class Investigation:
             with model_calls(self.run, "inspector", self.name), tracing_context(enabled=False):
                 async for state in agent.astream(
                     {"messages": [message]}, stream_mode="values",
-                    config={"callbacks": [self.transcript], "configurable": {"thread_id": self.box.record.session_id}},
+                    config={"callbacks": [self.transcript], "configurable": {"thread_id": self.box.record.session_id},
+                            "recursion_limit": RECURSION_LIMIT},
                 ):
                     self.state = state
                     self.transcript.save(state["messages"])
@@ -342,6 +389,8 @@ class Investigation:
             raise
         except litellm.ContentPolicyViolationError as error:
             raise inspection.ProviderRefusal(checks.redacted(self.run, str(error))) from error
+        except GraphRecursionError as error:
+            raise inspection.StepLimit(f"ran out of steps after {self.transcript.turns} turns") from error
         except Exception as error:
             # A raised experiment cancels the ones waiting their turn, and the SDK can report that cancel
             # first; the experiment's own error is the turn's cause.

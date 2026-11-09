@@ -204,6 +204,10 @@ class Evidence:
         return any(contains(block, source.excerpt) for block in blocks + ["\n".join(current)])
 
 
+# The reason a claim without an Inspector interpretation stays provisional.
+NO_INTERPRETATION = "the claim lacks an interpretation or derivation"
+
+
 def tool_output(trajectory: Path, step_id: int, result: int) -> bytes:
     try:
         steps = Trajectory.model_validate_json(trajectory.read_text()).steps
@@ -329,6 +333,11 @@ def conclusions(assessment: Assessment) -> list[tuple[Observation, str]]:
     if assessment.check is None:
         return []
     return [(assessment.check.requirement, assessment.validity)] + [(item.requirement, item.validity) for item in assessment.conclusions]
+
+
+def satisfied(requirement: Observation, observed: list[tuple[Observation, str]]) -> bool:
+    """One of the `observed` conclusions supports `requirement`, or a requirement whose excerpt holds it in the same file."""
+    return any(validity == "supported" and requirement.within(other) for other, validity in observed)
 
 
 def _same(left: Content | None, right: Content | None) -> bool:
@@ -488,7 +497,7 @@ def judge(assessment: Assessment, evidence: Evidence) -> None:
     if not isinstance(observations, dict) or not isinstance(results, dict):
         return provisional("the check output lacks an `observations` or `results` object", "structured observations and computations from the recorded input bytes")
     if derivation is None or not claim.interpretation.strip():
-        return provisional("the claim lacks an interpretation or derivation", "an Inspector derivation naming measured observations")
+        return provisional(NO_INTERPRETATION, "an Inspector derivation naming measured observations")
     citation_gaps = []
     for citation in claim.citations:
         try:

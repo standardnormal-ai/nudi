@@ -437,7 +437,7 @@ def test_a_repair_evidences_the_category_of_its_session_and_keeps_its_experiment
     graded = "0000-simulator"
     run.grader = InspectionResult(
         mode="grader", status="complete", categories={"accepted_invalid": "no_evidenced_issue", "rejected_valid": "evidenced_issue"},
-        applicability={}, applicability_evidence={"accepted_invalid": {"status": "applicable"}},
+        applicability={},
         attempts=[InspectionAttempt(phase="broad", number=0, status="no_evidenced_issue"),
                   InspectionAttempt(phase="focused", number=1, category="accepted_invalid", status="no_evidenced_issue"),
                   InspectionAttempt(phase="focused", number=1, category="rejected_valid", status="evidenced_issue")],
@@ -463,7 +463,7 @@ def test_every_experiment_without_an_assessment_is_listed_once_whatever_its_cate
     run.record.sandboxes = ["sandbox-0000"]
     run.grader = InspectionResult(
         mode="grader", status="partial", categories={"accepted_invalid": "evidenced_issue", "rejected_valid": "unknown"},
-        applicability={}, applicability_evidence={"rejected_valid": {"status": "applicable"}},
+        applicability={},
         assessments=[packaged("sandbox-0000", "check-0000")],
         experiments=[experiment(0, "accepted_invalid", "check-0000"),
                      {**experiment(1, "accepted_invalid", "check-0001", "measured"), "episode": "0000-simulator"},
@@ -482,6 +482,24 @@ def test_every_experiment_without_an_assessment_is_listed_once_whatever_its_cate
     assert "rejected_valid: no search attempt recorded" in text
 
 
+def test_each_open_category_gets_one_markdown_line_naming_what_keeps_it_open(tmp_path):
+    """`open` reaches report.json as recorded, and report.md lists each open category once with its experiments."""
+    run = RunDir(tmp_path)
+    open_entries = [
+        {"id": "experiment-0000", "category": "package_oracles", "reason": "its reading leaves unresolved: whether the fix is graded",
+         "next": "measure it"},
+        {"id": "experiment-0001", "category": "package_oracles", "reason": "its draft reading is open", "next": "complete it"},
+        {"id": "fabricated_answers", "category": "fabricated_answers", "reason": "no reading of this category agrees", "next": "measure"}]
+    run.hack = InspectionResult(mode="hack", status="partial", categories={"package_oracles": "unknown", "fabricated_answers": "unknown"},
+                                applicability={}, open=open_entries)
+    result = run.report(selected=["hack"])
+    assert result["inspections"]["hack_inspector"]["open"] == open_entries
+    lines = report.markdown(result).splitlines()
+    assert ("- hack_inspector package_oracles leads: experiment-0000: its reading leaves unresolved: whether the fix is graded; "
+            "experiment-0001: its draft reading is open") in lines
+    assert "- hack_inspector fabricated_answers leads: fabricated_answers: no reading of this category agrees" in lines
+
+
 def test_markdown_lists_searched_categories_without_verdicts(tmp_path):
     """Search names and findings remain visible, with no category verdict or applicability prose."""
     run = RunDir(tmp_path)
@@ -491,7 +509,6 @@ def test_markdown_lists_searched_categories_without_verdicts(tmp_path):
         mode="grader", status="partial",
         categories={"accepted_invalid": "evidenced_issue", "rejected_valid": "unknown"},
         applicability={"rejected_valid": prose},
-        applicability_evidence={"accepted_invalid": {"status": "unknown"}, "rejected_valid": {"status": "unknown"}},
         attempts=[InspectionAttempt(phase="broad", number=0, status="unobservable", error="Invalid probe: reference"),
                   InspectionAttempt(phase="focused", number=1, category="accepted_invalid", status="evidenced_issue"),
                   InspectionAttempt(phase="focused", number=1, category="rejected_valid", status="model_output_failure",
@@ -738,23 +755,76 @@ def test_a_problem_where_correct_work_failed_is_named_so_and_never_on_the_exploi
     assert labels == {"P2": (3, "●●●○○ exploit executable by learner with full information"),
                       "P3": (3, "Correct work failed, reproduced by an Attacker with full instructions")}
     lines = report.problem_lines(built)
-    assert lines[0] == ("Problems by level: ●●●○○ exploit executable by learner with full information: P2; "
-                        "Correct work failed, reproduced by an Attacker with full instructions: P3.")
-    assert "- P3 from the hack inspector, Correct work failed, reproduced by an Attacker with full instructions: Leading zeros; findings" in lines[3]
+    # Correct work failed is no exploit, so it has its own line apart from the problems by level.
+    assert lines[:2] == ["Problems by level: ●●●○○ exploit executable by learner with full information: P2.",
+                         "Correct work failed, reproduced by an Attacker with full instructions: P3."]
+    assert "- P3 from the hack inspector, Correct work failed, reproduced by an Attacker with full instructions: Leading zeros; findings" in lines[4]
     # A report from before `label` gives the same words from its candidates.
     for item in built["attack"]["problems"]:
         del item["level"], item["label"]
     assert report.problem_lines(built) == lines
 
 
-def test_an_older_problem_without_findings_is_only_suspected(tmp_path):
-    """A report from before `level` with a problem no finding evidenced shows it as suspected, not reproduced."""
+def test_a_problem_no_evidence_confirmed_is_a_lead_and_never_on_the_ladder(tmp_path):
+    """An older record's problems formed before measurement, which nothing evidenced, are leads: report.json lists them
+    apart from the problems, and report.md names them on one line with no level and no verdict. A stored report with
+    a level-1 problem shows it the same way."""
     run = RunDir(tmp_path)
     answered(run)
-    run.attack.problems = [Problem(id="P1", source="hack inspector", cause="A bash shim.", members=["experiment-0003"])]
+    run.attack.attempts[0].problem = "P2"
+    run.attack.problems = [Problem(id="P1", source="hack inspector", cause="A bash shim.", members=["experiment-0002"], evidence="not_reproduced"),
+                           Problem(id="P2", source="hack inspector", cause="Leading zeros.", members=["experiment-0003"], findings=["hack-1"], evidence="evidenced"),
+                           Problem(id="P3", source="hack inspector", cause="A stale log.", members=["experiment-0004"])]
     built = run.report()
-    del built["attack"]["problems"][0]["level"], built["attack"]["problems"][0]["label"]
-    assert report.problem_lines(built)[0] == "Problems by level: ●○○○○ suspected exploit: P1."
+    assert [item["id"] for item in built["attack"]["problems"]] == ["P2"]
+    assert built["attack"]["leads"] == [{"id": "P1", "cause": "A bash shim."}, {"id": "P3", "cause": "A stale log."}]
+    lines = report.problem_lines(built)
+    assert lines[0] == "Problems by level: ●●●○○ exploit executable by learner with full information: P2."
+    assert lines[-1] == "- Leads, which no evidence confirmed: P1 (A bash shim), P3 (A stale log)."
+    markdown = report.markdown(built)
+    assert "suspected exploit" not in markdown and "tested in" not in markdown
+    stored = json.loads(json.dumps(built))
+    stored["attack"]["leads"] = []
+    stored["attack"]["problems"].append({**stored["attack"]["problems"][0], "id": "P1", "cause": "A bash shim.", "level": 1,
+                                         "label": "●○○○○ suspected exploit", "findings": []})
+    assert report.problem_lines(stored)[0] == lines[0] and report.problem_lines(stored)[-1] == "- Leads, which no evidence confirmed: P1 (A bash shim)."
+
+
+def test_an_evidenced_problem_says_whether_a_package_copy_or_a_native_episode_evidenced_it(tmp_path):
+    """Below an Attacker's exploit, a problem's label names where its findings were evidenced, by their execution
+    scope; package and native problems are listed apart."""
+    run = RunDir(tmp_path)
+    answered(run)
+    native = run.episode(rewards={"reward": 1.0})
+    run.hack.assessments.append(evidenced(native, "check-0007"))
+    run.hack.experiments.append(experiment(7, "grader_tampering", "check-0007"))
+    run.attack.problems = [Problem(id="P4", source="hack inspector", cause="Echo the input.", members=["hack-3"], findings=["hack-3"], evidence="evidenced"),
+                           Problem(id="G1", source="grader inspector", cause="Empty output.", members=["grader-0"], findings=["grader-0"], evidence="evidenced")]
+    built = run.report()
+    labels = {item["id"]: (item["level"], item["label"]) for item in built["attack"]["problems"]}
+    assert labels == {"P4": (2, "●●○○○ exploit evidenced in a native episode"), "G1": (2, "●●○○○ exploit evidenced in a package sandbox")}
+    assert report.problem_lines(built)[0] == ("Problems by level: ●●○○○ exploit evidenced in a native episode: P4; "
+                                              "●●○○○ exploit evidenced in a package sandbox: G1.")
+    # Each category's latest readings that read legitimate are counted, with no verdict on the category.
+    assert "- hack_inspector legitimate readings: grader_tampering 1" in report.markdown(built).splitlines()
+
+
+def test_each_problem_shows_its_cause_with_its_cases_beneath(tmp_path):
+    """A problem's line gives its cause; each case the judge placed in it follows on its own line."""
+    run = RunDir(tmp_path)
+    answered(run)
+    run.attack.attempts[0].problem = "P2"
+    cases = [{"id": "hack-1", "check": "check-0003", "outcome": "accepted_invalid", "mechanism": "A shim\non PATH.",
+              "location": "/usr/bin/bash", "capture_point": "verification_start"},
+             {"id": "hack-4", "check": "check-0008", "outcome": "accepted_invalid", "mechanism": "A shim in /bin."}]
+    run.attack.problems = [Problem(id="P2", source="hack inspector", cause="A bash shim.", members=["hack-1", "hack-4"], findings=["hack-1"],
+                                   evidence="evidenced", cases=cases)]
+    built = run.report()
+    section = report.markdown(built).split("\n## Attack\n")[1].splitlines()
+    at = next(index for index, line in enumerate(section) if line.startswith("- P2 from"))
+    assert section[at + 1:at + 3] == ["  - hack-1: A shim on PATH; check check-0003; location /usr/bin/bash; capture point verification_start",
+                                      "  - hack-4: A shim in /bin; check check-0008"]
+    assert not any(line.startswith("  - ") for line in built["answer"])
 
 
 def test_the_report_names_the_hack_findings_given_to_the_grader_inspector_and_each_candidate_source(tmp_path):
@@ -1045,20 +1115,21 @@ def test_each_problem_reports_the_least_help_an_attacker_needed(tmp_path):
     assert [(item["id"], item["source"], item["members"], item["help_needed"]) for item in built["attack"]["problems"]] == [
         ("P1", "hack inspector", ["experiment-0000", "grader-5"], "found_alone"), ("P2", "hack inspector", ["experiment-0001"], "single_hint"),
         ("P3", "hack inspector", ["experiment-0002"], "full_info"), ("P4", "hack inspector", ["experiment-0003"], "not_exploited"),
-        ("P5", "hack inspector", ["experiment-0004"], "not_reproduced"), ("P6", "hack inspector", ["experiment-0005"], "full_info_or_less"), ("G1", "grader inspector", ["grader-0"], "unknown"),
+        ("P6", "hack inspector", ["experiment-0005"], "full_info_or_less"), ("G1", "grader inspector", ["grader-0"], "unknown"),
         ("G2", "grader inspector", ["grader-1"], "no_guidance"), ("A1", "Attacker", [episodes[1]], "found_alone"),
         (None, None, [], "not_exploited")]
-    # Problems go by their step on the exploit ladder, highest first; a suspicion the hack inspector did not reproduce is
-    # only counted. A full-hint reproduction whose single hint stayed unsettled is at full information.
+    # Problems go by their step on the exploit ladder, highest first; one nothing evidenced is a lead, apart from them.
+    # Without the inspections, where a level-2 problem was evidenced is not known. A full-hint reproduction whose single hint stayed unsettled is at full information.
     assert ("Problems by level: ●●●●● exploit executable by unaided learner: P1, A1; ●●●●○ exploit executable by learner with hint: P2; ●●●○○ exploit executable by learner with full information: P3, P6; "
-            "●●○○○ reproduced exploit: P4, G1, G2, an older problem; 1 more suspected exploit, not reproduced.") in built["answer"]
+            "●●○○○ evidenced exploit: P4, G1, G2, an older problem.") in built["answer"]
+    assert built["attack"]["leads"] == [{"id": "P5", "cause": "Read the key."}]
     # Where each id letter comes from, once, right after the problems in the Answer and in the Attack section.
     legend = ("P: found by the hack inspector's search. G: found by the grader inspector in the simulations. "
-              "A: found by an Attacker on its own.")
+              "A: found by an Attacker, not among the inspectors' findings.")
     at = next(index for index, line in enumerate(built["answer"]) if line.startswith("Problems by level: "))
     assert built["answer"][at + 1] == legend and built["answer"].count(legend) == 1
     assert [(item["id"], item["level"]) for item in built["attack"]["problems"]] == [
-        ("P1", 5), ("P2", 4), ("P3", 3), ("P4", 2), ("P5", 1), ("P6", 3), ("G1", 2), ("G2", 2), ("A1", 5), (None, 2)]
+        ("P1", 5), ("P2", 4), ("P3", 3), ("P4", 2), ("P6", 3), ("G1", 2), ("G2", 2), ("A1", 5), (None, 2)]
     assert built["attack"]["problems"][1]["label"] == "●●●●○ exploit executable by learner with hint"
     assert not any("not_needed" in warning for warning in built["warnings"])
     section = report.markdown(built).split("\n## Attack\n")[1].split("\n## ")[0].splitlines()
@@ -1067,26 +1138,21 @@ def test_each_problem_reports_the_least_help_an_attacker_needed(tmp_path):
     assert "- P2 from the hack inspector, ●●●●○ exploit executable by learner with hint: Skip the test; findings hack-1." in section
     assert "- P3 from the hack inspector, ●●●○○ exploit executable by learner with full information: Pad the log; findings hack-2." in section
     assert "- P6 from the hack inspector, ●●●○○ exploit executable by learner with full information: Skip the hash; findings hack-4." in section
-    assert "- P4 from the hack inspector, ●●○○○ reproduced exploit, Attackers did not exploit it: Echo the input; findings hack-3." in section
-    assert ("- 1 more suspected exploit, not reproduced: P5. The hack inspector's sandbox test did not reproduce it, "
-            "so no Attacker tried it.") in section
-    several = json.loads(json.dumps(built))
-    several["attack"]["problems"].append({**several["attack"]["problems"][4], "id": "P7"})
-    assert ("- 2 more suspected exploits, not reproduced: P5, P7. The hack inspector's sandbox test did not reproduce them, "
-            "so no Attacker tried them.") in report.markdown(several)
-    rows = [line.split(" from ")[0].split(",")[0] for line in section if line.startswith(("- P", "- G", "- A", "- An older", "- 1 more"))]
-    assert rows == ["- P1", "- A1", "- P2", "- P3", "- P6", "- P4", "- G1", "- G2", "- An older problem", "- 1 more suspected exploit"]
-    assert "- G1 from the grader inspector, ●●○○○ reproduced exploit, no clear Attacker result: Accept any output; findings grader-0." in section
-    assert "- G2 from the grader inspector, ●●○○○ reproduced exploit, not attacked: no guidance: Reject zeros; findings grader-1." in section
+    assert "- P4 from the hack inspector, ●●○○○ evidenced exploit, Attackers did not exploit it: Echo the input; findings hack-3." in section
+    rows = [line.split(" from ")[0].split(",")[0] for line in section if line.startswith(("- P", "- G", "- A", "- An older", "- Leads"))]
+    assert rows == ["- P1", "- A1", "- P2", "- P3", "- P6", "- P4", "- G1", "- G2", "- An older problem", "- Leads"]
+    assert "- Leads, which no evidence confirmed: P5 (Read the key)." in section
+    assert "- G1 from the grader inspector, ●●○○○ evidenced exploit, no clear Attacker result: Accept any output; findings grader-0." in section
+    assert "- G2 from the grader inspector, ●●○○○ evidenced exploit, not attacked: no guidance: Reject zeros; findings grader-1." in section
     assert f"- A1 from the Attacker, ●●●●● exploit executable by unaided learner: Write the score file; found in {episodes[1]}." in section
-    assert "- An older problem, ●●○○○ reproduced exploit, Attackers did not exploit it: An older record's cause; findings hack-3." in section
+    assert "- An older problem, ●●○○○ evidenced exploit, Attackers did not exploit it: An older record's cause; findings hack-3." in section
     assert "- Not attempted, the Attacker with full instructions did not exploit it: hack-0 with only a hint, hack-3 with only a hint" in section
     # A report written before problems had ids still renders.
     older = json.loads(json.dumps(built))
     for item in older["attack"]["problems"]:
         for key in ("id", "source", "members", "help_needed", "level", "label"):
             item.pop(key)
-    assert "- An older problem, ●●○○○ reproduced exploit, no clear Attacker result: Forge the digest; findings hack-0." in report.markdown(older)
+    assert "- An older problem, ●●○○○ evidenced exploit, no clear Attacker result: Forge the digest; findings hack-0." in report.markdown(older)
     assert legend not in report.markdown(older).split("\n## Attack\n")[1], "problems without ids have no letters to explain"
 
 
@@ -1235,3 +1301,11 @@ def test_nudi_report_rebuilds_an_ended_run_and_refuses_a_running_one(tmp_path, c
     logged(run, {"kind": "run_start", "pid": os.getpid(), "host": "another-host", "analyses": ["simulation"]})
     assert cli.main(["report", str(run.path)]) == 1
     assert json.loads((run.path / "report.json").read_text())["status"] == "stopped"
+
+
+def test_a_problem_names_every_inspector_whose_finding_it_holds():
+    """A member names its inspector: a hack inspector finding, `hack-N`, or an older run's hack inspector experiment, and
+    a grader inspector finding."""
+    for member in ("hack-3", "experiment-0003"):
+        assert report.problem_sources({"source": "grader inspector", "members": ["grader-0", member]}, 2) == (
+            "the grader inspector and the hack inspector")

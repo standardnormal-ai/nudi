@@ -221,6 +221,10 @@ class Observation(BaseModel):
     or relative to the task directory."""
     excerpt: str
 
+    def within(self, other: "Observation") -> bool:
+        """True when this excerpt lies inside `other`'s in the same file, so work that meets `other` meets it."""
+        return (self.episode, self.path) == (other.episode, other.path) and self.excerpt in other.excerpt
+
 
 class Content(BaseModel):
     """Exact content an episode retained: a file, or one tool output in its ATIF trajectory."""
@@ -614,7 +618,7 @@ class Claim(BaseModel):
     """For an ordinary episode: the reference that grader metrics use; see `MetricBasis`."""
     attribution: dict | None = None
     """The attack inspector's link of an Attacker exploit to its target candidate: `relation`
-    `target` or `other`, the `check` it cites and a `rationale`. Other jobs never write it."""
+    `target` or `other`, and a `rationale`; a target relation rests on the reading's own check. Other jobs never write it."""
 
 
 Discrepancy = Literal["over", "under", "none", "unknown"]
@@ -661,6 +665,8 @@ class Assessment(BaseModel):
     """Evidence that would settle a provisional claim."""
     limits: list[str] = []
     """What the evidence does not establish, kept for evidenced issues too."""
+    nudi_claim: bool = False
+    """nudi made this claim for an experiment that failed or returned no reward; no Inspector interpreted it."""
     persistence: Literal["not_claimed", "unknown", "not_observed", "survived", "unsupported"] = "not_claimed"
     """Separate from scoring mismatch. Absence is only the observed location after that reset."""
     persistence_reasons: list[str] = []

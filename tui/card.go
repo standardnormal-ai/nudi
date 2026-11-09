@@ -82,7 +82,7 @@ func card(r Report, w int, color bool) string {
 func banner(r Report, found, w int) string {
 	n, noun := found, "evidenced finding"
 	if r.helpNeeded() {
-		n, noun = len(slices.DeleteFunc(slices.Clone(r.Attack.Problems), func(p Problem) bool { return p.HelpNeeded == "not_reproduced" })), "problem"
+		n, noun = len(slices.DeleteFunc(slices.Clone(r.Attack.Problems), Problem.lead)), "problem"
 	}
 	bar := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#0d1117")).Background(grey).Padding(0, 1)
 	if n == 0 {
@@ -95,38 +95,40 @@ func banner(r Report, found, w int) string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, bar.Width(w-lipgloss.Width(count)).Render(r.Answer[0]), count)
 }
 
-// problemLines list the problems by their step on the exploit chart, highest first, each with its source. Suspicions
-// the hack inspector's sandbox test did not reproduce are counted on one line. Reports whose problems lack
-// `help_needed` have none.
+// problemLines list the problems by their step on the exploit chart, highest first, each with its source. Leads, the
+// problems no evidence confirmed, are counted on one line. Reports whose problems lack `help_needed` have none.
 func problemLines(r Report, w int) []string {
 	if !r.helpNeeded() {
 		return nil
 	}
-	ps := slices.DeleteFunc(slices.Clone(r.Attack.Problems), func(p Problem) bool { return p.HelpNeeded == "not_reproduced" })
-	suspected := len(r.Attack.Problems) - len(ps)
+	ps := slices.DeleteFunc(slices.Clone(r.Attack.Problems), Problem.lead)
+	leads := len(r.Attack.Leads) + len(r.Attack.Problems) - len(ps)
 	slices.SortStableFunc(ps, func(a, b Problem) int { return b.ladder() - a.ladder() })
 	name := func(p Problem) string {
 		return strings.TrimSpace(p.ID + " " + strings.Join(strings.Fields(p.Cause), " "))
 	}
+	// The report's label, or in reports before `label` the chart's words, and at level 2 the reason.
 	label := func(p Problem) string {
-		switch l := p.ladder(); {
-		case r.validWork(p) && l == 2 && p.HelpNeeded == "not_exploited":
-			return "Correct work failed, Attackers did not reproduce it"
-		case r.validWork(p):
-			return "Correct work failed" + validWorkWords[l]
-		case l == 2 && reasonWords[p.HelpNeeded] != "":
-			return ladderWords[l] + ", " + reasonWords[p.HelpNeeded]
-		case l == 1:
-			return ladderWords[l] + ", no sandbox test evidenced it"
-		default:
-			return ladderWords[l]
+		l, text := p.ladder(), p.Label
+		if text == "" && r.validWork(p) {
+			text = "Correct work failed" + validWorkWords[l]
+		} else if text == "" {
+			text = ladderWords[l]
 		}
+		reason := reasonWords[p.HelpNeeded]
+		if r.validWork(p) && p.HelpNeeded == "not_exploited" {
+			reason = "Attackers did not reproduce it"
+		}
+		if l == 2 && reason != "" {
+			return text + ", " + reason
+		}
+		return text
 	}
 	// Every inspector whose finding the judge placed in the problem, then an Attacker with no extra information.
 	sources := func(p Problem) []string {
 		out := []string{p.Source}
 		for _, m := range p.Members {
-			s := map[string]string{"experiment": "hack inspector", "grader": "grader inspector"}[strings.SplitN(m, "-", 2)[0]]
+			s := map[string]string{"hack": "hack inspector", "experiment": "hack inspector", "grader": "grader inspector"}[strings.SplitN(m, "-", 2)[0]]
 			if s != "" && !slices.Contains(out, s) {
 				out = append(out, s)
 			}
@@ -153,9 +155,8 @@ func problemLines(r Report, w int) []string {
 			out = append(out, wrap("from "+strings.Join(names, " + "), w, "   ", dim))
 		}
 	}
-	if suspected > 0 {
-		out = append(out, " "+dim(fmt.Sprintf("%d %ssuspected exploit%s, not reproduced", suspected, strings.Repeat("more ", min(1, len(ps))),
-			strings.Repeat("s", min(1, suspected-1)))))
+	if leads > 0 {
+		out = append(out, " "+dim(fmt.Sprintf("%d lead%s, which no evidence confirmed", leads, strings.Repeat("s", min(1, leads-1)))))
 	}
 	return out
 }

@@ -753,7 +753,7 @@ def test_secondary_conclusions_survive_unknown_primary_validity_in_labels_and_re
     probes = [facts_probe(name)] + ([facts_probe(name, "newline")] if case == "conflicting" else [])
     responses = [
         {"probes": probes},
-        read("unknown", ["not_returned"], bounded=False, readings=[("newline", "violated")],
+        read("unknown", [], readings=[("newline", "violated")],
              basis=metric_basis("violated", ["newline"], ["check-0000"]),
              unresolved=["whether the newline requirement applies"] if case == "unresolved" else []),
     ]
@@ -822,9 +822,9 @@ def test_corrected_interpretation_uses_the_next_existing_attempt_without_rerunni
     label = inspection.ordinary[name]
     if case == "corrected":
         payload = json.loads(script.requests[2]["messages"][-1]["content"])
-        assert payload["unreviewed_ordinary_episodes"] == [] and "interpret_experiment" in payload["instruction"]
-        diagnostics = payload["unresolved_ordinary_reviews"][name]
-        assert [item["id"] for item in diagnostics["checks"]] == ["check-0000"] and NEWLINE in json.dumps(diagnostics["reasons"])
+        assert "interpret_experiment" in payload["instruction"]
+        (entry,) = [entry for entry in payload["open"] if entry["category"] is None]
+        assert entry["id"] == name and NEWLINE in entry["reason"]
         assert [item.status for item in inspection.attempts] == ["no_evidenced_issue", "duplicate_case"]
         repaired = inspection.reviews[1]
         assert (repaired.episode, repaired.reinterprets, repaired.status, repaired.checks, repaired.assessment) == (
@@ -844,7 +844,8 @@ def test_corrected_interpretation_uses_the_next_existing_attempt_without_rerunni
 @pytest.mark.parametrize(("invalid", "reply"), [
     ("unlisted", "invalid_experiment"),
     ("item", "invalid_experiment"),
-    ("claim", "invalid_claim"),
+    # The claim schema refuses this before nudi reads it.
+    ("claim", "Error invoking tool 'interpret_experiment'"),
     ("list", "invalid_experiment"),
 ])
 def test_invalid_reinterpretation_preserves_other_repairs_and_ordinary_probes(tmp_path, monkeypatch, credentials, invalid, reply):

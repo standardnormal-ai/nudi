@@ -10,6 +10,7 @@ import json
 import os
 import signal
 import time
+from contextvars import ContextVar
 
 from nudi.assessment import Evidence
 from nudi.episode import grading_bound
@@ -26,6 +27,9 @@ CHECK_INPUT_CONTRACT = (
     "(paths the copy omits), episode and ids. Never conclude that anything under an excluded path is missing. An absent "
     "file has no bytes: never measure it as empty content or zero."
 )
+
+# The ids of the checks the current experiment created. Experiments run at once, so each reads only its own.
+created: ContextVar[list[str] | None] = ContextVar("nudi_created", default=None)
 
 # Python 2 prints 2 here and is never used to run a check.
 PYTHON_CANDIDATES = ("python3", "python")
@@ -90,6 +94,8 @@ async def check_submission(run, copy: StateCopy, requirement, scoring, program: 
     check = Check(id=f"check-{len(run.record.checks):04d}", content=copy.receipt, ids=copy.ids, state_copy=copy.id,
                   requirement=requirement, scoring=scoring, command=[], exit_code=None, output="", program=program, timing=timing)
     run.record.checks.append(check)
+    if (ids := created.get()) is not None:
+        ids.append(check.id)
     run.save()
     evidence = Evidence(run.config.output_dir, copy.episode)
     evidence.content(copy.receipt)

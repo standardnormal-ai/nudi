@@ -295,7 +295,7 @@ def test_a_stop_writes_running_reports_marks_waiting_ones_and_prints_the_summary
     monkeypatch.setattr(send, "MODAL_START_GAP", 0)
     analyses, both = Analyses(monkeypatch), asyncio.Barrier(2)
 
-    async def interrupted(run, *, focused_attempts, on_evidence=None, gate=None, judge=None):
+    async def interrupted(run, *, focused_attempts, on_evidence=None, gate=None):
         analyses.calls.append(("inspect_hacks", run.config.output_dir.name))
         await both.wait()
         if run.config.output_dir.name == "task-a":

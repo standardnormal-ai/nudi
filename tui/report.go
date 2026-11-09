@@ -187,6 +187,7 @@ type Attack struct {
 	MaximumAttempts int                   `json:"maximum_attempts"`
 	Candidates      []Candidate           `json:"candidates"`
 	Problems        []Problem             `json:"problems"` // absent before nudi 0.0.1
+	Leads           []Problem             `json:"leads"`    // an older record's problems no evidence confirmed, with id and cause
 	Attempts        []Attempt             `json:"attempts"`
 	Findings        map[string][]Finding  `json:"findings"`
 	Exploits        map[string][]*Exploit `json:"exploits"` // by kind; absent from pooled attack records
@@ -222,6 +223,11 @@ type Problem struct {
 	HelpNeeded string   `json:"help_needed"` // the least help an Attacker needed
 	Level      int      `json:"level"`       // the step on the exploit chart, 1 to 5; 0 in older reports
 	Label      string   `json:"label"`       // that step's chart text
+}
+
+// lead says whether a problem is a lead, one no evidence confirmed: level 1 in reports written before leads.
+func (p Problem) lead() bool {
+	return p.ladder() == 1
 }
 
 // ladder is the problem's step on the exploit chart, from `help_needed` in reports written before `level`.
@@ -518,7 +524,7 @@ func (r Report) topProblem(found []Finding) (*Problem, int) {
 	if !r.helpNeeded() {
 		return nil, 1
 	}
-	ps := slices.DeleteFunc(slices.Clone(r.Attack.Problems), func(p Problem) bool { return p.HelpNeeded == "not_reproduced" })
+	ps := slices.DeleteFunc(slices.Clone(r.Attack.Problems), Problem.lead)
 	slices.SortStableFunc(ps, func(a, b Problem) int { return b.ladder() - a.ladder() })
 	for _, p := range ps {
 		if n := evidenceOf(found, p); n > 0 && p.ID != "" {

@@ -57,7 +57,7 @@ type Event struct {
 	Finding  string   `json:"finding"`  // the probe, finding or attempt the judge judged
 	New      bool     `json:"new"`      // the judge found no known problem it is the same as
 	Cause    string   `json:"cause"`
-	Result   string   `json:"result"`   // evidenced or not_reproduced
+	Result   string   `json:"result"`   // evidenced; older logs also have not_reproduced
 	Replayed bool     `json:"replayed"` // a judged or reproduced event a rerun repeats from the earlier run
 }
 

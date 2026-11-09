@@ -582,6 +582,17 @@ def test_a_basis_without_a_check_does_not_veto_complete_once_its_requirements_ar
     assert run.report()["metrics"]["episodes"][name]["completion"] == "complete"
 
 
+def test_a_cited_requirement_inside_a_satisfied_check_excerpt_is_satisfied(tmp_path):
+    """The check observed the whole sentence satisfied, so the part the basis cites is satisfied too; only that direction."""
+    run = RunDir(tmp_path)
+    name = run.episode(rewards={"reward": 1.0})
+    whole = checked(name, "c0", "sorted", "supported", basis=basis("supported", ["sorted"], ["c0"], decision=RULE))
+    whole.check.requirement = Observation(episode=None, path="instruction.md", excerpt="Write the numbers sorted to /app/out.txt.")
+    run.label(name, "unknown", whole)
+    episode = run.report()["metrics"]["episodes"][name]
+    assert episode["completion"] == "complete", episode["completion_reasons"]
+
+
 def test_an_unobserved_requirement_is_listed_only_when_never_read_no_violation_is_observed_and_its_quote_is_grounded(tmp_path):
     """Review of the unobserved rule: an inconclusive read, a violation quoted differently or an invented quote
     keeps completion unknown, as before."""

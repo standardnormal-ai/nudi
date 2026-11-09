@@ -646,6 +646,9 @@ verification_hook: ContextVar[Callable[[TrialHookEvent], Awaitable[None]] | None
 dropped_links: ContextVar[Callable[[list[str]], None] | None] = ContextVar("nudi_dropped_links", default=None)
 agent_start_capture: ContextVar[Callable[[TrialHookEvent], Awaitable[None]] | None] = ContextVar("nudi_agent_start", default=None)
 trial_end_capture: ContextVar[Callable[[TrialHookEvent], Awaitable[None]] | None] = ContextVar("nudi_trial_end", default=None)
+# nudi's line about a bound near its end, given when the agent started on the event loop's clock; `AttackerTerminus` adds it to
+# the terminal output. Only an Attacker episode sets it (`attack`): Simulator and persistence probe episodes stay unchanged.
+bound_notice: ContextVar[Callable[[float], str | None] | None] = ContextVar("nudi_bound_notice", default=None)
 
 
 async def _run_hook(callback: Callable[[TrialHookEvent], Awaitable[None]] | None, event: TrialHookEvent) -> None:
@@ -736,16 +739,24 @@ class HostTerminus(Terminus2):
 
 class AttackerTerminus(HostTerminus):
     """HostTerminus for Attacker episodes: a shell that ends within a turn ends the turn, as one that
-    ended between turns does, so the episode is graded. Simulator episodes keep stock Harbor."""
+    ended between turns does, so the episode is graded. With `bound_notice` set, its line ends the
+    terminal output of each turn. Simulator episodes keep stock Harbor."""
+
+    async def run(self, *args, **kwargs):
+        self.started = asyncio.get_running_loop().time()
+        return await super().run(*args, **kwargs)
 
     async def _execute_commands(self, commands, session):
         try:
-            return await super()._execute_commands(commands, session)
+            timed_out, output = await super()._execute_commands(commands, session)
         except RuntimeError:
             if await session.is_session_alive():
                 raise
             # The shell ended within this turn; the next turn's liveness check ends the loop and the verifier grades the state.
             return False, "The terminal session has ended."
+        if (warn := bound_notice.get()) and (line := warn(self.started)):
+            output = f"{output}\n\n{line}"
+        return timed_out, output
 
 
 MODAL_BOX = "nudi.modal_env:ModalBox"

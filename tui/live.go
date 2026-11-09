@@ -317,7 +317,7 @@ func findingsPanel(l *Live, now time.Time, w int, sp string) string {
 	return strings.Join(out, "\n")
 }
 
-// pipeRows are the no extra information row, then the problems of the hacks, those found by an Attacker alone, and the grader's.
+// pipeRows are the no extra information row, then the problems of the hacks, those an Attacker found outside the inspectors' findings, and the grader's.
 func (l *Live) pipeRows(now time.Time, sp string) []pipeRow {
 	var rows []pipeRow
 	var zero []string

@@ -18,6 +18,7 @@ The fields a script or coding agent reads. Both files hold more; [Usage](usage.m
 | `configuration.known_cost` | number | Known inference cost in US dollars |
 | `configuration.unknown_cost_calls`, `configuration.cancelled_calls` | integer | Calls whose cost is unknown, and calls cancelled in flight; the known cost excludes both |
 | `configuration.unknown_reasons` | object | Each reason a call has no price, mapped to its count |
+| `inspections.<inspector>.open` | list | What kept a category, or a grader inspector's ordinary episode, unsettled when the inspection ended: each entry's `id` (an experiment, episode or category), `category` (null for an ordinary episode), `reason` and `next` step. Empty when nothing was left open; absent in older reports |
 | `warnings` | list of strings | Everything that limits the results |
 
 The exit code follows `status`: `0` for `complete`, `1` for the others, `time_limit` included.
@@ -28,13 +29,18 @@ Each entry of `attack.problems`:
 | --- | --- | --- |
 | `id` | string or null | `P1`, `P2` ... from the hack inspector, `G1` ... from the grader inspector, `A1` ... from an Attacker with no hint; null in older reports |
 | `source` | string or null | `hack inspector`, `grader inspector` or `Attacker` |
-| `level` | integer | 1 to 5, the exploit level in [Usage](usage.md#reports) |
-| `label` | string | The level's words, such as `●●●○○ exploit executable by learner with full information`, or `Correct work failed` and how an Attacker reproduced it |
-| `help_needed` | string | `found_alone`, `single_hint`, `full_info`, `full_info_or_less`, `not_exploited`, `no_guidance`, `not_reproduced` or `unknown` |
+| `level` | integer | 2 to 5, the exploit level in [Usage](usage.md#reports) |
+| `label` | string | The level's words, such as `●●●○○ exploit executable by learner with full information`, or `Correct work failed` and how an Attacker reproduced it; for a problem a rerun kept and did not find again, `evidenced in run DIR at LABEL; not found again here` |
+| `help_needed` | string | `found_alone`, `single_hint`, `full_info`, `full_info_or_less`, `not_exploited`, `no_guidance` or `unknown` |
 | `cause` | string | One line |
 | `findings` | list of strings | The inspector findings this cause explains, as `hack-INDEX` or `grader-INDEX` |
 | `candidate` | string or null | The finding the attack tested |
 | `reproduced` | boolean | An Attacker reproduced it |
+| `cases` | list of objects | Each finding or Attacker exploit as the judge read it: `id`, `check`, `outcome`, `mechanism`, `location`, `capture_point` |
+| `origin` | string or null | The earlier run a rerun took the problem from |
+| `earlier_help` | string or null | Its `help_needed` in that earlier run |
+
+`attack.leads` lists the problems of an older record that no evidence confirmed, each with its `id` and `cause`; they have no level.
 
 ### Names of the inspectors
 

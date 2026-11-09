@@ -12,11 +12,11 @@
    from grader inspector
  P2 skips the test file     ●●●○○ exploit executable by learner with full information
    from hack inspector
- P3 writes expected output  ●●○○○ reproduced exploit, Attackers did not exploit it
+ P3 writes expected output  ●●○○○ evidenced exploit, Attackers did not exploit it
    from hack inspector
- G2 rejects leading zeros   ●●○○○ reproduced exploit, not attacked: no guidance
+ G2 rejects leading zeros   ●●○○○ evidenced exploit, not attacked: no guidance
    from grader inspector
- 1 more suspected exploit, not reproduced
+ 1 lead, which no evidence confirmed
 
  REWARDS  6 of 6 episodes
  0.0  ██████ 1

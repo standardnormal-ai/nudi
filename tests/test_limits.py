@@ -1065,3 +1065,25 @@ def test_cancelled_sdk_inference_is_accounted_once(tmp_path, monkeypatch, creden
         assert ("xai/grok-4.7: a call was cancelled in flight; its cost is unknown and does not count toward the spending cap"
                 in stored_run(run).warnings)
     assert sandbox_record(run, session.box.record.name)["cleanup"]["removed"] is True
+
+
+def test_an_agent_is_told_once_a_fifth_or_less_of_a_bound_is_left(tmp_path, monkeypatch, credentials):
+    """Each bound an agent works under, its model turns, its agent timeout, the run's time limit and the spending cap,
+    adds itself to one plain line once 20% or less of it is left. While every bound has more left there is no line."""
+    from nudi.run_state import notice
+
+    run = new_run(tmp_path, monkeypatch, credentials, spending_cap=1.0)
+    finish = "Return your summary now."
+
+    async def main():
+        now = asyncio.get_running_loop().time()
+        quiet = notice(run, finish, turns=(79, 100), agent=(now + 3000, 10000))
+        run.time_limit = (now + 590, 3600)
+        run.record.known_cost = 0.8
+        late = notice(run, finish, turns=(99, 100), agent=(now + 1, 10000))
+        return quiet, late
+
+    quiet, late = asyncio.run(main())
+    assert quiet is None
+    assert late == ("Your session ends soon, with 1 model turn, 1 minute before the agent timeout, 10 minutes before the run's "
+                    "time limit and $0.20 of the spending cap left. Return your summary now.")

@@ -612,9 +612,9 @@ func TestMissingFlagDetailsAreUnavailable(t *testing.T) {
 	}
 }
 
-// An attempt not started for lack of time is not tested; one whose workspace ran out of memory failed.
+// An attempt not started for lack of time is not tested; one whose workspace ran out of memory, or whose attack inspector ran out of steps, failed.
 func TestAttackStopsHaveWords(t *testing.T) {
-	for status, want := range map[string]Result{"insufficient_time": NotTested, "out_of_memory": Failed} {
+	for status, want := range map[string]Result{"insufficient_time": NotTested, "out_of_memory": Failed, "step_limit": Failed} {
 		clear(missed)
 		if res, _ := lookup(attemptResults, status); res != want || missed[status] {
 			t.Errorf("%s shows as %v", status, res)

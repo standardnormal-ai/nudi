@@ -226,6 +226,8 @@ class Run:
     """When the last progress line was logged, a `time.monotonic()` value."""
     jobs: dict[str, tuple[str, str | None]] = field(default_factory=dict)
     """Inspector sessions and Attacker episodes between their start and end events: each one's job and problem."""
+    time_limit: tuple[float, float] | None = None
+    """The run's time limit while it runs: its deadline on the event loop's clock and its length in seconds."""
 
     def save(self) -> None:
         write_private(self.config.output_dir / "run.json", self.record.model_dump_json(indent=2))
@@ -291,6 +293,31 @@ class Run:
         if not headroom:
             self.warn(f"a held Inspector workspace and one fresh experiment use all {capacity.docker_cpus} of Docker's "
                       "CPUs: no CPU headroom remains for Docker, image builds or host processes")
+
+
+# The share of a bound left at which an agent is told, so it can still finish before the bound stops it.
+NOTICE_SHARE = 0.2
+
+
+def notice(run, finish: str, *, turns: tuple[int, int] | None = None, agent: tuple[float, float] | None = None) -> str | None:
+    """One plain line for an agent once 20% or less of a bound it works under is left, else None: `turns`, the model turns
+    it used and their bound; `agent`, its agent timeout's deadline on the event loop's clock and its length in seconds; the
+    run's time limit; and the spending cap. `finish` says how to wrap up."""
+    now, left = asyncio.get_running_loop().time(), []
+    if turns and (turns[1] - turns[0]) <= NOTICE_SHARE * turns[1]:
+        count = max(turns[1] - turns[0], 0)
+        left.append(f"{count} model turn{'s' * (count != 1)}")
+    for bound, name in ((agent, "the agent timeout"), (run.time_limit, "the run's time limit")):
+        if bound and bound[0] - now <= NOTICE_SHARE * bound[1]:
+            minutes = math.ceil(max(bound[0] - now, 0) / 60)
+            left.append(f"{minutes} minute{'s' * (minutes != 1)} before {name}")
+    cap = run.record.spending_cap
+    if cap and cap - run.record.known_cost <= NOTICE_SHARE * cap:
+        left.append(f"${max(cap - run.record.known_cost, 0):.2f} of the spending cap")
+    if not left:
+        return None
+    said = ", ".join(left[:-1]) + " and " + left[-1] if len(left) > 1 else left[0]
+    return f"Your session ends soon, with {said} left. {finish}"
 
 
 def elapsed(started: float) -> timedelta:

@@ -1234,3 +1234,29 @@ def test_an_attacker_shell_that_ends_within_a_turn_ends_the_turn_so_the_episode_
             asyncio.run(agent._execute_commands(commands, Session()))
     else:
         assert asyncio.run(agent._execute_commands(commands, Session())) == (False, "The terminal session has ended.")
+
+
+def test_terminus_adds_nudis_line_to_its_terminal_output_only_when_an_episode_sets_one(tmp_path):
+    """An Attacker episode sets `bound_notice`, given when its agent started; its line then ends the terminal output
+    the agent reads. Without it, as for the Simulator, the output is Terminus's own."""
+    from harbor.agents.terminus_2.terminus_2 import Command
+
+    from nudi.episode import AttackerTerminus, bound_notice
+
+    class Session:
+        async def send_keys(self, keys, **options):
+            pass
+
+        async def get_incremental_output(self):
+            return "screen"
+
+    agent = AttackerTerminus(tmp_path / "agent", model_name="openai/gpt-4o")
+    agent.started = 5.0
+    commands = [Command("ls\n", 0.1)]
+    assert asyncio.run(agent._execute_commands(commands, Session())) == (False, "screen")
+
+    async def told():
+        bound_notice.set(lambda started: f"Ends soon; started at {started}.")
+        return await agent._execute_commands(commands, Session())
+
+    assert asyncio.run(told()) == (False, "screen\n\nEnds soon; started at 5.0.")

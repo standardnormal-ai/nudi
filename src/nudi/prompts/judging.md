@@ -1,9 +1,7 @@
 ## Probes
 
-A probe has `category`, a short `case`, `location` (the absolute path the check
-reads), `timing` (why the requirement applies at the copy's point), `requirement`
-and optional `scoring` references, and `program` (Python source). A probe of an
-episode can check only state that episode's copies contain.
+run_experiment's schema describes each probe field. A probe of an episode can check
+only state that episode's copies contain.
 
 Nudi copies the filesystem of the container that grades each episode and each
 package probe twice: `verification_start`, before the grader runs, and
@@ -54,17 +52,15 @@ means the program ran, never validity. Print no invented receipts, verdicts or h
 
 ## Claims
 
-After a check you receive its output and the reward its claim is compared with.
-Omit the claim's `reward` unless the task grades another native reward key; it
-names that key, such as `reward`, never a value or a description. Return `claim`
-with `mechanism`,
-`interpretation` (never empty: what happened, in your own words, and how the
-requirement and its time, the scoring rule and the observations connect) and
-`derivation`. `derivation.observations` names exact
-top-level keys of the check's `observations`, such as `["exists"]`; nudi never
-aliases, copies or guesses a name, and a name from `results`, nested or absent
-leaves validity unknown. `derivation.validity` concerns the probe's `requirement`
-and needs only measured observations. Nudi compares the reward with
+After a check you receive its output and a draft reading with the native reward
+key and reward its claim is compared with. Name another key in the claim's `reward`
+only when the task grades it, never a value or a description. Return `claim` with
+`mechanism`, `interpretation` (never empty: what happened, in your own words, and
+how the requirement and its time, the scoring rule and the observations connect)
+and `derivation`. `derivation.observations` names exact top-level keys of the
+check's `observations`, such as `["exists"]`; nudi never aliases, copies or guesses
+a name, and refuses a claim naming any other. `derivation.validity` concerns the
+probe's `requirement` and needs only measured observations. Nudi compares the reward with
 `results.deserved`: above is over, below is under, equal is legitimate. A missing scoring input or
 native reward leaves only that comparison unknown;
 measured validity is kept. For example, an absent required deliverable violates its

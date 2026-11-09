@@ -102,20 +102,15 @@ class Analyses:
         self.raise_if("grader")
         return self.inspection(run, "grader", self.assessments, self.ordinary)
 
-    async def inspect_hacks(self, run, *, focused_attempts, on_evidence=None, gate=None, judge=None):
+    async def inspect_hacks(self, run, *, focused_attempts, on_evidence=None, gate=None):
         self.calls.append(("inspect_hacks", focused_attempts))
         self.raise_if("hack")
         result = self.inspection(run, "hack")
-        # As the hack inspector does: each reading's probe is judged first, and an evidenced reading evidences its problem.
+        # As the hack inspector does: it awaits the evidence hook for each evidenced reading as it records it.
         for index, item in enumerate(self.candidates):
-            problem = judge and await judge(f"experiment-{index:04d}", {"mechanism": item.claim.mechanism})
             result.assessments.append(item)
-            if inspection.evidenced(item):
-                if problem:
-                    problem.findings.append(f"hack-{index}")
-                    problem.evidence = "evidenced"
-                if on_evidence:
-                    on_evidence(result, index)
+            if inspection.evidenced(item) and on_evidence:
+                await on_evidence(result, index)
         (run.config.output_dir / "inspection-hack.json").write_text(result.model_dump_json())
         return result
 
@@ -607,6 +602,19 @@ def test_a_later_reading_of_its_check_withdraws_every_earlier_candidate():
     assert candidates["hack-7"].guidance == {"full": None, "minimal": None}
 
 
+def test_a_control_is_no_candidate_so_no_problem_is_made_of_it():
+    """A control checks the measurement, so even an evidenced, guided reading of its check feeds no attack, and the
+    attack phase, which judges candidates no problem holds, makes no problem of it."""
+    def reading(check):
+        return Assessment(claim=Claim(mechanism=MECHANISM, episode="0000-inspector", interpretation=INTERPRETATION,
+                                      check=check, full_guidance=REPRODUCTION), outcome="accepted_invalid")
+
+    hack = InspectionResult(mode="hack", categories={}, applicability={}, assessments=[reading("check-0000"), reading("check-0001")],
+                            experiments=[{"id": "experiment-0000", "check": "check-0000", "control": True},
+                                         {"id": "experiment-0001", "check": "check-0001"}])
+    assert [item.id for item in send.guidance(hack)["candidates"]] == ["hack-1"]
+
+
 def judge_replies(monkeypatch, replies):
     """Replace only the judge call's provider IO. Each of `replies` in turn is the Verdict tool call's arguments, or an
     exception it raises."""
@@ -643,48 +651,102 @@ def judged_events(run_dir):
             for item in map(json.loads, (run_dir / "events.jsonl").read_text().splitlines()) if item["kind"] == "judged"]
 
 
-def test_one_judge_call_per_probe_names_its_problem_and_each_problem_is_attacked_once(tmp_path, monkeypatch):
+def test_one_judge_call_per_evidenced_reading_names_its_problem_and_each_problem_is_attacked_once(tmp_path, monkeypatch):
     """One flaw read several ways is several findings, and attacking each of them can spend every attempt on that flaw
-    while another is never attacked. Before each probe's experiment one call of the inspector model judges it against
-    the problems so far; the first needs no call. A problem's first evidenced finding with full guidance is attacked
-    beside the hack inspector: hack-0 has none, so hack-2 stands for the pipe problem."""
-    requests = judge_replies(monkeypatch, [{"same_as": None}, {"same_as": "P1"}, {"same_as": "P1"}])
+    while another is never attacked. Each evidenced reading, as it is recorded, is judged by one call of the inspector
+    model against the problems so far; the first needs no call, and a reading of unknown outcome is not judged. A
+    problem's first evidenced finding with full guidance is attacked beside the hack inspector: hack-0 has none, so
+    hack-2 stands for the pipe problem. Each finding is a case of its problem."""
+    requests = judge_replies(monkeypatch, [{"same_as": None}, {"same_as": "P1"}])
     analyses = Analyses(monkeypatch, candidates=pipe_findings(), judging=True)
     send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
 
-    assert len(requests) == 3
+    assert len(requests) == 2
     assert {(request["model"], request["api_key"]) for request in requests} == {(DEFAULT_MODELS["inspector"].model, SECRET)}
     assert [tool["function"]["name"] for tool in requests[0]["tools"]] == ["Verdict"]
+    case = lambda id, mechanism: {"id": id, "outcome": "accepted_invalid", "mechanism": mechanism}
     assert json.loads(requests[1]["messages"][-1]["content"]) == {
-        "finding": {"mechanism": "Forge the pipe bytes on stdout."}, "known_problems": [
-            {"id": "P1", "cause": "Forge the pipe bytes in the output."}, {"id": "P2", "cause": "Return a constant drift score."}]}
+        "finding": {"outcome": "accepted_invalid", "mechanism": "Forge the pipe bytes on stdout."}, "known_problems": [
+            {"id": "P1", "cause": "Forge the pipe bytes in the output.", "cases": [case("hack-0", "Forge the pipe bytes in the output.")]},
+            {"id": "P2", "cause": "Return a constant drift score.", "cases": [case("hack-1", "Return a constant drift score.")]}]}
     saved = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text())
     assert [(item.id, item.source, item.members, item.findings, item.evidence) for item in saved.problems] == [
-        ("P1", "hack inspector", ["experiment-0000", "experiment-0002", "experiment-0003"], ["hack-0", "hack-2"], "evidenced"),
-        ("P2", "hack inspector", ["experiment-0001"], ["hack-1"], "evidenced")]
+        ("P1", "hack inspector", ["hack-0", "hack-2"], ["hack-0", "hack-2"], "evidenced"),
+        ("P2", "hack inspector", ["hack-1"], ["hack-1"], "evidenced")]
+    assert [[item["id"] for item in problem.cases] for problem in saved.problems] == [["hack-0", "hack-2"], ["hack-1"]]
     assert [item.id for item in analyses.candidates_sent] == ["hack-1", "hack-2"]
     assert [(item["finding"], item["problem"], item["new"]) for item in judged_events(tmp_path / "run")] == [
-        ("experiment-0000", "P1", True), ("experiment-0001", "P2", True), ("experiment-0002", "P1", False),
-        ("experiment-0003", "P1", False)]
+        ("hack-0", "P1", True), ("hack-1", "P2", True), ("hack-2", "P1", False)]
     assert not any("judging" in warning for warning in json.loads((tmp_path / "run" / "run.json").read_text())["warnings"])
 
 
-@pytest.mark.parametrize("reply", [
-    {"same_as": "P9"}, {"same_as": ["P1"]},
-    litellm.APIConnectionError(message="gateway unreachable", llm_provider="openai", model="deepseek"),
-], ids=["unknown id", "invalid schema", "call failure"])
-def test_a_failed_judge_call_counts_as_a_new_problem_with_one_warning(tmp_path, monkeypatch, reply):
-    judge_replies(monkeypatch, [reply] * 3)
-    analyses = Analyses(monkeypatch, candidates=pipe_findings(), judging=True)
-    send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
+def test_a_legitimate_reading_and_a_control_make_no_problem(tmp_path, monkeypatch):
+    """Only an evidenced candidate finding is judged: a legitimate reading is no finding, and a control's evidenced
+    reading checks the measurement, so it is never a candidate."""
+    requests = judge_replies(monkeypatch, [])
+    Analyses(monkeypatch, judging=True)
 
-    assert [item.id for item in analyses.candidates_sent] == ["hack-1", "hack-2"]
-    assert [(item["problem"], item["new"]) for item in judged_events(tmp_path / "run")] == [
-        ("P1", True), ("P2", True), ("P3", True), ("P4", True)]
-    warnings = [item for item in json.loads((tmp_path / "run" / "run.json").read_text())["warnings"] if "problem" in item]
-    assert [warning.split(" failed")[0] for warning in warnings] == [
-        "judging experiment-0001", "judging experiment-0002", "judging experiment-0003"]
-    assert all("counts as a new problem" in warning and SECRET not in warning for warning in warnings)
+    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate):
+        report = hack_findings(("legitimate", "grader_tampering", REPRODUCTION), ("accepted_invalid", "grader_tampering", REPRODUCTION))
+        report.experiments[1]["control"] = True
+        for index in range(2):
+            await on_evidence(report, index)
+        return report
+
+    monkeypatch.setattr(send, "inspect_hacks", inspect_hacks)
+    send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
+    assert requests == [] and judged_events(tmp_path / "run") == []
+    assert AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text()).problems == []
+
+
+def test_a_reading_again_of_a_judged_check_joins_its_problem_without_a_judge_call(tmp_path, monkeypatch):
+    """An inspector asked for guidance interprets the same experiment again; that reading is the same case, so it joins
+    the problem of the check's earlier reading with no second judge call and no second case."""
+    requests = judge_replies(monkeypatch, [])
+    analyses = Analyses(monkeypatch, judging=True)
+
+    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate):
+        report = hack_findings(("accepted_invalid", "grader_tampering", None))
+        await on_evidence(report, 0)
+        report.assessments.append(report.assessments[0].model_copy(update={"claim": report.assessments[0].claim.model_copy(
+            update={"full_guidance": REPRODUCTION})}))
+        await on_evidence(report, 1)
+        return report
+
+    monkeypatch.setattr(send, "inspect_hacks", inspect_hacks)
+    send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
+    (problem,) = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text()).problems
+    assert requests == [] and (problem.members, problem.findings) == (["hack-0"], ["hack-0", "hack-1"])
+    assert [item["id"] for item in problem.cases] == ["hack-0"]
+    assert [item.id for item in analyses.candidates_sent] == ["hack-1"]
+
+
+def test_the_judge_runs_with_its_own_callbacks_so_it_is_no_turn_of_the_inspector_it_runs_inside(tmp_path, monkeypatch):
+    """The judge is called inside the hack inspector's tool call, whose callbacks count its model turns and write its
+    transcript. It runs with its own callbacks, so neither hears its call."""
+    from langchain_core.callbacks import AsyncCallbackHandler
+    from langchain_core.runnables.config import var_child_runnable_config
+
+    requests = judge_replies(monkeypatch, [{"same_as": None}])
+    analyses = Analyses(monkeypatch, candidates=pipe_findings()[1:3], judging=True)
+    heard = []
+
+    class Turns(AsyncCallbackHandler):
+        async def on_chat_model_start(self, serialized, messages, **kwargs):
+            heard.append(messages)
+
+    inspect_hacks = analyses.inspect_hacks
+
+    async def in_a_tool_call(run, **options):
+        token = var_child_runnable_config.set({"callbacks": [Turns()]})
+        try:
+            return await inspect_hacks(run, **options)
+        finally:
+            var_child_runnable_config.reset(token)
+
+    monkeypatch.setattr(send, "inspect_hacks", in_a_tool_call)
+    send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
+    assert len(requests) == 1 and heard == []
 
 
 GRADER_STEPS, GRADER_LOCATION = "Write the answer in the documented format.", "tests/test_outputs.py"
@@ -725,13 +787,13 @@ def test_each_grader_finding_is_judged_against_every_problem_and_only_new_ones_a
     assert (grader.id, grader.source, grader.valid_work) == ("grader-1", "grader_inspector", True)
     assert grader.guidance == {"full": GRADER_STEPS, "minimal": f"{WHERE_TO_LOOK}\n{GRADER_LOCATION}"}
     assert [(item.id, item.source, item.members, item.findings) for item in analyses.problems_sent] == [
-        ("P1", "hack inspector", ["experiment-0000", "grader-0"], ["hack-0", "grader-0"]),
+        ("P1", "hack inspector", ["hack-0", "grader-0"], ["hack-0", "grader-0"]),
         ("G1", "grader inspector", ["grader-1"], ["grader-1"])]
     assert [(item["inspector"], item["finding"], item["problem"], item["new"]) for item in judged_events(tmp_path / "run")] == [
-        ("hack", "experiment-0000", "P1", True), ("grader", "grader-0", "P1", False), ("grader", "grader-1", "G1", True)]
+        ("hack", "hack-0", "P1", True), ("grader", "grader-0", "P1", False), ("grader", "grader-1", "G1", True)]
     # Only the change of evidence is logged: P1 was already evidenced, so its grader finding writes no second event.
     assert [(item["text"].split(" ", 2)[2], item["problem"]) for item in events(tmp_path / "run") if item["kind"] == "reproduced"] == [
-        ("grader inspector found G1", "G1")]
+        ("hack inspector found P1", "P1"), ("grader inspector found G1", "G1")]
 
 
 @pytest.mark.parametrize("status", ["complete", "partial"])
@@ -850,54 +912,58 @@ def test_without_hack_findings_the_grader_inspector_request_is_unchanged(tmp_pat
     assert analyses.grader_request is None
 
 
-def test_the_judge_reads_the_finding_and_each_problems_first_case_and_measured_findings(tmp_path, monkeypatch):
-    """The judge compares the probe's category, mechanism, cited text and where it looks with each problem's first case and,
-    once a problem is evidenced, the findings that measured it with their outcome. A long excerpt is cut and marked so,
-    and each `judged` event keeps the request the judge read."""
-    requests = judge_replies(monkeypatch, [{"same_as": None}])
-    analyses = Analyses(monkeypatch, judging=True)
-    first = {"category": "grader_tampering", "mechanism": "Swap the\n test runner.", "scoring": None, "location": "tests/run.sh",
-             "requirement": {"episode": None, "path": "instruction.md", "excerpt": "x" * (send.EXCERPT + 5)}, "capture_point": "verification_start"}
-    measured = {"id": "hack-0", "check": "check-0000", "outcome": "accepted_invalid", "mechanism": "Swap the test runner."}
+def test_the_judge_groups_by_cause_and_reads_each_findings_case_and_each_problems_cases(tmp_path, monkeypatch):
+    """A problem is one cause. The judge reads the finding's category, outcome, mechanism, cited text, location and
+    capture point, and each known problem's cause with its cases; it returns the problem whose cause this is, also where
+    the location differs, or null for a new cause. A long excerpt is cut and marked so, and each `judged` event keeps
+    the request the judge read."""
+    from nudi.records import Check, Content
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, judge):
-        problem = await judge("experiment-0000", first)
-        problem.measured.append(measured)
-        problem.evidence = "evidenced"
-        await judge("experiment-0001", {**first, "mechanism": "Edit the scorer."})
-        return analyses.inspection(run, "hack")
+    requests = judge_replies(monkeypatch, [{"same_as": "P1"}])
+    Analyses(monkeypatch, judging=True)
+    requirement = Observation(episode=None, path="instruction.md", excerpt="x" * (send.EXCERPT + 5))
+
+    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate):
+        report = hack_findings(("accepted_invalid", "grader_tampering", None), ("accepted_invalid", "grader_tampering", None))
+        for index, location in enumerate(("tests/run.sh", "tests/helper.sh")):
+            report.experiments[index].update(location=location, capture_point="verification_start")
+            run.record.checks.append(Check(id=f"check-{index}", content=Content(episode="0000-inspector", path="x", sha256="ab" * 32),
+                                           ids={}, requirement=requirement, command=["python3"], exit_code=0, output="{}"))
+        for index in range(2):
+            await on_evidence(report, index)
+        return report
 
     monkeypatch.setattr(send, "inspect_hacks", inspect_hacks)
     send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
-    case = {"category": "grader_tampering", "location": "tests/run.sh", "capture_point": "verification_start"}
+    cut = {"path": "instruction.md", "excerpt": "x" * send.EXCERPT + " [cut]"}
+    first = {"id": "hack-0", "check": "check-0", "outcome": "accepted_invalid", "mechanism": "way 0", "location": "tests/run.sh",
+             "capture_point": "verification_start"}
     sent = json.loads(requests[0]["messages"][-1]["content"])
-    assert sent == {"finding": {**case, "mechanism": "Edit the scorer.", "requirement": {"path": "instruction.md", "excerpt": "x" * send.EXCERPT + " [cut]"}},
-                    "known_problems": [{"id": "P1", "cause": "Swap the test runner.", "case": case, "evidenced_findings": [measured]}]}
+    assert sent == {"finding": {"category": "grader_tampering", "outcome": "accepted_invalid", "mechanism": "way 1", "requirement": cut,
+                                "location": "tests/helper.sh", "capture_point": "verification_start"},
+                    "known_problems": [{"id": "P1", "cause": "way 0", "cases": [first]}]}
     assert [item["request"] for item in events(tmp_path / "run") if item["kind"] == "judged"] == [None, sent]
-    assert "the same flaw reached by another input or read another way is the same problem" in send.JUDGE_PROMPT
+    (problem,) = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text()).problems
+    assert [(item["id"], item["location"]) for item in problem.cases] == [("hack-0", "tests/run.sh"), ("hack-1", "tests/helper.sh")]
+    prompt = send.JUDGE_PROMPT
+    assert "A problem is one cause: one flaw of the grader or environment." in prompt
+    assert "Matching paths alone do not make the same cause." in prompt and "When unsure" not in prompt
+    assert "different route" not in prompt and not hasattr(inspection, "IDENTITY")
 
 
-def test_a_grader_finding_of_a_problem_the_hack_inspector_did_not_reproduce_evidences_and_attacks_it(tmp_path, monkeypatch):
-    """The hack inspector's experiment did not evidence P1, so it was not attacked. The grader inspector evidences the
-    same flaw in an ordinary episode, so P1 is evidenced after all, with a `reproduced` event, and attacked with that finding."""
+def test_a_grader_finding_of_a_known_problem_is_its_new_case_and_states_its_outcome(tmp_path, monkeypatch):
+    """The grader inspector evidences the hack inspector's P1 in an ordinary episode: the judge reads the grader
+    finding's outcome, and the finding becomes P1's case. P1 is attacked with its first finding with full guidance."""
     requests = judge_replies(monkeypatch, [{"same_as": "P1"}])
-    analyses = Analyses(monkeypatch, judging=True, assessments=[
+    analyses = Analyses(monkeypatch, judging=True, candidates=[candidate(MECHANISM, INTERPRETATION, "accepted_invalid")], assessments=[
         candidate("accepted forged output", INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION)])
-
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, judge):
-        (await judge("experiment-0000", {"mechanism": MECHANISM})).evidence = "not_reproduced"
-        return analyses.inspection(run, "hack")
-
-    monkeypatch.setattr(send, "inspect_hacks", inspect_hacks)
     send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
     assert [item.id for item in analyses.candidates_sent] == ["grader-0"]
-    assert [(item.id, item.findings, item.evidence) for item in analyses.problems_sent] == [("P1", ["grader-0"], "evidenced")]
-    # The grader finding states its outcome to the judge, and then is P1's measured finding.
+    assert [(item.id, item.findings, item.evidence) for item in analyses.problems_sent] == [("P1", ["hack-0", "grader-0"], "evidenced")]
     assert json.loads(requests[0]["messages"][-1]["content"])["finding"]["outcome"] == "accepted_invalid"
-    assert [(item["id"], item["outcome"]) for item in analyses.problems_sent[0].measured] == [("grader-0", "accepted_invalid")]
-    # The viewer reads the change from the log, as when a hack experiment evidences a problem.
-    assert [(item["problem"], item["result"], "replayed" in item) for item in events(tmp_path / "run") if item["kind"] == "reproduced"] == [
-        ("P1", "evidenced", False)]
+    assert [(item["id"], item["outcome"]) for item in analyses.problems_sent[0].cases] == [
+        ("hack-0", "accepted_invalid"), ("grader-0", "accepted_invalid")]
+
 
 def test_a_time_limit_during_the_attack_still_reports_its_untested_attempts_as_not_tested(tmp_path, monkeypatch, capsys):
     """The attack runs last in the full analysis, so a time limit can leave its candidates untested. Its record so far still
@@ -933,7 +999,7 @@ def test_a_time_limit_during_the_attack_still_reports_its_untested_attempts_as_n
     assert [tested["conditions"][level]["tested"] for level in ("full", "minimal")] == [False, False]
     assert "- attempt 1 on hack-0 (no category, none) with full instructions did not start: cancelled" in output
     assert "- Not attempted: hack-0 (no category, none) with only a hint" in output
-    assert (f"- P1 from the hack inspector, ●●○○○ reproduced exploit, no clear Attacker result: {MECHANISM.rstrip('.')}; "
+    assert (f"- P1 from the hack inspector, ●●○○○ exploit evidenced in a native episode, no clear Attacker result: {MECHANISM.rstrip('.')}; "
             "findings hack-0 (no category, none).") in output
 
 
@@ -1836,6 +1902,27 @@ def test_attack_from_replays_the_earlier_runs_problems_in_its_log_without_a_judg
     assert all(item["text"].endswith("in the earlier run") and item["replayed"] is True for item in log)
 
 
+def test_a_rerun_keeps_only_evidenced_earlier_problems_each_with_the_run_and_level_that_evidenced_it(tmp_path, monkeypatch):
+    """An earlier problem nothing evidenced is dropped. An earlier A problem keeps its run and the help its Attacker
+    needed there; this rerun's Attackers did not find it again, so it shows its earlier level and says so."""
+    found = [candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION)]
+    earlier = earlier_run(tmp_path, monkeypatch, "hacking", candidates=found)
+    saved = AttackResult.model_validate_json((earlier / "attack.json").read_text())
+    saved.problems += [attack.Problem(id="P2", source="hack inspector", cause="A stale log.", members=["experiment-0001"], evidence="not_reproduced"),
+                       attack.Problem(id="A1", source="Attacker", cause="Write the score file.", members=["0007-attacker"])]
+    saved.attempts.append(attack.AttackAttempt(level="none", number=1, context="attacker-none-1", episode="0007-attacker",
+                                               status="evidenced_issue", problem="A1"))
+    (earlier / "attack.json").write_text(saved.model_dump_json())
+    analyses = Analyses(monkeypatch, judging=True)
+    built = send_nudis(tmp_path / "task", output_dir=tmp_path / "run-2", attack_from=earlier)
+
+    assert [item.id for item in analyses.problems_sent] == ["P1", "A1"]
+    kept = next(item for item in built["attack"]["problems"] if item["id"] == "A1")
+    where = str(earlier.resolve())
+    assert (kept["origin"], kept["earlier_help"], kept["level"]) == (where, "found_alone", 5)
+    assert kept["label"] == f"evidenced in run {where} at ●●●●● exploit executable by unaided learner; not found again here"
+
+
 def test_a_rerun_whose_copy_fails_still_ends_its_event_log(tmp_path, monkeypatch):
     """Copying is part of the run, so a failed copy stops it with a last event, as any other error does."""
     earlier = earlier_run(tmp_path, monkeypatch, "hacking")
@@ -2125,13 +2212,10 @@ def hack_findings(*readings) -> InspectionResult:
     return result
 
 
-async def evidence_each(report, judge, on_evidence, readings):
-    """As the hack inspector does for each of `readings`: its probe is judged, then its evidenced reading evidences the problem."""
+async def evidence_each(report, on_evidence, readings):
+    """As the hack inspector does for each of `readings`: it awaits the evidence hook as it records the evidenced reading."""
     for index in readings:
-        problem = await judge(f"experiment-{index:04d}", {"mechanism": report.assessments[index].claim.mechanism})
-        problem.findings.append(f"hack-{index}")
-        problem.evidence = "evidenced"
-        on_evidence(report, index)
+        await on_evidence(report, index)
 
 
 def real_early_attack(monkeypatch, analyses, judge):
@@ -2159,6 +2243,30 @@ def real_early_attack(monkeypatch, analyses, judge):
     monkeypatch.setattr(send, "attack", attacking)
 
 
+def test_an_attacker_exploit_is_judged_with_its_case_and_becomes_a_case_of_its_problem(tmp_path, monkeypatch):
+    """A no-hint exploit reaches the judge with the category, location and capture point of the attack inspector's
+    experiment that evidenced it, as an inspector's finding does, and its problem keeps it as a case."""
+    from test_runner import CONTRACT_TASK
+
+    requests = judge_replies(monkeypatch, [{"same_as": None}])
+    analyses = Analyses(monkeypatch, judging=True, candidates=[
+        candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION)])
+
+    async def judge(target, episode):
+        return "accepted_invalid"
+
+    real_early_attack(monkeypatch, analyses, judge)
+    send_nudis(CONTRACT_TASK, output_dir=tmp_path / "run", analysis="hacking", minimal_hints=False)
+    (request,) = [json.loads(item["messages"][-1]["content"]) for item in requests]
+    where = {"location": "/app/answer.txt", "capture_point": "verification_start"}
+    assert {key: request["finding"].get(key) for key in ("category", "outcome", *where)} == {
+        "category": "accepted_invalid", "outcome": "accepted_invalid", **where}
+    saved = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text())
+    (episode,) = [item.episode for item in saved.attempts if item.level == "none"]
+    found = next(item for item in saved.problems if item.id == "A1")
+    assert found.cases == [{"id": episode, "check": f"check-{episode}", "outcome": "accepted_invalid", "mechanism": "scripted", **where}]
+
+
 def test_a_time_limit_during_the_hack_inspection_keeps_the_early_reproduction(tmp_path, monkeypatch):
     """hack-0's full and single hint attempts reproduced and hack-1's was still judged when the time limit stopped the
     hack inspection. The attack record is cancelled and keeps the reproductions."""
@@ -2173,10 +2281,10 @@ def test_a_time_limit_during_the_hack_inspection_keeps_the_early_reproduction(tm
 
     real_early_attack(monkeypatch, analyses, judge)
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, judge):
+    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate):
         report = hack_findings(("accepted_invalid", "grader_tampering", REPRODUCTION), ("accepted_invalid", "package_oracles", REPRODUCTION))
         (run.config.output_dir / "inspection-hack.json").write_text(report.model_dump_json())
-        await evidence_each(report, judge, on_evidence, range(2))
+        await evidence_each(report, on_evidence, range(2))
         await asyncio.sleep(30)
 
     monkeypatch.setattr(send, "inspect_hacks", inspect_hacks)
@@ -2203,10 +2311,10 @@ def test_a_time_limit_after_the_hack_inspection_returned_cancels_the_early_attem
 
     real_early_attack(monkeypatch, analyses, judge)
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, judge):
+    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate):
         report = hack_findings(("accepted_invalid", "grader_tampering", REPRODUCTION), ("accepted_invalid", "package_oracles", REPRODUCTION))
         (run.config.output_dir / "inspection-hack.json").write_text(report.model_dump_json())
-        await evidence_each(report, judge, on_evidence, range(2))
+        await evidence_each(report, on_evidence, range(2))
         return report
 
     monkeypatch.setattr(send, "inspect_hacks", inspect_hacks)
@@ -2218,6 +2326,22 @@ def test_a_time_limit_after_the_hack_inspection_returned_cancels_the_early_attem
     assert [(item["candidate"], item["level"], item["status"]) for item in saved["attempts"]] == [
         ("hack-0", "full", "evidenced_issue"), ("hack-1", "full", "cancelled"), ("hack-0", "minimal", "evidenced_issue")]
     assert built["status"] == "time_limit" and built["analyses"]["hack"] == "complete"
+
+
+def test_a_run_with_a_time_limit_lets_its_agents_be_told_how_much_of_it_is_left(tmp_path, monkeypatch):
+    """The time limit's deadline and length reach the run, so each agent's notice counts the time left before it."""
+    from test_runner import CONTRACT_TASK
+
+    analyses, seen = Analyses(monkeypatch), []
+
+    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate):
+        seen.append((run.time_limit[0] - asyncio.get_running_loop().time(), run.time_limit[1]))
+        return hack_findings()
+
+    monkeypatch.setattr(send, "inspect_hacks", inspect_hacks)
+    send_nudis(CONTRACT_TASK, output_dir=tmp_path / "run", analysis="hacking", time_limit=90, discovery_attempts=0)
+    (left, length), = seen
+    assert length == 5400 and 5390 < left <= 5400
 
 
 def test_a_raising_early_attack_is_one_warning_and_the_hack_phase_keeps_its_status(tmp_path, monkeypatch):
@@ -2259,11 +2383,11 @@ def test_hack_sessions_and_early_attempts_share_the_slots_of_the_run(tmp_path, m
 
     real_early_attack(monkeypatch, analyses, judge)
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, judge):
+    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate):
         report = hack_findings(("accepted_invalid", "grader_tampering", REPRODUCTION))
         (run.config.output_dir / "inspection-hack.json").write_text(report.model_dump_json())
         async with gate:
-            await evidence_each(report, judge, on_evidence, [0])
+            await evidence_each(report, on_evidence, [0])
             await hold("broad")
         for name in ("focused-1", "focused-2"):
             async with gate:

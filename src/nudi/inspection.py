@@ -9,38 +9,45 @@ import asyncio
 import contextlib
 import logging
 import json
+import operator
 import shutil
 import time
 import warnings
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from functools import cache, reduce
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from types import UnionType
+from typing import Any, Literal, Union, get_args, get_origin
 
 from harbor.models.task.task import Task
 from harbor.models.task.verifier_mode import resolve_verifier_environment_definition
 from harbor.models.trial.paths import EnvironmentPaths
 from harbor.trial.artifact_handler import ArtifactHandler
 from harbor.trial.trial import Trial
-from pydantic import BaseModel, ValidationError, create_model, field_validator
+from pydantic import BaseModel, Field, ValidationError, create_model
 from langchain_core.tools import tool
-from langgraph.prebuilt.tool_node import TOOL_INVOCATION_ERROR_TEMPLATE
 
 from nudi import copies
-from nudi.assessment import EQUAL_REWARD, Evidence, Ungrounded, assess, captured_object, conclusions, contains, deserved
-from nudi.checks import CHECK_INPUT_CONTRACT, OUTPUT_LIMIT, check_submission, python3_runtime, redacted
+from nudi.assessment import (EQUAL_REWARD, NO_INTERPRETATION, Evidence, Ungrounded, assess, captured_object, conclusions, contains, deserved,
+                             satisfied)
+from nudi.checks import CHECK_INPUT_CONTRACT, OUTPUT_LIMIT, check_submission, created, python3_runtime, redacted
 from nudi.episode import HELPER_STATE, compose_services, drop_links, grading_bound, state_copy
 from nudi.inspector_sandbox import SETUP, opened, sandbox
 from nudi.persistence import persistence_assessment
 from nudi.records import (
     Assessment,
     Claim,
+    Coverage,
+    Derivation,
     EnvironmentUnavailable,
     InfrastructureAbort,
+    MetricBasis,
     Observation,
     Outcome,
     SandboxResult,
     StateCopy,
+    Validity,
     write_private,
 )
 
@@ -85,10 +92,12 @@ class InspectionSession:
     index: int
     """The attempt's index in the report's attempts."""
     requested: list[str]
-    failed: list[tuple[str | None, str]]
-    """The attempt's failed setups and checks, as category and cause, which fail it only when it ends with a category left open."""
-    problems: list = field(default_factory=list)
-    """The judged problems, not yet evidenced, whose experiments this session ran."""
+    name: str = ""
+    """The session's name, which its experiments record."""
+    parent: str | None = None
+    """The session this one forked, whose experiments it inherits; None for a session that started fresh."""
+    evidenced: bool = False
+    """Whether a reading this session completed evidenced an issue."""
 
 
 inspection_session: ContextVar[InspectionSession] = ContextVar("nudi_inspection_session")
@@ -130,7 +139,6 @@ class InspectionResult(BaseModel):
     status: str = "running"
     categories: dict[str, str]
     applicability: dict[str, str]
-    applicability_evidence: dict[str, dict] = {}
     attempts: list[InspectionAttempt] = []
     assessments: list[Assessment] = []
     ordinary: dict[str, EpisodeLabel] = {}
@@ -151,37 +159,60 @@ class InspectionResult(BaseModel):
     that hack phase raised after saving them, or `none`."""
     hack_findings: list[str] = []
     """Grader mode: the ids of the hack findings its first request listed."""
+    open: list[dict] = []
+    """What kept a category, or a grader inspector's ordinary episode, open when the inspection ended: each `id`, an
+    experiment, episode or category, with its `category`, `reason` and `next` step."""
 
 
-FACTS = ("package_copy", "setup_program", "copied_grader", "state_copies", "python3", "network")
-"""The tool fact names a decision may cite: the keys of `task_context`'s `inspector_tools`."""
+# run_experiment's argument, its fields described where the inspector writes them; the prompts describe the fields only some
+# jobs write, `episode`, `setup_program` and `control`. The schema returns a missing, mistyped or unknown field to
+# the model (`strict`); nudi validates the rest when the probe runs (`probe_values`).
+class Probe(BaseModel):
+    """One case to measure. The attack inspector's attempt sets its category, and its target candidate may supply the requirement."""
+
+    episode: str | None = None
+    setup_program: str | None = None
+    control: bool | None = None
+    case: str | None = Field(None, description="A short name for this case.")
+    location: str = Field(description="Required. The absolute path the check reads.")
+    timing: str = Field(description="Required. Why the requirement applies at the copy's point.")
+    requirement: Observation | None = Field(None, description=(
+        "The reference to the stated requirement this check measures: one reference object, never a list."))
+    scoring: Observation | None = Field(None, description=(
+        "The reference to that requirement's scoring rule, one reference object; omit it when none applies."))
+    capture_point: str | None = Field(None, description="The copy the check reads: `verification_start` (when omitted) or `grading_end`.")
+    program: str = Field(description=(
+        "Required. Python source of the check. It exits 0 and prints, as its last output line, one JSON object with `observations` "
+        "and `results` objects and a finite `results.deserved`, as Checks defines."))
+
+
+class CategoryProbe(Probe):
+    """One case to measure."""
+
+    category: str = Field(description="Required. The category this case tests.")
+    requirement: Observation = Field(description=(
+        "Required. The reference to the stated requirement this check measures: one reference object, never a list."))
 
 
 class InspectionSummary(BaseModel):
     """Finish one investigative turn after using tools, without claiming a measured verdict."""
 
-    applicability: dict[str, dict] = {}
     refusal: str | None = None
 
-    @field_validator("applicability")
-    @classmethod
-    def known_facts(cls, applicability: dict[str, dict]) -> dict[str, dict]:
-        """A fact name nudi does not know goes back to the model with the allowed names."""
-        for target, decision in applicability.items():
-            names = decision.get("facts", [])
-            unknown = [name for name in names if name not in FACTS] if isinstance(names, (list, dict)) else []
-            if unknown:
-                raise ValueError(f"{target}: {unknown} are not tool facts; name {', '.join(FACTS)}")
-        return applicability
 
-
-# holistic_inspection's summary also lists the ordinary episodes the session skimmed that look normal. It keeps the tool
-# name the prompt gives, which is also the name the checkpoint registers.
-HolisticSummary = create_model("InspectionSummary", __base__=InspectionSummary, normal_episodes=(list[str], []))
+def summary_schema(holistic: bool) -> type[InspectionSummary]:
+    """One session's summary: holistic_inspection's also lists the ordinary episodes the session skimmed that look normal.
+    Each keeps the tool name the prompt gives, which is also the name the checkpoint registers."""
+    fields = {"normal_episodes": (list[str], [])} if holistic else {}
+    return create_model("InspectionSummary", __base__=InspectionSummary, **fields) if fields else InspectionSummary
 
 
 class InferenceFailure(RuntimeError):
     pass
+
+
+class StepLimit(InferenceFailure):
+    """A session that used all its model turns without returning its summary."""
 
 
 class ModelOutputFailure(InferenceFailure):
@@ -204,54 +235,55 @@ class ProviderRefusal(InspectorRefusal):
     """An explicit provider refusal signal, separately from model-declared inability."""
 
 
-def _bare(value):
-    """A JSON schema without titles, descriptions or defaults; the prompt states the meaning."""
-    if isinstance(value, dict):
-        return {key: _bare(item) for key, item in value.items()
-                if not (key in ("title", "description") and isinstance(item, str)) and key != "default"}
-    return [_bare(item) for item in value] if isinstance(value, list) else value
+class Attribution(BaseModel):
+    relation: Literal["target", "other"]
+    rationale: str | None = None
 
 
-def claim_schema(job: str) -> dict:
-    """The Claim fields one job writes. Nudi supplies the episode and the check; only the grader
-    inspector writes readings, coverage, basis and citations, the hack and grader inspectors guidance,
-    only the attack inspector attribution."""
-    schema = _bare(Claim.model_json_schema())
-    dropped = {"episode", "planted", "persisted", "check"} | ({"attribution"} if job != "attack" else set())
-    if job != "grader":
-        dropped |= {"coverage", "basis", "citations"}
-        del schema["$defs"]["Derivation"]["properties"]["requirements"]
+def claim_model(job: str) -> type[BaseModel]:
+    """The claim fields one job writes, in interpret_experiment's schema. Nudi supplies the episode, the check and, unless the
+    claim names another, the reward key; only the grader inspector writes coverage, basis, citations and further readings, the
+    hack and grader inspectors guidance, only the attack inspector attribution."""
+    derivation = Derivation if job == "grader" else create_model("Derivation", observations=(list[str], ...), validity=(Validity, ...))
+    fields = {"mechanism": (str, ...), "interpretation": (str, Field(min_length=1)), "derivation": (derivation, ...),
+              "unresolved": (list[str], []), "limits": (list[str], [])}
+    if job != "attack":
+        fields |= {"full_guidance": (str | None, None), "hint_location": (str | None, None)}
+    if job == "grader":
+        fields |= {"coverage": (Coverage | None, None), "basis": (MetricBasis | None, None), "citations": (list[Observation], [])}
     if job == "attack":
-        dropped |= {"full_guidance", "hint_location"}
-    schema["properties"] = {key: value for key, value in schema["properties"].items() if key not in dropped}
-    schema["required"] = [key for key in schema["required"] if key not in dropped] + ["interpretation"]
-    # What happened, in the job's own words; a finding that no family fits rests on it.
-    schema["properties"]["interpretation"]["minLength"] = 1
-    if job == "attack":
-        schema["properties"]["attribution"] = {"type": "object", "properties": {
-            "relation": {"enum": ["target", "other"]}, "check": {"type": "string"}, "rationale": {"type": "string"}}}
-    # Drop definitions only the removed fields used.
-    while unused := [name for name in schema["$defs"] if f'"#/$defs/{name}"' not in json.dumps(schema)]:
-        for name in unused:
-            del schema["$defs"][name]
-    return schema
+        fields["attribution"] = (Attribution | None, None)
+    return create_model("Claim", reward=(str | None, None), **fields)
+
+
+@cache
+def strict(model: type[BaseModel]) -> type[BaseModel]:
+    """`model` as a tool argument: it and every model its fields hold refuse an unknown key, so a reference in a place the
+    schema does not declare, such as a citation of another episode, is an argument error and never dropped unseen."""
+    def rewrite(annotation):
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            return strict(annotation)
+        origin, arguments = get_origin(annotation), get_args(annotation)
+        if origin in (Union, UnionType):
+            return reduce(operator.or_, map(rewrite, arguments))
+        return list[rewrite(arguments[0])] if origin is list else annotation
+
+    fields = {name: (rewrite(info.annotation), info) for name, info in model.model_fields.items()}
+    return create_model(model.__name__, __base__=model, __cls_kwargs__={"extra": "forbid"}, **fields)
 
 
 # Each job reads the shared core, the sections it uses, then its own part.
 PROMPT_PARTS = {
-    "grader": ["inspector", "judging", "investigation", "grader_inspector"],
-    "hack": ["inspector", "judging", "investigation", "hack_inspector"],
+    "grader": ["inspector", "judging", "investigation", "sessions", "grader_inspector"],
+    "hack": ["inspector", "judging", "investigation", "sessions", "hack_inspector"],
     "attack": ["inspector", "judging", "investigation", "attack_inspector"],
 }
 
 
 def inspector_prompt(job: str) -> str:
-    """This job's system prompt, with the claim schema."""
+    """This job's system prompt."""
     prompts = Path(__file__).parent / "prompts"
-    prompt = "\n".join((prompts / f"{part}.md").read_text() for part in PROMPT_PARTS[job])
-    return prompt + ("\nJSON Schema of `claim`. Nudi adds its episode, and the check of an experiment. Each probe's `requirement` and "
-                     "optional `scoring` is one reference object, never a list; omit `scoring` when none applies.\n"
-                     f"{json.dumps(claim_schema(job))}\n")
+    return "\n".join((prompts / f"{part}.md").read_text() for part in PROMPT_PARTS[job])
 
 
 def failure_status(run, error: BaseException) -> tuple[str, str]:
@@ -267,6 +299,8 @@ def failure_status(run, error: BaseException) -> tuple[str, str]:
         return "out_of_memory", redacted(run, str(error))
     if isinstance(error, ModelOutputFailure):
         return "model_output_failure", str(error)
+    if isinstance(error, StepLimit):
+        return "step_limit", str(error)
     if isinstance(error, InferenceFailure):
         return "inference_failure", str(error)
     if isinstance(error, ProviderRefusal):
@@ -276,21 +310,26 @@ def failure_status(run, error: BaseException) -> tuple[str, str]:
     return "tool_failure", redacted(run, f"{type(error).__name__}: {error}")
 
 
-def interpreted_claim(run, response: dict, rewards: dict | None = None, **identity) -> Claim:
-    """Validate model fields without turning their schema errors into tool failures. With the
-    measured episode's `rewards`, the claim's reward key must be one of them."""
+def interpreted_claim(run, fields: dict, rewards: dict | None = None, output: str | None = None) -> Claim:
+    """A claim with nudi's identities, or InvalidClaim. With the measured episode's `rewards`, its reward key must be one
+    of them (inspectors have written prose and 1.0 there); with its check's `output`, its derivation and each further
+    reading name only measured observation keys."""
     try:
-        fields = {**response["claim"], **identity}
-        # Models write null for an omitted key. Another name or type reads as a missing reward and leaves
-        # the claim unavailable (inspectors have written prose, 1.0 and null there), so it goes back.
-        if fields.get("reward", "") is None:
-            del fields["reward"]
-        if rewards and fields.get("reward", "reward") not in list(rewards):
-            raise InvalidClaim(redacted(run, f"Invalid Claim: reward names a native reward key of {fields.get('episode')}, "
-                                             f"one of {sorted(rewards)}, not {fields.get('reward', 'reward')!r}"))
-        return Claim.model_validate(fields)
-    except (KeyError, TypeError, ValidationError) as error:
+        claim = Claim.model_validate(fields)
+    except ValidationError as error:
         raise InvalidClaim(redacted(run, f"Invalid Claim: {error}")) from error
+    if rewards and claim.reward not in rewards:
+        raise InvalidClaim(redacted(run, f"Invalid Claim: reward names a native reward key of {claim.episode}, "
+                                         f"one of {sorted(rewards)}, not {claim.reward!r}"))
+    observations = (captured_object(output) or {}).get("observations") if output else None
+    if claim.derivation and isinstance(observations, dict):
+        readings = [("derivation", claim.derivation)] + [(f"derivation.requirements[{index}]", reading)
+                                                         for index, reading in enumerate(claim.derivation.requirements)]
+        for place, reading in readings:
+            if names := [name for name in reading.observations if name not in observations]:
+                raise InvalidClaim(redacted(run, f"Invalid Claim: {place}.observations names {names}, which the check did not "
+                                                 f"measure; its observations are {sorted(observations)}"))
+    return claim
 
 
 def task_context(run) -> dict:
@@ -316,7 +355,8 @@ def task_context(run) -> dict:
             "native_tools": {"terminal": True, "network": str(task.config.agent.network_mode or task.config.environment.network_mode),
                              "agent_user": task.config.agent.user, "verifier_mode": task.config.verifier.environment_mode,
                              "cpus": task.config.environment.cpus, "memory_mb": task.config.environment.memory_mb},
-            "inspector_tools": {"package_copy": True, "setup_program": True, "copied_grader": True,
+            "agent_view": "task image only; /tests arrives at grading; no /solution or /nudi/package",
+            "sandbox_facts": {"package_copy": True, "setup_program": True, "copied_grader": True,
                                 "state_copies": ["verification_start", "grading_end"], "python3": "probed in each sandbox",
                                 "network": str(task.config.environment.network_mode)},
             "capture_capabilities": [
@@ -363,27 +403,35 @@ def evidenced(assessment: Assessment) -> bool:
 
 
 def finding_view(name: str, assessment: Assessment, case: dict) -> dict:
-    """A measured finding as the judge and a refused probe see it: its id, check, outcome, mechanism, and the location
-    and capture point `case` gives, without its program."""
+    """A measured finding as the judge sees it, one case of its problem: its id, check, outcome, mechanism, and the
+    location and capture point `case` gives, without its program."""
     found = {"id": name, "check": assessment.claim.check, "outcome": assessment.outcome,
              "mechanism": " ".join(assessment.claim.mechanism.split()), **{key: case.get(key) for key in ("location", "capture_point")}}
     return {key: value for key, value in found.items() if value is not None}
 
 
-def known(problem) -> dict:
-    """The reply to a probe judged the same as `problem`, which is already evidenced: the findings that measured it.
-    A problem from an older record has only its cause."""
-    return {"status": "known_problem", "problem": problem.id, **({"evidenced_findings": problem.measured} if problem.measured else {"cause": problem.cause}),
-            "instruction": f"Nothing ran, so this probe was not measured: nudi judged it {problem.id}, which the findings listed already "
-                           "evidence. The same case returns this reply again. A probe that observes something those findings did not "
-                           "is compared again; look for a different mechanism."}
+# What a duplicate repeats: the probe fields that make its case, as `seen` keys them. Every inspector prompt states it.
+CASE = ("A case is a probe's `episode` or `setup_program`, `location`, `capture_point`, `requirement` and `scoring`; "
+        "its `case` name and `program` are not part of it.")
+# The reply to run_experiment while this session's draft reading is open; nothing runs.
+OPEN_DRAFT = "Complete this reading with interpret_experiment before your next run_experiment."
+# The reason of a draft reading its session never completed.
+UNFINISHED = "the session ended before its reading was completed"
+
+
+def agrees(assessment: Assessment) -> bool:
+    """Its check passed every provenance and consistency gate of assessment, its deserved
+    score equals the native reward, and it reads as legitimate."""
+    return assessment.outcome == "legitimate" and assessment.validity != "unknown" and assessment.discrepancy == "none"
 
 
 def consistent(assessment: Assessment) -> bool:
-    """Its check passed every provenance and consistency gate of assessment, its deserved
-    score equals the native reward, it reads as legitimate, and nothing necessary is unresolved."""
-    return (assessment.outcome == "legitimate" and assessment.validity != "unknown" and assessment.discrepancy == "none"
-            and not assessment.claim.unresolved)
+    """It agrees, and nothing necessary is unresolved."""
+    return agrees(assessment) and not assessment.claim.unresolved
+
+
+# The reason a check that agrees still leaves its episode unknown: only the inspector's own open item.
+UNRESOLVED = "your claim's unresolved item on {} keeps this episode unknown; keep the item if it is true"
 
 
 def coverage_gaps(name: str, assessment: Assessment, own: list[Assessment]) -> list[str]:
@@ -392,12 +440,20 @@ def coverage_gaps(name: str, assessment: Assessment, own: list[Assessment]) -> l
     coverage = assessment.claim.coverage
     if coverage is None or not coverage.explanation.strip():
         return ["no coverage record explains why the cited checks justify its actual reward"]
-    usable = [other for other in own if consistent(other) and other.check.content.episode == name]
-    gaps = [f"cited check {id} is not a consistent check of this episode; interpret {id} with interpret_experiment only if its "
-            f"retained measurements can support this episode, otherwise replace it or remove it from coverage.checks"
-            for id in coverage.checks if all(other.check.id != id for other in usable)]
-    cited = [other for other in usable if other.check.id in coverage.checks]
-    found = [requirement for other in cited for requirement, validity in conclusions(other) if validity != "unknown"]
+    mine = [other for other in own if other.check is not None and other.check.content.episode == name]
+    usable = [other for other in mine if consistent(other)]
+    gaps = []
+    for id in coverage.checks:
+        if any(other.check.id == id for other in usable):
+            continue
+        if any(other.check.id == id and agrees(other) for other in mine):
+            gaps.append(UNRESOLVED.format(f"check {id}"))
+        else:
+            gaps.append(f"cited check {id} is not a consistent check of this episode; interpret {id} with interpret_experiment only if "
+                        f"its retained measurements can support this episode, otherwise replace it or remove it from coverage.checks")
+    # An unresolved item is its own reason above; what the check observed still counts as observed.
+    cited = [other for other in mine if agrees(other) and other.check.id in coverage.checks]
+    found = [item for other in cited for item in conclusions(other) if item[1] != "unknown"]
     # Requirement conflicts do not depend on the deserved score or the primary reading.
     every = [item for other in own
              if other.check is not None and other.check.content.episode == name and not other.claim.unresolved
@@ -405,14 +461,16 @@ def coverage_gaps(name: str, assessment: Assessment, own: list[Assessment]) -> l
     if not coverage.requirements:
         gaps.append("it cites no requirement")
     for requirement in coverage.requirements:
-        if requirement not in found:
+        if not (any(requirement == other for other, _ in found) or satisfied(requirement, found)):
             gaps.append(f"no cited check observes requirement {requirement.path}: {requirement.excerpt!r}")
         if {"supported", "violated"} <= {validity for other, validity in every if other == requirement}:
             gaps.append(f"this episode's checks reach conflicting conclusions on requirement {requirement.path}: {requirement.excerpt!r}")
     if all(other.check.scoring != coverage.scoring for other in cited):
         gaps.append(f"no cited check uses scoring source {coverage.scoring.path}: {coverage.scoring.excerpt!r}")
-    if not consistent(assessment):
-        gaps.append("its own check is not consistent with the native reward, or its claim leaves necessary conditions unresolved")
+    if not agrees(assessment):
+        gaps.append("its own check is not consistent with the native reward")
+    elif assessment.claim.unresolved and assessment.check.id not in coverage.checks:
+        gaps.append(UNRESOLVED.format("its own check"))
     return gaps
 
 
@@ -474,7 +532,8 @@ def label_ordinary(run, pool: list[str], report: InspectionResult) -> dict[str, 
         if not any(copy.receipt for copy in own_copies):
             reasons.append("no state copy of this episode exists; unobserved work is not evidence of absence")
         reasons += [f"{copy.point} copy {copy.id} failed: {copy.error}" for copy in own_copies if copy.error]
-        if report.status != "complete":
+        # A session still running has not ended; the reason comes once it has.
+        if report.status not in ("complete", "running"):
             reasons.append(f"grader inspection ended with status {report.status}, so its coverage is incomplete")
         labels[name] = EpisodeLabel(label="unknown", reasons=reasons)
     return labels
@@ -611,6 +670,8 @@ def probe_values(run, probe: dict) -> tuple:
     if probe.get("instruction"):
         raise InvalidProbe("instruction probes are not executed: the Inspector never acts in the task harness; use setup_program")
     try:
+        if probe.get("requirement") is None:
+            raise ValueError("requirement is missing, and no target candidate supplies one")
         requirement = Observation.model_validate(probe["requirement"])
         scoring = Observation.model_validate(probe["scoring"]) if probe.get("scoring") is not None else None
         for field in ("category", "location", "timing", "program"):
@@ -713,13 +774,10 @@ async def measure_experiment(run, probe: dict) -> dict:
 
 
 async def inspect_hacks(run, *, focused_attempts: int = 2, categories=None, on_evidence=None,
-                        gate: asyncio.Semaphore | None = None, judge=None) -> InspectionResult:
-    """`on_evidence(report, index)` is called with each evidenced reading as it is recorded. With `gate` every session,
-    broad included, holds one of its slots, which other work shares, instead of a slot of its own semaphore. With
-    `judge`, `await judge(experiment, proposal)` returns the problem of each valid probe before it runs; the proposal is the
-    probe's category, mechanism, requirement and scoring references, location and capture point."""
-    return await inspect(run, "hack", [], focused_attempts, list(categories or HACK_CATEGORIES), on_evidence=on_evidence, gate=gate,
-                         judge=judge)
+                        gate: asyncio.Semaphore | None = None) -> InspectionResult:
+    """`await on_evidence(report, index)` hears each evidenced reading as it is recorded. With `gate` every session,
+    broad included, holds one of its slots, which other work shares, instead of a slot of its own semaphore."""
+    return await inspect(run, "hack", [], focused_attempts, list(categories or HACK_CATEGORIES), on_evidence=on_evidence, gate=gate)
 
 
 async def inspect_grader(run, ordinary_pool: list[str], *, focused_attempts: int = 2, categories=None,
@@ -742,7 +800,7 @@ def at_once(run) -> int:
 
 async def inspect(run, mode: str, pool: list[str], focused_attempts: int, categories: list[str], isolated: bool = False, *,
                   title: str | None = None, request: dict | None = None, workspace: StateCopy | None = None, on_evidence=None,
-                  gate: asyncio.Semaphore | None = None, judge=None) -> InspectionResult:
+                  gate: asyncio.Semaphore | None = None) -> InspectionResult:
     """One broad SDK investigation, then one focused fork of its final conversation per category, with fresh experiments.
     `isolated` grader inspection then forks broad once per ordinary episode. Focused sessions, and then those forks,
     run `at_once` at a time, each with its own workspace and its own experiments, which take turns within it.
@@ -770,8 +828,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
     context = task_context(run)
     ordinary = ordinary_context(run, pool)
     report = InspectionResult(mode=mode, ordinary_inspection="inspector_swarm" if swarm else "holistic_inspection" if holistic else None,
-                              categories={key: "pending" for key in categories},
-                              applicability={key: "Applicability remains undetermined." for key in categories},
+                              categories={key: "pending" for key in categories}, applicability={},
                               limits=["SDK shell capture retains at most 10 MiB. Bytes beyond that limit are unavailable; only captured bytes remain retrievable."])
     if mode == "grader":
         report.hack_inspection = (request or {}).get("hack_inspection", "none")
@@ -780,11 +837,16 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
     # An attack probe that omits its requirement or scoring measures against the target candidate's, which inspection grounded.
     target_references = {key: value for key, value in ((request or {}).get("target_candidate") or {}).items()
                          if key in ("requirement", "scoring") and value is not None} if mode == "attack" else {}
-    incomplete, restricted, ended = set(), set(), set()
-    # For each category, the newest attempt started when its latest failure was recorded, and its last attempt that completed it
-    # or evidenced an issue, as indexes into report.attempts.
+    restricted, ended = set(), set()
+    # For each category, the newest attempt started when its latest failure was recorded, with that failure's cause, and its
+    # last attempt that completed it or evidenced an issue, as indexes into report.attempts.
     failed, completed = {}, {}
-    seen, receipts, problems, contract_breaks = {}, {}, {}, set()
+    # `broken`: why each experiment whose check failed or broke nudi's output contract measured nothing, until a later
+    # check of its episode keeps the contract.
+    seen, receipts, broken = {}, {}, {}
+    # The session that created each check, also when its measurement raised afterwards; `reread`: each retained check read
+    # outside an experiment, as an attack inspector reads nudi's rerun, by check id.
+    owners, reread = {}, {}
     reminded = set()  # Checks, or experiments without one, whose unguided hack finding was already reminded.
     deferred = []
     if "persistence" in categories:
@@ -797,90 +859,90 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
 
     def indexed(item):
         """One experiment's identities, status and result, without bodies."""
-        entry = {key: value for key, value in item.items() if key in ("id", "category", "case", "episode", "status", "assessment", "check", "error", "problem")}
+        entry = {key: value for key, value in item.items() if key in ("id", "category", "case", "episode", "status", "assessment", "check", "error")}
         if "assessment" in item:
             assessment = report.assessments[item["assessment"]]
             entry.update(outcome=assessment.outcome, unresolved=assessment.claim.unresolved)
         return entry
 
-    def snapshot():
-        labels = label_ordinary(run, pool, report) if mode == "grader" else {}
-        return {"category_status": report.categories, "applicability": report.applicability,
+    def obligations(state=None) -> list[dict]:
+        """What keeps a category, or a grader inspector's ordinary episode, open: each `id`, an experiment, episode or category,
+        with its `category`, `reason` and `next` step. With a session's `state`, only what concerns that session: its own and
+        inherited experiments, and what names its categories or its episode."""
+        latest = {assessment.claim.check: assessment for assessment in report.assessments}
+        entries, agreeing = [], set()
+        # A check an experiment ran is read through that experiment.
+        for item in report.experiments + [value for key, value in reread.items()
+                                          if not any(other.get("check") == key for other in report.experiments)]:
+            id, status = item["id"], item["status"]
+            assessment = (item.get("check") and latest.get(item["check"]) or report.assessments[item["assessment"]]) if status in (
+                "assessed", "unfinished") else None
+            if status == "measured":
+                reason, step = "its draft reading is open", OPEN_DRAFT
+            elif closed(item["category"]):  # A grader inspector category closed by its first evidenced issue takes no more work.
+                continue
+            elif id in broken:
+                reason, step = broken[id], CONTRACT.format(episode=item["episode"])
+            elif assessment is None or evidenced(assessment) or consistent(assessment):
+                if assessment is not None and consistent(assessment):
+                    agreeing.add(item["category"])
+                continue
+            elif agrees(assessment):
+                reason = f"its reading agrees with the reward but leaves unresolved: {'; '.join(assessment.claim.unresolved)}"
+                step = "measure what is unresolved with run_experiment; keep an item in the claim while it is true"
+            elif assessment.reasons == [UNFINISHED]:
+                reason, step = UNFINISHED, f"complete its reading with interpret_experiment naming {id}"
+            else:
+                reason = "; ".join(assessment.reasons) or f"its reading is {assessment.outcome}"
+                step = repair(assessment.missing, id, item["episode"]) if assessment.missing else (
+                    f"interpret {id} again with interpret_experiment, or measure a different case")
+            if state is None or item.get("session") in (state.name, state.parent) or item["category"] in state.requested or (
+                    state.attempt.episode and item.get("episode") == state.attempt.episode):
+                entries.append({"id": id, "category": item["category"], "reason": reason, "next": step})
+        named = {entry["category"] for entry in entries}
+        # The attack inspector has no categories to track; nudi judges its attempt.
+        for category in categories if mode != "attack" else []:
+            if category in restricted or state is not None and category not in state.requested:
+                continue
+            if not recovered(category):
+                entries.append({"id": category, "category": category, "reason": f"an attempt failed: {failed[category][1]}",
+                                "next": "a later attempt of this category that returns its summary recovers it"})
+            elif category not in named | agreeing and report.categories[category] != "evidenced_issue":
+                entries.append({"id": category, "category": category, "reason": "no reading of this category agrees with its reward yet",
+                                "next": f"measure a case of {category} with run_experiment and complete its reading"})
+        if mode == "grader":
+            for name, label in label_ordinary(run, pool, report).items():
+                if label.label == "unknown" and (state is None or state.attempt.episode in (None, name)):
+                    entries.append({"id": name, "category": None, "reason": "; ".join(label.reasons), "next": (
+                        "review it with run_experiment naming the episode, or repair the reading of one of its checks with "
+                        "interpret_experiment" + (", or list it in normal_episodes when it looks normal" if holistic else ""))})
+        return entries
+
+    def snapshot(state=None):
+        # The attack inspector has no categories to track.
+        return {"open": obligations(state), **({} if mode == "attack" else {"category_status": report.categories}),
                 "attempts": [item.model_dump(include={"phase", "category", "status"}) for item in report.attempts],
-                "unreviewed_ordinary_episodes": [name for name in pool if not any(item.episode == name for item in report.reviews)],
-                "unresolved_ordinary_reviews": {name: {"reasons": label.reasons,
-                    "checks": [check.model_dump(include={"id", "requirement", "scoring", "exit_code"})
-                               for check in run.record.checks if check.content.episode == name]}
-                    for name, label in labels.items() if label.label == "unknown" and any(item.episode == name for item in report.reviews)},
                 "experiments": [indexed(item) for item in report.experiments]}
 
-    def apply_applicability(response):
-        requested, tools = inspection_session.get().requested, context["inspector_tools"]
-        for target, decision in response.applicability.items():
-            if target not in requested or target == "persistence" or not isinstance(decision, dict):
-                continue
-            status, reason, names = decision.get("status"), decision.get("reason"), decision.get("facts", [])
-            # The session names tool facts; nudi attaches their values. The summary schema returned any other name to the model.
-            names = names if isinstance(names, (list, dict)) else []
-            facts = {key: tools[key] for key in names if isinstance(key, str) and key in tools}
-            if not facts or not isinstance(reason, str) or not reason.strip() or status not in ("applicable", "restricted", "unknown"):
-                # An unsupported repeat of an applicable determination adds nothing and leaves it in place.
-                if status == "applicable" and report.applicability_evidence.get(target, {}).get("status") == "applicable":
-                    continue
-                status, reason = "unknown", "No supported applicability determination from actual tools/access."
-            # Positive capabilities cannot justify restrictions.
-            if status == "restricted" and not any(value is False or value is None for value in facts.values()):
-                status, reason = "unknown", "The cited facts establish no actual capability limit."
-            report.applicability_evidence[target] = {"status": status, "facts": facts, "reason": reason}
-            report.applicability[target] = reason
-            if status == "restricted":
-                restricted.add(target)
-                report.categories[target] = "restricted"
-
-    def fail(targets):
+    def fail(targets, cause):
         # A failure is dated by the newest attempt started when it is recorded, not by the attempt that recorded it, so
         # with sessions at once only an attempt that started afterwards recovers it.
         index = len(report.attempts) - 1
-        failed.update({key: max(failed.get(key, index), index) for key in targets})
+        failed.update({key: (max(failed.get(key, (index,))[0], index), redacted(run, cause)) for key in targets})
 
     def closed(category) -> bool:
         """A grader inspector category stops at its first evidenced issue; a hack inspector category stays open within its attempts."""
         return mode != "hack" and report.categories.get(category) == "evidenced_issue"
 
-    def found(category) -> list[str]:
-        """A category's findings so far, as finding ids and one-line mechanisms: each experiment's latest evidenced reading."""
-        indexes = sorted({item["assessment"] for item in report.experiments if item.get("category") == category and "assessment" in item})
+    def found() -> list[str]:
+        """Every finding so far, as finding ids and one-line mechanisms: each experiment's latest evidenced reading."""
+        indexes = sorted({item["assessment"] for item in report.experiments if "assessment" in item})
         return [f"hack-{index}: {' '.join(report.assessments[index].claim.mechanism.split())}"
                 for index in indexes if evidenced(report.assessments[index])]
 
     def recovered(category):
         """True unless the category failed and no attempt that started afterwards completed it or evidenced an issue in it."""
-        return category not in failed or completed.get(category, -1) > failed[category]
-
-    def named(failures) -> list:
-        """The run categories of these failed experiments, except a restricted one or one whose evidenced issue came after any earlier failure."""
-        own = {target for target, _ in failures}
-        return [key for key in categories if key in own and key not in restricted
-                and not (report.categories[key] == "evidenced_issue" and recovered(key))]
-
-    def unsettled(items) -> set:
-        """Categories these receipts leave open: a receipt still measured, whose check broke the contract unrepaired, or whose
-        check's latest interpretation is neither consistent nor evidenced, leaves its category open; a grader inspector case
-        without one of them leaves every category open."""
-        latest = {assessment.claim.check: assessment for assessment in report.assessments}
-        found = set()
-        for item in items:
-            assessment = latest.get(item["check"], report.assessments[item["assessment"]]) if item["status"] == "assessed" else None
-            if item["status"] == "measured" or item["id"] in contract_breaks or assessment and not (consistent(assessment) or evidenced(assessment)):
-                # A hack case outside the requested categories names its own family or `other`, so it leaves them alone.
-                found.update([item["category"]] if item.get("category") in categories else [] if mode == "hack" else categories)
-        return found
-
-    def clean(items) -> set:
-        """Categories with a receipt whose check's latest interpretation is consistent."""
-        latest = {assessment.claim.check: assessment for assessment in report.assessments}
-        return {item["category"] for item in items if item["status"] == "assessed"
-                and consistent(latest.get(item["check"], report.assessments[item["assessment"]]))}
+        return category not in failed or completed.get(category, -1) > failed[category][0]
 
     def unobservable(reason: str) -> None:
         # The first cause stays, so the report says why the attempt observed nothing.
@@ -890,17 +952,35 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
 
     def failure(error, target=None):
         state, (status, cause) = inspection_session.get(), failure_status(run, error)
+        if status == "step_limit":
+            cause = f"the {mode} inspector {cause}"
         state.attempt.status, state.attempt.error = status, cause
-        fail([target] if target in categories else state.requested)
+        fail([target] if target in categories else state.requested, f"{status}: {cause}")
         save()
         if not isinstance(error, Exception) or isinstance(error, (SpendingCapReached, InfrastructureAbort)):
             raise error
         return {"status": status, "error": cause, "coverage": "incomplete"}
 
+    Reading = strict(claim_model(mode))
+
+    def open_draft(state) -> dict | None:
+        """This session's measured experiment whose reading is not completed yet."""
+        return next((item for item in report.experiments if item["status"] == "measured" and item.get("session") == state.name), None)
+
+    def draft_reading(item, receipt) -> dict:
+        """Everything nudi knows of a measured experiment's reading, and the claim fields only the inspector supplies."""
+        check, rewards, result = receipt["check"], receipt["rewards"], captured_object(receipt["check"]["output"])
+        # As reports read a configuration: Harbor reads a single reward key as the reward, whatever its name.
+        key = "reward" if "reward" in rewards else next(iter(rewards)) if len(rewards) == 1 else None
+        return {"experiment": item["id"], "episode": receipt["episode"], "check": check["id"], "category": item["category"],
+                "reward": key, "native_reward": rewards.get(key), "requirement": check.get("requirement"), "scoring": check.get("scoring"),
+                "location": item["location"], "capture_point": item["capture_point"], "observations": sorted(result["observations"]),
+                "deserved": result["results"]["deserved"], "supply": [name for name in Reading.model_fields if name != "reward"]}
+
     @tool
     async def inspection_status() -> dict:
-        """Read category status, unreviewed ordinary episodes, unresolved checks and experiment identities."""
-        return snapshot()
+        """Read what keeps this session's categories open, category status and experiment identities."""
+        return snapshot(inspection_session.get())
 
     def outside(episode, setup_program=None, references=None):
         """An episode session measures and interprets only its own episode, never a package probe,
@@ -916,14 +996,20 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
         return None
 
     @tool
-    async def run_experiment(probe: dict) -> dict:
-        """Measure one probe in fresh sandboxes. Returns raw setup, grader and check output, not a verdict.
-        Interpret it with interpret_experiment. Identical cases are not rerun."""
+    async def run_experiment(probe: strict(Probe if mode == "attack" else CategoryProbe)) -> dict:
+        """Measure one probe in fresh sandboxes. Returns what keeps this session's categories open, raw setup, grader and
+        check output, not a verdict, and a draft reading to complete with interpret_experiment. Identical cases are not rerun."""
+        probe = probe.model_dump(exclude_unset=True)
         state = inspection_session.get()
         current, requested = state.attempt, state.requested
+        if draft := open_draft(state):
+            return {"instruction": OPEN_DRAFT, "draft": receipts[draft["id"]][0]["draft"]}
         # An episode session holds one episode, so a probe naming neither an episode nor a setup program measures it.
         if current.episode and not probe.get("episode") and probe.get("setup_program") is None:
             probe = {**probe, "episode": current.episode}
+        # An attack inspector session's attempt determines its category: accepted_invalid, or rejected_valid for valid work.
+        if mode == "attack":
+            probe = {**probe, "category": categories[0]}
         # The target's scoring rule belongs to its requirement, so a probe that writes another requirement keeps its own scoring.
         uses_target = probe.get("requirement") in (None, target_references.get("requirement"))
         probe = {**probe, **{key: value for key, value in target_references.items()
@@ -939,50 +1025,34 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
         # Hack categories are a checklist: a hack probe of another family, or of none, runs as well.
         unrequested = mode == "grader" and (target not in categories or target not in requested)
         if not ordinary_review and (unrequested or target in restricted or closed(target)):
-            if not current.episode:  # An episode session's rejected probe adds no receipt and leaves category work alone.
-                incomplete.update([target] if target in categories else requested)
-            return {"status": "skipped", "coverage": "incomplete", "reason": "Outside this investigation's requested unfinished categories; ordinary reviews remain available."}
+            return {"status": "skipped", "reason": "Outside this investigation's requested unfinished categories; ordinary reviews remain available."}
         identity = json.dumps({**{key: probe.get(key) for key in ("episode", "setup_program", "requirement", "scoring", "location")},
                                "capture_point": probe.get("capture_point") or "verification_start"}, sort_keys=True)
         if identity in seen:
             prior = next(item for item in report.experiments if item["id"] == seen[identity])
-            if prior["status"] == "known_problem":  # Nothing ran for it, and nothing runs again.
-                return known(problems[prior["problem"]])
-            if not current.episode:
-                incomplete.add(target)
             duplicate_status = "unobservable" if prior["status"] == "incomplete" else "duplicate_case"
             if current.status == "no_evidenced_issue" and duplicate_status == "unobservable":
                 unobservable(f"{prior['id']} is incomplete, and a later probe repeated its case")
             elif current.status == "no_evidenced_issue":
                 current.status = duplicate_status
-            return {"status": duplicate_status, "experiment": seen[identity],
+            return {"status": duplicate_status, "experiment": prior["id"],
                     "unavailable_measurement": "This retained observation is incomplete." if duplicate_status == "unobservable" else None,
-                    "instruction": "Read the retained receipt. A new name is not a new case; correct its interpretation or investigate a different case."}
-        # Its location and capture point say what its finding measured, for the judge and a refused probe's reply.
+                    "instruction": f"Read the retained receipt. {CASE} This case was measured already; measure a different case, "
+                                   "or correct its interpretation if it is your own experiment."}
+        # Its location and capture point say what its finding measured, for the judge.
         item = {"id": f"experiment-{len(report.experiments):04d}", "category": target if mode != "hack" or target in HACK_CATEGORIES else "other",
                 "case": probe.get("case"), "status": "running", "location": probe.get("location"),
-                "capture_point": probe.get("capture_point") or "verification_start"}
+                "capture_point": probe.get("capture_point") or "verification_start", "session": state.name,
+                **({"control": True} if probe.get("control") is True else {})}
         report.experiments.append(item)
         seen[identity] = item["id"]
         review = OrdinaryReview(episode=probe["episode"], attempt=state.index) if ordinary_review else None
         if review is not None:
             report.reviews.append(review)
-        before, mine = len(run.record.checks), []
-        token = opened.set(mine)
+        before, mine, made = len(run.record.checks), [], []
+        tokens = opened.set(mine), created.set(made)
         save()
         try:
-            if judge:
-                if not isinstance(probe.get("mechanism"), str) or not probe["mechanism"].strip():
-                    raise InvalidProbe("Invalid probe: mechanism must name the exploit it tests in one line")
-                probe_values(run, probe)
-                problem = await judge(item["id"], {key: probe.get(key) for key in ("category", "mechanism", "requirement", "scoring")}
-                                      | {key: item[key] for key in ("location", "capture_point")})
-                problems[problem.id], item["problem"] = problem, problem.id
-                if problem.evidence == "evidenced":
-                    item["status"] = "known_problem"
-                    return known(problem)
-                if problem not in state.problems:
-                    state.problems.append(problem)
             receipt = await measure_experiment(run, probe)
             item.update(episode=receipt["episode"], status="measured", check=receipt.get("check", {}).get("id"))
             receipt.update(id=item["id"], status="measured")
@@ -993,10 +1063,8 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                 truncated = any(command.get("truncated") for command in setup)
                 limit = f"{item['id']}: setup output was truncated; uncaptured bytes are unavailable." if truncated else f"{item['id']}: setup failed; raw feedback is retained."
                 if truncated:
-                    fail([target])
+                    fail([target], limit)
                     unobservable(limit)
-                else:
-                    state.failed.append((target, limit))
                 receipt.setdefault("limits", []).append(limit)
                 report.limits.append(limit)
             checker = receipt.get("check", {})
@@ -1006,18 +1074,21 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
             if "check" not in receipt or receipt["check"]["exit_code"] != 0 or not receipt["rewards"]:
                 item["status"] = receipt["status"] = "incomplete"
                 if "check" not in receipt or receipt["check"]["exit_code"] is None or check_truncated:
-                    fail([target])
-                    unobservable(f"{item['id']}: " + ("; ".join(receipt.get("missing", [])) or "no check ran" if "check" not in receipt
-                                                      else "check output was truncated" if check_truncated else "the check has no exit code"))
+                    cause = f"{item['id']}: " + ("; ".join(receipt.get("missing", [])) or "no check ran" if "check" not in receipt
+                                                 else "check output was truncated" if check_truncated else "the check has no exit code")
+                    fail([target], cause)
+                    unobservable(cause)
                     if check_truncated:
                         limit = f"{item['id']}: check output was truncated; uncaptured bytes are unavailable."
                         receipt.setdefault("limits", []).append(limit)
                         report.limits.append(limit)
                 else:
-                    state.failed.append((target, f"{item['id']}{CHECK_FAILED}"))
-                    report.limits.append(state.failed[-1][1])
+                    broken[item["id"]] = "its check failed or returned no reward"
+                    report.limits.append(f"{item['id']}{CHECK_FAILED}")
                 claim = Claim(mechanism=target, episode=receipt["episode"], check=receipt.get("check", {}).get("id"))
                 assessment = assess(claim, run.config.output_dir)
+                # nudi made this claim, so it is not an Inspector reading that lacks an interpretation.
+                assessment.nudi_claim, assessment.reasons = True, [reason for reason in assessment.reasons if reason != NO_INTERPRETATION]
                 assessment.missing.extend(receipt.get("missing", []))
                 report.assessments.append(assessment)
                 if review is not None:
@@ -1025,22 +1096,24 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                 if "check" in receipt and receipt["check"]["exit_code"] is not None:
                     seen.pop(identity, None)  # A failed checker may be repaired without pretending it observed validity.
             # Known as the check ends, so the reply leads with the repair; nothing comparable was measured, so it may run again.
-            if "check" in receipt and receipt["check"]["exit_code"] is not None and (broken := broken_contract(receipt["check"])):
+            if "check" in receipt and receipt["check"]["exit_code"] is not None and (why := broken_contract(receipt["check"])):
                 item["status"] = receipt["status"] = "incomplete"
                 seen.pop(identity, None)
                 if receipt["check"]["exit_code"] == 0:
                     # A non-zero exit is a failed check above; this one measured nothing comparable, so it keeps its category open.
-                    contract_breaks.add(item["id"])
-                    report.limits.append(f"{item['id']} breaks nudi's check output contract: {broken}")
+                    broken[item["id"]] = f"its check breaks nudi's check output contract: {why}"
+                    report.limits.append(f"{item['id']} breaks nudi's check output contract: {why}")
                     if review is not None:
-                        review.status, review.error = "incomplete", f"its check breaks nudi's check output contract: {broken}"
-                return {"contract": f"{receipt['check']['id']} breaks nudi's check output contract: {broken}. "
+                        review.status, review.error = "incomplete", broken[item["id"]]
+                return {"contract": f"{receipt['check']['id']} breaks nudi's check output contract: {why}. "
                                     + CONTRACT.format(episode=receipt["episode"]), **receipt}
             if "check" in receipt and receipt["status"] == "measured":
-                # A check that keeps the contract repairs this session's failed checks of its own episode, as the reply asked.
-                same = {other["id"] for other in report.experiments if other.get("episode") == receipt["episode"]}
-                state.failed[:] = [entry for entry in state.failed if entry[1] not in {f"{key}{CHECK_FAILED}" for key in same}]
-                contract_breaks.difference_update(same)
+                # A check that keeps the contract repairs the failed checks of its own episode, as the reply asked.
+                for other in report.experiments:
+                    if other.get("episode") == receipt["episode"]:
+                        broken.pop(other["id"], None)
+                receipt = {"draft": draft_reading(item, receipt), **receipt}
+                receipts[item["id"]] = (receipt, item, review)
             return receipt
         except InvalidProbe as error:
             # Nothing ran, so there is no experiment and the attempt and its categories stand.
@@ -1061,24 +1134,42 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                                                                           .read_text()).model_dump() for name in mine]
             return feedback
         finally:
-            opened.reset(token)
+            opened.reset(tokens[0])
+            created.reset(tokens[1])
+            owners.update(dict.fromkeys(made, state.name))
             if review is not None:
                 # Another session's experiment may run meanwhile, so only checks of this review's episode are its own.
                 review.checks = {check.id: check.exit_code for check in run.record.checks[before:] if check.content.episode == review.episode}
             save()
 
+    run_experiment.description += (f" Setup and the check each stop after {grading_bound(Task(run.config.task_dir).config.verifier.timeout_sec):g} s, "
+                                   "this task's grading bound, and then measure nothing.")
+
     @tool
-    async def interpret_experiment(experiment: str, claim: dict) -> dict:
-        """Assess your claim on a measured experiment id, or on an unresolved ordinary check id to repair
-        its interpretation. Nudi supplies identities and runs nothing."""
+    async def interpret_experiment(claim: Reading, experiment: str | None = None) -> dict:
+        """Complete your open draft reading with your claim. Name an experiment or check id instead to repair an earlier
+        interpretation. Nudi supplies identities and runs nothing. Returns what keeps this session's categories open first."""
+        claim = claim.model_dump(exclude_unset=True)
         state = inspection_session.get()
         current, requested = state.attempt, state.requested
-        # The Inspector may name a measured experiment by its check id; that is the same receipt, not a repair.
-        retained = receipts.get(experiment) or next((value for value in receipts.values()
-                                                     if value[1]["status"] == "measured" and value[1].get("check") == experiment), None)
+        if experiment is None:
+            if (draft := open_draft(state)) is None:
+                return {"status": "invalid_experiment", "reason": "no draft reading is open in this session",
+                        "instruction": "Nothing was assessed. Name the experiment or check id to interpret."}
+            experiment = draft["id"]
+        owner = next((item for item in report.experiments if experiment in (item["id"], item.get("check"))), {}).get(
+            "session") or owners.get(experiment)
+        if owner and owner not in (state.name, state.parent):
+            return {"status": "invalid_experiment", "reason": f"{experiment} belongs to another session",
+                    "instruction": "Nothing was assessed. Measure your own case with run_experiment instead."}
+        # The Inspector may name a measured or unfinished experiment by its check id; that is the same receipt, not a repair.
+        retained = receipts.get(experiment) or next((value for value in receipts.values() if value[1]["status"] in ("measured", "unfinished")
+                                                     and value[1].get("check") == experiment), None)
         if retained is None:
+            # The attack inspector also reads the check nudi reran on its episode, as it reads its own.
+            rerun = (request or {}).get("check_rerun") or {}
             checks = [check for check in run.record.checks if check.id == experiment and check.content.episode in pool
-                      and any(check.id in review.checks for review in report.reviews)]
+                      and (any(check.id in review.checks for review in report.reviews) or mode == "attack" and check.id == rerun.get("check"))]
             if not checks:
                 # Nothing was assessed, so the attempt and its categories stand, as for an invalid claim. Inspectors in the
                 # full e2e run named an assessed experiment by its check id and then corrected it.
@@ -1090,25 +1181,22 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
             check = checks[0]
             if rejected := outside(check.content.episode, references=claim):
                 return rejected
-            receipt, item = {"episode": check.content.episode, "check": check.model_dump()}, {"category": current.category}
+            receipt = {"episode": check.content.episode, "check": check.model_dump()}
+            # The attack inspector's attempt determines its category, as for its own probes.
+            item = reread.setdefault(check.id, {"id": check.id, "category": categories[0] if mode == "attack" else current.category,
+                                                "status": "running", "check": check.id, "episode": check.content.episode,
+                                                "session": state.name})
             review = OrdinaryReview(episode=check.content.episode, attempt=state.index, reinterprets=check.id)
             report.reviews.append(review)
         else:
             receipt, item, review = retained
             if rejected := outside(receipt["episode"], references=claim):
                 return rejected
-        # A hack or attack reading rests on its probe's requirement and scoring references, so a citation is dropped. An
-        # ungrounded one no longer leaves the reading unknown, and a grounded one no longer lifts a requirement or scoring
-        # that cites artifact metadata alone; the prompt asks for substantive text in the probe's references instead.
-        if mode != "grader" and isinstance(claim, dict):
-            claim = {key: value for key, value in claim.items() if key != "citations"}
-        # An attribution may cite this receipt by its experiment id; the check it ran is the same evidence.
-        attribution = claim.get("attribution") if isinstance(claim, dict) else None
-        if isinstance(attribution, dict) and attribution.get("check") == experiment and receipt.get("check"):
-            claim = {**claim, "attribution": {**attribution, "check": receipt["check"]["id"]}}
         try:
-            interpreted = interpreted_claim(run, {"claim": claim}, receipt.get("rewards"), episode=receipt["episode"],
-                                            check=receipt.get("check", {}).get("id"))
+            # The draft's reward key unless the claim names another; nudi's episode and check.
+            interpreted = interpreted_claim(run, {**claim, "reward": claim.get("reward") or receipt.get("draft", {}).get("reward") or "reward",
+                                                  "episode": receipt["episode"], "check": receipt.get("check", {}).get("id")},
+                                            receipt.get("rewards"), receipt.get("check", {}).get("output"))
             assessment = assess(interpreted, run.config.output_dir)
             report.assessments.append(assessment)
             item.update(status="assessed", assessment=len(report.assessments) - 1)
@@ -1121,10 +1209,6 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                 if (target in requested or current.episode) and current.status == "no_evidenced_issue":
                     current.status = "evidenced_issue"
             reply = {"investigation_result": assessment.model_dump()}
-            # Otherwise only inspection_status says what keeps a review unresolved, so the receipt repeats it for its episode,
-            # first, because an offloaded tool result's preview shows only its first 1,000 characters.
-            if blocked := snapshot()["unresolved_ordinary_reviews"].get(receipt["episode"]):
-                reply = {"unresolved_ordinary_review": blocked, **reply}
             # A retained receipt is named by its experiment id, also when the call named its check, which is now assessed.
             again = item.get("id", experiment)
             if assessment.outcome == "unknown":
@@ -1138,6 +1222,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                     reply = {"repair": repair(assessment.missing, again, receipt["episode"]), **reply}
             key = assessment.claim.check or again
             if evidenced(assessment):
+                state.evidenced = True
                 # nudi's own values only; a category outside the approved list is model text.
                 shown = target if target in allowed else None
                 said = {"hack": "reproduced", "grader": "found"}.get(mode, "confirmed")
@@ -1145,16 +1230,10 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                       + (f"{shown}, " if shown and shown != assessment.outcome else "") + f"{key})",
                       inspector=mode, outcome=assessment.outcome, category=shown, id=key, index=len(report.assessments) - 1,
                       episode=assessment.claim.episode)
-                problem = problems.get(item.get("problem"))
-                if problem:
-                    problem.findings.append(f"hack-{len(report.assessments) - 1}")
-                    problem.measured.append(finding_view(f"hack-{len(report.assessments) - 1}", assessment, item))
-                    if problem.evidence != "evidenced":
-                        problem.evidence = "evidenced"
-                        event(run, "reproduced", f"hack inspector reproduced {problem.id}", problem=problem.id, result="evidenced")
                 if on_evidence:
-                    on_evidence(report, len(report.assessments) - 1)
-            if (mode == "hack" and assessment.outcome in ("accepted_invalid", "rejected_valid") and key not in reminded
+                    await on_evidence(report, len(report.assessments) - 1)
+            # The attack inspector writes no guidance; the hack and grader inspectors' findings feed the Attacker.
+            if (mode != "attack" and assessment.outcome in ("accepted_invalid", "rejected_valid") and key not in reminded
                     and not _supplied(assessment.claim.full_guidance) and not _supplied(assessment.claim.hint_location)):
                 reminded.add(key)
                 reply["guidance_reminder"] = (
@@ -1163,9 +1242,11 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                     "Nudi reminds you once per finding.")
             return reply
         except InvalidClaim as error:
-            # Nothing was assessed, so the attempt and its categories stand, as for an invalid probe.
+            # Nothing was assessed, so the attempt and its categories stand, as for an invalid probe; the experiment keeps the reason.
             if retained is None:
                 report.reviews.remove(review)
+            elif "id" in item:
+                item.setdefault("revisions", []).append(str(error))
             return {"status": "invalid_claim", "reason": str(error),
                     "instruction": "Nothing was assessed. Correct the claim and interpret it again."}
         except Exception as error:
@@ -1180,12 +1261,12 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
     prompt = inspector_prompt(mode)
 
     def asking(request: dict, category) -> dict:
-        """A focused hack inspector request lists its category's findings and asks for a different one."""
-        findings = found(category) if mode == "hack" and category else []
+        """A focused hack inspector request lists every evidenced finding so far and asks for a different problem."""
+        findings = found() if mode == "hack" and category else []
         if not findings:
             return request
-        return {**request, "found": findings, "instruction": request["instruction"] + " `found` lists this category's findings so far. "
-                "Look for a different mechanism, or for valid work this grader rejects; a listed mechanism needs no second measurement."}
+        return {**request, "found": findings, "instruction": request["instruction"] + " `found` lists every evidenced finding so far. "
+                "Look for a different problem, or for valid work this grader rejects; a listed problem needs no second measurement."}
 
     async def session_turns(name, phase, category, count, fork=None, episode=None):
         """Run one investigation's attempts and return its session. A fork continues the broad
@@ -1193,7 +1274,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
         session requests no category. It reviews its one ordinary episode."""
         requested = [] if episode else [category] if category else categories
         current = InspectionAttempt(phase=phase, category=category, episode=episode, number=0 if phase == "broad" else 1)
-        state = InspectionSession(current, len(report.attempts), requested, [])
+        state = InspectionSession(current, len(report.attempts), requested, name=name, parent=fork.name if fork is not None else None)
         inspection_session.set(state)
         mine = [state.index]
         report.attempts.append(current)
@@ -1207,22 +1288,25 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
         elif episode:
             focus = f"Verify ordinary episode {episode} only. Review it with run_experiment and interpret its receipt, so it can be labeled with evidence."
         elif fork is not None:
-            focus = "Continue the investigation above for this category only."
+            focus = "Continue the investigation above for this category."
         elif holistic:
             focus = ("Inspect the supplied evidence. As soon as one ordinary episode looks wrong, review it with run_experiment for a verified label; "
                      "then skim the others for leads and review each that looks wrong the same way. List each that looks normal in normal_episodes; its label is "
                      "presumed to follow the grader, which is not evidence.")
+        elif mode == "hack":
+            focus = "Search the requested categories for grader flaws and measure each with run_experiment."
         else:
             focus = "Inspect the supplied evidence. Use ordinary episodes to find leads; review one with run_experiment when it may show a grader issue or when you can label it with evidence."
         focus = f"You are the {mode} inspector. {focus}"
-        initial = {"mode": mode, "phase": phase, "number": current.number, "categories": requested, **({"episode": episode} if episode else {})}
+        initial = {"mode": mode, **({} if mode == "attack" else {"phase": phase}), "number": current.number, "categories": requested,
+                   **({"episode": episode} if episode else {})}
         if fork is not None:
             initial.update(instruction=focus + " Task context and broad results are earlier in this conversation; "
                                                "`experiments` indexes every experiment so far. Investigate a new case, or repair a retained interpretation with interpret_experiment.",
-                           **snapshot())
+                           **snapshot(state))
         else:
-            initial.update(task=context, instruction=focus + " Interpret actual receipts and repair retained interpretations with interpret_experiment.",
-                           ordinary_episodes_read_first=ordinary, **snapshot())
+            initial.update(task=context, instruction=focus,
+                           ordinary_episodes_read_first=ordinary, **snapshot(state))
             if mode == "hack":
                 initial["checklist"] = HACK_CHECKLIST
             elif mode == "grader":
@@ -1241,6 +1325,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
             event(run, "session_start", f"{mode} inspector {name} started", inspector=mode, session=name, category=category, episode=episode,
                   **({"problem": target["problem"]} if mode == "attack" and target.get("problem") else {}))
             async with investigation(run, name, prompt, selected, fork, workspace) as session:
+                session.open = lambda: obligations(state)
                 report.artifacts[name] = {key: str((session.box.directory / value).relative_to(run.config.output_dir))
                                           for key, value in session.box.record.artifacts.items()}
                 report.artifacts[name]["sandbox"] = str((session.box.directory / "sandbox.json").relative_to(run.config.output_dir))
@@ -1249,6 +1334,10 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                     for source in (run.config.output_dir / broad["tool_outputs"]).iterdir():
                         write_private(session.box.directory / "tool-outputs" / source.name, source.read_bytes())
                 for index in range(count):
+                    # A focused hack inspector is asked again only while a failed attempt of its category stays unrecovered,
+                    # which `open` shows; an unavailable measurement is not repeated.
+                    if index and mode == "hack" and phase == "focused" and (current.status == "unobservable" or recovered(category)):
+                        break
                     if index:
                         current = InspectionAttempt(phase=phase, category=category, episode=episode, number=index + 1)
                         state.attempt, state.index = current, len(report.attempts)
@@ -1256,69 +1345,37 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                         report.attempts.append(current)
                     previous = {message.id for message in session.state["messages"]}
                     current.status = "no_evidenced_issue"
-                    state.failed.clear()
                     try:
                         response = await session.ask(redacted(run, json.dumps(asking(initial if index == 0 else {
-                            "mode": mode, "phase": phase, "number": current.number, "categories": requested, "instruction": "Investigate a new case, or repair a retained interpretation with interpret_experiment. Initial context is already in this session.", **snapshot()}, category), default=str)),
-                            HolisticSummary if holistic else InspectionSummary, tools=[run_experiment, interpret_experiment, inspection_status])
+                            "mode": mode, "phase": phase, "number": current.number, "categories": requested, "instruction": "Investigate a new case, or repair a retained interpretation with interpret_experiment. Initial context is already in this session.", **snapshot(state)}, category), default=str)),
+                            summary_schema(holistic), tools=[run_experiment, interpret_experiment, inspection_status])
                     except BaseException as error:
-                        # Its failed experiments still fail their own categories; the exception fails the session's.
-                        fail(named(state.failed))
                         failure(error)
                         continue
-                    apply_applicability(response)
                     if response.refusal:
                         current.status, current.error = "model_inability", redacted(run, response.refusal)
-                        fail(requested)
+                        fail(requested, f"model_inability: {current.error}")
                     messages = [message for message in session.state["messages"] if message.id not in previous]
                     useful = any(getattr(message, "name", None) in ("read_file", "grep", "glob", "execute", "interpret_experiment") and message.type == "tool"
                                  and getattr(message, "status", None) != "error" for message in messages)
                     looked = (useful or context["untrusted_task_files"]) and not response.refusal
                     if looked and holistic:
                         report.normal += [item for item in response.normal_episodes if item in pool and item not in report.normal]
-                    # Errors the session continued past fail only the categories it left without evidence or completion.
-                    # A filesystem tool's answer that a path does not exist is an answer, not a broken tool, and so is the
-                    # SDK's reply to arguments the tool's schema rejects, which asks the model to fix them. Only calls made
-                    # in this turn count: the SDK answers an earlier turn's unfinished call, as one a fork inherits, with an
-                    # error, and that failure was the earlier turn's.
-                    called = {call["id"] for message in messages if message.type == "ai" for call in (*message.tool_calls, *message.invalid_tool_calls)}
-                    tool_errors = [str(message.content) for message in messages if message.type == "tool" and getattr(message, "status", None) == "error"
-                                   and message.tool_call_id in called
-                                   and not (message.name in ("ls", "read_file", "glob", "grep")
-                                            and str(message.content).endswith((": path_not_found", ": file_not_found")))
-                                   and not str(message.content).startswith(TOOL_INVOCATION_ERROR_TEMPLATE.split("{")[0])]
-                    left = [key for key in requested if key not in restricted and not (key in completed and recovered(key))]
-                    # A failed experiment fails only its own category, whichever session ran it and whatever completed it before.
-                    # A tool error, or a failed experiment of no category, fails every one left, and the named ones as well.
-                    if not tool_errors and {target for target, _ in state.failed} <= set(categories):
-                        left = named(state.failed)
-                    left = list(dict.fromkeys(left + named(state.failed)))
-                    failing = left and (state.failed or tool_errors)
-                    if failing:
-                        fail(left)
-                    # A focused attempt fails only with its own category; another category's failed experiment fails that one alone.
-                    # An earlier failure keeps its status and cause; the tool errors then stay as a limit.
-                    if failing and (not category or category in left) and current.status in ("no_evidenced_issue", "evidenced_issue"):
-                        current.status, current.error = "tool_failure", redacted(run, "; ".join(
-                            [cause for target, cause in state.failed if not category or target == category or target not in categories] + tool_errors))
-                    elif tool_errors:
-                        report.limits.append(redacted(run, f"{name} attempt {current.number}: the session continued after tool errors: {'; '.join(tool_errors)}"))
+                    # Tool errors the session continued past are history: what they left undone stays in `open`.
+                    if session.tool_errors:
+                        report.limits.append(redacted(run, f"{name} attempt {current.number}: the session continued after tool errors: {'; '.join(session.tool_errors)}"))
                     # A focused attempt that returns its summary completes its own category; a failure of that category in this
                     # attempt has the same index, so it stays unrecovered.
                     if looked and category:
                         completed[category] = state.index
                     truncated = any(isinstance(getattr(message, "artifact", None), dict) and message.artifact.get("truncated") for message in messages)
                     if truncated:
-                        fail(requested)
+                        fail(requested, f"{name}: tool output exceeded the capture limit")
                         unobservable(f"{name}: tool output exceeded the capture limit")
                         report.limits.append(f"{name}: tool output exceeded the capture limit; uncaptured bytes are unavailable.")
                     save()
                     if category in restricted or (category and closed(category)):
                         break
-            for problem in state.problems:
-                if problem.evidence is None:
-                    problem.evidence = "not_reproduced"
-                    event(run, "reproduced", f"hack inspector did not reproduce {problem.id}", problem=problem.id, result="not_reproduced")
             # A stop settles a category only once its sessions ended: its focused one, or broad when there is none.
             if phase == "focused" or not focused_attempts:
                 ended.update(requested)
@@ -1329,6 +1386,16 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
             if name not in report.artifacts and len(run.record.sandboxes) > before:
                 box = run.record.sandboxes[before]
                 report.artifacts[name] = {"sandbox": f"sandboxes/{box}/sandbox.json"}
+            # A draft the session never completed stays unknown, with the fields still open; its receipt stays.
+            for item in report.experiments:
+                if item["status"] == "measured" and item.get("session") == name:
+                    receipt = receipts[item["id"]][0]
+                    claim = Claim(mechanism=item["category"], episode=receipt["episode"], check=receipt["check"]["id"],
+                                  reward=receipt["draft"]["reward"] or "reward")
+                    report.assessments.append(assess(claim, run.config.output_dir).model_copy(update={
+                        "outcome": "unknown", "nudi_claim": True, "reasons": [UNFINISHED],
+                        "missing": [field for field, info in Reading.model_fields.items() if info.is_required()]}))
+                    item.update(status="unfinished", assessment=len(report.assessments) - 1)
             for review in report.reviews:
                 if review.status == "running" and review.attempt in mine:
                     review.status, review.error = "incomplete", "the session ended before its measured check was interpreted"
@@ -1340,13 +1407,15 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                   + (": repeated a check it had already run" if current.status == "duplicate_case" else f": attempt {current.status}"
                      if current.status not in ("evidenced_issue", "no_evidenced_issue", "unknown") else "")
                   + (f"; searched {own}" if own else ""), inspector=mode, session=name,
-                  elapsed=took, status=current.status, category=own, category_status=report.categories.get(own))
+                  elapsed=took, status=current.status, category=own, category_status=report.categories.get(own),
+                  result="evidenced_issue" if state.evidenced else "open" if obligations(state) or current.status not in (
+                      "evidenced_issue", "no_evidenced_issue", "duplicate_case") else "no_evidenced_issue")
         return session
 
-    settling = None
+    settling = False
     try:
         if mode == "attack":
-            settling = []
+            settling = True
             await session_turns(title, "episode", None, 1, None, pool[0])
             return report
         # Beside other holders of the gate, broad holds a slot too, also through its deferred native persistence episodes.
@@ -1377,8 +1446,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                                if focused_attempts), return_exceptions=True)
         if stops:
             raise stops[0]
-        # Receipts measured by now define category coverage; episode sessions may still repair them.
-        settling = [item for _, item, _ in receipts.values()]
+        settling = True
         await asyncio.gather(*(turn(f"{mode}-episode-{name}", "episode", None, 1, name) for name in pool if swarm), return_exceptions=True)
         if stops:
             raise stops[0]
@@ -1404,27 +1472,18 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
         report.attempts = [report.attempts[index] for index in order]
         for review in report.reviews:
             review.attempt = order.index(review.attempt)
-        # Settle on every exit, on each condition as it is now; an error before category work ended leaves pending categories unknown.
-        # A stop then settles each category whose sessions all ended, on the receipts so far; the others stay unknown for the stop.
-        # No issue also needs a case of the category, measured before the episode sessions, whose latest reading is consistent.
-        stopped = []
-        if settling is None and report.status in ("cancelled", "spending_exhausted"):
-            settling = [item for _, item, _ in receipts.values()]
-            stopped = [category for category in categories if category not in ended and report.categories[category] == "pending"]
-            if stopped:
+        # Settle on every exit, on `open` as it is now: a category settles once its sessions ended and nothing open names it.
+        # An error before category work ended leaves pending categories unknown; a stop settles the categories whose sessions ended.
+        if not settling and report.status in ("cancelled", "spending_exhausted"):
+            settling = True
+            if stopped := [category for category in categories if category not in ended and report.categories[category] == "pending"]:
                 report.limits.append(f"{mode} inspection stopped ({report.status}) before every session of {', '.join(stopped)} ended")
-        open_categories, measured = (set(categories), set()) if settling is None else (unsettled(settling) | set(stopped), clean(settling))
+        named = {entry["category"] for entry in obligations()}
         for category in categories:
             if report.categories[category] == "pending":
-                report.categories[category] = "no_evidenced_issue" if (
-                    category in completed and category not in incomplete and recovered(category) and category not in open_categories
-                    and category in measured and report.applicability_evidence.get(category, {}).get("status") == "applicable") else "unknown"
+                report.categories[category] = "no_evidenced_issue" if settling and category in ended and category not in named else "unknown"
         if report.status == "running":
-            # A failed attempt stays in attempts and warnings; it forces partial only while unrecovered. A restriction keeps its
-            # stated reason and gets no later attempt, and an episode session's repeated case adds no receipt.
-            report.status = "complete" if all(value in ("evidenced_issue", "no_evidenced_issue", "restricted") for value in report.categories.values()) and all(
-                recovered(category) for category in categories if category not in restricted) and all(
-                item.status in ("evidenced_issue", "no_evidenced_issue", "duplicate_case") for item in report.attempts if item.phase == "episode") else "partial"
+            report.status = "complete" if all(value in ("evidenced_issue", "no_evidenced_issue", "restricted") for value in report.categories.values()) and not obligations() else "partial"
         if mode == "grader":
             reviewed = {review.episode for review in report.reviews}
             causes = "; ".join(f"{item.phase} attempt {item.number} {item.status}: {item.error or 'incomplete'}" for item in report.attempts
@@ -1432,11 +1491,15 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
             # A skimmed episode named normal gets a presumed label instead.
             report.unreviewed = {name: f"No experiment reviewed this episode; inspection {report.status}. {causes}" for name in pool
                                  if name not in reviewed and name not in report.normal}
-            if report.unreviewed and report.status == "complete":
-                report.status = "partial"
-            # A failed review stays in reviews; its episode's label shows whether a result is missing.
+            # A failed review stays in reviews; its episode's label shows whether a result is missing. An unknown label is in
+            # `open`; an episode without a native reward cannot be labeled, so it is a limit and asks for no review.
             report.ordinary = label_ordinary(run, pool, report)
-            if any(label.label in ("unknown", "unavailable", "ungrounded") for label in report.ordinary.values()) and report.status == "complete":
-                report.status = "partial"
+            report.limits += [f"{name}: {label.reasons[0]}" for name, label in report.ordinary.items() if label.label == "unavailable"]
+        report.open = obligations()
+        named = {entry["category"] for entry in report.open}
+        # A category its sessions never finished has nothing of its own open; the stop or error keeps it unknown.
+        report.open += [{"id": category, "category": category, "reason": f"the inspection ended ({report.status}) before its sessions of this category did",
+                         "next": "run the inspection again"} for category in categories
+                        if mode != "attack" and report.categories[category] == "unknown" and category not in named]
         save()
     return report
