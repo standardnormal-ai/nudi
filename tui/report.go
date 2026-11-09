@@ -232,9 +232,6 @@ func (p Problem) ladder() int {
 	if l, ok := helpLevels[p.HelpNeeded]; ok {
 		return l
 	}
-	if p.Source == "Attacker" {
-		return 5
-	}
 	if p.HelpNeeded == "no_guidance" || len(p.Findings) > 0 {
 		return 2
 	}

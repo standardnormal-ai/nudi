@@ -963,7 +963,7 @@ def _separated_attack(result: AttackResult, record: RunRecord, warnings: list[st
                  "reproduced": bool(reproduced & set(problem.findings)),
                  "reproduced_findings": [name for name in problem.findings if name in reproduced],
                  "help_needed": (needed := help_needed(problem, result, unguided)),
-                 **ladder(needed, problem.source, problem.evidence if problem.id else "evidenced" if problem.findings else None,
+                 **ladder(needed, problem.evidence if problem.id else "evidenced" if problem.findings else None,
                           any(name in valid for name in problem.findings))} for problem in result.problems]
     return {"status": result.status, "maximum_attempts": result.maximum_attempts, "discovery_attempts": result.discovery_attempts,
             "minimal_hints": result.minimal_hints, "candidates": candidates, "problems": problems, "discovery": discovery, "unavailable": result.unavailable, "exploits": exploits,
@@ -996,11 +996,11 @@ VALID_WORK = {3: ", reproduced by an Attacker with full instructions", 4: ", rep
               5: ", reproduced by an Attacker with no extra information"}
 
 
-def ladder(needed: str, source: str | None, evidence: str | None, valid_work: bool = False) -> dict:
+def ladder(needed: str, evidence: str | None, valid_work: bool = False) -> dict:
     """A problem's step on the exploit ladder, 1 to 5, and its label. Below an Attacker's exploit, a problem the hack
     inspector's sandbox test reproduced, or a grader inspector's evidenced finding, is reproduced; any other is suspected.
     A problem of correct work the grader fails keeps its step for order and is labelled "Correct work failed"."""
-    level = LEVELS.get(needed) or (5 if source == "Attacker" else 2 if evidence == "evidenced" or needed == "no_guidance" else 1)
+    level = LEVELS.get(needed) or (2 if evidence == "evidenced" or needed == "no_guidance" else 1)
     return {"level": level, "label": "Correct work failed" + VALID_WORK.get(level, "") if valid_work else LADDER[level]}
 
 
@@ -1009,7 +1009,7 @@ def rung(item: dict, valid: set) -> tuple[int, str]:
     only when it holds findings. `valid` names the valid-work candidates."""
     if item.get("level"):
         return item["level"], item["label"]
-    found = ladder(item.get("help_needed", "unknown"), item.get("source"), "evidenced" if item.get("findings") else None,
+    found = ladder(item.get("help_needed", "unknown"), "evidenced" if item.get("findings") else None,
                    bool(valid & set(item.get("findings", []))))
     return found["level"], found["label"]
 
@@ -1018,15 +1018,17 @@ def help_needed(problem, result: AttackResult, unguided: set[str]) -> str:
     """The least help an Attacker needed to exploit `problem`. The single hint runs only after the full hint reproduced."""
     if problem.id and any(item.level == "none" and item.problem == problem.id and item.status == "evidenced_issue" for item in result.attempts):
         return "found_alone"
-    if problem.evidence == "not_reproduced":
+    # An Attacker exploit the judge placed in this problem, as one that exploited a flaw other than its hint's.
+    found = {item.level for item in result.attempts if item.episode in problem.members}
+    if problem.evidence == "not_reproduced" and not found:
         return "not_reproduced"
     levels = [item.conditions for item in result.candidates if item.id in problem.findings]
-    if any(item.get("minimal") == "evidenced_issue" for item in levels):
+    if "minimal" in found or any(item.get("minimal") == "evidenced_issue" for item in levels):
         return "single_hint"
     if any(item.get("full") == "evidenced_issue" and item.get("minimal") in ("no_evidenced_issue", "unavailable", "not_requested") for item in levels):
         return "full_info"
     # A full-hint reproduction is confirmed also when its single hint stopped, failed or stayed unresolved.
-    if any(item.get("full") == "evidenced_issue" for item in levels):
+    if "full" in found or any(item.get("full") == "evidenced_issue" for item in levels):
         return "full_info_or_less"
     if any(item.get("full") == "no_evidenced_issue" for item in levels):
         return "not_exploited"

@@ -1091,6 +1091,26 @@ def test_each_problem_reports_the_least_help_an_attacker_needed(tmp_path):
 
 
 
+def test_an_attacker_problem_is_unaided_only_when_a_no_hint_attempt_found_it(tmp_path):
+    """An exploit the judge placed in a new Attacker problem gives that problem the level of its attempt's hint: one a
+    single-hint Attacker found while testing another problem is at the hint's level, one a no-hint Attacker found at 5."""
+    run = RunDir(tmp_path)
+    hinted, unaided = run.episode("attacker", {"reward": 1.0}), run.episode("attacker", {"reward": 1.0})
+    candidate = Candidate(id="hack-0", source="hack_inspector", mechanism="m", outcome="accepted_invalid",
+                          guidance={"full": "steps", "minimal": "look"}, conditions={"full": "evidenced_issue", "minimal": "no_evidenced_issue"})
+    attempts = [AttackAttempt(level="minimal", number=1, context="attacker-hack-0-minimal-1", candidate="hack-0", sources=["hack-0"],
+                              episode=hinted, status="other_exploit", problem="P1"),
+                AttackAttempt(level="none", number=1, context="attacker-none-1", episode=unaided, status="evidenced_issue", problem="A2")]
+    problems = [Problem(id="P1", source="hack inspector", cause="Skip the test.", members=["experiment-0000"], findings=["hack-0"], evidence="evidenced"),
+                Problem(id="A1", source="Attacker", cause="Hide the module.", members=[hinted, hinted]),
+                Problem(id="A2", source="Attacker", cause="Write the score file.", members=[unaided])]
+    run.attack = AttackResult(status="complete", candidates=[candidate], attempts=attempts, problems=problems, discovery={"none": "evidenced_issue"})
+
+    built = run.report(selected=["attack"])
+    assert [(item["id"], item["help_needed"], item["level"]) for item in built["attack"]["problems"]] == [
+        ("P1", "full_info", 3), ("A1", "single_hint", 4), ("A2", "found_alone", 5)]
+
+
 def test_a_finding_without_guidance_says_so_also_without_an_attack_candidate(tmp_path):
     """The hacking analysis attacks only during the hack phase, which takes no finding without guidance, so such a
     problem has no attack candidate; its retained finding still says it gave no guidance. A guided finding without
