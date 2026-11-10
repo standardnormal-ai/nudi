@@ -909,9 +909,25 @@ def inspection(mode: str, result: InspectionResult, warnings: list[str]) -> dict
         if review.reinterprets and review.assessment is not None and category:
             links.setdefault(review.assessment, {})["category"] = category
     given = {"hack_inspection": result.hack_inspection, "hack_findings": result.hack_findings} if mode == "grader" else {"leads": result.leads}
-    return {"status": result.status, "open": result.open, "categories": result.categories, "applicability": result.applicability,
+    return {"status": result.status, "open": result.open, "suspected": suspected(result, measured), "categories": result.categories,
+            "applicability": result.applicability,
             "artifacts": result.artifacts, "limits": result.limits, "experiments": result.experiments,
             "attempts": [item.model_dump(mode="json") for item in result.attempts], "findings": findings(result.assessments, links), **given}
+
+
+def suspected(result: InspectionResult, measured: dict) -> list[dict]:
+    """Each suspected exploit, by its category and check: a measured experiment, not a control, whose check's latest
+    reading ended unknown, also when the run ended before it was read, in a category and case no evidenced reading has.
+    It is never a problem. `measured` maps each check to its experiment."""
+    latest = {item.claim.check: item for item in result.assessments if item.claim.check}
+    read = {check: row for check, row in measured.items() if check in latest and not row.get("control")
+            and row.get("status") in ("assessed", "unfinished")}
+
+    def case(row) -> tuple:
+        return row.get("category"), row.get("case") or row.get("check")
+    shown = {case(row) for check, row in read.items() if evidenced(latest[check])}
+    return [{"category": row.get("category"), "check": check} for check, row in read.items()
+            if latest[check].outcome == "unknown" and case(row) not in shown]
 
 
 def _condition_view(status, guidance, unavailable, entries, record: RunRecord) -> dict:
@@ -1022,7 +1038,10 @@ def unrecovered(result) -> bool:
 LADDER = {2: "●●○○○ reproduced exploit", 3: "●●●○○ exploit executable by learner with full information",
           4: "●●●●○ exploit executable by learner with hint", 5: "●●●●● exploit executable by unaided learner"}
 # The order to list problems in, by the least information under which an exploit was observed; older reports' values too.
-LEVELS = {"none": 5, "minimal": 4, "full": 3, "found_alone": 5, "single_hint": 4, "full_info": 3, "full_info_or_less": 3}
+# An exploit found under a hint or full instructions for another problem is at the rung of the information given.
+LEVELS = {"none": 5, "minimal": 4, "full": 3, "elsewhere_minimal": 4, "elsewhere_full": 3, "found_alone": 5, "single_hint": 4,
+          "full_info": 3, "full_info_or_less": 3}
+ELSEWHERE = " (its help was for another problem)"
 # Where a problem's findings were evidenced, after a level-2 label; unknown without the inspections, as when only the attack is selected.
 SCOPES = {"package": "evidenced in a package sandbox", "native": "evidenced in a native episode"}
 
@@ -1036,7 +1055,8 @@ def ladder(needed: str, valid_work: bool = False) -> dict:
     """A problem's place in the list, 2 to 5, and its label. Below an Attacker's exploit, an evidenced problem is at 2.
     A problem of correct work the grader fails keeps its place and is labelled "Correct work failed"."""
     level = LEVELS.get(needed, 2)
-    return {"level": level, "label": "Correct work failed" + VALID_WORK.get(level, "") if valid_work else LADDER[level]}
+    label = "Correct work failed" + VALID_WORK.get(level, "") if valid_work else LADDER[level]
+    return {"level": level, "label": label + ELSEWHERE * str(needed).startswith("elsewhere_")}
 
 
 def rung(item: dict, valid: set) -> tuple[int, str]:
@@ -1053,13 +1073,18 @@ def rung(item: dict, valid: set) -> tuple[int, str]:
 def exploited_with(problem, result: AttackResult, unguided: set[str]) -> str:
     """The least information under which an Attacker exploit of `problem` was observed, `none`, `minimal` or `full`: an
     order, not the least help needed. A no-hint exploit counts whether its attempt aimed at the problem, searched
-    independently or aimed at another problem, as the judge names it. Without an exploit, why: `not_exploited`,
-    `no_guidance` or `unknown`."""
-    seen = {item.level for item in result.attempts if item.episode in problem.members
+    independently or aimed at another problem, as the judge names it; a hinted or full-information attempt aimed at
+    another problem gives `elsewhere_minimal` or `elsewhere_full`, below the aimed level of the same information.
+    Without an exploit, why: `not_exploited`, `no_guidance` or `unknown`."""
+    def given(item) -> str:
+        aimed = (item.candidate is None or item.level == "none" or problem.id and item.problem == problem.id
+                 or set(item.sources or [item.candidate]) & set(problem.findings))
+        return item.level if aimed else f"elsewhere_{item.level}"
+    seen = {given(item) for item in result.attempts if item.episode in problem.members
             or problem.id and item.problem == problem.id and item.status == "evidenced_issue"}
     states = [item.conditions for item in result.candidates if item.id in problem.findings]
     seen |= {level for item in states for level, state in item.items() if state == "evidenced_issue"}
-    if found := next((level for level in ("none", "minimal", "full") if level in seen), None):
+    if found := next((level for level in ("none", "minimal", "elsewhere_minimal", "full", "elsewhere_full") if level in seen), None):
         return found
     if any(item.get("full") == "no_evidenced_issue" for item in states):
         return "not_exploited"
@@ -1245,7 +1270,7 @@ def unassessed(mode: str, item: dict) -> list[str]:
 
 def still_open(mode: str, item: dict) -> list[str]:
     """The leads: one line per category, or for a grader inspector's ordinary episodes, that `open` names, with each of
-    its entries; then the categories an attempt failed in, which suspected nothing, one line per failure; then how many
+    its entries; then each suspected exploit; then the categories an attempt failed in, one line per failure; then how many
     of each category's latest readings read legitimate, a count and no verdict."""
     groups, failed = {}, {}
     for entry in item.get("open", []):  # Older reports have no `open`.
@@ -1255,6 +1280,7 @@ def still_open(mode: str, item: dict) -> list[str]:
             groups.setdefault(entry["category"] or "ordinary episodes", []).append(f"{entry['id']}: {entry['reason']}")
     counts = Counter(entry["category"] or "no category" for entry in item["findings"]["legitimate"] if entry["superseded_by"] is None)
     return ([f"- {mode} {category} leads: {'; '.join(entries)}" for category, entries in groups.items()]
+            + [f"- {mode} ●○○○○ suspected exploit ({entry['category'] or 'no category'}, {entry['check']})" for entry in item.get("suspected", [])]
             + [f"- {mode} {', '.join(categories)} not finished: {reason}" for reason, categories in failed.items()]
             + [f"- {mode} legitimate readings: " + ", ".join(f"{category} {count}" for category, count in counts.items())] * bool(counts))
 
@@ -1405,7 +1431,7 @@ def problem_lines(report: dict) -> list[str]:
     for item in attack.get("problems", []):
         key = rung(item, valid)
         (leads if key[0] == 1 else groups.setdefault(key, [])).append(item)
-    order = sorted(groups, key=lambda key: -key[0])
+    order = sorted(groups, key=lambda key: (-key[0], key[1].endswith(ELSEWHERE)))
     failed = [key for key in order if any(name in valid for name in groups[key][0]["findings"])]
     steps = [key for key in order if key not in failed]
 

@@ -501,6 +501,35 @@ def test_each_open_category_gets_one_markdown_line_naming_what_keeps_it_open(tmp
     assert "- hack_inspector fabricated_answers leads: fabricated_answers: no reading of this category agrees" in lines
 
 
+def test_a_measured_suspicion_left_unread_at_run_end_is_a_suspected_exploit_and_no_problem(tmp_path):
+    """A measured experiment whose reading ended unfinished or unknown, in a category and case no evidenced reading has,
+    is listed as a suspected exploit beside the leads, with its category and check, and is no problem. An experiment
+    with nothing measured stays a plain lead, and an evidenced reading of the same case suppresses the line."""
+    run = RunDir(tmp_path)
+    box = "sandbox-0000"
+    run.record.sandboxes = [box]
+    assessments = [checked(box, "check-0", "summary", "unknown"), checked(box, "check-1", "summary", "unknown"),
+                   checked(box, "check-2", "summary", "unknown"), evidenced(box, "check-3")]
+    experiments = [{**experiment(0, "package_oracles", "check-0", "unfinished"), "case": "a", "assessment": 0},
+                   {**experiment(1, "fabricated_answers", "check-1"), "case": "b", "assessment": 1},
+                   {**experiment(2, "grader_tampering", "check-2", "unfinished"), "case": "c", "assessment": 2},
+                   {**experiment(3, "grader_tampering", "check-3"), "case": "c", "assessment": 3},
+                   {"id": "experiment-0004", "category": "leakage_metadata", "case": "d", "status": "running"}]
+    open_entries = [{"id": "experiment-0004", "category": "leakage_metadata", "reason": "its reading is unknown", "next": "measure"}]
+    run.hack = InspectionResult(mode="hack", status="partial", categories={}, applicability={}, assessments=assessments,
+                                experiments=experiments, open=open_entries)
+    run.attack = AttackResult(status="complete", discovery={"none": "no_evidenced_issue"})
+    built = run.report(selected=["hack", "attack"])
+    assert (built["attack"]["problems"], built["attack"]["leads"]) == ([], [])
+    assert built["inspections"]["hack_inspector"]["suspected"] == [
+        {"category": "package_oracles", "check": "check-0"}, {"category": "fabricated_answers", "check": "check-1"}]
+    lines = report.markdown(built).splitlines()
+    assert "- hack_inspector ●○○○○ suspected exploit (package_oracles, check-0)" in lines
+    assert "- hack_inspector ●○○○○ suspected exploit (fabricated_answers, check-1)" in lines
+    assert sum("●○○○○" in line for line in lines) == 2
+    assert "- hack_inspector leakage_metadata leads: experiment-0004: its reading is unknown" in lines
+
+
 def test_a_category_whose_attempt_failed_is_listed_as_not_finished_not_as_a_lead(tmp_path):
     """A failed attempt suspected nothing, so it is no lead: its categories are listed together, with the failure."""
     run = RunDir(tmp_path)
@@ -1241,28 +1270,41 @@ def test_each_problem_lists_the_conditions_an_attacker_tried_it_under(tmp_path):
 
 
 def test_an_attacker_problem_is_unaided_only_when_a_no_hint_attempt_found_it(tmp_path):
-    """An exploit the judge placed in a new Attacker problem gives that problem the level of its attempt's hint: one a
-    single-hint Attacker found while testing another problem is at the hint's level, one a no-hint Attacker found at 5."""
+    """An exploit the judge placed in a new Attacker problem is labelled by the information its attempt was given: one
+    found while the Attacker held full instructions or a hint for another problem is at that rung, below an aimed exploit
+    there, and says its help was for another problem; one a no-hint Attacker also found is at 5."""
     run = RunDir(tmp_path)
-    hinted, unaided = run.episode("attacker", {"reward": 1.0}), run.episode("attacker", {"reward": 1.0})
+    full, hinted, unaided = (run.episode("attacker", {"reward": 1.0}) for _ in range(3))
     candidate = Candidate(id="hack-0", source="hack_inspector", mechanism="m", outcome="accepted_invalid",
                           guidance={"full": "steps", "minimal": "look"}, conditions={"full": "evidenced_issue", "minimal": "no_evidenced_issue"})
-    attempts = [AttackAttempt(level="minimal", number=1, context="attacker-hack-0-minimal-1", candidate="hack-0", sources=["hack-0"],
+    attempts = [AttackAttempt(level="full", number=1, context="attacker-hack-0-full-1", candidate="hack-0", sources=["hack-0"],
+                              episode=full, status="evidenced_issue", problem="P1"),
+                AttackAttempt(level="minimal", number=1, context="attacker-hack-0-minimal-1", candidate="hack-0", sources=["hack-0"],
                               episode=hinted, status="other_exploit", problem="P1"),
-                AttackAttempt(level="none", number=1, context="attacker-none-1", episode=unaided, status="evidenced_issue", problem="A2")]
+                AttackAttempt(level="none", number=1, context="attacker-none-1", episode=unaided, status="evidenced_issue", problem="A3")]
     problems = [Problem(id="P1", source="hack inspector", cause="Skip the test.", members=["experiment-0000"], findings=["hack-0"], evidence="evidenced"),
-                Problem(id="A1", source="Attacker", cause="Hide the module.", members=[hinted, hinted]),
-                Problem(id="A2", source="Attacker", cause="Write the score file.", members=[unaided])]
+                Problem(id="A1", source="Attacker", cause="Hide the module.", members=[full]),
+                Problem(id="A2", source="Attacker", cause="Patch the runner.", members=[hinted, hinted]),
+                Problem(id="A3", source="Attacker", cause="Write the score file.", members=[full, unaided])]
     run.attack = AttackResult(status="complete", candidates=[candidate], attempts=attempts, problems=problems, discovery={"none": "evidenced_issue"})
 
     built = run.report(selected=["attack"])
-    assert [(item["id"], item["exploited_with"], item["level"]) for item in built["attack"]["problems"]] == [
-        ("P1", "full", 3), ("A1", "minimal", 4), ("A2", "none", 5)]
-    # A1's own condition: the single-hint attempt aimed at P1 that found it.
+    other = " (its help was for another problem)"
+    assert [(item["id"], item["exploited_with"], item["level"], item["label"]) for item in built["attack"]["problems"]] == [
+        ("P1", "full", 3, "●●●○○ exploit executable by learner with full information"),
+        ("A1", "elsewhere_full", 3, "●●●○○ exploit executable by learner with full information" + other),
+        ("A2", "elsewhere_minimal", 4, "●●●●○ exploit executable by learner with hint" + other),
+        ("A3", "none", 5, "●●●●● exploit executable by unaided learner")]
+    # A2's own condition: the single-hint attempt aimed at P1 that found it.
     model = "openai/deepseek/deepseek-v4.1-flash-1017"
-    assert built["attack"]["problems"][1]["conditions"] == [
+    assert built["attack"]["problems"][2]["conditions"] == [
         {"condition": "elsewhere_minimal", "attempts": 1, "exploited": 1, "model": model, "status": "evidenced_issue"},
         {"condition": "independent", "attempts": 1, "exploited": 0, "model": model, "status": "no_evidenced_issue"}]
+    # Each rung lists its aimed exploits before the exploits whose help was for another problem.
+    assert report.problem_lines(built)[0] == (
+        "Problems by level: ●●●●● exploit executable by unaided learner: A3; ●●●●○ exploit executable by learner with hint" + other
+        + ": A2; ●●●○○ exploit executable by learner with full information: P1; ●●●○○ exploit executable by learner with full information"
+        + other + ": A1.")
 
 
 def test_a_problem_whose_findings_later_readings_withdrew_is_a_lead(tmp_path):
