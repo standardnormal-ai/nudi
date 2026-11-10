@@ -676,7 +676,8 @@ def test_the_attack_inspector_target_carries_its_check_requirement_and_scoring(t
 
 def test_the_attack_inspector_starts_from_the_source_check_rerun_on_the_attackers_copy(tmp_path, monkeypatch, credentials):
     """Before the attack inspector judges an attempt, nudi reruns the check that evidenced its candidate on the Attacker's
-    copy at that check's capture point, and hands the output to the attack inspector, labelled, in its request. A
+    copy at that check's capture point, and hands the output to the attack inspector, labelled, in its request, with the
+    finding's location and that capture point, which its draft reading names. A
     candidate without a check program gets no rerun. The attack inspector still judges every attempt."""
     requirement = Observation(episode=None, path="instruction.md", excerpt="Write a valid answer.")
     requests, reruns = [], []
@@ -715,7 +716,7 @@ def test_the_attack_inspector_starts_from_the_source_check_rerun_on_the_attacker
                                    exit_code=0, output='{"observations": {"rewritten": true}}', program="print(1)",
                                    state_copy=source.id, timing="at grading"))
     candidates = [attack_module.Candidate(id=f"hack-{number}", mechanism=f"mechanism {number}", check=check, source="hack_inspector",
-                                          guidance={"full": f"Exploit {number}.", "minimal": None})
+                                          guidance={"full": f"Exploit {number}.", "minimal": None}, location="/app/answer.txt")
                   for number, check in enumerate(["check-0000", None])]
     for name in ("0000-attacker", "0001-attacker"):
         (run.config.output_dir / "episodes" / name / "nudi-evidence").mkdir(parents=True)
@@ -725,7 +726,8 @@ def test_the_attack_inspector_starts_from_the_source_check_rerun_on_the_attacker
     rerun = requests[0]["check_rerun"]
     assert rerun == {"label": "the hack inspector's check check-0000, rerun by nudi on this attempt's verification_start copy",
                      "check": "check-0001", "program": "print(1)", "exit_code": 0, "output": '{"observations": {"rewritten": true}}',
-                     "source_output": '{"observations": {"rewritten": true}}'}
+                     "source_output": '{"observations": {"rewritten": true}}', "location": "/app/answer.txt",
+                     "capture_point": "verification_start"}
     assert "check_rerun" not in requests[1] and len(requests) == 2
     assert "`check_rerun`" in inspection.inspector_prompt("attack")
 
@@ -2664,7 +2666,7 @@ def test_a_queued_finding_withdrawn_before_its_slot_frees_launches_no_attacker(t
         feed, gate = asyncio.Queue(), asyncio.Semaphore(1)
         await gate.acquire()
         attacking = asyncio.create_task(attack_module.attack(run, maximum_attempts=1, discovery_attempts=0, feed=feed, gate=gate,
-                                                             current=lambda item: item.id not in withdrawn))
+                                                             current=lambda item: None if item.id in withdrawn else item))
         for item in (candidate("hack-0", "FULL-0", "MINIMAL-0"), candidate("hack-1", "FULL-1"), None):
             feed.put_nowait(item)
         await asyncio.sleep(0.05)
@@ -2677,6 +2679,55 @@ def test_a_queued_finding_withdrawn_before_its_slot_frees_launches_no_attacker(t
     assert result.status == "complete"
     events = [json.loads(line) for line in (run.config.output_dir / "events.jsonl").read_text().splitlines()]
     assert [item["candidate"] for item in events if item["kind"] == "withdrawn"] == ["hack-0"]
+
+
+@pytest.mark.parametrize("latest", [None, "FULL-1"])
+def test_a_queued_finding_runs_the_guidance_of_the_latest_reading_of_its_check(tmp_path, monkeypatch, credentials, latest):
+    """hack-0 waits for a slot with full guidance; meanwhile hack-1, a later evidenced reading of its check, replaced it.
+    The Attacker runs hack-1's full guidance, never hack-0's. Without it no Attacker starts, the full level is unavailable
+    with the reason, and the report counts no full-information attempt."""
+    run = new_run(tmp_path, monkeypatch, credentials, concurrency=4)
+    monkeypatch.setattr(run_state, "run_episode", scripted_episodes)
+    monkeypatch.setattr(attack_module, "inspect", scripted_judge({})[0])
+    replacement = candidate("hack-1", latest)
+
+    async def main():
+        feed, gate = asyncio.Queue(), asyncio.Semaphore(1)
+        await gate.acquire()
+        attacking = asyncio.create_task(attack_module.attack(run, maximum_attempts=1, discovery_attempts=0, feed=feed, gate=gate,
+                                                             current=lambda item: replacement))
+        for item in (candidate("hack-0", "FULL-0"), None):
+            feed.put_nowait(item)
+        await asyncio.sleep(0.05)
+        gate.release()
+        return await attacking
+
+    result = asyncio.run(main())
+    told = [(run.config.output_dir / "episodes" / item.episode / "nudi-evidence" / "extension.md").read_text() for item in result.attempts]
+    assert not any("FULL-0" in text for text in told)
+    (item,) = result.candidates
+    built = report.attack(result, run.record, [])
+    attempts = sum(condition["attempts"] for entry in built["candidates"] for condition in entry["conditions"].values() if condition)
+    if latest:
+        assert len(told) == 1 and "FULL-1" in told[0] and item.guidance["full"] == "FULL-1"
+    else:
+        assert told == [] and attempts == 0
+        assert item.conditions["full"] == "unavailable" and item.guidance["full"] is None
+        assert item.unavailable["full"] == attack_module.LATER_UNGUIDED.format(level="full")
+
+
+def test_a_level_skipped_for_missing_guidance_is_decided_by_a_later_attempt_that_ran(tmp_path, monkeypatch, credentials):
+    """hack-0's first full attempt finds no guidance on the latest reading and does not start; by the second the guidance
+    is back, so that attempt runs and decides the level, which is no longer unavailable."""
+    run = new_run(tmp_path, monkeypatch, credentials, concurrency=4)
+    monkeypatch.setattr(run_state, "run_episode", scripted_episodes)
+    monkeypatch.setattr(attack_module, "inspect", scripted_judge({})[0])
+    replacements = iter([candidate("hack-1"), candidate("hack-1", "FULL-1")])
+    result = asyncio.run(attack_module.attack(run, maximum_attempts=2, discovery_attempts=0, candidates=[candidate("hack-0", "FULL-0")],
+                                              current=lambda item: next(replacements)))
+    (item,) = result.candidates
+    assert [attempt.status for attempt in result.attempts] == ["no_evidenced_issue"]
+    assert (item.conditions["full"], item.guidance["full"], "full" in item.unavailable) == ("no_evidenced_issue", "FULL-1", False)
 
 
 def test_a_hint_that_worked_is_followed_by_a_no_hint_attempt_on_the_same_problem(tmp_path, monkeypatch, credentials):
@@ -2816,10 +2867,10 @@ def test_unknown_persistence_does_not_erase_a_scoring_finding(tmp_path):
 
 def test_inspector_persistence_request_is_not_an_attack(tmp_path, monkeypatch, credentials):
     """The plant is a native episode, which admission refuses beside a held workspace on the
-    measured VM. Nudi runs it after the broad investigation releases its workspace."""
+    measured VM. Nudi runs it after the broad investigation, which hands it on as a lead, releases its workspace."""
     from test_inspection import MEASURED_VM, InspectorScript, Sandboxes, resource_task
     Sandboxes(monkeypatch)
-    script = InspectorScript([{"probes": [{"category": "persistence", "location": "/app/nudi-persistence.bin"}]}])
+    script = InspectorScript([{"leads": [{"category": "persistence", "case": "a file may survive", "location": "/app/nudi-persistence.bin"}]}])
     seen = []
 
     async def fake(run, location):

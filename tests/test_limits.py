@@ -739,6 +739,49 @@ def test_a_rate_limit_or_a_refusal_in_words_only_keeps_its_reason_and_stops_noth
     assert len(endpoint.requests) == 2 and record.stop_reason is None and message.split(",")[0] in record.calls[-1].error
 
 
+@pytest.mark.parametrize("status,stops", [(402, True), (403, False)])
+def test_an_account_status_chained_inside_a_rate_limit_stops_the_run(tmp_path, monkeypatch, credentials, status, stops):
+    """LiteLLM raises some providers' 402 as a rate limit, keeping the provider's error in the exception chain. A 401 or
+    402 anywhere in the chain is an account refusal and stops the run with its reason; a chained 403 fails that call alone."""
+    from litellm.llms.nlp_cloud.common_utils import NLPCloudError
+
+    run = new_run(tmp_path, monkeypatch, credentials)
+    stops_seen = []
+    run.stop = lambda: stops_seen.append(True)
+    try:
+        try:
+            raise NLPCloudError(status_code=status, message="payment required")
+        except NLPCloudError as provider:
+            raise litellm.RateLimitError(message="NLPCloudException - payment required", llm_provider="nlp_cloud", model="nlp_cloud/m") from provider
+    except litellm.RateLimitError as error:
+        chained = error
+
+    async def main():
+        with model_calls(run, "inspector", "hack-broad"):
+            with pytest.raises(litellm.RateLimitError):
+                await litellm.acompletion(model="nlp_cloud/m", messages=[{"role": "user", "content": "hi"}], mock_response=chained)
+
+    asyncio.run(main())
+    record = stored_run(run)
+    assert stops_seen == ([True] if stops else [])
+    assert (record.stop_reason or "").startswith("the model provider refused a call of the hack inspector (hack-broad): ") == stops
+    assert "payment required" in record.calls[-1].error
+
+
+@pytest.mark.parametrize("link", ["__cause__", "__context__"])
+def test_an_exception_chain_that_loops_back_ends_the_account_check(link):
+    """A chain whose cause or context points back to an earlier exception is read once each, so the check ends. It runs
+    in its own process, which a loop could not leave."""
+    import subprocess
+    import sys
+
+    code = ("import litellm\nfrom nudi.run_state import account_refusal\n"
+            "outer = litellm.RateLimitError(message='rate limited', llm_provider='openai', model='m')\n"
+            f"inner = RuntimeError('inner')\nouter.__cause__ = inner\ninner.{link} = outer\nprint(account_refusal(outer))")
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60, env=os.environ)
+    assert done.stdout.splitlines()[-1:] == ["False"], done.stderr
+
+
 def test_known_cost_equal_to_the_cap_reaches_it(tmp_path, monkeypatch, credentials):
     fake_trials(monkeypatch, raise_failure)
     run = new_run(tmp_path, monkeypatch, credentials, spending_cap=0.5)

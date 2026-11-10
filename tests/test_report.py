@@ -1129,6 +1129,24 @@ def test_an_attempt_that_was_not_run_or_not_assessed_is_listed_apart_from_the_at
         "  - Independent attacker: Not attempted."]
 
 
+def test_a_native_timeout_without_reward_or_assessment_is_not_an_attempt(tmp_path):
+    """An Attacker episode that timed out with no reward was not assessed, so it is listed apart and is not counted."""
+    run = RunDir(tmp_path)
+    timed_out = run.episode("attacker")
+    run.attack = AttackResult(status="partial", candidates=[Candidate(
+        id="hack-0", mechanism="m", outcome="accepted_invalid", guidance={"full": "steps", "minimal": "look"},
+        conditions={"full": "native_timeout", "minimal": "unattempted", "none": "unattempted"})],
+        attempts=[AttackAttempt(level="full", number=1, context="c0", candidate="hack-0", sources=["hack-0"], episode=timed_out,
+                                status="native_timeout", error="the Attacker failed: agent_timeout")],
+        problems=[Problem(id="P1", source="hack inspector", cause="Skip the test.", findings=["hack-0"], evidence="evidenced")],
+        discovery={"none": "unattempted"})
+    built = run.report(selected=["attack"])
+    (row, *_) = built["attack"]["problems"][0]["conditions"]
+    assert (row["condition"], row["attempts"], row["not_assessed"]) == (
+        "full", 0, [{"episode": timed_out, "status": "native_timeout", "reward": "no reward", "error": "the Attacker failed: agent_timeout"}])
+    assert "of 1 attempts" not in report.markdown(built)
+
+
 def test_each_problem_lists_the_conditions_an_attacker_tried_it_under(tmp_path):
     """Problems go by the least information under which an exploit was observed, a sort and no measure of the help
     needed. A no-hint reproduction judged the same as P1 finds P1 independently; a new one is the Attacker's own A1.

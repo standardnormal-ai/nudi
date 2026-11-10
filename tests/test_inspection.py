@@ -140,7 +140,7 @@ class InspectorScript:
             return self.call(body, "run_experiment", {"probe": turn["probe"]})
         return self.call(body, "InspectionSummary", {
             "completed": turn["response"].get("completed", prose(context["categories"])), "refusal": turn["response"].get("refusal"),
-            "normal_episodes": turn["response"].get("normal_episodes", [])})
+            "normal_episodes": turn["response"].get("normal_episodes", []), "leads": turn["response"].get("leads", [])})
 
     @staticmethod
     def call(body, name, arguments):
@@ -226,7 +226,7 @@ def test_the_grader_inspector_takes_the_shared_gate(tmp_path, monkeypatch, crede
     run = new_run(tmp_path, monkeypatch, credentials)
 
     async def main():
-        gate = asyncio.Semaphore(1)
+        gate = inspection_module.Gate(1)
         async with gate:  # a Simulator episode
             grading = asyncio.create_task(inspection_module.inspect_grader(run, [], categories=["accepted_invalid"],
                                                                            focused_attempts=1, gate=gate))
@@ -449,7 +449,8 @@ def test_retained_workspace_omits_the_uploaded_host_transcript(tmp_path):
 def test_fork_keeps_broad_compaction_without_summarizing_again(tmp_path, monkeypatch, credentials, unit_sandboxes):
     """A compacted broad state is copied with its summarization event: the fork sees what broad saw last."""
     finish = ("InspectionSummary", {"completed": []})
-    script = AgentScript(*[("execute", {"command": "true"})] * 4, "overflow", finish, finish, summary="BROAD_SUMMARY")
+    script = AgentScript(*[("execute", {"command": "true"})] * 4, "overflow", ("InspectionSummary", {"leads": []}), finish,
+                         summary="BROAD_SUMMARY")
 
     async def main():
         async with serve(script) as base:
@@ -574,9 +575,10 @@ def test_index_lists_experiment_identities_and_inspection_status_returns_it(tmp_
     mock_experiments(monkeypatch, investigate)
     probe = setup_probe()
     claim = {**SCRIPTED_READING, "mechanism": "graded fix"}
-    finish = ("InspectionSummary", {"completed": []})
-    script = AgentScript(("run_experiment", {"probe": probe}), ("interpret_experiment", {"experiment": "experiment-0000", "claim": claim}),
-                         finish, ("inspection_status", {}), finish)
+    # Broad orients, so the focused session measures the case.
+    script = AgentScript(("InspectionSummary", {"leads": []}), ("run_experiment", {"probe": probe}),
+                         ("interpret_experiment", {"experiment": "experiment-0000", "claim": claim}), ("inspection_status", {}),
+                         ("InspectionSummary", {}))
 
     async def main():
         async with serve(script) as base:
@@ -584,11 +586,10 @@ def test_index_lists_experiment_identities_and_inspection_status_returns_it(tmp_
             return await inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=1)
 
     asyncio.run(main())
-    focused = json.loads(script.requests[3][1]["messages"][-1]["content"])
-    assert focused["experiments"] == [{"id": "experiment-0000", "category": "package_oracles", "case": "answer without explanation",
-                                       "episode": "case", "status": "assessed", "assessment": 0, "outcome": "legitimate",
-                                       "check": "scripted-check-0", "unresolved": ["whether the fix is graded"]}]
-    assert json.loads(script.tool_results()[-1])["experiments"] == focused["experiments"]
+    assert json.loads(script.tool_results()[-1])["experiments"] == [{
+        "id": "experiment-0000", "category": "package_oracles", "case": "answer without explanation", "episode": "case",
+        "status": "assessed", "assessment": 0, "outcome": "legitimate", "check": "scripted-check-0",
+        "unresolved": ["whether the fix is graded"]}]
 
 
 def test_an_inspector_is_told_in_its_tool_replies_before_the_framework_step_limit_stops_it(
@@ -675,7 +676,7 @@ def test_candidate_continues_until_evidence_and_only_stops_its_category(tmp_path
     import nudi.inspection as inspection_module
 
     probe = {"category": "package_oracles", "case": "one", "setup_program": "first case"}
-    script = InspectorScript([{"probes": [probe]}, {"probes": [{**probe, "case": "two", "setup_program": "second case"}]}, {"probes": []}])
+    script = InspectorScript([{"probes": []}, {"probes": [probe, {**probe, "case": "two", "setup_program": "second case"}]}, {"probes": []}])
     outcomes = iter(["unknown", "accepted_invalid"])
 
     async def investigate(run, candidate, session):
@@ -721,8 +722,9 @@ def test_a_hack_category_stays_open_after_its_first_issue_and_lists_every_findin
     summary is not asked again."""
     probe = lambda category, case: {"category": category, "case": case, "setup_program": case}
     requests = inspector_responses(monkeypatch, [
-        {"probes": [probe("grader_tampering", "forge"), probe("package_oracles", "read")]},
-        {"probes": [probe("grader_tampering", "rewrite")]}, {"probes": []},
+        {"probes": []},
+        {"probes": [probe("grader_tampering", "forge"), probe("package_oracles", "read"), probe("grader_tampering", "rewrite")]},
+        {"probes": []},
     ])
 
     async def investigate(run, probe, session):
@@ -733,20 +735,19 @@ def test_a_hack_category_stays_open_after_its_first_issue_and_lists_every_findin
     run = new_run(tmp_path, monkeypatch, credentials, concurrency=2)  # One session at a time keeps the script's order.
     result = asyncio.run(inspection_module.inspect(run, "hack", [], 2, ["grader_tampering", "package_oracles"]))
     assert [(item.phase, item.category, item.status) for item in result.attempts] == [
-        ("broad", None, "evidenced_issue"), ("focused", "grader_tampering", "evidenced_issue"),
+        ("broad", None, "no_evidenced_issue"), ("focused", "grader_tampering", "evidenced_issue"),
         ("focused", "package_oracles", "no_evidenced_issue")]
     assert result.categories == {"grader_tampering": "evidenced_issue", "package_oracles": "evidenced_issue"}
     sent = [json.loads(request["messages"][-1]["content"]) for request in requests]
     assert "found" not in sent[0]
     # Broad has one job and one end; a focused session continues it for its category.
-    assert sent[0]["instruction"] == "You are the hack inspector. Search the requested categories for grader flaws and measure each with run_experiment."
+    assert sent[0]["instruction"].startswith("You are the hack inspector. Orient the focused sessions: ")
     assert all(request["instruction"].startswith("You are the hack inspector. Continue the investigation above for this category. ")
                for request in sent[1:])
     assert [request.get("found") for request in sent[1:]] == [
-        ["hack-0: forge the result", "hack-1: read the result"],
-        ["hack-0: forge the result", "hack-1: read the result", "hack-2: rewrite the result"]]
+        None, ["hack-0: forge the result", "hack-1: read the result", "hack-2: rewrite the result"]]
     assert all("`found` lists every evidenced finding so far. Look for a different problem" in request["instruction"]
-               and "valid work" in request["instruction"] for request in sent[1:])
+               and "valid work" in request["instruction"] for request in sent[2:])
 
 
 def test_the_replies_repeat_the_definitions_the_inspector_prompts_give():
@@ -778,10 +779,7 @@ def test_the_evidence_hook_is_awaited_once_for_each_evidenced_reading_of_either_
     """The hack inspector and the grader inspector await `on_evidence` with the report and the index of each evidenced
     reading as they record it, never for a legitimate one, so the attack can start on it before the inspection ends."""
     probe = lambda case: {"category": "grader_tampering", "case": case, "setup_program": case}
-    inspector_responses(monkeypatch, [
-        {"probes": [probe("forge"), probe("honest")]},
-        {"probes": [probe("rewrite")]},
-    ])
+    inspector_responses(monkeypatch, [{"probes": []}, {"probes": [probe("forge"), probe("honest"), probe("rewrite")]}])
 
     async def investigate(run, probe, session):
         return Assessment(claim=Claim(mechanism=probe["case"], episode=probe["case"]), execution_scope="package",
@@ -837,13 +835,13 @@ def test_a_probe_runs_without_a_mechanism_and_nothing_is_judged_before_it_is_mea
 
 def test_with_a_shared_gate_broad_holds_a_slot_through_its_persistence_probe_and_focused_sessions_wait(
         tmp_path, monkeypatch, credentials, unit_sandboxes):
-    """Every session takes a slot of the gate, broad included, which holds it through its deferred persistence readback.
+    """Every session takes a slot of the gate, broad included, which holds it through the readback of its persistence lead.
     Nothing starts while another holder has the only slot."""
     inspector_responses(monkeypatch, [
-        {"probes": [{"category": "persistence", "location": "/app/nudi-persistence.bin"}]},
+        {"leads": [{"category": "persistence", "case": "a file may survive", "location": "/app/nudi-persistence.bin"}]},
         {"probes": []},
     ])
-    gate, held = asyncio.Semaphore(1), []
+    gate, held = inspection_module.Gate(1), []
     reply = inspector.litellm.acompletion
 
     async def completion(**request):
@@ -878,10 +876,10 @@ def test_with_a_shared_gate_broad_holds_a_slot_through_its_persistence_probe_and
 def test_hack_stopping_requires_undeserved_reward_while_grader_keeps_both_directions(tmp_path, monkeypatch, credentials, mode, category, expected, unit_sandboxes):
     """A grader inspector category stops at its first evidenced issue. A hack inspector category stays open
     (the test above), so its focused session still runs and finds a second issue."""
-    requests = inspector_responses(monkeypatch, [
-        {"probes": [{"category": category, "case": "false rejection", "setup_program": "false rejection"}]},
-        {"probes": [{"category": category, "case": "false acceptance", "setup_program": "false acceptance"}]}, {"probes": []},
-    ])
+    rejection, acceptance = ({"category": category, "case": case, "setup_program": case} for case in ("false rejection", "false acceptance"))
+    # The grader broad session measures; the hack broad session orients, so its focused session measures both cases.
+    requests = inspector_responses(monkeypatch, [{"probes": [rejection]}, {"probes": [acceptance]}, {"probes": []}] if mode == "grader"
+                                   else [{"probes": []}, {"probes": [rejection, acceptance]}, {"probes": []}])
 
     async def investigate(run, probe, session):
         return Assessment(claim=Claim(mechanism=probe["case"], episode=probe["case"]), execution_scope="package",
@@ -1621,8 +1619,7 @@ def test_measured_violation_without_a_deserved_score_does_not_stop_hack_discover
     no_native_actor(monkeypatch)
     absent = {"claim": {"mechanism": "credit without explanation", "interpretation": "The required file is absent.",
                         "derivation": {"observations": ["exists"], "validity": "violated"}}}
-    requests = inspector_responses(monkeypatch, [{"probes": [setup_probe(program=ABSENCE)]},
-                                                 absent, {"probes": []}])
+    requests = inspector_responses(monkeypatch, [{"probes": []}, {"probes": [setup_probe(program=ABSENCE)]}, absent])
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
     result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=1))
     (assessment,) = result.assessments
@@ -1690,11 +1687,12 @@ def test_an_invalid_claim_after_a_completed_check_is_returned_to_the_model(tmp_p
 @pytest.mark.parametrize("reward", ["measured reward 1.0", 1.0])
 def test_a_claim_naming_a_reward_key_the_episode_lacks_is_returned_to_the_model(tmp_path, monkeypatch, credentials, reward, unit_sandboxes):
     """Inspectors have put prose and 1.0 in `reward`, which read as a missing reward; the claim goes back with the keys,
-    or with the schema's error for a number. Broad ends with its draft unfinished, and focused completes it."""
+    or with the schema's error for a number. The grader inspector's broad session ends with its draft unfinished, and
+    focused completes it."""
     Sandboxes(monkeypatch)
     no_native_actor(monkeypatch)
     inspector_responses(monkeypatch, [
-        {"probes": [setup_probe()]},
+        {"probes": [setup_probe(category="accepted_invalid")]},
         {"claim": {**VIOLATED["claim"], "reward": reward}},
         {"probes": [], "reinterpretations": [{"check": "experiment-0000", "claim": {**VIOLATED["claim"], "reward": None}}]},
     ])
@@ -1706,7 +1704,7 @@ def test_a_claim_naming_a_reward_key_the_episode_lacks_is_returned_to_the_model(
 
     monkeypatch.setattr(inspector.litellm, "acompletion", recorded)
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
-    result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=1))
+    result = asyncio.run(inspection_module.inspect_grader(run, [], categories=["accepted_invalid"], focused_attempts=1))
     feedback = {message["content"] for body in bodies for message in body["messages"] if message["role"] == "tool"}
     if isinstance(reward, str):
         invalid, = [json.loads(text) for text in feedback if '"invalid_claim"' in text]
@@ -1717,7 +1715,7 @@ def test_a_claim_naming_a_reward_key_the_episode_lacks_is_returned_to_the_model(
     assert [attempt.status for attempt in result.attempts] == ["no_evidenced_issue", "evidenced_issue"]
     assert [assessment.claim.reward for assessment in result.assessments] == ["reward", "reward"]
     assert result.assessments[0].reasons == [inspection_module.UNFINISHED]
-    assert result.categories == {"package_oracles": "evidenced_issue"}
+    assert result.categories == {"accepted_invalid": "evidenced_issue"}
 
 
 @pytest.mark.parametrize("fields, schema", [({"requirement": {"excerpt": ["not a string"]}}, True), ({"program": 7}, True),
@@ -1730,7 +1728,7 @@ def test_invalid_probe_fields_start_no_tool_work(tmp_path, monkeypatch, credenti
     but the category, with no case measured in it, stays unknown."""
     Sandboxes(monkeypatch)
     no_native_actor(monkeypatch)
-    inspector_responses(monkeypatch, [{"probes": [setup_probe(**fields)]}, {"probes": []}])
+    inspector_responses(monkeypatch, [{"probes": []}, {"probes": [setup_probe(**fields)]}])
     completion, bodies = inspector.litellm.acompletion, []
 
     async def recorded(**request):
@@ -2119,14 +2117,16 @@ def test_a_missing_native_reward_is_an_unavailable_measurement_not_a_failed_chec
     assert any("experiment-0000: its episode has no native reward" in entry["reason"] for entry in result.open)
 
 
-def consistent_broad(tmp_path, monkeypatch, credentials, *more, focused_attempts=1):
-    """A hack inspection of package_oracles whose broad session reads one consistent case, then calls `more` on its tools."""
+def consistent_focused(tmp_path, monkeypatch, credentials, *more, focused_attempts=1):
+    """A hack inspection of package_oracles whose focused session reads one consistent case, then calls `more` on its tools."""
     Sandboxes(monkeypatch)
     no_native_actor(monkeypatch)
     replies = []
 
     async def behave(name, tools, schema):
         if name == "hack-broad":
+            return schema(leads=[])
+        if name == "hack-package_oracles":
             await consistent_case(tools)
             for step in more:
                 replies.append(await step(tools))
@@ -2139,7 +2139,7 @@ def consistent_broad(tmp_path, monkeypatch, credentials, *more, focused_attempts
 
 
 def test_a_category_whose_readings_all_agree_settles_with_no_applicability_decision(tmp_path, monkeypatch, credentials, unit_sandboxes):
-    run, _, inspect = consistent_broad(tmp_path, monkeypatch, credentials)
+    run, _, inspect = consistent_focused(tmp_path, monkeypatch, credentials)
     result = inspect()
     assert result.categories == {"package_oracles": "no_evidenced_issue"} and result.status == "complete"
     assert result.open == []
@@ -2147,7 +2147,7 @@ def test_a_category_whose_readings_all_agree_settles_with_no_applicability_decis
 
 def test_a_repeated_case_leaves_its_category_settled(tmp_path, monkeypatch, credentials, unit_sandboxes):
     """A duplicate is refused and kept as history; it does not keep its category unknown."""
-    run, replies, inspect = consistent_broad(tmp_path, monkeypatch, credentials,
+    run, replies, inspect = consistent_focused(tmp_path, monkeypatch, credentials,
                                              lambda tools: tools["run_experiment"].ainvoke({"probe": deserved_probe()}),
                                              lambda tools: tools["inspection_status"].ainvoke({}))
     result = inspect()
@@ -2157,7 +2157,7 @@ def test_a_repeated_case_leaves_its_category_settled(tmp_path, monkeypatch, cred
 
 def test_a_tool_error_the_session_continued_past_does_not_keep_completed_work_unknown(tmp_path, monkeypatch, credentials, unit_sandboxes):
     """A recovered tool error, such as the SDK refusing a second write to one path, stays as a limit."""
-    run, _, inspect = consistent_broad(tmp_path, monkeypatch, credentials)
+    run, _, inspect = consistent_focused(tmp_path, monkeypatch, credentials)
     asked = inspector.Investigation.ask
 
     async def erring(session, context, schema, *, tools):
@@ -2175,18 +2175,19 @@ def test_a_tool_error_the_session_continued_past_does_not_keep_completed_work_un
 @pytest.mark.parametrize("forked", [True, False])
 def test_interpret_experiment_accepts_only_the_sessions_own_and_forked_experiments(tmp_path, monkeypatch, credentials, forked,
                                                                                   unit_sandboxes):
-    """A later session inherits broad's experiments only by forking broad's conversation. When broad leaves no model reply
-    to continue, the later session starts fresh and owns nothing of broad's, as it never owns a sibling's."""
+    """A later grader inspector session inherits broad's experiments only by forking broad's conversation. When broad
+    leaves no model reply to continue, the later session starts fresh and owns nothing of broad's, as it never owns a
+    sibling's."""
     mock_experiments(monkeypatch, agreeing())
     replies = {}
 
     async def behave(name, tools, schema):
         own = replies.setdefault(name, [])
-        if name == "hack-broad":
-            own.append(await tools["run_experiment"].ainvoke({"probe": setup_probe()}))
-        elif name == "hack-package_oracles":
+        if name == "grader-broad":
+            own.append(await tools["run_experiment"].ainvoke({"probe": setup_probe(category="accepted_invalid")}))
+        elif name == "grader-accepted_invalid":
             own.append(await tools["interpret_experiment"].ainvoke({"experiment": "experiment-0000", "claim": SCRIPTED_READING}))
-            receipt = await tools["run_experiment"].ainvoke({"probe": setup_probe(setup_program="other case")})
+            receipt = await tools["run_experiment"].ainvoke({"probe": setup_probe(category="accepted_invalid", setup_program="other case")})
             own.append(await tools["interpret_experiment"].ainvoke({"claim": receipt["scripted_claim"]}))
         else:
             own.append(await tools["interpret_experiment"].ainvoke({"experiment": "experiment-0001", "claim": SCRIPTED_READING}))
@@ -2203,9 +2204,9 @@ def test_interpret_experiment_accepts_only_the_sessions_own_and_forked_experimen
     if not forked:
         monkeypatch.setattr(inspector.Investigation, "ask", unanswered)
     run = new_run(tmp_path, monkeypatch, credentials, concurrency=2)
-    result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles", "fabricated_answers"], focused_attempts=1))
-    inherited, own = replies["hack-package_oracles"]
-    refused, = replies["hack-fabricated_answers"]
+    result = asyncio.run(inspection_module.inspect_grader(run, [], categories=["accepted_invalid", "rejected_valid"], focused_attempts=1))
+    inherited, own = replies["grader-accepted_invalid"]
+    refused, = replies["grader-rejected_valid"]
     for reply in [refused] + [inherited] * (not forked):
         assert reply["status"] == "invalid_experiment" and "another session" in reply["reason"]
         assert "Measure your own case" in reply["instruction"]
@@ -2247,23 +2248,28 @@ def test_a_session_end_carries_its_result_beside_its_status(tmp_path, monkeypatc
     mock_experiments(monkeypatch, measured)
 
     async def behave(name, tools, schema):
+        if name == "hack-broad":
+            return schema(leads=[])
         receipt = await tools["run_experiment"].ainvoke({"probe": setup_probe(setup_program=name)})
         await tools["interpret_experiment"].ainvoke({"claim": receipt["scripted_claim"]})
         return schema()
 
     episode_tools(monkeypatch, behave)
-    run = new_run(tmp_path, monkeypatch, credentials)
-    asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=1))
+    run = new_run(tmp_path, monkeypatch, credentials, concurrency=2)  # One session at a time keeps the order.
+    asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles", "grader_tampering"], focused_attempts=1))
     events = [json.loads(line) for line in (run.config.output_dir / "events.jsonl").read_text().splitlines()]
+    # The orienting broad session measures nothing and settles nothing. The grader_tampering session measured a
+    # legitimate package_oracles case, so its own category still has an `open` entry.
     assert [(item["session"], item["status"], item["result"]) for item in events if item["kind"] == "session_end"] == [
-        ("hack-broad", "evidenced_issue", "evidenced_issue"), ("hack-package_oracles", "no_evidenced_issue", "open")]
+        ("hack-broad", "no_evidenced_issue", "no_evidenced_issue"), ("hack-package_oracles", "evidenced_issue", "evidenced_issue"),
+        ("hack-grader_tampering", "no_evidenced_issue", "open")]
 
 
 @pytest.mark.parametrize("outcome", ["accepted_invalid", "rejected_valid"])
 def test_unguided_hack_finding_is_reminded_once_and_its_guided_reading_is_the_candidate(tmp_path, monkeypatch, credentials, outcome,
                                                                                         unit_sandboxes):
     """A finding without guidance gives the Attacker nothing to run. Nudi's reply reminds the hack inspector
-    once per check, across its sessions; a re-interpretation with guidance is that check's one candidate."""
+    once per check; a re-interpretation with guidance is that check's one candidate."""
     from nudi import send
 
     no_native_actor(monkeypatch)
@@ -2280,21 +2286,18 @@ def test_unguided_hack_finding_is_reminded_once_and_its_guided_reading_is_the_ca
 
     async def behave(name, tools, schema):
         interpret = tools["interpret_experiment"].ainvoke
-        if name == "hack-broad":
-            claims = {"finding": [finding, finding], "legitimate": [{**finding, "mechanism": "legitimate"}],
-                      "located": [{**finding, "hint_location": "tests/test.sh"}]}
-            for case, readings in claims.items():
-                receipt = await tools["run_experiment"].ainvoke({"probe": {"category": "package_oracles", "case": case, "setup_program": case}})
-                replies.extend([await interpret({"experiment": receipt["id"], "claim": claim}) for claim in readings])
-            return schema(completed=[])
-        if len(replies) == 4:
-            replies.extend([await interpret({"experiment": "experiment-0000", "claim": finding}),
-                            await interpret({"experiment": "experiment-0000", "claim": guided})])
+        claims = {"finding": [finding, finding], "legitimate": [{**finding, "mechanism": "legitimate"}],
+                  "located": [{**finding, "hint_location": "tests/test.sh"}]}
+        for case, readings in claims.items():
+            receipt = await tools["run_experiment"].ainvoke({"probe": {"category": "package_oracles", "case": case, "setup_program": case}})
+            replies.extend([await interpret({"experiment": receipt["id"], "claim": claim}) for claim in readings])
+        replies.extend([await interpret({"experiment": "experiment-0000", "claim": finding}),
+                        await interpret({"experiment": "experiment-0000", "claim": guided})])
         return schema()
 
     episode_tools(monkeypatch, behave)
-    run = new_run(tmp_path, monkeypatch, credentials, concurrency=2)  # The first focused session repairs the reading.
-    result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles", "unchecked_requirements"], focused_attempts=1))
+    run = new_run(tmp_path, monkeypatch, credentials)
+    result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles", "unchecked_requirements"], focused_attempts=0))
     assert len(replies) == 6 and all("investigation_result" in reply for reply in replies)
     reminder = replies[0]["guidance_reminder"]
     assert "full_guidance" in reminder and "hint_location" in reminder and "experiment-0000" in reminder
@@ -2361,6 +2364,48 @@ def test_a_later_reading_of_an_evidenced_check_is_a_revision_event(tmp_path, mon
     asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
     events = [json.loads(line) for line in (run.config.output_dir / "events.jsonl").read_text().splitlines()]
     assert [(item["index"], item["before"], item["after"]) for item in events if item["kind"] == "revised"] == [(1, "accepted_invalid", "legitimate")]
+
+
+def test_the_report_written_at_a_revision_has_the_corrected_reading(tmp_path, monkeypatch, credentials, unit_sandboxes):
+    """The report so far written at a `revised` event reads the saved corrected reading, so an evidenced reading read
+    again as unknown, without guidance, is superseded there and no longer claimed."""
+    from nudi import report
+
+    no_native_actor(monkeypatch)
+
+    async def investigate(run, probe, session):
+        return Assessment(claim=Claim(mechanism="finding", episode="sandbox-0000"), execution_scope="package", outcome="accepted_invalid")
+
+    mock_experiments(monkeypatch, investigate)
+    monkeypatch.setattr(inspection_module, "assess", lambda claim, directory: Assessment(
+        claim=claim, execution_scope="package", outcome="unknown" if claim.mechanism == "no finding" else "accepted_invalid"))
+    finding = {"mechanism": "finding", "interpretation": "The grader rewards any format.",
+               "full_guidance": "Write the number in any format.", "hint_location": "tests/test.sh"}
+
+    async def behave(name, tools, schema):
+        receipt = await tools["run_experiment"].ainvoke({"probe": {"category": "package_oracles", "case": "finding", "setup_program": "true"}})
+        for claim in (finding, {"mechanism": "no finding", "interpretation": "The format is checked."}):
+            await tools["interpret_experiment"].ainvoke({"experiment": receipt["id"], "claim": claim})
+        return schema(completed=prose(["package_oracles"]))
+
+    episode_tools(monkeypatch, behave)
+    run = new_run(tmp_path, monkeypatch, credentials)
+    written = []
+
+    def publish():
+        run.save()
+        paths = report.write(run.config.output_dir, (), ["hack"], running=True)
+        written.append((json.loads(paths[0].read_text()), paths[1].read_text()))
+
+    run.publish = publish
+    asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
+    events = [json.loads(line) for line in (run.config.output_dir / "events.jsonl").read_text().splitlines()]
+    assert [item["kind"] for item in events if item["kind"] == "revised"] == ["revised"]
+    built, text = written[-1]
+    findings = built["inspections"]["hack_inspector"]["findings"]
+    assert [item["superseded_by"] for item in findings["evidenced"]] == [{"index": 1, "result": "inconclusive"}]
+    assert [item["index"] for item in findings["inconclusive"]] == [1]
+    assert "No cheat and no misjudged work was evidenced." in text and "superseded by the later inconclusive reading" in text
 
 
 def test_applicability_has_no_native_scope():
@@ -2536,10 +2581,10 @@ def test_every_judging_job_must_say_what_happened_in_its_own_words(job):
 def test_hack_probe_outside_the_requested_category_runs_and_keeps_its_own_family_or_other(tmp_path, monkeypatch, credentials, unit_sandboxes):
     """Hack categories are a checklist, not a gate. The requested category settles as before, on its own consistent case."""
     inspector_responses(monkeypatch, [
+        {"probes": []},
         {"probes": [{"category": "online_lookup", "case": "lookup", "setup_program": "lookup"},
                     {"category": "a new trick", "case": "new", "setup_program": "new"},
                     {"category": "package_oracles", "case": "deserved", "setup_program": "deserved"}]},
-        {"probes": []},
     ])
 
     async def investigate(run, probe, session):
@@ -2957,21 +3002,21 @@ def test_an_invalid_probe_then_a_valid_one_settles_the_category_normally(tmp_pat
     assert len(run.record.checks) == 1
 
 
-@pytest.mark.parametrize("focused_attempts, last, settled, status", [
-    (2, {"probes": []}, "no_evidenced_issue", "complete"),
-    (1, None, "unknown", "partial"),
+@pytest.mark.parametrize("focused_attempts, settled, status", [
+    (2, "no_evidenced_issue", "complete"),
+    (1, "unknown", "partial"),
 ])
-def test_recovered_focused_failure_keeps_its_error_without_forcing_partial(tmp_path, monkeypatch, credentials, focused_attempts, last,
+def test_recovered_focused_failure_keeps_its_error_without_forcing_partial(tmp_path, monkeypatch, credentials, focused_attempts,
                                                                            settled, status, unit_sandboxes):
     """A failed attempt that a later attempt in the same category recovers from stays in the attempts and warnings only.
-    Broad measures one consistent case, so only the failure decides whether the category settles."""
+    The recovering attempt measures one consistent case, so only the failure decides whether the category settles."""
     Sandboxes(monkeypatch)
     no_native_actor(monkeypatch)
     inspector_responses(monkeypatch, [
+        {"probes": []},
+        inspection_module.ModelOutputFailure("The Inspector returned no structured result"),
         {"probes": [deserved_probe()]},
         SUPPORTED,
-        inspection_module.ModelOutputFailure("The Inspector returned no structured result"),
-        last,
     ])
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
     result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=focused_attempts))
@@ -2987,15 +3032,15 @@ def test_recovered_focused_failure_keeps_its_error_without_forcing_partial(tmp_p
 @pytest.mark.parametrize("mode, isolated", [("hack", False), ("attack", False), ("grader", True), ("grader", False)],
                          ids=["hack", "attack", "inspector_swarm", "holistic_inspection"])
 def test_each_summary_schema_asks_only_for_what_nudi_reads(tmp_path, monkeypatch, credentials, mode, isolated, unit_sandboxes):
-    """No code reads a list of completed categories, and only holistic grader inspection reads normal episodes. Every summary
-    keeps the tool name the prompt gives it."""
+    """No code reads a list of completed categories, only holistic grader inspection reads normal episodes, and only the
+    orienting hack broad session hands on leads. Every summary keeps the tool name the prompt gives it."""
     run = new_run(tmp_path, monkeypatch, credentials)
     pool = [] if mode == "hack" else ordinary_pool(run, 1)
     schemas = {}
 
     async def behave(name, tools, schema):
         schemas[name] = schema
-        return schema()
+        return schema(leads=[]) if "leads" in schema.model_fields else schema()
 
     episode_tools(monkeypatch, behave)
     categories = ["package_oracles"] if mode == "hack" else ["accepted_invalid"]
@@ -3003,8 +3048,9 @@ def test_each_summary_schema_asks_only_for_what_nudi_reads(tmp_path, monkeypatch
                                           title="attack-judge" if mode == "attack" else None))
     normal = {"normal_episodes"} if mode == "grader" and not isolated else set()
     assert len(schemas) == (1 if mode == "attack" else 3 if isolated else 2)
-    for schema in schemas.values():
-        assert set(schema.model_fields) == {"refusal"} | normal and schema.__name__ == "InspectionSummary"
+    for name, schema in schemas.items():
+        leads = {"leads"} if name == "hack-broad" else set()
+        assert set(schema.model_fields) == {"refusal"} | normal | leads and schema.__name__ == "InspectionSummary"
 
 
 @pytest.mark.parametrize("focused_attempts, measured, settled", [(0, True, "no_evidenced_issue"), (1, True, "no_evidenced_issue"), (1, False, "unknown")])
@@ -3014,8 +3060,10 @@ def test_a_category_settles_on_its_readings_whatever_the_summary_lists(tmp_path,
     settles; one without stays unknown."""
     Sandboxes(monkeypatch)
     no_native_actor(monkeypatch)
-    inspector_responses(monkeypatch, [{"probes": [deserved_probe()] if measured else [], "completed": ["package_oracles"]}, *([SUPPORTED] if measured else []),
-                                      {"probes": [], "completed": []}])
+    measure, reading = {"probes": [deserved_probe()] if measured else []}, [SUPPORTED] if measured else []
+    # With focused sessions, broad orients and the focused session measures.
+    inspector_responses(monkeypatch, [{"probes": [], "completed": ["package_oracles"]}, {**measure, "completed": []}, *reading] if focused_attempts
+                        else [{**measure, "completed": ["package_oracles"]}, *reading, {"probes": [], "completed": []}])
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
     result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=focused_attempts))
     assert [attempt.status for attempt in result.attempts] == ["no_evidenced_issue"] * (1 + focused_attempts)
@@ -3031,8 +3079,8 @@ def test_a_category_settles_on_its_readings_whatever_the_summary_lists(tmp_path,
 ])
 def test_pending_interpretation_mark_follows_the_receipt(tmp_path, monkeypatch, credentials, first, repaired, settled, status,
                                                          unit_sandboxes):
-    """A receipt whose claim was refused is left unfinished when broad ends; its category stays unsettled until it is
-    interpreted consistently."""
+    """A receipt whose claim was refused is left unfinished when the grader inspector's broad session ends; its category
+    stays unsettled until it is interpreted consistently."""
     Sandboxes(monkeypatch)
     no_native_actor(monkeypatch)
     observations = "exists" if first == "invalid" else ["missing"]
@@ -3040,16 +3088,16 @@ def test_pending_interpretation_mark_follows_the_receipt(tmp_path, monkeypatch, 
         "mechanism": "repaired", "interpretation": "The explanation is absent, so no credit is deserved.",
         "derivation": {"observations": ["exists"], "validity": "violated"}}}
     inspector_responses(monkeypatch, [
-        {"probes": [setup_probe()]},
+        {"probes": [setup_probe(category="accepted_invalid")]},
         {"claim": {"mechanism": first, "derivation": {"observations": observations, "validity": "violated"}}},
         {"probes": [], "reinterpretations": [repair] if repaired else []},
     ])
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
-    result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=1))
+    result = asyncio.run(inspection_module.inspect_grader(run, [], categories=["accepted_invalid"], focused_attempts=1))
     assert [attempt.status for attempt in result.attempts] == ["no_evidenced_issue", "evidenced_issue" if repaired else "no_evidenced_issue"]
     assert [item["status"] for item in result.experiments] == ["assessed" if repaired else "unfinished"]
     assert len(result.experiments[0].get("revisions", [])) == (first == "inconclusive")
-    assert result.categories == {"package_oracles": settled} and result.status == status
+    assert result.categories == {"accepted_invalid": settled} and result.status == status
 
 
 def no_native_actor(monkeypatch):
@@ -3907,7 +3955,7 @@ def test_a_citation_nested_in_a_grader_derivation_is_refused_before_assessment(t
 def test_the_attack_inspector_interprets_nudis_rerun_of_the_target_check_without_a_new_experiment(
         tmp_path, monkeypatch, credentials, unit_sandboxes):
     """The check nudi reran on the Attacker's copy is a receipt like the attack inspector's own: interpret_experiment
-    reads it by its check id and runs nothing. Another check of that episode stays outside the tool."""
+    also reads it by its check id and runs nothing. Another check of that episode stays outside the tool."""
     from nudi.records import Check, Content
 
     run = new_run(tmp_path, monkeypatch, credentials)
@@ -3930,14 +3978,14 @@ def test_the_attack_inspector_interprets_nudis_rerun_of_the_target_check_without
     assert replies[1]["status"] == "invalid_experiment"
     assert [item.claim.check for item in result.assessments] == ["check-0000"]
     assert len(run.record.checks) == 2
-    assert ("`check_rerun`, when present, is the check that evidenced the target, which nudi reran on this episode before you "
-            "started: interpret it with interpret_experiment by its `check` id when it measures what your verdict needs; "
-            "otherwise measure with run_experiment.") in " ".join(inspection_module.inspector_prompt("attack").split())
+    assert ("When it holds a `draft`, that is your open draft reading: complete it first with interpret_experiment, naming no "
+            "experiment. Then measure with run_experiment only what it leaves open: an entry in `open`, or, for valid work, a "
+            "requirement the score depends on that no reading measured.") in " ".join(inspection_module.inspector_prompt("attack").split())
 
 
 def test_an_unknown_reading_of_nudis_rerun_keeps_the_attack_judgement_open(tmp_path, monkeypatch, credentials, unit_sandboxes):
-    """The rerun check's reading is a reading of the session like its own experiments': an unknown one stays in `open`,
-    so its category and the session stay unsettled."""
+    """The rerun check's reading is a reading of the session like its own experiments': an unknown one stays in `open`
+    under its draft's experiment id, so its category and the session stay unsettled."""
     from nudi.records import Check, Content
 
     run = new_run(tmp_path, monkeypatch, credentials)
@@ -3957,10 +4005,103 @@ def test_an_unknown_reading_of_nudis_rerun_keeps_the_attack_judgement_open(tmp_p
     result = asyncio.run(inspection_module.inspect(run, "attack", pool, 0, ["accepted_invalid"], title="attack-judge",
                                                    request={"target_candidate": None, "check_rerun": {"check": "check-0000"}}))
     assert [(entry["id"], entry["category"], entry["reason"]) for entry in result.open] == [
-        ("check-0000", "accepted_invalid", "nothing settles it")]
+        ("experiment-0000", "accepted_invalid", "nothing settles it")]
     assert result.categories == {"accepted_invalid": "unknown"} and result.status == "partial"
     events = [json.loads(line) for line in (run.config.output_dir / "events.jsonl").read_text().splitlines()]
     assert [item["result"] for item in events if item["kind"] == "session_end"] == ["open"]
+
+
+def rerun_session(tmp_path, monkeypatch, credentials, behave, exit_code=0, output=None):
+    """An attack inspector session whose request carries nudi's rerun `check-0000` of the target's check on its episode,
+    which was rewarded 1.0 while the rerun measured a deserved score of 0. Returns the run, its result and each request."""
+    from nudi.records import Check, Content
+
+    run = new_run(tmp_path, monkeypatch, credentials)
+    pool = ordinary_pool(run, 1)
+    output = output or json.dumps({"observations": {"answered": 0}, "results": {"deserved": 0}})
+    requirement = Observation(episode=None, path="instruction.md", excerpt="Write the number 42")
+    run.record.checks.append(Check(id="check-0000", ids={}, content=Content(episode=pool[0], path="copy.json", sha256="0" * 64),
+                                   requirement=requirement, command=["python3"], exit_code=exit_code, output=output))
+    asked = []
+    episode_tools(monkeypatch, lambda name, tools, schema: behave(run, pool, tools, schema))
+    scripted = inspector.Investigation.ask
+
+    async def ask(session, context, schema, *, tools):
+        asked.append(json.loads(context))
+        return await scripted(session, context, schema, tools=tools)
+
+    monkeypatch.setattr(inspector.Investigation, "ask", ask)
+    rerun = {"label": "the hack inspector's check check-0000, rerun by nudi", "check": "check-0000", "exit_code": exit_code,
+             "output": output, "location": "/app/answer.txt", "capture_point": "verification_start"}
+    result = asyncio.run(inspection_module.inspect(run, "attack", pool, 0, ["accepted_invalid"], title="attack-judge",
+                                                   request={"target_candidate": None, "check_rerun": rerun}))
+    return run, result, asked
+
+
+def test_a_successful_rerun_is_the_attack_inspectors_open_draft_and_run_experiment_waits_for_it(
+        tmp_path, monkeypatch, credentials, unit_sandboxes):
+    """nudi's successful rerun of the target's check is the session's open draft reading from the start, with the native
+    reward, check, references, location, capture point, observations and deserved score. The first run_experiment
+    returns that draft and starts no sandbox; interpret_experiment with no id completes it."""
+    replies = []
+
+    async def behave(run, pool, tools, schema):
+        before = (len(run.record.sandboxes), len(run.record.checks))
+        replies.append(await tools["run_experiment"].ainvoke({"probe": {k: v for k, v in review_probe(pool[0]).items() if k != "category"}}))
+        replies.append((len(run.record.sandboxes), len(run.record.checks)) == before)
+        replies.append(await tools["interpret_experiment"].ainvoke(SUPPORTED))
+        return schema()
+
+    run, result, asked = rerun_session(tmp_path, monkeypatch, credentials, behave)
+    waited, untouched, interpreted = replies
+    draft = waited["draft"]
+    assert waited["instruction"] == inspection_module.OPEN_DRAFT and untouched
+    assert (draft["experiment"], draft["episode"], draft["check"], draft["reward"], draft["native_reward"]) == (
+        "experiment-0000", "0000-simulator", "check-0000", "reward", 1.0)
+    assert draft["requirement"] == {"episode": None, "path": "instruction.md", "excerpt": "Write the number 42"}
+    assert (draft["location"], draft["capture_point"], draft["observations"], draft["deserved"]) == (
+        "/app/answer.txt", "verification_start", ["answered"], 0)
+    assert interpreted["investigation_result"]["claim"]["check"] == "check-0000"
+    assert [(item["id"], item["status"], item["check"]) for item in result.experiments] == [("experiment-0000", "assessed", "check-0000")]
+    # The first request shows the draft and the open entry it makes, and asks for it first.
+    assert asked[0]["check_rerun"]["draft"] == draft
+    assert [entry["id"] for entry in asked[0]["open"]] == ["experiment-0000"]
+    assert "interpret_experiment first" in asked[0]["instruction"] and "Measure it with run_experiment" not in asked[0]["instruction"]
+
+
+def test_a_session_ending_before_it_interprets_the_rerun_leaves_the_draft_unfinished(
+        tmp_path, monkeypatch, credentials, unit_sandboxes):
+    """The draft is saved before the first turn, and a session that ends without interpreting it leaves it unfinished:
+    nudi does not settle the reward's disagreement with the deserved score from the numbers alone."""
+    saved = []
+
+    async def behave(run, pool, tools, schema):
+        saved.append(json.loads((run.config.output_dir / "inspection-attack-judge.json").read_text())["experiments"])
+        return schema()
+
+    run, result, _ = rerun_session(tmp_path, monkeypatch, credentials, behave)
+    assert [(item["id"], item["status"], item["check"]) for item in saved[0]] == [("experiment-0000", "measured", "check-0000")]
+    assert [(item["id"], item["status"]) for item in result.experiments] == [("experiment-0000", "unfinished")]
+    (assessment,) = result.assessments
+    assert (assessment.outcome, assessment.reasons, assessment.claim.check) == ("unknown", [inspection_module.UNFINISHED], "check-0000")
+    recorded = json.loads((run.config.output_dir / "inspection-attack-judge.json").read_text())
+    assert [item["status"] for item in recorded["experiments"]] == ["unfinished"]
+
+
+@pytest.mark.parametrize("exit_code, output", [(1, "Traceback"), (0, "no json")], ids=["failed check", "broken contract"])
+def test_a_failed_rerun_leaves_run_experiment_working_at_once(tmp_path, monkeypatch, credentials, exit_code, output, unit_sandboxes):
+    """A rerun whose check failed or broke the output contract is no draft: run_experiment measures at once."""
+    mock_experiments(monkeypatch, reviewed("unknown"))
+    replies = []
+
+    async def behave(run, pool, tools, schema):
+        replies.append(await tools["run_experiment"].ainvoke({"probe": {k: v for k, v in review_probe(pool[0]).items() if k != "category"}}))
+        return schema()
+
+    _, result, asked = rerun_session(tmp_path, monkeypatch, credentials, behave, exit_code, output)
+    assert "instruction" not in replies[0] and replies[0]["status"] == "measured"
+    assert [item["case"] for item in result.experiments] == ["answer in 0000-simulator"]
+    assert "draft" not in asked[0]["check_rerun"] and "interpret_experiment first" not in asked[0]["instruction"]
 
 
 @pytest.mark.parametrize("target", ["both", "scoring", None], ids=["target candidate", "target scoring only", "discovery"])
@@ -5721,8 +5862,8 @@ def test_real_sdk_tool_infrastructure_abort_stops_before_focused_retry(tmp_path,
     from nudi.records import InfrastructureAbort
 
     Sandboxes(monkeypatch)
-    script = AgentScript(("run_experiment", {"probe": setup_probe()}),
-                         ("InspectionSummary", {"completed": []}))
+    script = AgentScript(("InspectionSummary", {"leads": []}), ("run_experiment", {"probe": setup_probe()}),
+                         ("InspectionSummary", {}))
 
     async def abort(run, probe):
         raise InfrastructureAbort("fatal experiment infrastructure")
@@ -5734,25 +5875,24 @@ def test_real_sdk_tool_infrastructure_abort_stops_before_focused_retry(tmp_path,
             run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path),
                           models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
             with pytest.raises(InfrastructureAbort, match="fatal experiment infrastructure"):
-                await inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=1)
+                await inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=2)
             return run
 
     run = asyncio.run(main())
     result = inspection_module.InspectionResult.model_validate_json((run.config.output_dir / "inspection-hack.json").read_text())
-    assert len(result.attempts) == len(script.requests) == 1
-    assert result.attempts[0].status == "tool_failure" and result.status == "partial"
+    assert len(result.attempts) == len(script.requests) == 2
+    assert result.attempts[-1].status == "tool_failure" and result.status == "partial"
     assert all(sandbox_record(run, name)["cleanup"]["removed"] for name in run.record.sandboxes)
 
 
 def test_a_summary_that_fails_validation_returns_to_the_model(tmp_path, monkeypatch, credentials):
     """Full e2e run: a summary field of the wrong type failed the summary and lost the attempt. The validation error now
-    goes back to the model, and its corrected summary completes the attempt. Broad measures one consistent case, which
-    settling the category as no issue needs."""
+    goes back to the model, and its corrected summary completes the attempt. The focused session measures one consistent
+    case, which settling the category as no issue needs."""
     Sandboxes(monkeypatch)
-    script = AgentScript(("run_experiment", {"probe": deserved_probe()}),
-                         ("interpret_experiment", {"experiment": "experiment-0000", **SUPPORTED}),
-                         ("InspectionSummary", {"refusal": ["not text"]}),
-                         ("InspectionSummary", {}), ("InspectionSummary", {}))
+    script = AgentScript(("InspectionSummary", {"refusal": ["not text"], "leads": []}), ("InspectionSummary", {"leads": []}),
+                         ("run_experiment", {"probe": deserved_probe()}),
+                         ("interpret_experiment", {"experiment": "experiment-0000", **SUPPORTED}), ("InspectionSummary", {}))
 
     async def main():
         async with serve(script) as base:
@@ -5875,11 +6015,18 @@ def test_a_session_ending_with_a_draft_open_leaves_it_unfinished(tmp_path, monke
 
 
 def test_an_unfinished_reading_is_completed_later_by_its_experiment_id(tmp_path, monkeypatch, credentials):
-    """A focused fork names the broad session's unfinished experiment; its reading replaces nudi's."""
+    """A grader inspector focused fork names the broad session's unfinished experiment; its reading replaces nudi's."""
     Sandboxes(monkeypatch)
-    script = AgentScript(("run_experiment", {"probe": deserved_probe()}), SUMMARY,
+    script = AgentScript(("run_experiment", {"probe": deserved_probe("accepted_invalid")}), SUMMARY,
                          ("interpret_experiment", {"experiment": "experiment-0000", **SUPPORTED}), SUMMARY)
-    run, result = scripted_hack_inspection(tmp_path, monkeypatch, credentials, script, focused_attempts=1)
+
+    async def main():
+        async with serve(script) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path),
+                          models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
+            return await inspection_module.inspect(run, "grader", [], 1, ["accepted_invalid"])
+
+    result = asyncio.run(main())
     assert [(assessment.outcome, assessment.nudi_claim) for assessment in result.assessments] == [("unknown", True), ("legitimate", False)]
     assert result.experiments[0]["status"] == "assessed" and result.experiments[0]["assessment"] == 1
 
@@ -6226,15 +6373,15 @@ def test_tool_error_the_session_recovers_from_is_a_limit(tmp_path, monkeypatch, 
 
 @pytest.mark.parametrize("repeated", [True, False])
 def test_truncated_checker_output_stays_unobservable(tmp_path, monkeypatch, credentials, unit_sandboxes, repeated):
-    """Truncated checker output fails its category, whether a repeat then evidences the issue
-    or the response completes the category."""
+    """Truncated checker output leaves its attempt unobservable and a limit. It measured nothing, so a repeat that
+    evidences the issue settles the category; without one the category stays unknown."""
     no_native_actor(monkeypatch)
     truncating = setup_probe(category="accepted_invalid", program=f"print('x' * {inspector_sandbox.OUTPUT_LIMIT + 1})\n")
     inspector_responses(monkeypatch, [{"probes": [truncating] + [setup_probe(category="accepted_invalid")] * repeated}] + [VIOLATED] * repeated)
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
     result = asyncio.run(inspection_module.inspect_grader(run, [], categories=["accepted_invalid"], focused_attempts=0))
     assert [check.exit_code for check in run.record.checks] == [125, 0][:1 + repeated]
-    assert (result.status, result.attempts[0].status) == ("partial", "unobservable")
+    assert (result.status, result.attempts[0].status) == ("complete" if repeated else "partial", "unobservable")
     assert result.attempts[0].error == "experiment-0000: check output was truncated"
     assert result.categories["accepted_invalid"] == ("evidenced_issue" if repeated else "unknown")
     assert any("experiment-0000" in limit and "truncated" in limit for limit in result.limits)
@@ -6372,7 +6519,7 @@ def test_real_sdk_interruption_joins_running_and_waiting_experiments_before_retu
         async with serve(script) as base:
             run = new_run(tmp_path, monkeypatch, credentials, capacity=(4, 4096), task_dir=explained_task(tmp_path),
                           models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
-            inspecting = asyncio.create_task(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=1))
+            inspecting = asyncio.create_task(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
             await asyncio.wait_for(started.wait(), 20)
             if interruption == "cancelled":
                 inspecting.cancel()
@@ -6535,7 +6682,7 @@ def test_a_start_that_succeeds_after_the_third_failure_keeps_the_count(tmp_path,
 
 def test_a_hack_inspection_whose_verifier_never_starts_stops_after_three_experiments(tmp_path, monkeypatch, credentials):
     """The hack inspector's run_experiment raises EnvironmentUnavailable on the third failed verifier start: the
-    inspection ends environment_unavailable with three experiments, and no focused attempt starts."""
+    inspection ends environment_unavailable with three experiments, and no later attempt starts."""
     from nudi.records import EnvironmentUnavailable
 
     sandboxes = Sandboxes(monkeypatch)
@@ -6548,7 +6695,7 @@ def test_a_hack_inspection_whose_verifier_never_starts_stops_after_three_experim
     inspector_responses(monkeypatch, [{"probes": probes}, {"probes": []}, {"probes": []}])
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=separate_task(tmp_path))
     with pytest.raises(EnvironmentUnavailable, match="verifier environment failed to start 3 times in a row"):
-        asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"]))
+        asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
     saved = inspection_module.InspectionResult.model_validate_json((run.config.output_dir / "inspection-hack.json").read_text())
     assert saved.status == "environment_unavailable"
     assert [item["status"] for item in saved.experiments] == ["tool_failure"] * 3
@@ -7280,3 +7427,156 @@ def test_a_check_program_that_never_ends_stops_at_the_grading_bound_and_the_hack
     assert float(message.split("stopped after ")[1].split(" s")[0]) >= 0.2
     assert "Nothing was measured" in message and "not itself a reward hack finding" in message
     assert result.assessments == [] and result.attempts[0].error == experiment["error"]
+
+
+def orienting_turns(monkeypatch, behave):
+    """Each Inspector turn calls `behave(session name, request, tools, schema)` with its first request decoded, its tools by
+    name and its summary schema; a session continues the messages of the one it forks."""
+    filled = {"run_experiment": ("probe", SCRIPTED_PROBE), "interpret_experiment": ("claim", SCRIPTED_READING)}
+
+    async def ask(session, context, schema, *, tools):
+        result = await behave(session.name, json.loads(context), {item.name: Filled(item, *filled[item.name]) if item.name in filled
+                                                                  else item for item in tools}, schema)
+        session.state = {"messages": [*session.state["messages"], AIMessage(content="", id=uuid4().hex)]}
+        return result
+
+    async def fork(session, source):
+        session.state = {"messages": list(source.state["messages"])}
+
+    monkeypatch.setattr(inspector.Investigation, "ask", ask)
+    monkeypatch.setattr(inspector.Investigation, "fork", fork)
+
+
+LEADS = [{"category": "package_oracles", "case": "the tests read /app/answer.txt only", "location": "/app/answer.txt"},
+         {"category": "package_oracles", "case": "a reference file sits in the image", "location": "/app/expected.txt"},
+         {"category": "fabricated_answers", "case": "a fixed answer passes", "location": "/app/answer.txt"}]
+
+
+def test_with_focused_sessions_the_hack_broad_session_orients_and_hands_its_leads_to_each_focused_request(
+        tmp_path, monkeypatch, credentials, unit_sandboxes):
+    """Broad has no run_experiment and no category obligation in its request or status reply; its request says it ends on
+    its leads. Each focused request lists exactly its category's leads, so every lead handed over is received."""
+    seen = {}
+
+    async def behave(name, request, tools, schema):
+        seen[name] = {"request": request, "tools": set(tools) - {"InspectionSummary"}, "schema": set(schema.model_fields)}
+        if name == "hack-broad":
+            seen[name]["status"] = await tools["inspection_status"].ainvoke({})
+            return schema(leads=LEADS)
+        return schema()
+
+    orienting_turns(monkeypatch, behave)
+    run = new_run(tmp_path, monkeypatch, credentials)
+    result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles", "fabricated_answers"], focused_attempts=1))
+    broad = seen["hack-broad"]
+    assert broad["tools"] == {"inspection_status"} and "leads" in broad["schema"]
+    assert not {"open", "category_status"} & set(broad["request"]) and not {"open", "category_status"} & set(broad["status"])
+    assert "run_experiment" not in broad["request"]["instruction"].split("cannot")[0] and "`leads`" in broad["request"]["instruction"]
+    for category in ("package_oracles", "fabricated_answers"):
+        focused = seen[f"hack-{category}"]
+        assert "run_experiment" in focused["tools"] and "leads" not in focused["schema"]
+        assert focused["request"]["leads"] == [{key: lead[key] for key in ("case", "location")} for lead in LEADS if lead["category"] == category]
+    received = sum(len(seen[f"hack-{category}"]["request"]["leads"]) for category in ("package_oracles", "fabricated_answers"))
+    assert received == len(result.leads) == len(LEADS)
+    assert [lead["to"] for lead in result.leads] == ["hack-package_oracles", "hack-package_oracles", "hack-fabricated_answers"]
+    assert not any("leads" in limit for limit in result.limits)
+
+
+def test_without_focused_sessions_the_hack_broad_session_measures_and_keeps_its_obligations(tmp_path, monkeypatch, credentials, unit_sandboxes):
+    seen = {}
+
+    async def behave(name, request, tools, schema):
+        seen.update(request=request, tools=set(tools), schema=set(schema.model_fields), status=await tools["inspection_status"].ainvoke({}))
+        return schema()
+
+    orienting_turns(monkeypatch, behave)
+    run = new_run(tmp_path, monkeypatch, credentials)
+    result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
+    assert {"run_experiment", "interpret_experiment", "inspection_status"} <= seen["tools"] and "leads" not in seen["schema"]
+    entry, = seen["request"]["open"]
+    assert entry["id"] == "package_oracles" and "run_experiment" in entry["next"]
+    assert seen["status"]["open"] == seen["request"]["open"] and "measure each with run_experiment" in seen["request"]["instruction"]
+    assert result.leads == []
+
+
+def test_a_broad_persistence_lead_runs_the_native_readback_after_broad_and_before_the_focused_sessions(
+        tmp_path, monkeypatch, credentials, unit_sandboxes):
+    order = []
+
+    async def behave(name, request, tools, schema):
+        order.append(name)
+        if name == "hack-broad":
+            return schema(leads=[{"category": "persistence", "case": "a cache file may survive", "location": "/app/nudi-persistence.bin"}])
+        return schema()
+
+    async def readback(run, location):
+        order.append(location)
+        return Assessment(claim=Claim(mechanism="persistence", episode="probe"), outcome="unknown", persistence="not_observed")
+
+    monkeypatch.setattr(inspection_module, "persistence_assessment", readback)
+    orienting_turns(monkeypatch, behave)
+    run = new_run(tmp_path, monkeypatch, credentials)
+    result = asyncio.run(inspection_module.inspect_hacks(run, categories=["persistence", "grader_tampering"], focused_attempts=1))
+    assert order == ["hack-broad", "/app/nudi-persistence.bin", "hack-grader_tampering"]
+    assert result.assessments[-1].persistence == "not_observed" and result.leads[0]["to"] == "persistence readback"
+
+
+def test_each_open_entry_closes_by_its_own_next_step(tmp_path, monkeypatch, credentials, unit_sandboxes):
+    """An unknown reading without missing items and a case whose episode has no native reward each advise a step; taking
+    it, a different case naming the entry in `replaces`, leaves nothing open."""
+    scripted = {"/app/unknown.txt": Assessment(claim=Claim(mechanism="unclear", episode="case"), outcome="unknown",
+                                                reasons=["the reading conflicts with the copy"], execution_scope="package")}
+
+    async def investigate(run, probe, session):
+        return scripted.get(probe["location"]) or await agreeing()(run, probe, session)
+
+    mock_experiments(monkeypatch, investigate)
+    measured = inspection_module.measure_experiment
+
+    async def measure(run, probe):
+        receipt = await measured(run, probe)
+        return {**receipt, "rewards": {}} if probe["location"] == "/app/rewardless.txt" else receipt
+
+    monkeypatch.setattr(inspection_module, "measure_experiment", measure)
+    steps = []
+
+    async def behave(name, tools, schema):
+        for location in ("/app/unknown.txt", "/app/rewardless.txt"):
+            receipt = await tools["run_experiment"].ainvoke({"probe": setup_probe(location=location)})
+            if "scripted_claim" in receipt and receipt["status"] == "measured":
+                await tools["interpret_experiment"].ainvoke({"claim": receipt["scripted_claim"]})
+            entry = next(entry for entry in (await tools["inspection_status"].ainvoke({}))["open"] if entry["id"] == receipt["id"])
+            steps.append(entry["next"])
+            assert f"naming {receipt['id']} in `replaces`" in entry["next"]
+            later = await tools["run_experiment"].ainvoke({"probe": setup_probe(location=f"{location}.other", replaces=receipt["id"])})
+            await tools["interpret_experiment"].ainvoke({"claim": later["scripted_claim"]})
+        return schema()
+
+    episode_tools(monkeypatch, behave)
+    run = new_run(tmp_path, monkeypatch, credentials)
+    result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
+    assert len(steps) == 2 and result.open == [] and result.categories == {"package_oracles": "no_evidenced_issue"}
+
+
+def test_an_inspector_session_claims_a_free_slot_before_other_waiting_work():
+    """Simulator episodes and Attacker attempts queue early; a focused session waiting for a slot takes the next one."""
+    async def main():
+        gate, order = inspection_module.Gate(1), []
+
+        async def holder(name, slot):
+            async with slot():
+                order.append(name)
+
+        await gate.acquire()
+        other = asyncio.create_task(holder("attacker", lambda: gate))
+        await asyncio.sleep(0)
+        session = asyncio.create_task(holder("focused", gate.first))
+        cancelled = asyncio.create_task(holder("cancelled", gate.first))
+        await asyncio.sleep(0)
+        cancelled.cancel()
+        await asyncio.sleep(0)
+        gate.release()
+        await asyncio.gather(other, session, return_exceptions=True)
+        assert order == ["focused", "attacker"] and not gate.locked()
+
+    asyncio.run(main())

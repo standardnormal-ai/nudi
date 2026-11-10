@@ -31,6 +31,7 @@ NO_CANDIDATE = "no candidate"
 FULL_UNAVAILABLE = "candidate exists but generated full guidance unavailable"
 MINIMAL_UNAVAILABLE = "candidate exists but generated minimal guidance unavailable"
 NOT_SUPPLIED = "not supplied"
+LATER_UNGUIDED = "the latest reading of its check has no {level} guidance, so its Attacker did not start"
 
 
 class Candidate(BaseModel):
@@ -43,6 +44,8 @@ class Candidate(BaseModel):
     """The check its reading cites."""
     category: str | None = None
     """The inspector category of the experiment that measured `check`."""
+    location: str | None = None
+    """The location of the experiment that measured `check`; None in older records."""
     outcome: str | None = None
     """Its reading's outcome. `unknown` is a suspected mismatch, not a demonstrated one; None in older records."""
     guidance: dict[str, str | None] = {}
@@ -59,7 +62,8 @@ class Problem(BaseModel):
     cause is one of its cases, also where its location differs."""
 
     cause: str
-    """One line."""
+    """The judge's one sentence naming the flaw, from the verdict that made it; the first finding's mechanism when that
+    judge call failed, and in older records."""
     findings: list[str] = []
     """Ids of the candidate findings this cause explains."""
     id: str | None = None
@@ -67,15 +71,16 @@ class Problem(BaseModel):
     source: str | None = None
     """`hack inspector`, `grader inspector` or `Attacker`; None in older records."""
     members: list[str] = []
-    """Each id the judge placed here: a hack or grader finding, or an Attacker episode; older records name a hack
-    probe's experiment."""
+    """Each id the judge placed here, once: a hack or grader finding, or an Attacker episode; older records name a hack
+    probe's experiment and can list an episode twice."""
     evidence: str | None = None
     """`evidenced` once an inspector finding evidenced it; older records also have `not_reproduced`, which the report
     shows as a lead. The report reads the inspections' current readings, so later readings that withdrew every finding
     make it a lead too."""
     cases: list[dict] = []
     """Each case as the judge reads it: the finding or Attacker episode id, check, outcome, mechanism, location and
-    capture point. Empty in older records."""
+    capture point, with its verdict's `cause` and `reason`, None when the judge call failed. Empty in older records, and
+    without `cause` and `reason` in records from before verdicts gave them."""
     origin: str | None = None
     """The earlier run a rerun took this problem from; None for a problem of this run."""
     earlier_exploited_with: str | None = None
@@ -219,9 +224,10 @@ def recorded_failure(run, name: str, episode) -> tuple[str, str] | None:
     return "unknown", f"unknown cause: {cause}"
 
 
-async def rerun_check(run, check, episode: str, source: str | None) -> dict:
+async def rerun_check(run, check, episode: str, source: str | None, location: str | None) -> dict:
     """The check that evidenced an attempt's candidate, rerun on the Attacker episode's copy at that check's capture point,
-    as the attack inspector's starting point. A failed rerun says why; the attack inspector judges either way."""
+    as the attack inspector's starting point, with the candidate's `location`. A failed rerun says why; the attack
+    inspector judges either way."""
     from nudi.run_state import SpendingCapReached
 
     point = next((copy.point for copy in run.record.copies if copy.id == check.state_copy), "verification_start")
@@ -236,7 +242,7 @@ async def rerun_check(run, check, episode: str, source: str | None) -> dict:
     except Exception as error:
         return {"label": label, "status": "unavailable", "reason": redacted(run, f"{type(error).__name__}: {error}")}
     return {"label": label, "check": rerun.id, "program": check.program, "exit_code": rerun.exit_code, "output": rerun.output,
-            "source_output": check.output}
+            "source_output": check.output, "location": location, "capture_point": point}
 
 
 def _attempt_limit(name: str, value) -> None:
@@ -293,7 +299,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                  minimal: str | None = None, unavailable_reasons: dict[str, str] | None = None,
                  candidates: list[Candidate] | None = None, problems: list[Problem] | None = None,
                  deadline: float | None = None, minimal_hints: bool = True, feed: asyncio.Queue | None = None,
-                 gate: asyncio.Semaphore | None = None, judge=None, current=None) -> AttackResult:
+                 gate: contextlib.AbstractAsyncContextManager | None = None, judge=None, current=None) -> AttackResult:
     """Reproduce each candidate and search the environment with no hint.
 
     `discovery_attempts` is the total no-hint attempts, default one. `maximum_attempts` is the
@@ -334,8 +340,10 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
 
     With `feed` the attack runs beside the inspections: it takes candidates from the queue until None, which adds no
     candidate; planned attempts still run. With `gate` every attempt holds one of its slots, which other work shares.
-    `current(candidate)`, given, says whether a later reading has not withdrawn the candidate; once an attempt has its slot,
-    a candidate group none of whose members is current starts no Attacker, and its unattempted steps are `withdrawn`.
+    `current(candidate)`, given, returns the candidate that stands for it now, from the latest reading of its check, or
+    None once a later reading withdrew it; once an attempt has its slot, a candidate group none of whose members is current
+    starts no Attacker, and its unattempted steps are `withdrawn`. Otherwise a hinted attempt uses the first standing
+    candidate's guidance for its level; without it the attempt does not start and an unattempted level is `unavailable`.
 
     An attempt's own copies, of its Attacker episode and of its attack inspector's experiments, are deleted when it ends,
     unless it was cancelled; no other session reads them (`copies`).
@@ -579,7 +587,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                            "executed_instruction": (run.config.output_dir / "episodes" / name / "nudi-evidence" / "extension.md").read_text(),
                            "workspace": "verification_start copy" if found else "task image"}
                 if check is not None and check.program:
-                    request["check_rerun"] = await rerun_check(run, check, name, members[0].source)
+                    request["check_rerun"] = await rerun_check(run, check, name, members[0].source, members[0].location)
                 session = await inspect(run, "attack", [name], 0, ["rejected_valid" if valid_work else "accepted_invalid"],
                                         title=f"attack_inspector-{context}", workspace=found[-1] if found else None, request=request)
                 own.update(row["episode"] for row in session.experiments if row.get("episode"))
@@ -705,16 +713,32 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
         plan.extend((stream, (level, number, members, members[0].guidance.get(level))) for number in range(1, maximum_attempts + 1))
         waiting.extend(range(len(plan) - maximum_attempts, len(plan)))
 
-    async def attempt(level, number, members, *entry) -> None:
+    async def attempt(level, number, members, text, position) -> None:
         async with gate or contextlib.nullcontext():
-            if members and current and not any(current(item) for item in members):
+            standing = [found for item in members if (found := current(item))] if members and current else members
+            if members and not standing:
                 if members[0].conditions[level] == "unattempted":
                     event(run, "withdrawn", f"{members[0].id} was withdrawn by a later reading, so its Attacker does not start",
                           candidate=members[0].id, problem=(problem := owner(members[0].id)) and problem.id, level=level)
                 for item in members:
                     item.conditions.update({key: "withdrawn" for key, value in item.conditions.items() if value == "unattempted"})
                 return save()
-            await one(level, number, members, *entry)
+            if members and level != "none":
+                # The latest reading's guidance runs; without guidance for this level the attempt does not start. A level is
+                # unavailable only while no attempt at it ran, so one that runs later decides it.
+                text = standing[0].guidance.get(level)
+                for item in members:
+                    if text is not None:
+                        item.guidance[level] = text
+                        if item.conditions[level] == "unavailable":
+                            item.conditions[level] = "unattempted"
+                            item.unavailable.pop(level, None)
+                    elif item.conditions[level] in ("unattempted", "unavailable"):
+                        item.guidance[level], item.conditions[level] = None, "unavailable"
+                        item.unavailable[level] = LATER_UNGUIDED.format(level=level)
+                if text is None:
+                    return save()
+            await one(level, number, members, text, position)
 
     try:
         while True:

@@ -908,7 +908,7 @@ def inspection(mode: str, result: InspectionResult, warnings: list[str]) -> dict
         category = result.attempts[review.attempt].category
         if review.reinterprets and review.assessment is not None and category:
             links.setdefault(review.assessment, {})["category"] = category
-    given = {"hack_inspection": result.hack_inspection, "hack_findings": result.hack_findings} if mode == "grader" else {}
+    given = {"hack_inspection": result.hack_inspection, "hack_findings": result.hack_findings} if mode == "grader" else {"leads": result.leads}
     return {"status": result.status, "open": result.open, "categories": result.categories, "applicability": result.applicability,
             "artifacts": result.artifacts, "limits": result.limits, "experiments": result.experiments,
             "attempts": [item.model_dump(mode="json") for item in result.attempts], "findings": findings(result.assessments, links), **given}
@@ -1345,7 +1345,7 @@ def rewards(attempt: dict) -> str:
 
 
 # An Attacker attempt that did not run or was not judged: it shows nothing, so no count of attempts includes it.
-UNASSESSED = {*SESSION_FAILURES, "cancelled", "spending_exhausted", "environment_unavailable", "infrastructure_failure", "running"}
+UNASSESSED = {*SESSION_FAILURES, "cancelled", "spending_exhausted", "environment_unavailable", "infrastructure_failure", "native_timeout", "running"}
 STOPPED = {"unknown": "result unclear", "cancelled": "cancelled", "spending_exhausted": "stopped by the spending cap", "running": "unfinished",
            "insufficient_time": "its agent timeout is longer than the time left before the time limit"}
 WAITING = {"unattempted": "Not attempted", "unavailable": "Not attempted, no guidance", "not_requested": "Not attempted, hints not requested",

@@ -621,15 +621,18 @@ def record_call(run: Run, role: Role, episode: str, request: dict, response=None
 KEY_LIKE = re.compile(r"\b[a-z]{2,4}-[A-Za-z0-9_-]{12,}|Bearer\s+\S+|[A-Za-z0-9_+/=-]{32,}")
 # An account refusal, which no retry recovers: a refused credential or payment, by its status or the provider's own error
 # code. Never by message text, nor 403, a content refusal too: an Attacker's untrusted content could produce either.
-ACCOUNT_STATUS = (401, 402)
+ACCOUNT_STATUS = {401, 402}
 ACCOUNT_CODES = {"insufficient_quota", "invalid_api_key", "billing_hard_limit_reached", "billing_not_active"}
 
 
 def account_refusal(error: BaseException) -> bool:
-    """Whether a failed call's status, or the error code or type in the provider's JSON error body, which LiteLLM keeps
-    on an exception it chains, is an account refusal."""
-    status, codes = getattr(error, "status_code", None), set()
-    while error is not None:
+    """Whether a failed call's status, or the error code or type in the provider's JSON error body, on the exception or
+    one it chains, is an account refusal. LiteLLM raises some providers' 402 as a 429, chained to the provider's error."""
+    statuses, codes, seen = set(), set(), set()
+    # A chain can point back to an earlier exception, so each is read once.
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        statuses.add(getattr(error, "status_code", None))
         body = getattr(error, "body", None)
         if not isinstance(body, dict):
             try:
@@ -639,7 +642,7 @@ def account_refusal(error: BaseException) -> bool:
         if isinstance(body, dict):
             codes |= {body.get("code"), body.get("type")}
         error = error.__cause__ or error.__context__
-    return status in ACCOUNT_STATUS or bool(codes & ACCOUNT_CODES)
+    return bool(statuses & ACCOUNT_STATUS or codes & ACCOUNT_CODES)
 
 
 def provider_reason(run: Run, error: BaseException) -> str:
@@ -758,7 +761,7 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
         run.save()
 
 
-async def simulate(run: Run, episodes: int = 12, *, gate: asyncio.Semaphore | None = None) -> Simulation:
+async def simulate(run: Run, episodes: int = 12, *, gate: contextlib.AbstractAsyncContextManager | None = None) -> Simulation:
     """Run `episodes` ordinary Simulator episodes of the original task and harness.
 
     Every count takes this path. As many workers as the run's queue runs at once admit

@@ -18,6 +18,7 @@ The fields a script or coding agent reads. Both files hold more; [Usage](usage.m
 | `configuration.known_cost` | number | Known inference cost in US dollars |
 | `configuration.unknown_cost_calls`, `configuration.cancelled_calls` | integer | Calls whose cost is unknown, and calls cancelled in flight; the known cost excludes both |
 | `configuration.unknown_reasons` | object | Each reason a call has no price, mapped to its count |
+| `inspections.hack_inspector.leads` | list | With focused sessions, each lead the broad hack inspector session handed on: its `category`, `case`, `location` and `to`, the focused session whose first request listed it or `persistence readback`; `to` is null for a lead no session received, which `limits` counts. Absent in older reports |
 | `inspections.<inspector>.open` | list | What kept a category, or a grader inspector's ordinary episode, unsettled when the inspection ended: each entry's `id` (an experiment, episode or category), `category` (null for an ordinary episode), `reason` and `next` step. Empty when nothing was left open; absent in older reports |
 | `warnings` | list of strings | Everything that limits the results |
 
@@ -32,13 +33,13 @@ Each entry of `attack.problems`:
 | `level` | integer | 2 to 5, which orders the problems, as in [Usage](usage.md#reports) |
 | `label` | string | The level's words, such as `●●●○○ exploit executable by learner with full information`, or `Correct work failed` and how an Attacker reproduced it; for a problem a rerun kept and did not find again, `evidenced in run DIR at LABEL; not found again here` |
 | `exploited_with` | string | The least information under which an Attacker exploit was observed, `none`, `minimal` or `full`, an order and not the help needed; otherwise `not_exploited`, `no_guidance` or `unknown`. Older reports have `help_needed` |
-| `conditions` | list of objects | Each condition an Attacker tried it under, in order: `condition` (`full`, `minimal`, `none` aimed at it; `elsewhere_full`, `elsewhere_minimal`, `elsewhere_none` aimed at another problem, listed only when one of those attempts exploited it; or `independent`, the no-hint search), `attempts` assessed, how many `exploited` it, the Attacker `model`, the `status`, and, when any, `not_assessed`, the attempts that did not run or were not judged, such as at an inference failure or a cancellation, each with its `episode`, `status`, `reward` and `error`; they are not in `attempts` |
+| `conditions` | list of objects | Each condition an Attacker tried it under, in order: `condition` (`full`, `minimal`, `none` aimed at it; `elsewhere_full`, `elsewhere_minimal`, `elsewhere_none` aimed at another problem, listed only when one of those attempts exploited it; or `independent`, the no-hint search), `attempts` assessed, how many `exploited` it, the Attacker `model`, the `status`, and, when any, `not_assessed`, the attempts that did not run or were not judged, such as at an inference failure, a cancellation or a timeout without reward, each with its `episode`, `status`, `reward` and `error`; they are not in `attempts` |
 | `scope` | string or null | Where its findings were evidenced, `package` or `native` (native when any is); null without the inspections. At level 2 `report.md` and the viewer give it after the label |
-| `cause` | string | One line |
+| `cause` | string | The judge's one sentence naming the flaw of the grader or environment, from the verdict that made the problem; its first finding's mechanism when that judge call failed, and in older reports |
 | `findings` | list of strings | The inspector findings this cause explains, as `hack-INDEX` or `grader-INDEX` |
 | `candidate` | string or null | The finding the attack tested |
 | `reproduced` | boolean | An Attacker reproduced it |
-| `cases` | list of objects | Each finding or Attacker exploit as the judge read it: `id`, `check`, `outcome`, `mechanism`, `location`, `capture_point` |
+| `cases` | list of objects | Each finding or Attacker exploit as the judge read it: `id`, `check`, `outcome`, `mechanism`, `location`, `capture_point`, and its verdict's `cause`, the flaw it matched, and `reason`, one sentence on why; both null when the judge call failed, and absent in older reports. Two readings of one Attacker attempt are two cases, while `members` lists the attempt once |
 | `origin` | string or null | The earlier run a rerun took the problem from |
 | `earlier_exploited_with` | string or null | Its `exploited_with` in that earlier run |
 

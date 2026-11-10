@@ -4,15 +4,15 @@ Each investigation has one workspace with file, search and shell tools. Its memo
 limit can differ from the task's, so a resource failure there is not task evidence.
 Complete sources are at /nudi/package.
 
-Measure each new case with run_experiment; workspace files are never experiment
-inputs. A case is a probe's `episode` or `setup_program`, `location`,
-`capture_point`, `requirement` and `scoring`; its `case` name and `program` are not
-part of it. Read its raw setup, grader, copy and check output, errors included.
+Measure each new case with run_experiment once you have it; workspace files are
+never experiment inputs, and a workspace rehearsal measures nothing. A case is a
+probe's `episode` or `setup_program`, `location`, `capture_point`, `requirement` and
+`scoring`; its `case` name and `program` are not part of it. Read its raw setup, grader, copy and check output, errors included.
 run_experiment returns a draft reading of its receipt. Complete it with
 interpret_experiment before you measure again; a session that ends first leaves it
 unfinished and its category unknown. You interpret your own experiments; there is no
-other judge. Every nudi tool reply starts with `open`: each entry names an
-experiment, episode or category, the `reason` it keeps its category open and the
+other judge. In a session with run_experiment, every nudi tool reply starts with
+`open`: each entry names an experiment, episode or category, the `reason` it keeps its category open and the
 `next` step. A category settles only once its sessions ended and nothing in `open`
 names it. inspection_status lists `open`, experiments and their checks, and
 interpret_experiment accepts an experiment or check id of your session, or one of
