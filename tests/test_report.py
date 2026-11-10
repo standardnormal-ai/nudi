@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -498,6 +499,19 @@ def test_each_open_category_gets_one_markdown_line_naming_what_keeps_it_open(tmp
     assert ("- hack_inspector package_oracles leads: experiment-0000: its reading leaves unresolved: whether the fix is graded; "
             "experiment-0001: its draft reading is open") in lines
     assert "- hack_inspector fabricated_answers leads: fabricated_answers: no reading of this category agrees" in lines
+
+
+def test_a_category_whose_attempt_failed_is_listed_as_not_finished_not_as_a_lead(tmp_path):
+    """A failed attempt suspected nothing, so it is no lead: its categories are listed together, with the failure."""
+    run = RunDir(tmp_path)
+    failed = "an attempt failed: inference_failure: APIError: API key spend limit exceeded."
+    open_entries = [{"id": category, "category": category, "reason": failed, "next": "a later attempt"}
+                    for category in ("leakage_metadata", "package_oracles")]
+    run.hack = InspectionResult(mode="hack", status="partial", categories={"leakage_metadata": "unknown", "package_oracles": "unknown"},
+                                applicability={}, open=open_entries)
+    lines = report.markdown(run.report(selected=["hack"])).splitlines()
+    assert f"- hack_inspector leakage_metadata, package_oracles not finished: {failed}" in lines
+    assert not any(" leads: " in line for line in lines)
 
 
 def test_markdown_lists_searched_categories_without_verdicts(tmp_path):
@@ -1085,6 +1099,36 @@ def test_repeated_warnings_are_grouped_and_multi_line_errors_shortened_in_markdo
     assert "mechanism" not in lines and "  Field required" not in lines
 
 
+def test_an_attempt_that_was_not_run_or_not_assessed_is_listed_apart_from_the_attempts_that_exploited(tmp_path):
+    """"0 of 1 attempts exploited it" reads as an assessed negative. An attempt whose Attacker or attack inspector failed is
+    out of that count and listed with its reward and reason, and the step it blocked says which step failed."""
+    run = RunDir(tmp_path)
+    full, failed, empty = (run.episode("attacker", {"reward": 1.0}) for _ in range(3))
+    run.attack = AttackResult(status="partial", candidates=[Candidate(
+        id="hack-0", mechanism="m", outcome="accepted_invalid", guidance={"full": "steps", "minimal": "look"},
+        conditions={"full": "evidenced_issue", "minimal": "inference_failure", "none": "unattempted"})],
+        attempts=[AttackAttempt(level="full", number=1, context="c0", candidate="hack-0", sources=["hack-0"], episode=full,
+                                status="evidenced_issue", problem="P1", rewards={"reward": 1.0}),
+                  AttackAttempt(level="minimal", number=1, context="c1", candidate="hack-0", sources=["hack-0"], episode=failed,
+                                status="inference_failure", error="the attack inspector failed: APIError: spend limit", rewards={"reward": 1.0}),
+                  AttackAttempt(level="minimal", number=2, context="c2", candidate="hack-0", sources=["hack-0"], episode=empty,
+                                status="no_evidenced_issue", rewards={"reward": 0.0})],
+        problems=[Problem(id="P1", source="hack inspector", cause="Skip the test.", findings=["hack-0"], evidence="evidenced")],
+        discovery={"none": "unattempted"})
+    built = run.report(selected=["attack"])
+    assert [(row["condition"], row["attempts"], row.get("not_assessed", [])) for row in built["attack"]["problems"][0]["conditions"][:2]] == [
+        ("full", 1, []), ("minimal", 1, [{"episode": failed, "status": "inference_failure", "reward": "reward 1",
+                                          "error": "the attack inspector failed: APIError: spend limit"}])]
+    model = "openai/deepseek/deepseek-v4.1-flash-1017"
+    section = report.markdown(built).split("\n## Attack\n")[1].splitlines()
+    at = section.index(next(line for line in section if line.startswith("- P1 ")))
+    assert section[at + 2:at + 5] == [
+        f"  - With only a hint: 0 of 1 attempts exploited it, {model}, inference_failure. Not run or not assessed: {failed}, "
+        "reward 1, inference_failure: the attack inspector failed: APIError: spend limit.",
+        "  - With no extra information, aimed at it: Not attempted, the step with only a hint failed (inference_failure).",
+        "  - Independent attacker: Not attempted."]
+
+
 def test_each_problem_lists_the_conditions_an_attacker_tried_it_under(tmp_path):
     """Problems go by the least information under which an exploit was observed, a sort and no measure of the help
     needed. A no-hint reproduction judged the same as P1 finds P1 independently; a new one is the Attacker's own A1.
@@ -1363,6 +1407,62 @@ def ended_pid() -> int:
     process = subprocess.Popen([sys.executable, "-c", ""])
     process.wait()
     return process.pid
+
+
+def test_a_report_so_far_says_the_run_is_still_running_and_names_no_gap_yet(tmp_path):
+    """While the run goes, an analysis still running or without a record yet is no warning: the run has not ended."""
+    run = RunDir(tmp_path)
+    run.episode(rewards={"reward": 1.0})
+    run.record.simulation.status = "running"
+    run.hack = InspectionResult(mode="hack", status="running", categories={"package_oracles": "pending"}, applicability={})
+    run.save()
+    report.write(run.path, selected=["simulation", "hack", "attack"], running=True)
+    built = json.loads((run.path / "report.json").read_text())
+    assert built["status"] == "running" and built["analyses"] == {"simulation": "running", "hack": "running", "attack": "not started"}
+    assert built["outcome"] == "Still running. Results below are what was found so far; the final report replaces this one."
+    assert not [warning for warning in built["warnings"] if "simulation" in warning or "hack" in warning or "attack" in warning]
+
+
+def test_nudi_report_on_a_killed_run_replaces_its_report_so_far_with_a_stopped_one(tmp_path, capsys):
+    """A run killed after a confirmation leaves a report with status `running`; `nudi report` says it stopped."""
+    run = RunDir(tmp_path)
+    run.episode(rewards={"reward": 1.0})
+    run.record.simulation.status = "running"
+    run.save()
+    report.write(run.path, selected=["simulation"], running=True)
+    logged(run, {"kind": "run_start", "pid": ended_pid(), "analyses": ["simulation"]})
+    assert cli.main(["report", str(run.path)]) == 1
+    built = json.loads((run.path / "report.json").read_text())
+    assert built["status"] == "stopped" and built["unfinished"] == {"simulation": "running"}
+    assert capsys.readouterr().out.startswith("# nudi report\n\n## Answer\n\n- Stopped: the nudi process ended without closing out")
+
+
+def test_one_report_so_far_of_a_large_run_builds_within_a_second(tmp_path):
+    """Each confirmation rebuilds the report on the event loop, so one build of a run larger than a long measured one,
+    with 60 ordinary episodes, 3000 model calls and 60 Attacker attempts, takes under a second; a slower build would need
+    fewer rebuilds."""
+    run = RunDir(tmp_path)
+    for index in range(60):
+        name = run.episode(rewards={"reward": float(index % 2)})
+        run.label(name, "unknown", checked(name, f"check-{name}", "sorted", "violated" if index % 2 else "supported",
+                                           basis=basis("supported", ["sorted"], [f"check-{name}"])))
+    run.hack = InspectionResult(mode="hack", status="complete", categories={"package_oracles": "evidenced_issue"}, applicability={},
+                                assessments=[evidenced(name, f"hack-check-{index}") for index, name in enumerate(run.record.episodes)])
+    attempts = []
+    for index in range(60):
+        name = run.episode("attacker", {"reward": 1.0})
+        attempts.append(AttackAttempt(level="full", number=1, context=f"attacker-hack-{index}-full-1", episode=name, rewards={"reward": 1.0},
+                                      status="evidenced_issue", assessment=index))
+    run.attack = AttackResult(status="running", attempts=attempts,
+                              assessments=[evidenced(item.episode, f"attack-check-{index}") for index, item in enumerate(attempts)])
+    run.record.calls = [CallRecord(role="inspector", episode=run.record.episodes[index % 120], model="openai/gpt-test", cost=0.001,
+                                   cost_source="litellm", prompt_tokens=1000, completion_tokens=100) for index in range(3000)]
+    run.save()
+    started = time.perf_counter()
+    report.write(run.path, running=True)
+    took = time.perf_counter() - started
+    assert json.loads((run.path / "report.json").read_text())["status"] == "running"
+    assert took < 1, f"one report build took {took:.2f} s"
 
 
 def test_nudi_report_says_a_killed_run_stopped_without_closing_out(tmp_path, monkeypatch, capsys):

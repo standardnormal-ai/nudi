@@ -14,6 +14,7 @@ from nudi.episode import bound_notice
 from nudi.inspection import (
     HACK_CHECKLIST,
     InferenceFailure,
+    InspectionResult,
     OUTCOMES,
     InspectorRefusal,
     ModelOutputFailure,
@@ -292,7 +293,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                  minimal: str | None = None, unavailable_reasons: dict[str, str] | None = None,
                  candidates: list[Candidate] | None = None, problems: list[Problem] | None = None,
                  deadline: float | None = None, minimal_hints: bool = True, feed: asyncio.Queue | None = None,
-                 gate: asyncio.Semaphore | None = None, judge=None) -> AttackResult:
+                 gate: asyncio.Semaphore | None = None, judge=None, current=None) -> AttackResult:
     """Reproduce each candidate and search the environment with no hint.
 
     `discovery_attempts` is the total no-hint attempts, default one. `maximum_attempts` is the
@@ -333,6 +334,8 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
 
     With `feed` the attack runs beside the inspections: it takes candidates from the queue until None, which adds no
     candidate; planned attempts still run. With `gate` every attempt holds one of its slots, which other work shares.
+    `current(candidate)`, given, says whether a later reading has not withdrawn the candidate; once an attempt has its slot,
+    a candidate group none of whose members is current starts no Attacker, and its unattempted steps are `withdrawn`.
 
     An attempt's own copies, of its Attacker episode and of its attack inspector's experiments, are deleted when it ends,
     unless it was cancelled; no other session reads them (`copies`).
@@ -434,9 +437,10 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
         attempt.assessment = len(result.assessments) - 1
         save()
 
-    async def decide(attempt: AttackAttempt, index: int, level: str, members: list[Candidate]) -> bool:
+    async def decide(attempt: AttackAttempt, index: int, level: str, members: list[Candidate], judging: bool = True) -> bool:
         """The findings and status of attempt `index`, from the latest reading of each of its checks, so a reading that
-        corrects an exploit withdraws its finding. True only when this stream should stop."""
+        corrects an exploit withdraws its finding. True only when this stream should stop. Without `judging` it awaits
+        nothing."""
         latest = {}
         for position, (assessment, owner) in enumerate(zip(result.assessments, owners)):
             if owner == index:
@@ -474,7 +478,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
 
         # Saved before any judging, so a stop while the judge reads leaves the other exploits unjudged and keeps the rest.
         status = recorded()
-        if judge:
+        if judge and judging:
             # A no-hint exploit is a problem of its own; an exploit of another problem is judged as one is, and the
             # attempt keeps its target's problem. The judge's problem is the one identity: an exploit it puts in the
             # target's problem reproduces the target.
@@ -553,7 +557,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                 result.limits.append(f"{name}: {failure[1]}, but the episode produced a reward, so it was interpreted.")
                 failure, timeout = None, failure
             if failure:
-                attempt.status, attempt.error = failure
+                attempt.status, attempt.error = failure[0], f"the Attacker failed: {failure[1]}"
                 mark(level, members, failure[0])
                 save()
                 return
@@ -593,7 +597,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                 # A failed session is that failure; an unobservable measurement leaves the work unjudged below.
                 judged = session.attempts[-1]
                 if attempt.status == "running" and judged.status in SESSION_FAILURES:
-                    attempt.status, attempt.error = judged.status, judged.error
+                    attempt.status, attempt.error = judged.status, f"the attack inspector failed: {judged.error or judged.status}"
                     mark(level, members, judged.status)
             # Without its trajectory, a timed-out episode with no evidenced issue stays a timeout.
             if attempt.status == "running" and timeout and "trajectory" not in episode.artifacts:
@@ -622,6 +626,12 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
             save()
             raise
         except (asyncio.CancelledError, KeyboardInterrupt):  # KeyboardInterrupt: a second Ctrl-C
+            # The readings its attack inspector saved before the stop stay, unjudged, as its returned session's would.
+            saved = run.config.output_dir / f"inspection-attack_inspector-{context}.json"
+            if index not in owners and saved.is_file():
+                for assessment in InspectionResult.model_validate_json(saved.read_text()).assessments:
+                    retain(attempt, index, assessment)
+                await decide(attempt, index, level, members, judging=False)
             if attempt.status != "evidenced_issue":  # an exploit saved before the stop stays evidenced
                 attempt.status = "cancelled"
             result.status = "cancelled"
@@ -677,7 +687,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
             needed.extend(item.conditions[level] for item in result.candidates for before, level in zip((None, *levels), levels)
                           if item.conditions.get(level) not in ("unavailable", "not_applicable")
                           and (before is None or item.conditions[before] == "evidenced_issue"))
-        return bool(needed) and all(state in ("evidenced_issue", "no_evidenced_issue") for state in needed)
+        return bool(needed) and all(state in ("evidenced_issue", "no_evidenced_issue", "withdrawn") for state in needed)
 
     plan = [(None, ("none", number, [], None)) for number in range(1, discovery_attempts + 1)]
     for suspected in (False, True):
@@ -695,9 +705,16 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
         plan.extend((stream, (level, number, members, members[0].guidance.get(level))) for number in range(1, maximum_attempts + 1))
         waiting.extend(range(len(plan) - maximum_attempts, len(plan)))
 
-    async def attempt(*entry) -> None:
+    async def attempt(level, number, members, *entry) -> None:
         async with gate or contextlib.nullcontext():
-            await one(*entry)
+            if members and current and not any(current(item) for item in members):
+                if members[0].conditions[level] == "unattempted":
+                    event(run, "withdrawn", f"{members[0].id} was withdrawn by a later reading, so its Attacker does not start",
+                          candidate=members[0].id, problem=(problem := owner(members[0].id)) and problem.id, level=level)
+                for item in members:
+                    item.conditions.update({key: "withdrawn" for key, value in item.conditions.items() if value == "unattempted"})
+                return save()
+            await one(level, number, members, *entry)
 
     try:
         while True:

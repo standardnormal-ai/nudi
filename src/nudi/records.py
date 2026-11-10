@@ -199,6 +199,8 @@ class CallRecord(BaseModel):
     provider_cost: float | None = None
     """The provider's own `usage.cost`, when it reported one."""
     error: str | None = None
+    """A failed call's error type, then the provider's reason with credentials and key-like text removed; older records
+    have the type only."""
     refusals: list[str] = []
     """Explicit model refusal signals the provider returned for this call: a message
     `refusal`, a `content_filter` finish reason or a content policy error. Never inferred
@@ -495,6 +497,8 @@ class RunRecord(BaseModel):
     warnings: list[str] = []
     limitations: list[str] = []
     time_limit_reached: bool = False
+    stop_reason: str | None = None
+    """Why the run stopped all its work, as at an account refusal by the model provider, naming the agent whose call it was."""
     failed_phases: list[str] = []
     """Phases that raised an error or did not run to their end, as at the spending cap; Ctrl-C and the time limit are no
     failure. An inspection or attack that returned with evidence unresolved ran to its end; the report also counts one that

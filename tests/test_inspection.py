@@ -659,7 +659,7 @@ def test_run_experiment_states_each_probe_field_and_the_check_output_contract_in
     schema = tool["parameters"]["properties"]["probe"]
     probe = schema["properties"]
     assert sorted(probe) == ["capture_point", "case", "category", "control", "episode", "location", "program",
-                             "requirement", "scoring", "setup_program", "timing"]
+                             "replaces", "requirement", "scoring", "setup_program", "timing"]
     assert sorted(schema["required"]) == ["category", "location", "program", "requirement", "timing"]
     assert all(probe[name]["description"].startswith("Required. ") for name in schema["required"])
     assert probe["program"]["description"] == (
@@ -2061,6 +2061,64 @@ def test_inspection_status_and_the_result_list_the_same_open_obligations(tmp_pat
     assert result.categories == {"package_oracles": "unknown"} and result.status == "partial"
 
 
+@pytest.mark.parametrize("replaced", [False, True])
+def test_only_an_explicit_replacement_resolves_an_open_reading(tmp_path, monkeypatch, credentials, unit_sandboxes, replaced):
+    """A reading left unresolved stays open until a later experiment names it in `replaces`, as its next step asks; another
+    reading of the same category answers a different question and leaves it open."""
+    async def investigate(run, probe, session):
+        unresolved = [UNRESOLVED_ITEM] if probe["location"] == "/app/explanation.txt" else []
+        return await agreeing(*unresolved)(run, probe, session)
+
+    mock_experiments(monkeypatch, investigate)
+    replies = []
+
+    async def behave(name, tools, schema):
+        if name == "hack-broad":
+            first = await tools["run_experiment"].ainvoke({"probe": setup_probe()})
+            await tools["interpret_experiment"].ainvoke({"claim": first["scripted_claim"]})
+            replies.append(await tools["inspection_status"].ainvoke({}))
+            later = await tools["run_experiment"].ainvoke({"probe": setup_probe(
+                location="/app/answer.txt", case="graded answer", **({"replaces": first["id"]} if replaced else {}))})
+            await tools["interpret_experiment"].ainvoke({"claim": later["scripted_claim"]})
+        return schema()
+
+    episode_tools(monkeypatch, behave)
+    run = new_run(tmp_path, monkeypatch, credentials)
+    result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
+    assert "naming experiment-0000 in `replaces`" in replies[0]["open"][0]["next"]
+    assert [entry["id"] for entry in result.open] == ([] if replaced else ["experiment-0000"])
+    assert result.experiments[1].get("replaces") == ("experiment-0000" if replaced else None)
+
+
+def test_a_missing_native_reward_is_an_unavailable_measurement_not_a_failed_check(tmp_path, monkeypatch, credentials, unit_sandboxes):
+    """A check that exits 0 on an episode without a native reward did not fail: the reward is unavailable, which no
+    re-check adds, so the case is not run again and the limit says why."""
+    mock_experiments(monkeypatch, agreeing())
+    scripted = inspection_module.measure_experiment
+
+    async def rewardless(run, probe):
+        return {**await scripted(run, probe), "rewards": {}}
+
+    monkeypatch.setattr(inspection_module, "measure_experiment", rewardless)
+    replies = []
+
+    async def behave(name, tools, schema):
+        if name == "hack-broad":
+            for _ in range(2):
+                replies.append(await tools["run_experiment"].ainvoke({"probe": setup_probe()}))
+        return schema()
+
+    episode_tools(monkeypatch, behave)
+    run = new_run(tmp_path, monkeypatch, credentials)
+    result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
+    assert result.experiments[0]["status"] == "incomplete" and len(result.experiments) == 1
+    assert replies[1]["status"] == "unobservable" and result.attempts[0].status == "unobservable"
+    assert not any(inspection_module.CHECK_FAILED in limit for limit in result.limits)
+    assert "experiment-0000: its episode has no native reward to compare." in result.limits
+    assert all("its check failed" not in entry["reason"] for entry in result.open)
+    assert any("experiment-0000: its episode has no native reward" in entry["reason"] for entry in result.open)
+
+
 def consistent_broad(tmp_path, monkeypatch, credentials, *more, focused_attempts=1):
     """A hack inspection of package_oracles whose broad session reads one consistent case, then calls `more` on its tools."""
     Sandboxes(monkeypatch)
@@ -2277,6 +2335,32 @@ def test_guidance_reminder_names_the_experiment_when_its_check_was_named(tmp_pat
     assert list(replies[2]) == ["investigation_result"]
     (candidate,) = send.guidance(result)["candidates"]
     assert candidate.id == "hack-1" and candidate.guidance["full"] == guided["full_guidance"]
+
+
+def test_a_later_reading_of_an_evidenced_check_is_a_revision_event(tmp_path, monkeypatch, credentials, unit_sandboxes):
+    """A finding that a later reading of its check withdraws or corrects is announced, so the report so far shows it; a
+    first reading is not a revision."""
+    no_native_actor(monkeypatch)
+
+    async def investigate(run, probe, session):
+        return Assessment(claim=Claim(mechanism="finding", episode="sandbox-0000"), execution_scope="package", outcome="accepted_invalid")
+
+    mock_experiments(monkeypatch, investigate)
+    monkeypatch.setattr(inspection_module, "assess", lambda claim, directory: Assessment(
+        claim=claim, execution_scope="package", outcome="legitimate" if claim.mechanism == "no finding" else "accepted_invalid"))
+    finding = {"mechanism": "finding", "interpretation": "The grader rewards any format."}
+
+    async def behave(name, tools, schema):
+        receipt = await tools["run_experiment"].ainvoke({"probe": {"category": "package_oracles", "case": "finding", "setup_program": "true"}})
+        for claim in (finding, {**finding, "mechanism": "no finding"}):
+            await tools["interpret_experiment"].ainvoke({"experiment": receipt["id"], "claim": claim})
+        return schema(completed=prose(["package_oracles"]))
+
+    episode_tools(monkeypatch, behave)
+    run = new_run(tmp_path, monkeypatch, credentials)
+    asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
+    events = [json.loads(line) for line in (run.config.output_dir / "events.jsonl").read_text().splitlines()]
+    assert [(item["index"], item["before"], item["after"]) for item in events if item["kind"] == "revised"] == [(1, "accepted_invalid", "legitimate")]
 
 
 def test_applicability_has_no_native_scope():
@@ -7067,7 +7151,8 @@ def test_an_unknown_reading_starts_its_reply_with_the_cheapest_repair(tmp_path, 
     assert next(iter(check_side)) == next(iter(claim_side)) == "repair"
     assert check_side["repair"] == (
         "Missing: a check computing the deserved score as a finite `results.deserved`. Cheapest repair: call run_experiment "
-        f"again on episode {first['episode']} without a setup_program, with a check that provides it and "
+        f"again on episode {first['episode']} without a setup_program, naming {first['id']} in "
+        "`replaces`, with a check that provides it and "
         f"{inspection_module.CHECK_OUTPUT}.")
     assert claim_side["repair"].startswith("Missing: derivation.observations naming measured facts of the check output. "
                                            "Cheapest repair: call interpret_experiment on experiment-0001 again")

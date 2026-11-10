@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -25,7 +26,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import get_args
+from typing import Callable, get_args
 
 import litellm
 from dotenv import dotenv_values
@@ -228,6 +229,10 @@ class Run:
     """Inspector sessions and Attacker episodes between their start and end events: each one's job and problem."""
     time_limit: tuple[float, float] | None = None
     """The run's time limit while it runs: its deadline on the event loop's clock and its length in seconds."""
+    publish: Callable[[], None] | None = None
+    """Writes the report so far while the analyses run; `event` calls it after each confirmation."""
+    stop: Callable[[], None] | None = None
+    """Stops the analyses at once while they run; `refused` calls it."""
 
     def save(self) -> None:
         write_private(self.config.output_dir / "run.json", self.record.model_dump_json(indent=2))
@@ -238,9 +243,29 @@ class Run:
             event(self, "warning", message, logging.WARNING, message=message)
 
     def check_cap(self) -> None:
+        """Raise when no new call or work may start: at the spending cap, or after a stop such as an account refusal,
+        where work that asks ends as a cancelled one does."""
+        if self.record.stop_reason:
+            raise asyncio.CancelledError(self.record.stop_reason)
         cap = self.record.spending_cap
         if cap is not None and self.record.known_cost >= cap:
             raise SpendingCapReached(f"known cost ${self.record.known_cost:.6f} reached the spending cap ${cap}")
+
+    def refused(self, agent: str, reason: str) -> None:
+        """The model provider refused `agent`'s call for the account: every later call would fail alike, so the run
+        admits no new call or work and stops its analyses. No running agent can be warned, as it would need a call."""
+        if self.record.stop_reason:
+            return
+        self.record.stop_reason = f"the model provider refused a call of the {agent}: {reason}"
+        with events_lock:
+            running = [f"{key} ({job})" for key, (job, _) in self.jobs.items()]
+        if running:
+            self.record.warnings.append(f"the account refusal stopped these running agents: {', '.join(running)}")
+        self.save()
+        event(self, "provider_refused", f"stopping the run: {self.record.stop_reason}", logging.WARNING, agent=agent, reason=reason,
+              running=running)
+        if self.stop:
+            self.stop()
 
     async def admit_container(self, purpose: str) -> None:
         """Admit another container, a sandbox `purpose` or "native", only after every closed
@@ -351,7 +376,10 @@ def event(run, kind: str, message: str, severity: int | None = logging.INFO, /, 
     message is still logged. The message is logged after the lock is released, so no logging handler runs while it is
     held, and one that writes an event, from any thread, cannot block on it. The handlers can therefore receive lines
     written at once, or an event a handler writes while it receives one, in another order than the log's. A handler
-    that raises raises from this call. A full disk stops the run through its other records."""
+    that raises raises from this call. A full disk stops the run through its other records.
+
+    After each confirmation, a `judged` event of this run or an `attempt_result` with status `evidenced_issue`, and after
+    each `revised` reading or `withdrawn` finding, the run's `publish` writes the report so far."""
     with events_lock:
         moment = datetime.now(timezone.utc)
         # JSON has no duration, so a duration is whole seconds.
@@ -376,6 +404,10 @@ def event(run, kind: str, message: str, severity: int | None = logging.INFO, /, 
             run.last_line = time.monotonic()
     if severity is not None:
         logger.log(severity, message, extra={"event": item})
+    confirmed = (kind == "judged" and not fields.get("replayed") or kind == "attempt_result" and fields.get("status") == "evidenced_issue"
+                 or kind in ("revised", "withdrawn"))
+    if confirmed and (publish := getattr(run, "publish", None)):
+        publish()
 
 
 def resolve_credentials(config: RunConfig, models, roles) -> tuple[dict[Role, str], dict[Role, str]]:
@@ -585,6 +617,39 @@ def record_call(run: Run, role: Role, episode: str, request: dict, response=None
     run.save()
 
 
+# Key-like text a provider's message can quote: an `sk-` style key, a bearer token, or any long unbroken token.
+KEY_LIKE = re.compile(r"\b[a-z]{2,4}-[A-Za-z0-9_-]{12,}|Bearer\s+\S+|[A-Za-z0-9_+/=-]{32,}")
+# An account refusal, which no retry recovers: a refused credential or payment, by its status or the provider's own error
+# code. Never by message text, nor 403, a content refusal too: an Attacker's untrusted content could produce either.
+ACCOUNT_STATUS = (401, 402)
+ACCOUNT_CODES = {"insufficient_quota", "invalid_api_key", "billing_hard_limit_reached", "billing_not_active"}
+
+
+def account_refusal(error: BaseException) -> bool:
+    """Whether a failed call's status, or the error code or type in the provider's JSON error body, which LiteLLM keeps
+    on an exception it chains, is an account refusal."""
+    status, codes = getattr(error, "status_code", None), set()
+    while error is not None:
+        body = getattr(error, "body", None)
+        if not isinstance(body, dict):
+            try:
+                body = json.loads(getattr(error, "message", "")).get("error")
+            except (TypeError, ValueError, AttributeError):
+                body = None
+        if isinstance(body, dict):
+            codes |= {body.get("code"), body.get("type")}
+        error = error.__cause__ or error.__context__
+    return status in ACCOUNT_STATUS or bool(codes & ACCOUNT_CODES)
+
+
+def provider_reason(run: Run, error: BaseException) -> str:
+    """A failed call's type and the provider's reason on one line, without the run's credentials or key-like text."""
+    from nudi.checks import redacted
+
+    text = KEY_LIKE.sub("[redacted]", " ".join(redacted(run, str(error)).split()))
+    return f"{type(error).__name__}: {text[:300]}"
+
+
 class RunCalls(CustomLogger):
     """Process-wide LiteLLM callback that acts only within `model_calls`."""
 
@@ -613,7 +678,11 @@ class RunCalls(CustomLogger):
                 and (pending := pending_calls.get()) is not None
                 and (admitted := pending.pop(request_data["litellm_call_id"], None)) is not None):
             refusals = [type(exception).__name__] if isinstance(exception, litellm.ContentPolicyViolationError) else []
-            record_call(*scope, request_data, error=type(exception).__name__, refusals=refusals, started=admitted["started"])
+            reason = provider_reason(scope[0], exception)
+            record_call(*scope, request_data, error=reason, refusals=refusals, started=admitted["started"])
+            if account_refusal(exception):
+                from nudi.report import job
+                scope[0].refused(f"{job(scope[0].record.calls[-1], scope[0].record)} ({scope[2]})", reason.split(": ", 1)[1])
 
 
 async def run_role_episode(run: Run, role: Role, *, instruction: str | None = None, agent=None,

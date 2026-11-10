@@ -174,7 +174,6 @@ type Live struct {
 	Lanes                   []*Lane // the rows of the findings pipeline, in the order the judge named them
 	ZeroJudged              *Event  // the latest judge call on the exploit of an Attacker with no extra information
 	Slots                   *int
-	Hacked                  []int // the problems of the hacks and how many an Attacker exploited, as the hack phase ended
 	Warnings                int
 	Recent                  []string // the last events, in nudi's words or the judge's result in the viewer's
 }
@@ -238,10 +237,6 @@ func (l *Live) apply(e Event) {
 		}
 		// An analysis ends after its own sessions and attempts; the others run on beside it.
 		l.Agents = slices.DeleteFunc(l.Agents, func(a Agent) bool { return slices.Contains(phaseAgents[e.Phase], a.Who) })
-		if e.Phase == "hack" {
-			problems, exploited := l.hackCounts()
-			l.Hacked = []int{problems, exploited}
-		}
 	case "session_start":
 		a := Agent{Who: e.Inspector, Name: e.Session, Title: e.Session, Episode: text(e.Episode), Since: e.at(), Last: "started"}
 		if t := l.try(text(e.Episode)); e.Inspector == "attack" && t != nil {

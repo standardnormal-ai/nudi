@@ -7,12 +7,12 @@ The fields a script or coding agent reads. Both files hold more; [Usage](usage.m
 | Field | Type | Values |
 | --- | --- | --- |
 | `schema_version` | integer | `1`. Raised when a listed field changes meaning or goes away; absent in reports written before it |
-| `status` | string | `complete`: every selected step ran to its end. `time_limit`: the time limit ended the run with no phase failed before it. `partial`: a step failed, stopped, as at the spending cap, or never ran. `stopped`: written by `nudi report` for a run whose process ended without closing it out |
+| `status` | string | `complete`: every selected step ran to its end. `time_limit`: the time limit ended the run with no phase failed before it. `partial`: a step failed, stopped, as at the spending cap, or never ran. `stopped`: the model provider refused a call for the account, or written by `nudi report` for a run whose process ended without closing it out. `running`: the report so far, which the run rewrites after each confirmation while it goes; the final report replaces it |
 | `outcome` | string | The Answer's first line: how the run ended, in plain words |
 | `answer` | list of strings | `outcome`, then the verdict line, then a few lines on what was found |
 | `unfinished` | object | Each step that did not run to its end, mapped to its status |
 | `unresolved` | list of strings | Each step that ran to its end with evidence left unresolved |
-| `analyses` | object | Each selected step, `simulation`, `grader`, `hack` or `attack`, mapped to its status, such as `complete`, `partial`, `cancelled`, `spending_exhausted`, `running` or `not run` |
+| `analyses` | object | Each selected step, `simulation`, `grader`, `hack` or `attack`, mapped to its status, such as `complete`, `partial`, `cancelled`, `spending_exhausted`, `running` or `not run`; in a report so far, `not started` for one with no record yet |
 | `attack.problems` | list | One entry per problem, below; `attack` is null when the attack was not selected |
 | `labels.counts` | object | Ordinary episodes per grader inspector label: `accepted_invalid`, `rejected_valid`, `legitimate`, `unknown`, `unavailable`, `ungrounded` or `unreviewed`; only labels that occur appear. `labels` is null without a grader inspection |
 | `configuration.known_cost` | number | Known inference cost in US dollars |
@@ -32,7 +32,7 @@ Each entry of `attack.problems`:
 | `level` | integer | 2 to 5, which orders the problems, as in [Usage](usage.md#reports) |
 | `label` | string | The level's words, such as `●●●○○ exploit executable by learner with full information`, or `Correct work failed` and how an Attacker reproduced it; for a problem a rerun kept and did not find again, `evidenced in run DIR at LABEL; not found again here` |
 | `exploited_with` | string | The least information under which an Attacker exploit was observed, `none`, `minimal` or `full`, an order and not the help needed; otherwise `not_exploited`, `no_guidance` or `unknown`. Older reports have `help_needed` |
-| `conditions` | list of objects | Each condition an Attacker tried it under, in order: `condition` (`full`, `minimal`, `none` aimed at it; `elsewhere_full`, `elsewhere_minimal`, `elsewhere_none` aimed at another problem, listed only when one of those attempts exploited it; or `independent`, the no-hint search), `attempts` started, how many `exploited` it, the Attacker `model` and the `status` |
+| `conditions` | list of objects | Each condition an Attacker tried it under, in order: `condition` (`full`, `minimal`, `none` aimed at it; `elsewhere_full`, `elsewhere_minimal`, `elsewhere_none` aimed at another problem, listed only when one of those attempts exploited it; or `independent`, the no-hint search), `attempts` assessed, how many `exploited` it, the Attacker `model`, the `status`, and, when any, `not_assessed`, the attempts that did not run or were not judged, such as at an inference failure or a cancellation, each with its `episode`, `status`, `reward` and `error`; they are not in `attempts` |
 | `scope` | string or null | Where its findings were evidenced, `package` or `native` (native when any is); null without the inspections. At level 2 `report.md` and the viewer give it after the label |
 | `cause` | string | One line |
 | `findings` | list of strings | The inspector findings this cause explains, as `hack-INDEX` or `grader-INDEX` |

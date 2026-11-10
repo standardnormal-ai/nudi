@@ -2,7 +2,7 @@
  concurrency 12 of 12
 
  HACKS ✓ 18:00  4 problems, 2 exploited   GRADER ⣾ 6:59
- hack inspector + Attackers               Simulate · Inspect · Attack
+ hack inspector                           Simulate · Inspect · Attack
 
  AGENTS  1 running
  ╭──────────────────────╮

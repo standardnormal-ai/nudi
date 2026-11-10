@@ -294,3 +294,27 @@ func TestReplayRecordedLog(t *testing.T) {
 		}
 	}
 }
+
+// The attack runs on after the hack inspection ends, so the hacks piece counts what Attackers exploit after its end too,
+// and names only the hack inspector.
+func TestTheHacksCountUpdatesAfterTheHackPhaseEnd(t *testing.T) {
+	log := ev("00:00", "run_start", `, "backend": "docker", "analyses": ["hack", "attack"]`) +
+		ev("00:00", "phase_start", `, "phase": "hack"`) +
+		ev("00:00", "phase_start", `, "phase": "attack"`) +
+		ev("00:10", "judged", `, "inspector": "hack", "finding": "hack-0", "problem": "P1", "new": true, "cause": "forge"`) +
+		ev("01:00", "phase_end", `, "phase": "hack", "status": "complete", "elapsed": 60`)
+	l := liveFrom(t, log)
+	stepper := func() string { return plainText(liveStepper(l, at9("03:00"), "")) }
+	if s := stepper(); !strings.Contains(s, "1 problem, 0 exploited") || strings.Contains(s, "Attackers") || !strings.Contains(s, "hack inspector") {
+		t.Fatalf("at the hack phase end:\n%s", s)
+	}
+	for _, e := range readAll(t, ev("01:10", "attempt_start", `, "episode": "0000-attacker", "problem": "P1", "level": "full", "number": 1`)+
+		ev("02:00", "attempt_end", `, "episode": "0000-attacker", "problem": "P1", "level": "full", "number": 1`)+
+		ev("02:30", "attempt_result", `, "episode": "0000-attacker", "problem": "P1", "level": "full", "number": 1, "status": "evidenced_issue"`)+
+		ev("02:40", "judged", `, "inspector": "grader", "finding": "grader-0", "problem": "P2", "new": true, "cause": "skip"`)) {
+		l.apply(e)
+	}
+	if s := stepper(); !strings.Contains(s, "2 problems, 1 exploited") {
+		t.Fatalf("after the hack phase end:\n%s", s)
+	}
+}

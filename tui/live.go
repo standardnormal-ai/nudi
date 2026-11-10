@@ -104,8 +104,8 @@ func liveNotes(l *Live) string {
 // liveStepper shows the run's two pieces: HACKS, the hack phase, and GRADER, the simulation, grader and attack phases
 // as three steps lit one by one. A piece shows once one of its phases started, or pending from the start when run_start
 // selected it: the hacks with the hack phase, the grader with the simulation or the grader phase. A piece turns while a
-// phase of it runs, then is marked complete or with its status; the finished hacks count their problems and how many an
-// Attacker exploited.
+// phase of it runs, then is marked complete or with its status; the finished hacks count the problems so far and how
+// many an Attacker exploited, also while the attack runs on.
 func liveStepper(l *Live, now time.Time, sp string) string {
 	var heads, notes []string
 	hacks, grader := l.piece("HACKS", violet, []string{"hack"}, now, sp), l.piece("GRADER", blue, graderSteps, now, sp)
@@ -116,10 +116,11 @@ func liveStepper(l *Live, now time.Time, sp string) string {
 		grader = dim("GRADER ○")
 	}
 	if hacks != "" {
-		if l.Hacked != nil {
-			hacks += fmt.Sprintf("  %d problem%s, %d exploited", l.Hacked[0], plural(l.Hacked[0]), l.Hacked[1])
+		if p := l.phase("hack"); p != nil && p.Kind == "phase_end" {
+			problems, exploited := l.hackCounts()
+			hacks += fmt.Sprintf("  %d problem%s, %d exploited", problems, plural(problems), exploited)
 		}
-		heads, notes = append(heads, hacks), append(notes, dim("hack inspector + Attackers"))
+		heads, notes = append(heads, hacks), append(notes, dim("hack inspector"))
 	}
 	if grader != "" {
 		var steps []string

@@ -173,6 +173,7 @@ class Probe(BaseModel):
     setup_program: str | None = None
     control: bool | None = None
     case: str | None = Field(None, description="A short name for this case.")
+    replaces: str | None = Field(None, description="The experiment id whose open reading this case answers, when its next step asks for one.")
     location: str = Field(description="Required. The absolute path the check reads.")
     timing: str = Field(description="Required. Why the requirement applies at the copy's point.")
     requirement: Observation | None = Field(None, description=(
@@ -734,7 +735,8 @@ def broken_contract(check: dict) -> str | None:
 def repair(missing: list[str], experiment: str, episode: str) -> str:
     """An unknown reading's cheapest repair: the same check interpreted again when only the claim lacks something,
     else the same episode checked again. Both resolve the equal-reward case, and neither is preferred."""
-    check = f"call run_experiment again on episode {episode} without a setup_program, with a check that provides it and {CHECK_OUTPUT}"
+    check = (f"call run_experiment again on episode {episode} without a setup_program, naming {experiment} in `replaces`, "
+             f"with a check that provides it and {CHECK_OUTPUT}")
     claim = f"call interpret_experiment on {experiment} again with a derivation naming measured observations of its check"
     route = (f"either {claim}, if the observations support the requirement, or {check}" if EQUAL_REWARD in missing
              else claim if all(item in CLAIM_GAPS for item in missing) else check)
@@ -873,6 +875,8 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
         with its `category`, `reason` and `next` step. With a session's `state`, only what concerns that session: its own and
         inherited experiments, and what names its categories or its episode."""
         latest = {assessment.claim.check: assessment for assessment in report.assessments}
+        # An experiment a later one replaced, once that one has a reading, as its next step asked.
+        replaced = {item.get("replaces") for item in report.experiments if item["status"] in ("assessed", "unfinished")}
         entries, agreeing = [], set()
         # A check an experiment ran is read through that experiment.
         for item in report.experiments + [value for key, value in reread.items()
@@ -882,7 +886,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                 "assessed", "unfinished") else None
             if status == "measured":
                 reason, step = "its draft reading is open", OPEN_DRAFT
-            elif closed(item["category"]):  # A grader inspector category closed by its first evidenced issue takes no more work.
+            elif closed(item["category"]) or id in replaced:  # A closed grader inspector category takes no more work; a replaced reading is answered.
                 continue
             elif id in broken:
                 reason, step = broken[id], CONTRACT.format(episode=item["episode"])
@@ -892,7 +896,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                 continue
             elif agrees(assessment):
                 reason = f"its reading agrees with the reward but leaves unresolved: {'; '.join(assessment.claim.unresolved)}"
-                step = "measure what is unresolved with run_experiment; keep an item in the claim while it is true"
+                step = f"measure what is unresolved with run_experiment naming {id} in `replaces`; keep an item in the claim while it is true"
             elif assessment.reasons == [UNFINISHED]:
                 reason, step = UNFINISHED, f"complete its reading with interpret_experiment naming {id}"
             else:
@@ -1046,7 +1050,8 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
         item = {"id": f"experiment-{len(report.experiments):04d}", "category": target if mode != "hack" or target in HACK_CATEGORIES else "other",
                 "case": probe.get("case"), "status": "running", "location": probe.get("location"),
                 "capture_point": probe.get("capture_point") or "verification_start", "session": state.name,
-                **({"control": True} if probe.get("control") is True else {})}
+                **({"control": True} if probe.get("control") is True else {}),
+                **({"replaces": probe["replaces"]} if probe.get("replaces") else {})}
         report.experiments.append(item)
         seen[identity] = item["id"]
         review = OrdinaryReview(episode=probe["episode"], attempt=state.index) if ordinary_review else None
@@ -1074,13 +1079,18 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
             # check_submission reports truncated output as exit code 125; its retained command says which.
             check_truncated = bool(checker.get("sandbox")) and any(command.get("truncated") for command in SandboxResult.model_validate_json(
                 (run.config.output_dir / "sandboxes" / checker["sandbox"] / "sandbox.json").read_text()).commands)
+            # A check that exited 0 on an episode without a native reward did not fail; no re-check adds the reward.
+            rewardless = "check" in receipt and receipt["check"]["exit_code"] == 0 and not receipt["rewards"]
             if "check" not in receipt or receipt["check"]["exit_code"] != 0 or not receipt["rewards"]:
                 item["status"] = receipt["status"] = "incomplete"
-                if "check" not in receipt or receipt["check"]["exit_code"] is None or check_truncated:
+                if "check" not in receipt or receipt["check"]["exit_code"] is None or check_truncated or rewardless:
                     cause = f"{item['id']}: " + ("; ".join(receipt.get("missing", [])) or "no check ran" if "check" not in receipt
-                                                 else "check output was truncated" if check_truncated else "the check has no exit code")
+                                                 else "check output was truncated" if check_truncated
+                                                 else "its episode has no native reward to compare" if rewardless else "the check has no exit code")
                     fail([target], cause)
                     unobservable(cause)
+                    if rewardless:
+                        report.limits.append(f"{cause}.")
                     if check_truncated:
                         limit = f"{item['id']}: check output was truncated; uncaptured bytes are unavailable."
                         receipt.setdefault("limits", []).append(limit)
@@ -1096,7 +1106,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                 report.assessments.append(assessment)
                 if review is not None:
                     review.status, review.assessment = "assessed", len(report.assessments) - 1
-                if "check" in receipt and receipt["check"]["exit_code"] is not None:
+                if "check" in receipt and receipt["check"]["exit_code"] is not None and not rewardless:
                     seen.pop(identity, None)  # A failed checker may be repaired without pretending it observed validity.
             # Known as the check ends, so the reply leads with the repair; nothing comparable was measured, so it may run again.
             if "check" in receipt and receipt["check"]["exit_code"] is not None and (why := broken_contract(receipt["check"])):
@@ -1201,7 +1211,12 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                                                   "episode": receipt["episode"], "check": receipt.get("check", {}).get("id")},
                                             receipt.get("rewards"), receipt.get("check", {}).get("output"))
             assessment = assess(interpreted, run.config.output_dir)
+            before = next((item for item in reversed(report.assessments) if assessment.claim.check and item.claim.check == assessment.claim.check), None)
             report.assessments.append(assessment)
+            # A finding this reading withdraws or corrects is announced, so the report so far shows it.
+            if mode != "attack" and before is not None and evidenced(before):
+                event(run, "revised", f"{mode} inspector read {assessment.claim.check} again: {before.outcome}, now {assessment.outcome}",
+                      inspector=mode, id=assessment.claim.check, index=len(report.assessments) - 1, before=before.outcome, after=assessment.outcome)
             item.update(status="assessed", assessment=len(report.assessments) - 1)
             if review is not None:
                 review.status, review.error, review.assessment = "assessed", None, len(report.assessments) - 1

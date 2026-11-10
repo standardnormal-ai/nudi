@@ -673,6 +673,72 @@ def test_cap_refuses_new_calls_and_episodes_once_known_cost_reaches_it(tmp_path,
     assert record.episodes == []
 
 
+class Failing(Endpoint):
+    """An endpoint that answers every call with one HTTP error status, message and error code."""
+
+    def __init__(self, status: int, message: str, code: str = "error"):
+        super().__init__()
+        self.status, self.message, self.code = status, message, code
+
+    async def chat(self, request: web.Request) -> web.Response:
+        self.requests.append(await request.json())
+        return web.json_response({"error": {"message": self.message, "type": self.code, "code": self.code}}, status=self.status)
+
+
+@pytest.mark.parametrize("status,code", [(402, "error"), (429, "insufficient_quota")])
+def test_an_account_refusal_keeps_its_reason_without_keys_and_stops_new_work_at_once(tmp_path, monkeypatch, credentials, status, code):
+    """A spend limit refuses every later call alike, so its first refusal stops the run: the next call and the next episode
+    do not start, and the stop names the agent whose call it was. The provider's reason is kept, without key-like text.
+    The refusal is a payment status or the provider's own error code, never the message text."""
+    run = new_run(tmp_path, monkeypatch, credentials)
+    stops = []
+    run.stop = lambda: stops.append(True)
+    endpoint = Failing(status, f"API key spend limit exceeded for {FILE_KEY} sk-live0123456789abcdef", code)
+    fake_trials(monkeypatch, raise_failure)
+
+    async def main():
+        async with serve(endpoint) as base_url:
+            with model_calls(run, "inspector", "hack-broad"):
+                with pytest.raises(Exception, match="spend limit"):
+                    await call(base_url)
+                with pytest.raises(asyncio.CancelledError):
+                    await call(base_url)
+        with pytest.raises(asyncio.CancelledError):
+            await run_role_episode(run, "simulator")
+
+    asyncio.run(main())
+
+    assert (len(endpoint.requests), FakeTrial.created, stops) == (1, 0, [True])
+    record = stored_run(run)
+    error = record.calls[-1].error
+    assert "API key spend limit exceeded" in error and FILE_KEY not in error and "sk-live0123456789abcdef" not in error
+    assert record.stop_reason.startswith("the model provider refused a call of the hack inspector (hack-broad): ")
+    assert "API key spend limit exceeded" in record.stop_reason and FILE_KEY not in record.stop_reason
+    logged = [json.loads(line) for line in (run.config.output_dir / "events.jsonl").read_text().splitlines()]
+    refused = [item for item in logged if item["kind"] == "provider_refused"]
+    assert len(refused) == 1 and refused[0]["agent"] == "hack inspector (hack-broad)" and record.stop_reason in refused[0]["text"]
+
+
+@pytest.mark.parametrize("status,message", [(429, "Rate limit reached, retry in 1 s"), (403, "API key spend limit exceeded")])
+def test_a_rate_limit_or_a_refusal_in_words_only_keeps_its_reason_and_stops_nothing(tmp_path, monkeypatch, credentials, status, message):
+    """A rate limit is transient. An Attacker reads untrusted content, so a content refusal (403) or a message that only says
+    "spend limit" fails that call alone and never stops the run."""
+    run = new_run(tmp_path, monkeypatch, credentials)
+    run.stop = lambda: pytest.fail("this error stops nothing")
+    endpoint = Failing(status, message)
+
+    async def main():
+        async with serve(endpoint) as base_url:
+            with model_calls(run, "attacker", "0000-attacker"):
+                for _ in range(2):
+                    with pytest.raises(Exception, match=message.split(",")[0]):
+                        await call(base_url)
+
+    asyncio.run(main())
+    record = stored_run(run)
+    assert len(endpoint.requests) == 2 and record.stop_reason is None and message.split(",")[0] in record.calls[-1].error
+
+
 def test_known_cost_equal_to_the_cap_reaches_it(tmp_path, monkeypatch, credentials):
     fake_trials(monkeypatch, raise_failure)
     run = new_run(tmp_path, monkeypatch, credentials, spending_cap=0.5)

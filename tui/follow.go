@@ -18,8 +18,10 @@ import (
 const startWait = 2 * time.Minute
 
 // poll adds the events nudi appended since the last poll to l and returns them, with the report once nudi
-// has written it whole. After run_end the report is final, so one that cannot be read, or none, ends the follow.
-// So does a run whose process has ended without run_end, and a folder whose log has not begun within startWait.
+// has written its final one. While the run goes, nudi rewrites report.json after each confirmation with status
+// running, which is no final report. After run_end the report is final, so one that cannot be read, none, or one
+// still running ends the follow. So does a run whose process has ended without run_end, and a folder whose log has
+// not begun within startWait.
 func (f *follower) poll(l *Live) ([]Event, *Report, error) {
 	if f.begun.IsZero() {
 		f.begun = time.Now()
@@ -35,8 +37,11 @@ func (f *follower) poll(l *Live) ([]Event, *Report, error) {
 	}
 	r, err := load(f.dir)
 	switch {
-	case err == nil:
+	case err == nil && r.Status != "running":
 		return events, &r, nil
+	case err == nil && l.End != nil:
+		return events, nil, fmt.Errorf("%s: the run ended with status %s, but its report.json is the one written while it ran; nudi report %s writes the final one",
+			l.Dir, l.End.Status, l.Dir)
 	case l.End == nil && ended:
 		return events, nil, fmt.Errorf("%s: nudi (pid %d) is no longer running and wrote no run_end; nudi report %s writes its report",
 			l.Dir, l.Start.Pid, l.Dir)

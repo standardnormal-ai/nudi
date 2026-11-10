@@ -111,10 +111,12 @@ def retained(run_dir: Path, record: RunRecord) -> dict[str, bool]:
     return {"simulation": record.simulation is not None, **{name: (run_dir / file).is_file() for name, file in FILES.items()}}
 
 
-def build(run_dir: Path, secrets=(), selected=None, stop=None) -> dict:
+def build(run_dir: Path, secrets=(), selected=None, stop=None, running=False) -> dict:
     """The report of the run in `run_dir`. `selected` names the requested analyses,
     by default those with retained records; completion is relative to them. `stop` says why a run
-    stopped without closing out, such as a killed process or the error its `run_end` recorded: its status is `stopped`."""
+    stopped without closing out, such as a killed process or the error its `run_end` recorded: its status is `stopped`.
+    `running` builds the report so far of a run still going: its status is `running`, a selected analysis without a
+    record is `not started`, and neither that nor an analysis still running is a warning."""
     record = RunRecord.model_validate_json((run_dir / "run.json").read_text())
     present = retained(run_dir, record)
     selected = [name for name in ANALYSES if present[name]] if selected is None else list(selected)
@@ -125,11 +127,12 @@ def build(run_dir: Path, secrets=(), selected=None, stop=None) -> dict:
     warnings, notes, analyses = [f"run: {warning}" for warning in record.warnings], [], {}
     for name in selected:
         if not present[name]:
-            analyses[name] = "not run"
-            warnings.append(f"{name} was selected but not run")
+            analyses[name] = "not started" if running else "not run"
+            if not running:
+                warnings.append(f"{name} was selected but not run")
             continue
         analyses[name] = record.simulation.status if name == "simulation" else loaded[name].status
-        if analyses[name] != "complete":
+        if analyses[name] != "complete" and not (running and analyses[name] == "running"):
             warnings.append(f"{name} {analyses[name]}: its coverage is incomplete")
     if record.unknown_cost_calls:
         warnings.append(f"{record.unknown_cost_calls} model calls have unknown prices; the known cost excludes them")
@@ -148,7 +151,7 @@ def build(run_dir: Path, secrets=(), selected=None, stop=None) -> dict:
     pool = record.simulation.episodes if record.simulation else []
     report = {
         "schema_version": SCHEMA_VERSION,
-        "status": "stopped" if stop else ("partial" if failed else "time_limit") if record.time_limit_reached
+        "status": "stopped" if stop or record.stop_reason else "running" if running else ("partial" if failed else "time_limit") if record.time_limit_reached
                   else "partial" if unfinished else "complete",
         "unfinished": unfinished,
         "unresolved": [name for name, status in analyses.items() if status != "complete" and name not in unfinished],
@@ -190,9 +193,9 @@ def build(run_dir: Path, secrets=(), selected=None, stop=None) -> dict:
     return report
 
 
-def write(run_dir: Path, secrets=(), selected=None, stop=None) -> tuple[Path, Path]:
-    """Write `report.json` and `report.md` beside the run's records."""
-    report = build(run_dir, secrets, selected, stop)
+def write(run_dir: Path, secrets=(), selected=None, stop=None, running=False) -> tuple[Path, Path]:
+    """Write `report.json` and `report.md` beside the run's records, each replacing the earlier one whole."""
+    report = build(run_dir, secrets, selected, stop, running)
     paths = run_dir / "report.json", run_dir / "report.md"
     write_private(paths[0], json.dumps(report, indent=2, sort_keys=True) + "\n")
     write_private(paths[1], markdown(report))
@@ -1085,16 +1088,21 @@ def conditions(problem, result: AttackResult, record: RunRecord, valid_work: boo
         if aimed and not found or name == "independent" and valid_work:
             continue
         started = [item for item in result.attempts if item.episode in record.episodes and stream(item) == name]
+        # An attempt that failed to run or to be judged showed nothing, so it is listed apart and not counted.
+        apart = [item for item in started if item.status in UNASSESSED and item.episode not in problem.members]
+        assessed = [item for item in started if item not in apart]
         # An aimed attempt's own problem is its target; any other exploited this problem when the judge put it here.
         exploited = sum(item.episode in problem.members or item.status == "evidenced_issue" and (
-            aimed or name == "independent" and bool(problem.id) and item.problem == problem.id) for item in started)
+            aimed or name == "independent" and bool(problem.id) and item.problem == problem.id) for item in assessed)
         if not (aimed or exploited or name == "independent"):
             continue
         independent = result.discovery.get("none", "unattempted")
         status = ("evidenced_issue" if "evidenced_issue" in found else found[0]) if aimed else "evidenced_issue" if exploited else (
             "no_evidenced_issue" if independent == "evidenced_issue" else independent)
-        rows.append({"condition": name, "attempts": len(started), "exploited": exploited,
-                     "model": model.model if model and started else None, "status": status})
+        rows.append({"condition": name, "attempts": len(assessed), "exploited": exploited,
+                     "model": model.model if model and started else None, "status": status,
+                     **({"not_assessed": [{"episode": item.episode, "status": item.status, "reward": rewards(item.model_dump()),
+                                           "error": item.error} for item in apart]} if apart else {})})
     return rows
 
 
@@ -1237,12 +1245,17 @@ def unassessed(mode: str, item: dict) -> list[str]:
 
 def still_open(mode: str, item: dict) -> list[str]:
     """The leads: one line per category, or for a grader inspector's ordinary episodes, that `open` names, with each of
-    its entries; then how many of each category's latest readings read legitimate, a count and no verdict."""
-    groups = {}
+    its entries; then the categories an attempt failed in, which suspected nothing, one line per failure; then how many
+    of each category's latest readings read legitimate, a count and no verdict."""
+    groups, failed = {}, {}
     for entry in item.get("open", []):  # Older reports have no `open`.
-        groups.setdefault(entry["category"] or "ordinary episodes", []).append(f"{entry['id']}: {entry['reason']}")
+        if entry["id"] == entry["category"] and entry["reason"].startswith("an attempt failed: "):
+            failed.setdefault(entry["reason"], []).append(entry["category"])
+        else:
+            groups.setdefault(entry["category"] or "ordinary episodes", []).append(f"{entry['id']}: {entry['reason']}")
     counts = Counter(entry["category"] or "no category" for entry in item["findings"]["legitimate"] if entry["superseded_by"] is None)
     return ([f"- {mode} {category} leads: {'; '.join(entries)}" for category, entries in groups.items()]
+            + [f"- {mode} {', '.join(categories)} not finished: {reason}" for reason, categories in failed.items()]
             + [f"- {mode} legitimate readings: " + ", ".join(f"{category} {count}" for category, count in counts.items())] * bool(counts))
 
 
@@ -1331,11 +1344,13 @@ def rewards(attempt: dict) -> str:
     return ", ".join(f"{key} {number(value)}" for key, value in attempt["rewards"].items()) or "no reward"
 
 
+# An Attacker attempt that did not run or was not judged: it shows nothing, so no count of attempts includes it.
+UNASSESSED = {*SESSION_FAILURES, "cancelled", "spending_exhausted", "environment_unavailable", "infrastructure_failure", "running"}
 STOPPED = {"unknown": "result unclear", "cancelled": "cancelled", "spending_exhausted": "stopped by the spending cap", "running": "unfinished",
            "insufficient_time": "its agent timeout is longer than the time left before the time limit"}
 WAITING = {"unattempted": "Not attempted", "unavailable": "Not attempted, no guidance", "not_requested": "Not attempted, hints not requested",
            "not_needed": "Not run, the previous step did not exploit it",
-           "not_applicable": "Not attempted, no hint for correct work"}
+           "not_applicable": "Not attempted, no hint for correct work", "withdrawn": "Not attempted, a later reading withdrew the finding"}
 
 
 def ending(attempt: dict, valid_work: bool) -> str:
@@ -1414,10 +1429,18 @@ def problem_lines(report: dict) -> list[str]:
         lines += [f"  - {case['id']}: {oneline(case.get('mechanism') or '').rstrip('.')}"
                   + "".join(f"; {key.replace('_', ' ')} {case[key]}" for key in ("check", "location", "capture_point") if case.get(key))
                   for case in item.get("cases", [])]
+        before = None  # The aimed step before this one, which a step waits on.
         for row in item.get("conditions", []):
             head, verb = CONDITIONS[row["condition"]], "reproduced" if (level, label) in failed else "exploited"
+            waiting = WAITING.get(row["status"], row["status"])
+            if row["status"] == "unattempted" and before and before["status"] in UNASSESSED:
+                waiting = f"Not attempted, the step with {HINTS[before['condition']]} failed ({before['status']})"
+            apart = "; ".join(f"{entry['episode']}, {entry['reward']}, {entry['status']}" + (f": {entry['error'].splitlines()[0]}" if entry["error"] else "")
+                              for entry in row.get("not_assessed", []))
             lines.append(f"  - {head}: " + (f"{row['exploited']} of {row['attempts']} attempts {verb} it, {row['model']}, {row['status']}."
-                                             if row["attempts"] else WAITING.get(row["status"], row["status"]) + "."))
+                                             if row["attempts"] else "No attempt was assessed." if apart else waiting + ".")
+                         + f" Not run or not assessed: {apart}." * bool(apart))
+            before = row if row["condition"] in HINTS else before
     if leads:
         lines.append("- Leads, which no evidence confirmed: "
                      + ", ".join(f"{item.get('id') or 'an older problem'} ({item['cause'].rstrip('.')})" for item in leads) + ".")
@@ -1562,8 +1585,12 @@ def headline(report: dict, record: RunRecord, stop=None) -> str:
     unresolved = "".join(f" Evidence stayed unresolved in {', '.join(STEPS[name] for name in report['unresolved'])}, so the run may miss more."
                          for _ in report["unresolved"][:1])
     failed = "".join(f"; before that {', '.join(f'{STEPS[name]} failed' for name in record.failed_phases)}" for _ in record.failed_phases[:1])
+    if record.stop_reason:
+        return f"Stopped{took}: {record.stop_reason.rstrip('.')}{failed}. Results below are what was found so far."
     if stop:
         return f"Stopped: {stop}{failed}. Results below are what was found so far."
+    if report["status"] == "running":
+        return "Still running. Results below are what was found so far; the final report replaces this one."
     if any(warning.startswith("cancelled during ") for warning in record.warnings):
         return f"Stopped by you{took}{failed}. Results below are what was found so far."
     if any(warning.startswith("stopped by a termination signal during ") for warning in record.warnings):

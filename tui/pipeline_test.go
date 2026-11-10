@@ -97,7 +97,7 @@ func TestPipelineHacksScreen(t *testing.T) {
 	s := plainText(renderLive(l, l.Last.at(), 100, 0))
 	snapshot(t, "pipeline-hacks", "screen.txt", s)
 	for _, want := range []string{
-		"HACKS ⣾ 8:50", "hack inspector + Attackers", "AGENTS  5 of 6 slots",
+		"HACKS ⣾ 8:50", "hack inspector", "AGENTS  5 of 6 slots",
 		"hack-broad", "hack-grader_tamperi…", "no extra informatio…", "P2 full instructions", "0002-attacker, try 1", "P1 only a hint",
 		"FINDINGS", "judge", "reproduce", "full instructions", "only a hint",
 		"+ experiment-0002, experiment-0005 same as P1",
@@ -332,8 +332,9 @@ func TestPipelinePendingPieces(t *testing.T) {
 	}
 }
 
-// The hacks' counts are those of their own end: later attacks, and an Attacker's problem judged later, belong to the grader piece.
-func TestPipelineHackCountsFreeze(t *testing.T) {
+// The one attack runs on after the hack inspection ends, so the hacks' counts follow it: a later exploit of a problem of
+// the hacks, and an Attacker's problem judged later, count.
+func TestPipelineHackCountsFollowTheAttack(t *testing.T) {
 	l := liveFrom(t, ev("00:00", "run_start", `, "backend": "docker", "analyses": ["hack", "simulation", "grader", "attack"]`)+
 		ev("00:00", "phase_start", `, "phase": "hack", "slots": 6`)+
 		ev("00:01", "judged", `, "inspector": "hack", "finding": "experiment-0000", "problem": "P1", "new": true, "cause": "c1"`)+
@@ -350,8 +351,8 @@ func TestPipelineHackCountsFreeze(t *testing.T) {
 		ev("03:30", "judged", `, "inspector": "attack", "finding": "0000-attacker", "problem": "A1", "new": true, "cause": "c2"`)+
 		ev("03:30", "attempt_result", `, "episode": "0000-attacker", "problem": "A1", "level": "none", "status": "evidenced_issue"`))
 	s := plainText(renderLive(l, at9("04:00"), 100, 0))
-	if !strings.Contains(s, "HACKS ✓ 1:00  1 problem, 0 exploited") {
-		t.Errorf("hacks counts changed:\n%s", s)
+	if !strings.Contains(s, "HACKS ✓ 1:00  2 problems, 2 exploited") {
+		t.Errorf("hacks counts:\n%s", s)
 	}
 	if got := strings.Join(strings.Fields(strings.TrimPrefix(strings.TrimSpace(row(s, "grader-0 c1")), "grader-0 c1")), " "); got != "same as P1" {
 		t.Errorf("grader-0 row: %q", got)

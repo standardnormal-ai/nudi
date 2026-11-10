@@ -125,10 +125,10 @@ class Analyses:
         return result
 
     async def attack(self, run, *, maximum_attempts, discovery_attempts, feed, problems=(), deadline=None, minimal_hints=True,
-                     gate=None, judge=None):
+                     gate=None, judge=None, current=None):
         """The run's one attack: it records the candidates it is fed, then its call once the feed closes, and tests each
         without evidence."""
-        self.deadline, self.minimal_hints, self.gates["attack"] = deadline, minimal_hints, gate
+        self.deadline, self.minimal_hints, self.gates["attack"], self.current = deadline, minimal_hints, gate, current
         while (item := await feed.get()) is not None:
             self.early.append(item)
         self.calls.append(("attack", maximum_attempts, discovery_attempts, len(self.early)))
@@ -146,7 +146,7 @@ class Analyses:
 
 def after_feed(fake):
     """`fake` as the attack, called with the candidates it was fed once its feed closes."""
-    async def attack(run, *, feed, gate=None, judge=None, **options):
+    async def attack(run, *, feed, gate=None, judge=None, current=None, **options):
         candidates = []
         while (item := await feed.get()) is not None:
             candidates.append(item)
@@ -729,6 +729,66 @@ def judged_events(run_dir):
             for item in map(json.loads, (run_dir / "events.jsonl").read_text().splitlines()) if item["kind"] == "judged"]
 
 
+def test_the_report_so_far_is_written_after_the_first_confirmation_and_the_final_report_replaces_it(tmp_path, monkeypatch):
+    """A long run's findings are readable before it ends: each judged finding writes report.json and report.md from the
+    records so far, with status `running`, and the report at the end replaces them."""
+    analyses = Analyses(monkeypatch, candidates=pipe_findings()[1:2])
+    inspect_hacks, seen = analyses.inspect_hacks, []
+
+    async def hacks(run, *, on_evidence, **options):
+        async def heard(result, index):
+            await on_evidence(result, index)
+            seen.append(json.loads((run.config.output_dir / "report.json").read_text()))
+            seen.append((run.config.output_dir / "report.md").read_text())
+
+        return await inspect_hacks(run, on_evidence=heard, **options)
+
+    monkeypatch.setattr(send, "inspect_hacks", hacks)
+    built = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
+    so_far, markdown = seen
+    assert so_far["status"] == "running" and so_far["unfinished"] == {"attack": "not started"}
+    assert so_far["outcome"] == ("Still running. Results below are what was found so far; the final report replaces this one.")
+    assert not any("selected but not run" in warning or "coverage is incomplete" in warning for warning in so_far["warnings"])
+    assert markdown.startswith("# nudi report\n\n## Answer\n\n- Still running.")
+    assert built["status"] == "complete" and json.loads((tmp_path / "run" / "report.json").read_text()) == built
+    # Work left running after a stop writes no report over the final one.
+    assert analyses.run.publish is None
+
+
+def test_a_report_so_far_that_cannot_be_written_is_a_warning_and_the_run_goes_on(tmp_path, monkeypatch):
+    Analyses(monkeypatch, candidates=pipe_findings()[1:2])
+    write = report.write
+
+    def failing(run_dir, secrets=(), selected=None, stop=None, running=False):
+        if running:
+            raise ValueError("unreadable record")
+        return write(run_dir, secrets, selected, stop)
+
+    monkeypatch.setattr(report, "write", failing)
+    built = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
+    assert built["status"] == "complete"
+    assert "run: the report so far could not be written: ValueError: unreadable record" in built["warnings"]
+
+
+def test_each_confirmation_and_no_other_event_writes_the_report_so_far(tmp_path):
+    """A judged finding of this run, an evidenced Attacker result, a revised reading and a withdrawn Attacker write the report
+    so far; a judgement an attack rerun repeats from the earlier run, another result and other events do not."""
+    published = []
+    record = SimpleNamespace(known_cost=0.0, unknown_cost_calls=0, cancelled_calls=0)
+    run = SimpleNamespace(config=SimpleNamespace(output_dir=tmp_path), record=record, events_failed=False, jobs={},
+                          publish=lambda: published.append(len((tmp_path / "events.jsonl").read_text().splitlines())))
+    run_state.event(run, "judged", "judged", None, problem="P1", replayed=True)
+    run_state.event(run, "attempt_result", "result", None, episode="0001-attacker", status="no_evidenced_issue")
+    run_state.event(run, "phase_end", "ended", None, phase="hack")
+    run_state.event(run, "judged", "judged", None, problem="P2")
+    run_state.event(run, "attempt_result", "result", None, episode="0002-attacker", status="evidenced_issue")
+    # A withdrawal or correction of a finding writes it too.
+    run_state.event(run, "revised", "read again", None, inspector="hack", id="check-0", index=1)
+    run_state.event(run, "withdrawn", "withdrawn", None, candidate="hack-0")
+    # Each after its own event is in the log.
+    assert published == [4, 5, 6, 7]
+
+
 def test_one_judge_call_per_evidenced_reading_names_its_problem_and_each_problem_is_attacked_once(tmp_path, monkeypatch):
     """One flaw read several ways is several findings, and attacking each of them can spend every attempt on that flaw
     while another is never attacked. Each evidenced reading, as it is recorded, is judged by one call of the inspector
@@ -797,6 +857,23 @@ def test_a_reading_again_of_a_judged_check_joins_its_problem_without_a_judge_cal
     assert requests == [] and (problem.members, problem.findings) == (["hack-0"], ["hack-0", "hack-1"])
     assert [item["id"] for item in problem.cases] == ["hack-0"]
     assert [item.id for item in analyses.candidates_sent] == ["hack-1"]
+
+
+def test_a_fed_finding_a_later_reading_of_its_check_withdrew_is_no_longer_current(tmp_path, monkeypatch):
+    """The attack asks, before an Attacker starts, whether its finding still stands: a later legitimate reading of
+    hack-0's check withdrew it, while hack-1 stands."""
+    judge_replies(monkeypatch, [{"same_as": None}, {"same_as": None}])
+    analyses = Analyses(monkeypatch, judging=True)
+
+    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate):
+        report = hack_findings(("accepted_invalid", "grader_tampering", REPRODUCTION), ("accepted_invalid", "grader_tampering", REPRODUCTION))
+        await evidence_each(report, on_evidence, [0, 1])
+        report.assessments.append(report.assessments[0].model_copy(update={"outcome": "legitimate"}))
+        return report
+
+    monkeypatch.setattr(send, "inspect_hacks", inspect_hacks)
+    send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
+    assert [analyses.current(item) for item in analyses.candidates_sent] == [False, True]
 
 
 def test_the_judge_runs_with_its_own_callbacks_so_it_is_no_turn_of_the_inspector_it_runs_inside(tmp_path, monkeypatch):
@@ -1448,6 +1525,29 @@ def test_a_time_limit_ends_the_run_as_a_stop_does_and_exits_1(tmp_path, monkeypa
     assert log[-2]["text"] == error.splitlines()[-1]
     assert fields(log)[-2:] == [{"kind": "time_limit", "phases": ["grader", "attack"], "minutes": 0.01},
                                    {"kind": "run_end", "status": "time_limit", "report": "report.json"}]
+
+
+def test_an_account_refusal_stops_every_analysis_and_names_its_agent_and_reason(tmp_path, monkeypatch, capsys):
+    """After a spend limit every call fails, so the run stops at once instead of starting sessions and Attackers that
+    fail within minutes. stderr, events.jsonl and the report's first line say why and whose call it was; what finished stays."""
+    monkeypatch.setattr(send, "elapsed", lambda started: "0:00:00")
+    analyses = Analyses(monkeypatch)
+    said = "the model provider refused a call of the hack inspector (hack-broad): API key spend limit exceeded."
+
+    async def refusing(run, *, focused_attempts, **_):
+        (run.config.output_dir / "inspection-hack.json").write_text(analyses.inspection(run, "hack").model_dump_json())
+        run.refused("hack inspector (hack-broad)", "API key spend limit exceeded.")
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(send, "inspect_hacks", refusing)
+    assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run")]) == 1
+    output, error = capsys.readouterr()
+    assert f"nudi: stopping the run: {said}" in logged(error)
+    assert "nudi: hack inspector stopped after 0:00:00: the model provider refused calls" in logged(error)
+    assert f"- Stopped: {said.rstrip('.')}. Results below are what was found so far.\n" in output
+    built = json.loads((tmp_path / "run" / "report.json").read_text())
+    assert (built["status"], built["analyses"]["simulation"]) == ("stopped", "complete")
+    assert fields(events(tmp_path / "run"))[-1] == {"kind": "run_end", "status": "stopped", "error": said, "report": "report.json"}
 
 
 def sleeping(run, *args, **options):
@@ -2617,3 +2717,63 @@ def test_a_count_of_one_on_a_step_line_is_singular():
     assert send.phase_words("attack", {"attempts": 1, "findings": 0, "exploits": 0, "correct_work_failed": 0}) == "1 attempt, 0 exploits"
     assert send.phase_words("hack", {"experiments": 1, "assessments": 1}) == "1 experiment, 1 assessment"
     assert send.phase_words("grader", {"experiments": 2, "assessments": 1}) == "2 experiments, 1 assessment"
+
+
+def test_a_finding_judged_after_the_attack_returned_is_still_saved_as_a_problem(tmp_path, monkeypatch):
+    """The spending cap ended the attack while the hack inspector's admitted call finished. The finding that call evidenced
+    is judged afterwards; the attack record and the report keep its problem, which was not attacked."""
+    from test_runner import CONTRACT_TASK
+
+    analyses, returned = Analyses(monkeypatch), asyncio.Event()
+
+    async def capped(run, *, problems, maximum_attempts, discovery_attempts, **options):
+        result = AttackResult(status="spending_exhausted", maximum_attempts=maximum_attempts, discovery_attempts=discovery_attempts,
+                              problems=problems, discovery={"none": "spending_exhausted"})
+        (run.config.output_dir / "attack.json").write_text(result.model_dump_json())
+        returned.set()
+        return result
+
+    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate):
+        report = hack_findings(("accepted_invalid", "grader_tampering", REPRODUCTION))
+        (run.config.output_dir / "inspection-hack.json").write_text(report.model_dump_json())
+        await returned.wait()
+        await evidence_each(report, on_evidence, [0])
+        return report
+
+    monkeypatch.setattr(send, "attack", capped)
+    monkeypatch.setattr(send, "inspect_hacks", inspect_hacks)
+    built = send_nudis(CONTRACT_TASK, output_dir=tmp_path / "run", analysis="hacking")
+    saved = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text())
+    assert [(problem.id, problem.findings) for problem in saved.problems] == [("P1", ["hack-0"])]
+    assert [problem["id"] for problem in built["attack"]["problems"]] == ["P1"]
+
+
+def test_a_sibling_stop_keeps_the_exploit_an_attack_inspector_interpreted_before_its_session_returned(tmp_path, monkeypatch):
+    """The attack inspector had saved its reading of a no-hint exploit when the hack inspection's task environment could
+    not start, which cancelled its session. The attack record keeps that reading, so the report keeps the exploit."""
+    from nudi.records import EnvironmentUnavailable
+    from test_attack import judged
+    from test_runner import CONTRACT_TASK
+
+    analyses, interpreted = Analyses(monkeypatch), asyncio.Event()
+
+    async def judge(target, episode):
+        return "accepted_invalid"
+
+    real_early_attack(monkeypatch, judge)
+
+    async def inspect(run, mode, pool, *args, title, **kwargs):
+        (run.config.output_dir / f"inspection-{title}.json").write_text(judged(pool[0], "accepted_invalid").model_dump_json())
+        interpreted.set()
+        await asyncio.sleep(30)
+
+    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate):
+        await interpreted.wait()
+        raise EnvironmentUnavailable("the task's image failed to start")
+
+    monkeypatch.setattr(attack, "inspect", inspect)
+    monkeypatch.setattr(send, "inspect_hacks", inspect_hacks)
+    built = send_nudis(CONTRACT_TASK, output_dir=tmp_path / "run", analysis="hacking", minimal_hints=False)
+    saved = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text())
+    assert [(item.episode, item.status) for item in saved.attempts] == [("0000-attacker", "evidenced_issue")]
+    assert [item["attempt"] for item in built["attack"]["exploits"]["discovery"]] == [0]

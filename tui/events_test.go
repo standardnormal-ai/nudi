@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -271,5 +272,42 @@ func TestAPhaseEndKeepsTheOtherAnalysesAgents(t *testing.T) {
 	}
 	if got := running(); got != "" {
 		t.Fatalf("after the attack: %s", got)
+	}
+}
+
+// While the run goes, nudi rewrites report.json after each confirmation with status running; only the final one ends
+// the follow, and after run_end a report still running is no final report.
+func TestFollowKeepsFollowingARunningReport(t *testing.T) {
+	body, err := os.ReadFile("testdata/clean/report.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["status"] = "running"
+	running, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := writeReport(t, string(running))
+	addLog(t, dir, ev("00:00", "run_start", `, "pid": `+strconv.Itoa(os.Getpid())))
+	f, l := &follower{dir: dir}, &Live{Dir: dir}
+	if _, r, err := f.poll(l); r != nil || err != nil {
+		t.Fatalf("a running report ended the follow: %v %v", r, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "report.json"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, r, err := f.poll(l); r == nil || err != nil || r.Status == "running" {
+		t.Fatalf("the final report did not end the follow: %v %v", r, err)
+	}
+
+	dir = writeReport(t, string(running))
+	addLog(t, dir, ev("00:00", "run_start", `, "pid": `+strconv.Itoa(os.Getpid()))+ev("00:01", "run_end", `, "status": "stopped", "report": "report.json"`))
+	_, r, err := (&follower{dir: dir}).poll(&Live{Dir: dir})
+	if r != nil || err == nil || !strings.Contains(err.Error(), "written while it ran; nudi report") {
+		t.Fatalf("after run_end: %v %v", r, err)
 	}
 }

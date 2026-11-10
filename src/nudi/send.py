@@ -387,8 +387,8 @@ async def send_nudis_async(task_dir, config=None, **options) -> dict:
     selected roles' credentials are validated before any episode starts, and the output
     directory must be new or empty. The report is
     also written as `report.json` and `report.md` in the output directory, after
-    cancellation too. With `time_limit` the run stops at that many minutes as a cancelled
-    run does, and returns its report with status `time_limit`, or `partial` when a phase
+    cancellation too; until then each confirmation writes the report so far there, with status `running`.
+    With `time_limit` the run stops at that many minutes as a cancelled run does, and returns its report with status `time_limit`, or `partial` when a phase
     failed before. Every state copy of the run is deleted first, also after a failure.
     Each progress line, and then how the run ended, is appended to `events.jsonl` there as it happens. With `attack_from`
     the run copies an earlier run's inspection records and runs only the attack on them."""
@@ -411,7 +411,7 @@ async def send_nudis_async(task_dir, config=None, **options) -> dict:
         if earlier:
             take_over(run, earlier, results)
         result = await run_analyses(run, settings, selected, results)
-        ending = {"status": result["status"]}
+        ending = {"status": result["status"], **({"error": run.record.stop_reason} if run.record.stop_reason else {})}
         return result
     except (asyncio.CancelledError, KeyboardInterrupt):
         ending = {"status": "cancelled"}
@@ -471,8 +471,18 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
     """Run the `selected` analyses, except those already in `results`, each as soon as what it reads exists, write the
     report after cleanup, and return it. The Simulator, the hack inspector and the attack start at once; the grader
     inspector starts when the simulation has ended. A task environment that cannot start, or a full disk, in one analysis
-    stops the others."""
+    stops the others. Until the final report, each confirmation writes the report so far, with status `running`."""
 
+    def publish():
+        """The report so far, from the records saved so far and this run's record; one that cannot be built is a
+        warning, and the run goes on."""
+        try:
+            run.save()
+            report.write(settings.output_dir, run.keys.values(), selected, running=True)
+        except Exception as error:
+            run.warn(f"the report so far could not be written: {type(error).__name__}: {redacted(run, str(error))}")
+
+    run.publish = publish
     problems = []
     judge = judging(run, problems)
     # One set of slots for the run: each Simulator episode, inspector session and Attacker attempt holds one.
@@ -501,6 +511,14 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
             event(run, "reproduced", f"{SOURCES[inspector][1]} found {problem.id}", problem=problem.id, result="evidenced")
         return problem
 
+    live = {}  # Each inspection's record as it grows, from its evidence hook.
+
+    def current(item) -> bool:
+        """Whether a fed finding still stands: its check, or the finding itself without one, is still a candidate."""
+        inspector = item.id.split("-")[0]
+        return inspector not in live or any((other.check or other.id) == (item.check or item.id)
+                                            for other in guidance(**{inspector: live[inspector]})["candidates"])
+
     def attack_on(item, problem) -> None:
         """Feed a problem's first finding with full guidance to the attack."""
         if problem.id not in queued and item.guidance["full"]:
@@ -513,10 +531,14 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
             return None
 
         async def hook(report, index):
+            live[inspector] = report
             # A control's reading is no candidate, so it makes no problem.
             item = next((item for item in guidance(**{inspector: report})["candidates"] if item.id == f"{inspector}-{index}"), None)
             if item:
                 attack_on(item, await evidence(inspector, report, item))
+                if "attack" in results:  # The attack has returned, as at the spending cap: its record keeps the problem, not attacked.
+                    write_private(run.config.output_dir / "attack.json",
+                                  results["attack"].model_copy(update={"problems": problems}).model_dump_json(indent=2))
 
         return hook
 
@@ -563,7 +585,8 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
         closed = asyncio.create_task(closing())
         try:
             return await attack(run, maximum_attempts=settings.attacker_tries, discovery_attempts=settings.discovery_attempts, feed=feed,
-                                gate=gate, problems=problems, judge=exploit, deadline=limit.when(), minimal_hints=settings.minimal_hints)
+                                gate=gate, problems=problems, judge=exploit, deadline=limit.when(), minimal_hints=settings.minimal_hints,
+                                current=current)
         finally:
             closed.cancel()
 
@@ -624,6 +647,10 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
         return next((asyncio.CancelledError() if task.cancelled() else task.exception() for task in ended
                      if task.cancelled() or task.exception()), None)
 
+    # An account refusal stops the analyses as a task environment that cannot start does; work it ended is cancelled.
+    refusal = asyncio.Event()
+    run.stop = refusal.set
+
     # A rerun of the attack has the earlier results already, and runs no earlier analysis that failed.
     phases = [name for name in selected if name not in results and name not in run.record.failed_phases]
     tasks = {}
@@ -633,11 +660,12 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
         async with asyncio.timeout(settings.time_limit and settings.time_limit * 60) as limit:
             run.time_limit = settings.time_limit and (limit.when(), settings.time_limit * 60)
             tasks.update({name: asyncio.create_task(step(name)) for name in phases})
+            refused = asyncio.create_task(refusal.wait())
             try:
                 # Each analysis ends on its own; a stop reaches this task at once and waits for them with a bound.
-                while not (stop := stopped()) and not all(task.done() for task in tasks.values()):
-                    await asyncio.wait({task for task in tasks.values() if not task.done()}, return_when=asyncio.FIRST_COMPLETED)
-                if isinstance(stop, asyncio.CancelledError):
+                while not (stop := stopped()) and not refusal.is_set() and not all(task.done() for task in tasks.values()):
+                    await asyncio.wait({refused, *(task for task in tasks.values() if not task.done())}, return_when=asyncio.FIRST_COMPLETED)
+                if isinstance(stop, asyncio.CancelledError) and not refusal.is_set():
                     raise stop
             # A caller's own loop may raise a second Ctrl-C as KeyboardInterrupt, past a CancelledError handler.
             except (asyncio.CancelledError, KeyboardInterrupt):
@@ -655,17 +683,20 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
                     terminated = stopped_by() == "terminated"
                     run.record.warnings.append(f"{'stopped by a termination signal' if terminated else 'cancelled'} during {during}")
                 raise
-            if stop:
+            finally:
+                refused.cancel()
+            if stop or refusal.is_set():
                 # Another analysis's task environment cannot start either, and a full disk stops the run.
                 stopping, others = True, running()
                 for task in tasks.values():
                     task.cancel()
                 await wait_stopping(run, {name: tasks[name] for name in others})
+                why = "the model provider refused calls" if refusal.is_set() else "another analysis stopped the run"
                 for name in others:
                     took = elapsed(begun[name])
-                    event(run, "phase_end", f"{PHASES[name][0]} stopped after {took}: another analysis stopped the run", logging.WARNING,
+                    event(run, "phase_end", f"{PHASES[name][0]} stopped after {took}: {why}", logging.WARNING,
                           phase=name, elapsed=took, status="cancelled")
-                if not isinstance(stop, EnvironmentUnavailable):
+                if stop and not isinstance(stop, (EnvironmentUnavailable, asyncio.CancelledError)):
                     raise stop
         # A phase that caught the limit's cancellation and returned ends the block normally.
         run.record.time_limit_reached = limit.expired()
@@ -679,6 +710,8 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
             await (wait_stopping(run, {"the deletion of state copies": deleting}) if stopping else finish_cleanup(deleting))
         finally:
             try:
+                # Work left running after a stop writes no report over the final one.
+                run.publish = None
                 run.record.ended_at = datetime.now(timezone.utc).isoformat()
                 run.save()
             finally:

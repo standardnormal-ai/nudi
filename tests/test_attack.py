@@ -2652,6 +2652,33 @@ def test_a_candidate_fed_before_the_feed_closes_still_runs_and_an_empty_fed_atta
     assert result.status == "complete"
 
 
+def test_a_queued_finding_withdrawn_before_its_slot_frees_launches_no_attacker(tmp_path, monkeypatch, credentials):
+    """A fed finding waits for a slot; a later reading withdrew it meanwhile, so its Attacker never starts. Its steps say
+    so, the event names it, and the attack is complete."""
+    run = new_run(tmp_path, monkeypatch, credentials, concurrency=4)
+    monkeypatch.setattr(run_state, "run_episode", scripted_episodes)
+    monkeypatch.setattr(attack_module, "inspect", scripted_judge({})[0])
+    withdrawn = {"hack-0"}
+
+    async def main():
+        feed, gate = asyncio.Queue(), asyncio.Semaphore(1)
+        await gate.acquire()
+        attacking = asyncio.create_task(attack_module.attack(run, maximum_attempts=1, discovery_attempts=0, feed=feed, gate=gate,
+                                                             current=lambda item: item.id not in withdrawn))
+        for item in (candidate("hack-0", "FULL-0", "MINIMAL-0"), candidate("hack-1", "FULL-1"), None):
+            feed.put_nowait(item)
+        await asyncio.sleep(0.05)
+        gate.release()
+        return await attacking
+
+    result = asyncio.run(main())
+    assert [item.context for item in result.attempts] == ["attacker-hack-1-full-1"]
+    assert result.candidates[0].conditions == {"full": "withdrawn", "minimal": "withdrawn", "none": "withdrawn"}
+    assert result.status == "complete"
+    events = [json.loads(line) for line in (run.config.output_dir / "events.jsonl").read_text().splitlines()]
+    assert [item["candidate"] for item in events if item["kind"] == "withdrawn"] == ["hack-0"]
+
+
 def test_a_hint_that_worked_is_followed_by_a_no_hint_attempt_on_the_same_problem(tmp_path, monkeypatch, credentials):
     """hack-0's full hint and then its single hint reproduce it, so a no-hint attempt targets it: the Attacker gets the
     independent attempt's instruction and only its attack inspector is told the target. The single hint says only an

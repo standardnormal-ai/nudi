@@ -2,7 +2,7 @@
  concurrency 12 of 12
 
  HACKS ⣾ 8:50
- hack inspector + Attackers
+ hack inspector
 
  AGENTS  5 of 6 slots
  ╭──────────────────────╮╭──────────────────────╮╭──────────────────────╮╭──────────────────────╮
