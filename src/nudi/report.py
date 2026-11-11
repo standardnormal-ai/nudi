@@ -13,14 +13,13 @@ import operator
 import re
 import statistics
 from collections import Counter
-from itertools import takewhile
 from datetime import datetime, timedelta
 from fractions import Fraction
 from pathlib import Path
 
 from nudi.assessment import Evidence, Ungrounded, classify_probe, conclusions, satisfied
 from nudi.attack import SESSION_FAILURES, AttackAttempt, AttackResult
-from nudi.inspection import InspectionResult, evidenced
+from nudi.inspection import InspectionResult, evidenced, replaced, scope as inspection_scope
 from nudi.records import (CANCELLED, PROVIDER_REPORTED, Assessment, CallRecord, EpisodeResult, MetricBasis, Observation, RunRecord,
                           write_private)
 
@@ -155,6 +154,10 @@ def build(run_dir: Path, secrets=(), selected=None, stop=None, running=False) ->
                   else "partial" if unfinished else "complete",
         "unfinished": unfinished,
         "unresolved": [name for name, status in analyses.items() if status != "complete" and name not in unfinished],
+        "elapsed": (datetime.fromisoformat(record.ended_at) - datetime.fromisoformat(record.started_at)).total_seconds()
+                   if record.started_at and record.ended_at else None,
+        "stop": stopped(record, analyses, stop),
+        "phase_errors": phase_errors(record),
         "analyses": analyses,
         "configuration": configuration_section(record, results),
         "copies": state_copies(record),
@@ -174,6 +177,9 @@ def build(run_dir: Path, secrets=(), selected=None, stop=None, running=False) ->
         "warnings": warnings,
         "notes": notes,
     }
+    held = {name for item in (report["attack"] or {}).get("problems", []) for name in item["findings"]}
+    report["ungrouped"] = [name for mode in ("grader", "hack") if mode in loaded
+                           for item in current(report["inspections"][f"{mode}_inspector"]) if (name := f"{mode}-{item['index']}") not in held]
     if "grader" in loaded:
         report["labels"] = labels(pool, loaded["grader"], warnings)
         report["metrics"] = metrics(run_dir, pool, results, loaded["grader"], warnings)
@@ -191,6 +197,35 @@ def build(run_dir: Path, secrets=(), selected=None, stop=None, running=False) ->
     report["outcome"] = scrub(headline(report, record, stop), secrets)
     report["answer"] = [report["outcome"], *scrub(answer(report), secrets)]
     return report
+
+
+def stopped(record: RunRecord, analyses: dict, stop: str | None) -> dict | None:
+    """Why the run stopped before its end, as data: its `kind`, the analysis it stopped (`phase`), the time limit's
+    `minutes`, and the `reason` a caller such as `nudi report` gave or the provider's account refusal; None for a run
+    that ended on its own. Ctrl-C, SIGTERM and the time limit are read from the warnings the run recorded, the spending
+    cap from the analyses' statuses."""
+    found = {"kind": None, "phase": None, "minutes": None, "reason": stop}
+    if record.stop_reason:
+        return found | {"kind": "provider_refused", "reason": record.stop_reason}
+    for warning in record.warnings:
+        if match := re.fullmatch(r"(cancelled|stopped by a termination signal) during (.+)", warning):
+            return found | {"kind": "cancelled" if match[1] == "cancelled" else "terminated", "phase": match[2]}
+    if stop:
+        return found | {"kind": "stopped"}
+    if record.time_limit_reached:
+        for warning in record.warnings:
+            if match := re.fullmatch(r"the run stopped at its time limit of (\S+) minutes during (.+)", warning):
+                return found | {"kind": "time_limit", "minutes": float(match[1]), "phase": match[2]}
+        return found | {"kind": "time_limit"}
+    if capped := [name for name, status in analyses.items() if status == "spending_exhausted"]:
+        return found | {"kind": "spending_cap", "phase": capped[0]}
+    return None
+
+
+def phase_errors(record: RunRecord) -> dict[str, str]:
+    """The error of each analysis that raised one, from its `NAME failed: ERROR` or `NAME stopped: ERROR` warning."""
+    return {match[1]: match[2] for warning in record.warnings
+            if (match := re.fullmatch(rf"({'|'.join(ANALYSES)}) (?:failed|stopped): (.*)", warning, re.DOTALL))}
 
 
 def write(run_dir: Path, secrets=(), selected=None, stop=None, running=False) -> tuple[Path, Path]:
@@ -348,16 +383,23 @@ def summarize(key: str, names: list[str], results: dict) -> dict:
             "share": share, "distribution": [[value, count] for value, count in distribution], "unavailable": unavailable}
 
 
-def tags(named: list[str], results: dict, simulation) -> str:
-    """The timeouts, error types and refusal signals the named episodes recorded, each by name."""
-    recorded = {name: ["agent timeout"] * results[name].agent_timeout + ["verifier timeout"] * results[name].verifier_timeout
-                + [f"error {error.type}" for error in simulation.failures.get(name, [])]
-                + [f"refusal {signal}" for signal in simulation.refusals.get(name, [])] for name in named}
-    listing = "; ".join(f"{name} {', '.join(items)}" for name, items in recorded.items() if items)
-    tagged = sum(bool(items) for items in recorded.values())
+def recorded(named: list[str], results: dict, simulation) -> dict[str, dict]:
+    """The timeouts, error types and refusal signals each named episode recorded."""
+    return {name: {"agent_timeout": results[name].agent_timeout, "verifier_timeout": results[name].verifier_timeout,
+                   "errors": [error.type for error in simulation.failures.get(name, [])],
+                   "refusals": list(simulation.refusals.get(name, []))} for name in named}
+
+
+def tags(facts: dict[str, dict]) -> str:
+    """What the episodes of `recorded` recorded, each by name."""
+    found = {name: ["agent timeout"] * item["agent_timeout"] + ["verifier timeout"] * item["verifier_timeout"]
+             + [f"error {error}" for error in item["errors"]] + [f"refusal {signal}" for signal in item["refusals"]]
+             for name, item in facts.items()}
+    listing = "; ".join(f"{name} {', '.join(items)}" for name, items in found.items() if items)
+    tagged = sum(bool(items) for items in found.values())
     if not tagged:
         return "None recorded an error, timeout or refusal."
-    if tagged == len(named):
+    if tagged == len(found):
         return f"Every one recorded an error, timeout or refusal ({listing}), so time limits or infrastructure may explain the pattern."
     return f"{tagged} of them recorded an agent timeout, verifier timeout, error or refusal ({listing})."
 
@@ -398,10 +440,10 @@ def distribution_flags(report: dict, results: dict, simulation) -> None:
                     f"Every usable episode {'passes' if rule[0]['pass_rate']['numerator'] else 'fails'} its grounded decision rule."
                     if rule else f"Whether {fields['value']} is the grader's maximum or minimum is not established.")
                 fields["bound"] = f"{wilson(0, len(values))[1]:.0%}"
-                found = {"identical_rewards": (list(values), None)}
+                found, quartiles = {"identical_rewards": (list(values), None)}, None
             else:
                 q1, _, q3 = statistics.quantiles(values.values(), n=4, method="inclusive")
-                low, high = q1 - 3 * (q3 - q1), q3 + 3 * (q3 - q1)
+                low, high, quartiles = q1 - 3 * (q3 - q1), q3 + 3 * (q3 - q1), [q1, q3]
                 found = {"low_minority": ([name for name, value in values.items() if value < low], low),
                          "high_minority": ([name for name, value in values.items() if value > high], high)}
             share, excluded, shared = summary["share"], summary["attempted"] - len(values), []
@@ -419,13 +461,14 @@ def distribution_flags(report: dict, results: dict, simulation) -> None:
                 shared.append(f"{key!r} is a component or metric; its use as a training reward is not established.")
             for flag, (named, fence) in found.items():
                 if named:
+                    facts = recorded(named, results, simulation)
                     text = FLAG_TEXT[flag].format(**fields, count=len(named), fence=number(fence),
-                                                  named=", ".join(f"{name} {number(values[name])}" for name in named),
-                                                  tags=tags(named, results, simulation))
+                                                  named=", ".join(f"{name} {number(values[name])}" for name in named), tags=tags(facts))
                     clauses = [text, *shared]
                     if labels is not None:
                         clauses.append(label_clause(named, labels))
-                    summary["flags"].append({"flag": flag, "episodes": named, "text": " ".join(clauses)})
+                    summary["flags"].append({"flag": flag, "episodes": named, "text": " ".join(clauses), "quartiles": quartiles,
+                                             "fence": fence, "minimum": FLAG_MINIMUM, "recorded": facts})
 
 
 def ordinary(record: RunRecord, results: dict, warnings: list[str], notes: list[str]) -> dict:
@@ -460,7 +503,10 @@ def ordinary(record: RunRecord, results: dict, warnings: list[str], notes: list[
             elif distribution and summary["usable"] < FLAG_MINIMUM:
                 # From FLAG_MINIMUM usable rewards the identical_rewards flag replaces this note.
                 notes.append(f"{label}: constant {distribution[0][0]} across {summary['usable']} usable rewards; {DESCRIPTIVE}")
-        summaries.append({"configuration": config, "episodes": names, "rewards": rewards})
+        # A value that is not a finite number is null, as JSON has no other.
+        by_episode = {name: {key: value if value is not None and math.isfinite(value) else None
+                             for key, value in results[name].rewards.items()} for name in names}
+        summaries.append({"configuration": config, "episodes": names, "rewards": rewards, "episode_rewards": by_episode})
     return {"requested": simulation.requested, "attempted": len(simulation.episodes), "status": simulation.status,
             "unrecorded": unrecorded, "refusals": simulation.refusals,
             "failures": {name: [f"{error.type}: {error.message}" for error in errors] for name, errors in simulation.failures.items()},
@@ -841,7 +887,7 @@ def finding(assessment: Assessment, category: str | None = None, experiment: str
     return {
         "execution_scope": assessment.execution_scope, "category": category, "experiment": experiment,
         "claim": {"mechanism": claim.mechanism, "episode": claim.episode, "reward": claim.reward, "unresolved": claim.unresolved,
-                  "limits": claim.limits},
+                  "limits": claim.limits, "use": dump(claim.use)},
         "captured": {
             "copied_grader_reward" if assessment.execution_scope == "package" else "native_reward": assessment.reward,
             "ids": assessment.ids,
@@ -868,14 +914,19 @@ def result_of(assessment: Assessment) -> str:
     return "legitimate" if assessment.outcome == "legitimate" and not assessment.claim.unresolved else "inconclusive"
 
 
-def findings(assessments: list[Assessment], links: dict[int, dict] | None = None) -> dict:
+def findings(assessments: list[Assessment], links: dict[int, dict] | None = None, experiments: list[dict] = ()) -> dict:
     """Every finding by nudi's result, with its index into the inspection's assessments.
 
-    Category settlement reads a check's latest reading, so an earlier one names that reading as superseding it
+    Category settlement reads a check's latest reading, and an experiment that a later one of `experiments` replaces
+    through its replacement's, as `open` does, so an earlier one names that reading as superseding it
     and stays listed, since its evidence and open conditions can still explain a label, metric or category.
     A claim without a check is never superseded. Each finding keeps its execution scope, so package evidence
     stays distinct from native accessibility, and the category and experiment `links` give it."""
     latest = {item.claim.check: index for index, item in enumerate(assessments) if item.claim.check}
+    answered, checks = replaced(experiments, assessments), {row["id"]: row.get("check") for row in experiments}
+    for row in experiments:
+        if (gone := checks.get(row.get("replaces"))) in answered and row.get("check") in latest:
+            latest[gone] = latest[row["check"]]
     groups = {"evidenced": [], "legitimate": [], "inconclusive": []}
     for index, assessment in enumerate(assessments):
         later = latest.get(assessment.claim.check, index)
@@ -908,23 +959,25 @@ def inspection(mode: str, result: InspectionResult, warnings: list[str]) -> dict
         category = result.attempts[review.attempt].category
         if review.reinterprets and review.assessment is not None and category:
             links.setdefault(review.assessment, {})["category"] = category
-    given = {"hack_inspection": result.hack_inspection, "hack_findings": result.hack_findings} if mode == "grader" else {"leads": result.leads}
+    given = {"hack_inspection": result.hack_inspection, "hack_findings": result.hack_findings} if mode == "grader" else {}
     return {"status": result.status, "open": result.open, "suspected": suspected(result, measured), "categories": result.categories,
             "applicability": result.applicability,
             "artifacts": result.artifacts, "limits": result.limits, "experiments": result.experiments,
-            "attempts": [item.model_dump(mode="json") for item in result.attempts], "findings": findings(result.assessments, links), **given}
+            "attempts": [item.model_dump(mode="json") for item in result.attempts], "findings": findings(result.assessments, links, result.experiments), **given}
 
 
 def suspected(result: InspectionResult, measured: dict) -> list[dict]:
-    """Each suspected exploit, by its category and check: a measured experiment, not a control, whose check's latest
-    reading ended unknown, also when the run ended before it was read, in a category and case no evidenced reading has.
+    """Each suspected exploit, by its category and check: a measured experiment, not a control and not replaced, whose check's
+    latest reading ended unknown, also when the run ended before it was read, in a category and case no evidenced reading has.
+    A case is its name with what it measured: the episode or package, location and capture point.
     It is never a problem. `measured` maps each check to its experiment."""
     latest = {item.claim.check: item for item in result.assessments if item.claim.check}
     read = {check: row for check, row in measured.items() if check in latest and not row.get("control")
-            and row.get("status") in ("assessed", "unfinished")}
+            and row.get("status") in ("assessed", "unfinished") and check not in replaced(result.experiments, result.assessments)}
 
     def case(row) -> tuple:
-        return row.get("category"), row.get("case") or row.get("check")
+        return (row.get("category"), row.get("case") or row.get("check"), inspection_scope(row), row.get("location"),
+                row.get("capture_point") or "verification_start")
     shown = {case(row) for check, row in read.items() if evidenced(latest[check])}
     return [{"category": row.get("category"), "check": check} for check, row in read.items()
             if latest[check].outcome == "unknown" and case(row) not in shown]
@@ -996,7 +1049,11 @@ def _separated_attack(result: AttackResult, record: RunRecord, warnings: list[st
             leads.append({"id": problem.id, "cause": problem.cause})
             continue
         scopes = {inspected[name].execution_scope for name in problem.findings if name in inspected}
+        outcomes = {item.get("outcome") for item in problem.cases} | {inspected[name].outcome for name in problem.findings if name in inspected}
+        outcomes &= {"accepted_invalid", "rejected_valid"}
         scope = "native" if "native" in scopes else next(iter(scopes), None)
+        # Only a reading of an `other` experiment proposes a family, so a problem whose findings all do is outside every listed one.
+        families = [inspected[name].claim.family if name in inspected else None for name in problem.findings]
         rank = ladder(needed, valid_work)
         if problem.origin and needed not in LEVELS:  # This run's Attackers did not find it again.
             before = ladder(problem.earlier_exploited_with, valid_work)
@@ -1007,6 +1064,11 @@ def _separated_attack(result: AttackResult, record: RunRecord, warnings: list[st
             "reproduced": bool(reproduced & set(problem.findings)),
             "reproduced_findings": [name for name in problem.findings if name in reproduced], "exploited_with": needed,
             "conditions": conditions(problem, result, record, valid_work), "scope": scope,
+            "outcome": outcomes.pop() if len(outcomes) == 1 else None,
+            "family": families[0] if families and None not in families else None,
+            # Unknown without the inspections, as when only the attack is selected.
+            "evidenced_by_inspector": None if problem.findings and not inspected.keys() & set(problem.findings)
+                                      else bool(current & set(problem.findings)),
             "origin": problem.origin, "earlier_exploited_with": problem.earlier_exploited_with,
             # An attempt that targeted another problem and exploited this one, as the judge named it, once for all its readings.
             "exploited_by": [{"episode": episode, "target": target} for episode, target in dict.fromkeys(
@@ -1027,7 +1089,7 @@ def unrecovered(result) -> bool:
     def work(item) -> set:
         return {(item.level, item.candidate)} if isinstance(item, AttackAttempt) else ({item.category or item.episode} - {None}) or {
             key for key, value in result.categories.items() if value != "restricted"}
-    later, failures = set(), (*SESSION_FAILURES, "infrastructure_failure", "native_timeout")
+    later, failures = set(), FAILURES
     for item in reversed(result.attempts):  # Records keep each work's attempts in the order they started.
         if item.status in failures and not (work(item) and work(item) <= later):
             return True
@@ -1371,7 +1433,8 @@ def rewards(attempt: dict) -> str:
 
 
 # An Attacker attempt that did not run or was not judged: it shows nothing, so no count of attempts includes it.
-UNASSESSED = {*SESSION_FAILURES, "cancelled", "spending_exhausted", "environment_unavailable", "infrastructure_failure", "native_timeout", "running"}
+UNASSESSED = {*SESSION_FAILURES, "cancelled", "spending_exhausted", "environment_unavailable", "infrastructure_failure", "native_timeout",
+              "episode_failure", "running"}
 STOPPED = {"unknown": "result unclear", "cancelled": "cancelled", "spending_exhausted": "stopped by the spending cap", "running": "unfinished",
            "insufficient_time": "its agent timeout is longer than the time left before the time limit"}
 WAITING = {"unattempted": "Not attempted", "unavailable": "Not attempted, no guidance", "not_requested": "Not attempted, hints not requested",
@@ -1415,31 +1478,90 @@ CONDITIONS = {"full": "With full instructions", "minimal": "With only a hint", "
 
 
 # Where each problem id's letter comes from; `problems[].source` in report.json names it too.
-LEGEND = ("P: found by the hack inspector's search. G: found by the grader inspector in the simulations. "
-          "A: found by an Attacker, not among the inspectors' findings.")
+ATTACKER_ALONE = "A: found by an Attacker, not among the inspectors' findings."
+LEGEND = "P: found by the hack inspector's search. G: found by the grader inspector in the simulations. " + ATTACKER_ALONE
+# The A part once an inspector finding joined an Attacker's problem, naming those problems.
+JOINED = "A: first found by an Attacker; inspector findings joined {} later."
+# Where a valid-work problem no Attacker reproduced was shown, by the scope of its findings.
+UNREPRODUCED = {"package": "shown only in a package experiment"}
 
 
-def problem_lines(report: dict) -> list[str]:
-    """The problems by their step on the exploit ladder, highest first, with those where correct work failed on lines of
-    their own; then one line per problem in that order: its id, label, cause, source and findings, or the Attacker
-    episodes of one an Attacker found with no extra information, each of its cases beneath and then each condition an
-    Attacker tried it under; then the leads, problems
-    no evidence confirmed, which a stored report from before leads has at level 1. Older records have no problems, or
-    problems without ids or levels."""
-    attack, sources = report["attack"], candidate_sources(report)
+def ranked(attack: dict) -> tuple[list, list, dict, list]:
+    """The problems' exploit ladder steps, highest first, the steps where correct work failed, the problems of each step,
+    and the leads, problems no evidence confirmed, which a stored report from before leads has at level 1."""
     valid, groups, leads = {item["id"] for item in attack.get("candidates", []) if item["valid_work"]}, {}, list(attack.get("leads", []))
     for item in attack.get("problems", []):
         key = rung(item, valid)
         (leads if key[0] == 1 else groups.setdefault(key, [])).append(item)
     order = sorted(groups, key=lambda key: (-key[0], key[1].endswith(ELSEWHERE)))
     failed = [key for key in order if any(name in valid for name in groups[key][0]["findings"])]
-    steps = [key for key in order if key not in failed]
+    return [key for key in order if key not in failed], failed, groups, leads
+
+
+def unreproduced(key: tuple, item: dict) -> str:
+    """Where correct work no Attacker reproduced was shown, after its label."""
+    return "" if key[0] > 2 else ", " + UNREPRODUCED.get(item.get("scope"), "not reproduced by an Attacker")
+
+
+def legend(groups: dict) -> list[str]:
+    """Where each problem id's letter comes from, when the problems have ids."""
+    joined = [item["id"] for items in groups.values() for item in items if item.get("source") == "Attacker" and item.get("findings")]
+    return [LEGEND.replace(ATTACKER_ALONE, JOINED.format(", ".join(joined))) if joined else LEGEND] * any(
+        item.get("id") for items in groups.values() for item in items)
+
+
+def clauses(attack: dict, sources: dict) -> list[tuple[int, int | None, str, bool]]:
+    """Each Attacker exploit once per attempt and text, named by its problem: two readings of one attempt are one exploit."""
+    found = {}
+    for item in exploits(attack, sources, by_problem=True):
+        found.setdefault((item[0], item[2]), item)
+    return list(found.values())
+
+
+def owner(attack: dict, index: int, assessment: int | None) -> str | None:
+    """The problem of attempt `index`'s finding read in `assessment`: the problem the judge named for an `other` exploit,
+    the problem holding a reproduction's candidate, else the problem whose members hold the episode, else the problem
+    it aimed at; None without one."""
+    attempt, problems = attack["attempts"][index], [item for item in attack.get("problems", []) if item.get("id")]
+    ids = {problem["id"] for problem in problems}
+    for kind, items in attack.get("exploits", {}).items():
+        for item in items:
+            if (item["attempt"], item["assessment"]) != (index, assessment):
+                continue
+            if kind == "other" and item.get("problem") in ids:
+                return item["problem"]
+            held = [problem["id"] for problem in problems if item["candidate"] in problem.get("findings", [])]
+            if kind == "reproduction" and held:
+                return held[0]
+    return next((item["id"] for item in problems if attempt["episode"] in item.get("members", [])),
+                attempt.get("problem") if attempt.get("problem") in {item["id"] for item in problems} else None)
+
+
+def said(attack: dict, assessment: int | None) -> str:
+    """The start of what the attack inspector says the Attacker did, quoted after a colon; empty without it."""
+    return f': "{brief(how)}"' if (how := mechanism(attack, assessment)) else ""
+
+
+def problem_lines(report: dict) -> list[str]:
+    """The problems by their step on the exploit ladder, highest first, with those where correct work failed on lines of
+    their own; then one line per problem in that order: its id, label, cause, source and findings, or the Attacker
+    episodes of one an Attacker found with no extra information, each of its cases beneath, each Attacker exploit of it
+    with the start of what the Attacker did, and then each condition an Attacker tried it under; then the leads, problems
+    no evidence confirmed, which a stored report from before leads has at level 1. Older records have no problems, or
+    problems without ids or levels."""
+    attack, sources = report["attack"], candidate_sources(report)
+    steps, failed, groups, leads = ranked(attack)
+    quoted = clauses(attack, sources)
 
     def ids(key):
         return ", ".join(item.get("id") or "an older problem" for item in groups[key])
     lines = ["Problems by level: " + "; ".join(f"{label}: {ids((level, label))}" for level, label in steps) + "."] * bool(steps)
-    lines += [f"{label}: {ids((level, label))}." for level, label in failed]
-    lines += [LEGEND] * any(item.get("id") for items in groups.values() for item in items)
+    for key in failed:
+        shown = {}
+        for item in groups[key]:
+            shown.setdefault(unreproduced(key, item), []).append(item.get("id") or "an older problem")
+        lines += [f"{key[1]}{where}: {', '.join(names)}." for where, names in shown.items()]
+    lines += legend(groups)
     for (level, label), item in ((key, item) for key in steps + failed for item in groups[key]):
         reason = REASONS.get(item.get("exploited_with", item.get("help_needed", "unknown"))) if level == 2 else None
         if (level, label) in failed and reason == REASONS["not_exploited"]:
@@ -1455,6 +1577,8 @@ def problem_lines(report: dict) -> list[str]:
         lines += [f"  - {case['id']}: {oneline(case.get('mechanism') or '').rstrip('.')}"
                   + "".join(f"; {key.replace('_', ' ')} {case[key]}" for key in ("check", "location", "capture_point") if case.get(key))
                   for case in item.get("cases", [])]
+        lines += [f"  - {attack['attempts'][index]['episode']} {text}, {rewards(attack['attempts'][index])}{said(attack, assessment)}"
+                  for index, assessment, text, _ in quoted if item.get("id") and owner(attack, index, assessment) == item["id"]]
         before = None  # The aimed step before this one, which a step waits on.
         for row in item.get("conditions", []):
             head, verb = CONDITIONS[row["condition"]], "reproduced" if (level, label) in failed else "exploited"
@@ -1467,6 +1591,8 @@ def problem_lines(report: dict) -> list[str]:
                                              if row["attempts"] else "No attempt was assessed." if apart else waiting + ".")
                          + f" Not run or not assessed: {apart}." * bool(apart))
             before = row if row["condition"] in HINTS else before
+    if novel := [item for key in steps + failed for item in groups[key] if item.get("family")]:
+        lines.append("Novel families, outside every listed one: " + ", ".join(f"{item['id']} ({item['family']})" for item in novel) + ".")
     if leads:
         lines.append("- Leads, which no evidence confirmed: "
                      + ", ".join(f"{item.get('id') or 'an older problem'} ({item['cause'].rstrip('.')})" for item in leads) + ".")
@@ -1517,12 +1643,12 @@ def current(item: dict | None, skip: set = frozenset()) -> list[dict]:
             if found["superseded_by"] is None and found["index"] not in skip]
 
 
-def evidence(items: list[dict], outcome: str, owners: dict[str, str] = {}) -> dict[str, list[str]]:
-    """The findings with `outcome`, by category, each once: the problem id `owners` gives a finding, else its check id."""
+def evidence(items: list[dict], outcome: str) -> dict[str, list[str]]:
+    """The findings with `outcome`, by category, each once by its check id."""
     found = {}
     for finding in items:
         if finding["assessment"]["outcome"] == outcome:
-            found.setdefault(finding["category"] or "no category", {})[owners.get(finding["index"]) or check_id(finding)] = None
+            found.setdefault(finding["category"] or "no category", {})[check_id(finding)] = None
     return {category: sorted(checks) for category, checks in found.items()}
 
 
@@ -1530,23 +1656,55 @@ def flat(found: dict[str, list[str]]) -> str:
     return ", ".join(sorted({check for checks in found.values() for check in checks}))
 
 
+def used(report: dict) -> list[str]:
+    """One line per hack family that a current legitimate reading of a real episode shows it used, with the task's rule
+    each reading cites. A route the rule forbids violates the requirement, so its reading is never legitimate."""
+    found = {}
+    for mode in ("hack_inspector", "grader_inspector"):
+        items = [item for item in current_readings(report["inspections"].get(mode)) if item["claim"].get("use")]
+        for item in items:
+            if item["execution_scope"] == "native" and item["assessment"]["outcome"] == "legitimate":
+                use, requirement = item["claim"]["use"], item["captured"]["check"]["requirement"]
+                rule = ("the task states no rule against it" if use["rule"] == "none"
+                        else f'the task allows it: {requirement["path"]}, "{brief(oneline(requirement["excerpt"]))}"')
+                episodes, rules = found.setdefault(oneline(use["category"]), ({}, {}))
+                episodes[item["claim"]["episode"]], rules[rule] = None, None
+    return [f"{category} used in {', '.join(sorted(episodes))}; {'; '.join(rules)}." for category, (episodes, rules) in found.items()]
+
+
+def current_readings(item: dict | None) -> list[dict]:
+    """The legitimate and inconclusive readings that are their check's latest reading."""
+    return [found for key in ("legitimate", "inconclusive") for found in (item["findings"][key] if item else []) if found["superseded_by"] is None]
+
+
+def problem_answer(key: tuple, item: dict, failed: bool) -> str:
+    """A problem's Answer line: its id, label, and how many assessed Attacker attempts exploited it."""
+    level, label = key
+    where = unreproduced(key, item) if failed else f", {SCOPES[item['scope']]}" if level == 2 and item.get("scope") in SCOPES else ""
+    rows = item.get("conditions") or []
+    assessed, exploited = sum(row["attempts"] for row in rows), sum(row["exploited"] for row in rows)
+    counted = f"{exploited} of {assessed} assessed attempts {'reproduced' if failed else 'exploited'} it" if assessed else "no attempt was assessed"
+    return f"{item.get('id') or 'An older problem'}: {label}{where}; {counted}."
+
+
 def answer(report: dict) -> list[str]:
-    """A few plain lines after the headline: can the grader be cheated or does it misjudge work, how, and how far
-    each problem got.
+    """A few plain lines after the headline: can the grader be cheated or does it misjudge work, one line per problem
+    with its label and how many assessed attempts exploited it, and what no problem holds.
     Only facts the report computes; with nothing evidenced it says so and never calls the grader safe.
     Package evidence shows what a copy of the task package did, not that a task agent can cheat."""
     lines, cheated, real, misjudged = [], False, False, False
-    attack, clauses = report["attack"], {}
-    # One clause per attempt and text: two readings of one attempt are one exploit.
-    for item in exploits(attack, candidate_sources(report), by_problem=True) if attack else []:
-        clauses.setdefault((item[0], item[2]), item)
-    if done := list(clauses.values()):
-        attempts = attack["attempts"]
-        lines.append("In real episodes, Attackers " + "; ".join(
-            f"{text} ({attempts[index]['episode']}, {rewards(attempts[index])})" + (f': "{brief(how)}"' if (how := mechanism(attack, assessment)) else "")
-            for index, assessment, text, _ in done) + ".")
+    attack = report["attack"]
+    if done := clauses(attack, candidate_sources(report)) if attack else []:
         misjudged = any(valid for *_, valid in done)
         cheated = real = not all(valid for *_, valid in done)
+    if attack:
+        steps, failed, groups, _ = ranked(attack)
+        lines += [problem_answer(key, item, key in failed) for key in steps + failed for item in groups[key]] + legend(groups)
+    # An exploit no problem holds, as in an older record, keeps its clause; the others are on their problem's line.
+    if alone := [item for item in done if owner(attack, item[0], item[1]) is None]:
+        attempts = attack["attempts"]
+        lines.append("In real episodes, Attackers " + "; ".join(
+            f"{text} ({attempts[index]['episode']}, {rewards(attempts[index])}){said(attack, assessment)}" for index, assessment, text, _ in alone) + ".")
     # An attack finding that is no exploit entry, such as incorrect work passed while testing valid work,
     # keeps its own outcome without confirming the candidate under test.
     problems = attack.get("problems", []) if attack else []
@@ -1555,36 +1713,36 @@ def answer(report: dict) -> list[str]:
     for mode, found in (("attack_inspector", current(attack, shown)),
                         ("hack_inspector", current(report["inspections"].get("hack_inspector"))),
                         ("grader_inspector", current(report["inspections"].get("grader_inspector")))):
-        # An inspector finding is named by its problem's id, the one id that leads to its evidence.
+        cheats, rejected = evidence(found, "accepted_invalid"), evidence(found, "rejected_valid")
+        if cheats and mode == "hack_inspector":
+            cheated = True
+            real = real or any(item["execution_scope"] == "native" and item["assessment"]["outcome"] == "accepted_invalid" for item in found)
+        misjudged = misjudged or bool(rejected) or bool(cheats) and mode != "hack_inspector"
+        # A finding a problem holds is on that problem's line.
         prefix = mode.split("_")[0] + "-"
-        owners = {int(name.removeprefix(prefix)): item["id"] for item in problems if item.get("id")
-                  for name in item["findings"] if name.startswith(prefix) and mode != "attack_inspector"}
-        cheats, rejected = evidence(found, "accepted_invalid", owners), evidence(found, "rejected_valid", owners)
+        held = {int(name.removeprefix(prefix)) for item in problems if item.get("id")
+                for name in item["findings"] if name.startswith(prefix) and mode != "attack_inspector"}
+        found = [item for item in found if item["index"] not in held]
+        cheats, rejected = evidence(found, "accepted_invalid"), evidence(found, "rejected_valid")
         parts = []
         if cheats and mode == "hack_inspector":
             parts.append("cheats by " + ", ".join(f"{category} ({', '.join(checks)})" for category, checks in cheats.items()))
-            cheated = True
-            real = real or any(item["execution_scope"] == "native" and item["assessment"]["outcome"] == "accepted_invalid" for item in found)
         elif cheats:
             parts.append(f"cases where incorrect work passed ({flat(cheats)})")
-            misjudged = True
         if rejected:
             parts.append(f"cases where correct work failed ({flat(rejected)})")
-            misjudged = True
         if parts:
             scopes = {item["execution_scope"] for item in found}
             scope = scopes.pop() if len(scopes) == 1 else None
             opening = {"package": "In copies of the task package, the", "native": "In real episodes, the"}.get(scope, "The")
             lines.append(f"{opening} {mode.replace('_', ' ')} {VERBS[mode]} {'; and '.join(parts)}.")
-        if mode == "hack_inspector" and attack:
-            # The problems by level, and the legend when they have ids; their own lines are the Attack section's.
-            lines += takewhile(lambda line: not line.startswith("- "), problem_lines(report))
     verdict = ""
     if cheated:
         verdict = "The grader can be cheated" + ("" if real else " in a copy of the task package, not yet in a real episode")
     if misjudged:
         verdict = f"{verdict}, and it misjudges work" if verdict else "The grader misjudges work"
     verdict = f"{verdict}." if verdict else "No cheat and no misjudged work was evidenced."
+    lines += used(report)
     if earlier := report["configuration"]["attack_from"]:
         unrecorded = [name for name, state in report["analyses"].items() if state == "not run" and name != "attack"]
         lines.append(f"Only the attack ran in this run; the other analyses came from the earlier run {earlier}, "
@@ -1596,6 +1754,34 @@ def answer(report: dict) -> list[str]:
 
 
 STEPS = {"simulation": "the Simulator", "grader": "the grader inspector", "hack": "the hack inspector", "attack": "the attack"}
+# An attempt or experiment that failed to execute.
+FAILURES = (*SESSION_FAILURES, "infrastructure_failure", "native_timeout", "episode_failure")
+
+
+def lost(report: dict) -> dict[str, list[str]]:
+    """By step, the work that failed to execute, also when a later attempt recovered it, named by the agent that failed.
+    An inspector session that failed with its experiment's error is that experiment's failure."""
+    found, attempts = {}, {}
+    for item in (report["attack"] or {}).get("attempts", []):
+        if item["status"] in FAILURES:
+            attempts.setdefault(item.get("failed"), []).append(item["episode"] or item["context"])
+    for agent, names in attempts.items():
+        found.setdefault("attack", []).append(
+            f"the Attacker failed to run in {', '.join(names)}" if agent == "Attacker"
+            else f"the attack inspector failed on {', '.join(names)}, " + ("its reward kept" if len(names) == 1 else "their rewards kept")
+            if agent == "attack inspector" else f"an attack attempt failed in {', '.join(names)}")
+    for step, name in (("hack", "hack inspector"), ("grader", "grader inspector")):
+        inspection = report["inspections"].get(f"{step}_inspector") or {}
+        rows = [row for row in inspection.get("experiments", []) if row.get("status") in FAILURES]
+        errors = {row.get("error") for row in rows}
+        for item in inspection.get("attempts", []):
+            if item["status"] in FAILURES and item.get("error") not in errors:
+                of = item.get("category") or item.get("episode")
+                found.setdefault(step, []).append(f"the {name}'s {item['phase']} session{f' of {of}' if of else ''} failed ({item['status']})")
+        if rows:
+            found.setdefault(step, []).append(("a " if len(rows) == 1 else "") + f"{name} experiment{'s' * (len(rows) > 1)} failed: "
+                                              + ", ".join(f"{row['id']} ({row['status']})" for row in rows))
+    return found
 
 
 def headline(report: dict, record: RunRecord, stop=None) -> str:
@@ -1604,10 +1790,13 @@ def headline(report: dict, record: RunRecord, stop=None) -> str:
     if record.started_at and record.ended_at:
         minutes = int((datetime.fromisoformat(record.ended_at) - datetime.fromisoformat(record.started_at)).total_seconds()) // 60
         took = f" after {minutes // 60}:{minutes % 60:02d}"
-    # A partial step that is no failed phase ran to its end, with an attempt that failed to run.
-    gaps = [f"{STEPS[name]} " + ("did not run" if state == "not run" else "had an attempt that failed to run"
-                                 if state == "partial" and name not in record.failed_phases else STOPPED.get(state, "failed"))
-            for name, state in report["unfinished"].items()]
+    # A partial step that is no failed phase ran to its end, with an attempt that failed to run: its lost work says which.
+    work, gaps = lost(report), []
+    for name, state in report["unfinished"].items():
+        partial = state == "partial" and name not in record.failed_phases
+        gaps.append("; ".join(work.pop(name)) if partial and work.get(name) else f"{STEPS[name]} " + (
+            "did not run" if state == "not run" else "had an attempt that failed to run" if partial else STOPPED.get(state, "failed")))
+    also = "; ".join(phrase for phrases in work.values() for phrase in phrases)
     unresolved = "".join(f" Evidence stayed unresolved in {', '.join(STEPS[name] for name in report['unresolved'])}, so the run may miss more."
                          for _ in report["unresolved"][:1])
     failed = "".join(f"; before that {', '.join(f'{STEPS[name]} failed' for name in record.failed_phases)}" for _ in record.failed_phases[:1])
@@ -1627,7 +1816,9 @@ def headline(report: dict, record: RunRecord, stop=None) -> str:
         reasons = [warning.split(": ", 1)[1] for warning in record.warnings if " stopped: " in warning or " failed: " in warning]
         return f"Could not start: {reasons[0] if reasons else 'no step ran'}."
     if gaps:
-        return f"Finished with gaps: {', '.join(gaps)}. Results below are what was found.{unresolved}"
+        return f"Finished with gaps: {', '.join(gaps)}{f'; work was also lost: {also}' * bool(also)}. Results below are what was found.{unresolved}"
+    if also:
+        return f"Finished, but work was lost: {also}. Results below are what was found.{unresolved}"
     return f"Finished. Every step ran.{unresolved}"
 
 

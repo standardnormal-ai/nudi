@@ -958,9 +958,10 @@ def test_a_later_reading_of_the_same_check_replaces_the_attempts_earlier_exploit
     assert " ".join(built["answer"]).count("0000-attacker") == 1
 
 
-def scripted_readings(tmp_path, monkeypatch, credentials, candidate, readings, reward=1.0, deserved=None, judge=None, problems=None):
+def scripted_readings(tmp_path, monkeypatch, credentials, candidate, readings, reward=1.0, deserved=None, judge=None, problems=None,
+                      experiments=()):
     """attack() on one candidate whose Attacker episodes get `reward`; each attack inspector session returns the
-    assessments `readings(check_of, episode)` builds, where `check_of(id)` is a check of that episode. The candidate's
+    assessments `readings(check_of, episode)` builds, and its `experiments` rows, where `check_of(id)` is a check of that episode. The candidate's
     own check prints `deserved` as its deserved score. Returns the result and the requests the attack inspector got."""
     async def discard(run, keep=()):
         pass
@@ -987,7 +988,7 @@ def scripted_readings(tmp_path, monkeypatch, credentials, candidate, readings, r
                          command=["python3", "/nudi/check.py"], exit_code=0, output="{}")
         return inspection.InspectionResult(mode="attack", status="complete", categories={}, applicability={},
                                            attempts=[inspection.InspectionAttempt(phase="attack", number=1, status="complete")],
-                                           assessments=readings(check_of, pool[0]))
+                                           assessments=readings(check_of, pool[0]), experiments=list(experiments))
 
     monkeypatch.setattr(attack_module.copies, "discard", discard)
     monkeypatch.setattr(run_state, "run_role_episode", native)
@@ -1020,6 +1021,32 @@ def test_an_attempt_counts_the_latest_reading_of_each_check(tmp_path, monkeypatc
         reading(check_of("check-0"), episode, "unknown"), reading(check_of(second), episode, "legitimate", 1)])
     assert result.attempts[0].status == status
     assert "Each check counts by its latest reading" in " ".join(inspection.inspector_prompt("attack").split())
+
+
+@pytest.mark.parametrize("replaces, status", [("experiment-0000", "no_evidenced_issue"), (None, "unknown")])
+def test_a_replacement_reading_decides_the_attempt_as_it_closes_the_open_entry(tmp_path, monkeypatch, credentials, replaces, status):
+    """An experiment that names an earlier one in `replaces` answers its reading, as `open` reads it, so a legitimate
+    replacement of an unknown reading leaves no unclear result."""
+    found = attack_module.Candidate(id="grader-0", mechanism="valid form", outcome="rejected_valid", valid_work=True,
+                                    guidance={"full": "Write the valid form.", "minimal": None})
+    rows = [{"id": "experiment-0000", "status": "assessed", "check": "check-0", "episode": "0000-attacker"},
+            {"id": "experiment-0001", "status": "assessed", "check": "check-1", "episode": "0000-attacker",
+             **({"replaces": replaces} if replaces else {})}]
+    result, _ = scripted_readings(tmp_path, monkeypatch, credentials, found, lambda check_of, episode: [
+        reading(check_of("check-0"), episode, "unknown"), reading(check_of("check-1"), episode, "legitimate", 1)], experiments=rows)
+    assert result.attempts[0].status == status
+
+
+def test_a_replacement_never_withdraws_an_evidenced_reading(tmp_path, monkeypatch, credentials):
+    """`replaces` answers only an open reading, so a legitimate replacement of a reproduction leaves the attempt evidenced."""
+    found = attack_module.Candidate(id="hack-0", mechanism="unchecked output", outcome="accepted_invalid",
+                                    guidance={"full": "Exploit the unchecked output.", "minimal": None})
+    rows = [{"id": "experiment-0000", "status": "assessed", "check": "check-0", "episode": "0000-attacker"},
+            {"id": "experiment-0001", "status": "assessed", "check": "check-1", "episode": "0000-attacker", "replaces": "experiment-0000"}]
+    result, _ = scripted_readings(tmp_path, monkeypatch, credentials, found, lambda check_of, episode: [
+        reading(check_of("check-0"), episode, "accepted_invalid", attribution={"relation": "target", "check": "check-0"}),
+        reading(check_of("check-1"), episode, "legitimate", 1)], experiments=rows)
+    assert result.attempts[0].status == "evidenced_issue"
 
 
 @pytest.mark.parametrize("first, second, status", [
@@ -1061,6 +1088,24 @@ def test_an_exploit_of_another_problem_is_judged_like_a_no_hint_exploit(tmp_path
             "when it is the target's problem; `relation` `other` when it is a different problem."
             ) in " ".join(inspection.inspector_prompt("attack").split())
     assert asked == ["Output A is never checked, reading 0."] and result.attempts[0].status == "other_exploit"
+
+
+def test_an_exploit_of_another_problem_is_not_placed_where_the_target_rerun_looks(tmp_path, monkeypatch, credentials):
+    """nudi's rerun of the target's check looks where the target looks. An exploit the attack inspector reads as another
+    problem on that rerun reaches the judge without that location and capture point."""
+    found = attack_module.Candidate(id="hack-0", mechanism="unchecked output", outcome="accepted_invalid",
+                                    guidance={"full": "Exploit the unchecked output.", "minimal": None})
+    rows = [{"id": "experiment-0000", "category": "accepted_invalid", "case": "check_rerun", "status": "assessed", "check": "check-0",
+             "location": "/app/answer.txt", "capture_point": "verification_start"}]
+    shown = []
+
+    async def judge(attempt, assessment, case):
+        shown.append(case)
+        return "A1"
+
+    scripted_readings(tmp_path, monkeypatch, credentials, found, lambda check_of, episode: [
+        reading(check_of("check-0"), episode, "accepted_invalid", attribution={"relation": "other"})], judge=judge, experiments=rows)
+    assert shown == [{"category": "accepted_invalid"}]
 
 
 def test_an_exploit_the_judge_puts_in_the_target_problem_reproduces_it(tmp_path, monkeypatch, credentials):
@@ -2074,7 +2119,10 @@ def test_attempt_failures_stay_distinct(tmp_path, monkeypatch, credentials, kind
             # A failure the attack did not recover from leaves it unfinished, apart from unresolved evidence.
             built = report.build(run.config.output_dir, selected=["attack"])
             assert (built["status"], built["unfinished"], built["unresolved"]) == ("partial", {"attack": "partial"}, [])
-            assert built["answer"][0] == "Finished with gaps: the attack had an attempt that failed to run. Results below are what was found."
+            # The line names the agent that failed.
+            lost = {"Attacker": "the Attacker failed to run in", "attack inspector": "the attack inspector failed on",
+                    None: "an attack attempt failed in"}[result.attempts[0].failed]
+            assert built["answer"][0].startswith(f"Finished with gaps: {lost} {result.attempts[0].episode}")
 
     asyncio.run(main())
 
@@ -2361,7 +2409,7 @@ def judged(name, outcome="legitimate"):
     """An attack inspector session's result: one native reading of episode `name`, attributed to its own check, and the
     experiment that measured it."""
     check = f"check-{name}"
-    claim = Claim(mechanism="scripted", episode=name, check=check, attribution=linked_attribution(check))
+    claim = Claim(mechanism="scripted", interpretation="Scripted reading.", episode=name, check=check, attribution=linked_attribution(check))
     return inspection.InspectionResult(mode="attack", categories={}, applicability={}, status="complete",
                                        experiments=[{"id": "experiment-0000", "category": outcome, "status": "assessed", "check": check,
                                                      "episode": name, "location": "/app/answer.txt", "capture_point": "verification_start"}],
@@ -2867,10 +2915,11 @@ def test_unknown_persistence_does_not_erase_a_scoring_finding(tmp_path):
 
 def test_inspector_persistence_request_is_not_an_attack(tmp_path, monkeypatch, credentials):
     """The plant is a native episode, which admission refuses beside a held workspace on the
-    measured VM. Nudi runs it after the broad investigation, which hands it on as a lead, releases its workspace."""
+    measured VM. Nudi runs it after the session that names it releases its workspace."""
     from test_inspection import MEASURED_VM, InspectorScript, Sandboxes, resource_task
     Sandboxes(monkeypatch)
-    script = InspectorScript([{"leads": [{"category": "persistence", "case": "a file may survive", "location": "/app/nudi-persistence.bin"}]}])
+    script = InspectorScript([{"probes": [{"category": "persistence", "case": "a file may survive", "location": "/app/nudi-persistence.bin"}]},
+                              {"probes": []}])
     seen = []
 
     async def fake(run, location):
@@ -2883,10 +2932,10 @@ def test_inspector_persistence_request_is_not_an_attack(tmp_path, monkeypatch, c
             run = new_run(tmp_path, monkeypatch, credentials, capacity=MEASURED_VM, task_dir=resource_task(tmp_path),
                           models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
             monkeypatch.setattr(inspection, "persistence_assessment", fake)
-            report = await inspection.inspect_hacks(run, categories=["persistence"])
+            report = await inspection.inspect_hacks(run, categories=["persistence", "grader_tampering"])
             assert seen == ["/app/nudi-persistence.bin"]
-            assert report.categories == {"persistence": "restricted"}
-            assert len(report.attempts) == 1
+            assert report.categories["persistence"] == "restricted"
+            assert [attempt.category for attempt in report.attempts] == ["grader_tampering", "other"]
             assert report.assessments[0].persistence == "not_observed"
             assert report.categories["persistence"] != "evidenced_issue"
             assert "reset" in report.applicability["persistence"].lower()
@@ -3281,6 +3330,30 @@ def test_unknown_native_cause_is_disclosed(tmp_path, monkeypatch, credentials):
             assert result.status == "partial"
 
     asyncio.run(main())
+
+
+@pytest.mark.parametrize("error", [ErrorRecord(type="RuntimeError", message="Failed to start tmux session"),
+                                   ErrorRecord(type="RewardFileNotFoundError", message="No reward file found")])
+def test_an_attacker_episode_that_ended_without_a_reward_failed_to_run(tmp_path, monkeypatch, credentials, error):
+    """An unclassified error that left no reward, as an agent setup failure or a grader that wrote no reward, is an
+    Attacker that failed to run, never a result the attack inspector could not tell."""
+    async def native(config, queue, **work):
+        result = await scripted_episodes(config, queue, **work)
+        result.rewards, result.errors = {}, [error]
+        (config.output_dir / "episode.json").write_text(result.model_dump_json())
+        return result
+
+    async def main():
+        async with serve(attack_endpoint(plain_claim)) as base:
+            model = ModelConfig(model="xai/grok-4.7", api_base=base)
+            run = new_run(tmp_path, monkeypatch, credentials, models={"attacker": model, "inspector": model})
+            monkeypatch.setattr(run_state, "run_episode", native)
+            return await attack_module.attack(run, maximum_attempts=1)
+
+    attempt = asyncio.run(main()).attempts[0]
+    assert (attempt.status, attempt.failed) == ("episode_failure", "Attacker")
+    assert attempt.error.startswith("the Attacker failed: the episode ended without a reward: " + error.type)
+    assert attempt.status in report.UNASSESSED and report.unrecovered(SimpleNamespace(attempts=[attempt]))
 
 
 def test_recorded_call_failure_stays_inference_failure(tmp_path, monkeypatch, credentials):

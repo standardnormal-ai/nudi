@@ -32,8 +32,8 @@ from nudi import attack, checks, cli, copies, inspection, report, run_state, sen
 from nudi.attack import AttackResult
 from nudi.episode import tree_digest
 from nudi.inspection import EpisodeLabel, InspectionResult
-from nudi.records import (DEFAULT_MODELS, Assessment, Capacity, Claim, DiskFull, EpisodeResult, Observation, RunRecord, SandboxResult,
-                          Simulation, StateCopy)
+from nudi.records import (DEFAULT_MODELS, Assessment, Capacity, Claim, DiskFull, EpisodeResult, ModalSandbox, Observation, RunRecord,
+                          SandboxResult, Simulation, StateCopy)
 from nudi.run_state import Run
 from test_metrics import RULE, TASK, basis, checked
 
@@ -187,6 +187,12 @@ def test_version_is_the_installed_package_version(capsys):
     with pytest.raises(SystemExit) as done:
         cli.main(["--version"])
     assert done.value.code == 0 and capsys.readouterr().out == f"nudi {importlib.metadata.version('nudi')}\n"
+
+
+def test_help_points_to_the_viewer(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+    assert "related commands: nudi-view RUN opens a run in the terminal" in capsys.readouterr().out
 
 
 def test_python_dash_m_nudi_runs_the_command():
@@ -812,7 +818,7 @@ def test_one_judge_call_per_evidenced_reading_names_its_problem_and_each_problem
     assert [tool["function"]["name"] for tool in requests[0]["tools"]] == ["Verdict"]
     case = lambda id: {"id": id, "outcome": "accepted_invalid"}
     assert json.loads(requests[2]["messages"][-1]["content"]) == {
-        "finding": {"outcome": "accepted_invalid", "mechanism": "Forge the pipe bytes on stdout."}, "known_problems": [
+        "finding": {"outcome": "accepted_invalid", "mechanism": "Forge the pipe bytes on stdout.", "interpretation": INTERPRETATION}, "known_problems": [
             {"id": "P1", "cause": PIPE, "cases": [case("hack-0")]}, {"id": "P2", "cause": CALIBRATION, "cases": [case("hack-1")]}]}
     saved = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text())
     assert [(item.id, item.source, item.members, item.findings, item.evidence) for item in saved.problems] == [
@@ -836,8 +842,8 @@ def test_a_new_problems_cause_is_the_judges_sentence_and_known_problems_are_show
 
     sent = [json.loads(request["messages"][-1]["content"]) for request in requests]
     assert sent == [
-        {"finding": {"outcome": "accepted_invalid", "mechanism": "Forge the pipe bytes in the output."}, "known_problems": []},
-        {"finding": {"outcome": "accepted_invalid", "mechanism": "Forge the pipe bytes on stdout."},
+        {"finding": {"outcome": "accepted_invalid", "mechanism": "Forge the pipe bytes in the output.", "interpretation": INTERPRETATION}, "known_problems": []},
+        {"finding": {"outcome": "accepted_invalid", "mechanism": "Forge the pipe bytes on stdout.", "interpretation": INTERPRETATION},
          "known_problems": [{"id": "P1", "cause": PIPE, "cases": [{"id": "hack-0", "outcome": "accepted_invalid"}]}]}]
     cases = [{"id": "hack-0", "outcome": "accepted_invalid", "mechanism": "Forge the pipe bytes in the output.", "cause": PIPE,
               "reason": "No known problem trusts the pipe bytes."},
@@ -1132,10 +1138,10 @@ def test_without_hack_findings_the_grader_inspector_request_is_unchanged(tmp_pat
 
 
 def test_the_judge_groups_by_cause_and_reads_each_findings_case_and_each_problems_cases(tmp_path, monkeypatch):
-    """A problem is one cause. The judge reads the finding's category, outcome, mechanism, cited text, location and
-    capture point, and each known problem's cause with where and when its cases look; it returns the problem whose cause
-    this is, also where the location differs, or null for a new cause, with that cause and its reason. A long excerpt is
-    cut and marked so, and each `judged` event keeps the request the judge read."""
+    """A problem is one cause. The judge reads the finding's category, outcome, mechanism, interpretation, cited text,
+    location and capture point, and each known problem's cause with where and when its cases look; it returns the problem
+    whose cause this is, also where the location differs, or null for a new cause, with that cause and its reason. A long
+    excerpt or interpretation is cut and marked so, and each `judged` event keeps the request the judge read."""
     from nudi.records import Check, Content
 
     cause = "The grader runs a script the submission can replace."
@@ -1147,6 +1153,7 @@ def test_the_judge_groups_by_cause_and_reads_each_findings_case_and_each_problem
         report = hack_findings(("accepted_invalid", "grader_tampering", None), ("accepted_invalid", "grader_tampering", None))
         for index, location in enumerate(("tests/run.sh", "tests/helper.sh")):
             report.experiments[index].update(location=location, capture_point="verification_start")
+            report.assessments[index].claim.interpretation = f"reads {index}" if index == 0 else "y" * (send.EXCERPT + 5)
             run.record.checks.append(Check(id=f"check-{index}", content=Content(episode="0000-inspector", path="x", sha256="ab" * 32),
                                            ids={}, requirement=requirement, command=["python3"], exit_code=0, output="{}"))
         for index in range(2):
@@ -1156,21 +1163,49 @@ def test_the_judge_groups_by_cause_and_reads_each_findings_case_and_each_problem
     monkeypatch.setattr(send, "inspect_hacks", inspect_hacks)
     send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
     cut = {"path": "instruction.md", "excerpt": "x" * send.EXCERPT + " [cut]"}
-    first = {"id": "hack-0", "check": "check-0", "outcome": "accepted_invalid", "location": "tests/run.sh",
+    first = {"id": "hack-0", "check": "check-0", "outcome": "accepted_invalid", "category": "grader_tampering", "location": "tests/run.sh",
              "capture_point": "verification_start"}
     sent = [json.loads(request["messages"][-1]["content"]) for request in requests]
-    assert sent[1] == {"finding": {"category": "grader_tampering", "outcome": "accepted_invalid", "mechanism": "way 1", "requirement": cut,
+    assert sent[1] == {"finding": {"category": "grader_tampering", "outcome": "accepted_invalid", "mechanism": "way 1",
+                                   "interpretation": "y" * send.EXCERPT + " [cut]", "requirement": cut,
                                    "location": "tests/helper.sh", "capture_point": "verification_start"},
                        "known_problems": [{"id": "P1", "cause": cause, "cases": [first]}]}
-    assert sent[0]["known_problems"] == [] and sent[0]["finding"]["mechanism"] == "way 0"
+    assert sent[0]["known_problems"] == [] and (sent[0]["finding"]["mechanism"], sent[0]["finding"]["interpretation"]) == ("way 0", "reads 0")
     assert [item["request"] for item in events(tmp_path / "run") if item["kind"] == "judged"] == sent
     (problem,) = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text()).problems
     assert [(item["id"], item["location"]) for item in problem.cases] == [("hack-0", "tests/run.sh"), ("hack-1", "tests/helper.sh")]
+    assert "its interpretation of the evidence" in send.JUDGE_PROMPT and "When unsure" not in send.JUDGE_PROMPT
+    assert not hasattr(inspection, "IDENTITY")
+
+
+def test_the_judge_groups_by_what_the_grader_wrongly_trusts_and_sees_each_findings_category_and_family(tmp_path, monkeypatch):
+    """A problem is one thing the grader wrongly trusts; each way of using it is a case, and another trust is another problem
+    also on the same file. The judge reads a finding's category and, outside every listed category, its family, and the
+    same of each known problem's cases, so an unlisted family is never folded into a listed one only by its file."""
+    requests = judge_replies(monkeypatch, [said(cause="The grader trusts the helper script."), said(cause="The grader trusts a cache file.")])
+    Analyses(monkeypatch, judging=True)
+
+    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate):
+        report = hack_findings(("accepted_invalid", "grader_tampering", None), ("accepted_invalid", "other", None))
+        report.assessments[1].claim.family = "trusted cache file"
+        for index in range(2):
+            report.experiments[index].update(location="tests/helper.sh")
+            await on_evidence(report, index)
+        return report
+
+    monkeypatch.setattr(send, "inspect_hacks", inspect_hacks)
+    send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
+    sent = [json.loads(request["messages"][-1]["content"]) for request in requests]
+    assert sent[1]["finding"]["category"] == "other" and sent[1]["finding"]["family"] == "trusted cache file"
+    assert sent[1]["known_problems"] == [{"id": "P1", "cause": "The grader trusts the helper script.", "cases": [
+        {"id": "hack-0", "check": "check-0", "outcome": "accepted_invalid", "category": "grader_tampering", "location": "tests/helper.sh"}]}]
+    assert "family" not in sent[0]["finding"]
+    problems = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text()).problems
+    assert [(item.id, item.cases[0].get("family")) for item in problems] == [("P1", None), ("P2", "trusted cache file")]
     prompt = send.JUDGE_PROMPT
-    assert "A problem is one cause: one flaw of the grader or environment." in prompt
-    assert "Matching paths alone do not make the same cause." in prompt and "When unsure" not in prompt
-    assert "`cause`, one short sentence naming that flaw of the grader or environment" in prompt and "`reason`, one sentence" in prompt
-    assert "different route" not in prompt and not hasattr(inspection, "IDENTITY")
+    assert "A problem is one thing the grader wrongly trusts" in prompt and "each different way of using it a case" in prompt
+    assert "also when they touch the same file" in prompt and "`family`" in prompt
+    assert "`cause`, one short sentence naming that trust" in prompt and "`reason`, one sentence" in prompt
 
 
 def test_a_grader_finding_of_a_known_problem_is_its_new_case_and_states_its_outcome(tmp_path, monkeypatch):
@@ -2403,6 +2438,46 @@ def stored_copy(id, episode, backend, tag, image) -> dict:
                      finished_at="2026-01-01T00:00:01+00:00").model_dump(mode="json")
 
 
+@pytest.mark.parametrize("fail", [{}, {"simulation": RuntimeError("simulation failed")}])
+@pytest.mark.parametrize(("sandboxes", "stop_fails"), [(1, False), (1, True), (0, False)])
+def test_a_modal_run_stops_its_app_at_run_end(tmp_path, monkeypatch, fail, sandboxes, stop_fails):
+    """At run end, also after a failed step, the run's Modal App is stopped, so it no longer shows as live. A failed
+    stop is a warning that changes nothing else; a run that recorded no Modal sandbox asks Modal nothing."""
+    harbor_modal = pytest.importorskip("harbor.environments.modal")
+    calls = []
+
+    async def lookup(name, create_if_missing=False):
+        calls.append(("lookup", name, create_if_missing))
+
+        async def stop():
+            calls.append(("stop", name))
+            if stop_fails:
+                raise RuntimeError("as-secret-text")
+
+        return SimpleNamespace(stop=SimpleNamespace(aio=stop))
+
+    monkeypatch.setattr(harbor_modal, "App", SimpleNamespace(lookup=SimpleNamespace(aio=lookup)))
+    analyses = Analyses(monkeypatch, fail=fail)
+    start = analyses.start_run
+
+    def start_on(config, roles, analyses=()):
+        run = start(config, roles, analyses)
+        run.record.backend = "modal"
+        run.record.modal = [ModalSandbox(session_id="s", sandbox_id="sb-0", cpus=1, memory_mb=512, removed=True,
+                                         started_at="2026-01-01T00:00:00+00:00", stopped_at="2026-01-01T00:01:00+00:00")] * sandboxes
+        return run
+
+    monkeypatch.setattr(send, "start_run", start_on)
+    (tmp_path / "task").mkdir()
+    built = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="simulation")
+    app = f"nudi-{analyses.run.record.run_id}"
+    assert calls == ([("lookup", app, False), ("stop", app)] if sandboxes else [])
+    assert built["status"] == ("partial" if fail else "complete")
+    stopping = [warning for warning in built["warnings"] if app in warning]
+    assert stopping == ([f"run: Modal app {app} was not stopped (RuntimeError); stop it with `modal app stop {app}`"] if stop_fails else [])
+    assert "as-secret-text" not in (tmp_path / "run" / "run.json").read_text()
+
+
 @pytest.mark.parametrize("backend", ["docker", "modal"])
 def test_attack_from_never_deletes_or_marks_the_earlier_runs_state_copies(tmp_path, monkeypatch, backend):
     """The earlier run's copies stay as its evidence, and that run may still use them: neither the attack's mid-run
@@ -2498,7 +2573,8 @@ def real_early_attack(monkeypatch, judge):
 
 def test_an_attacker_exploit_is_judged_with_its_case_and_becomes_a_case_of_its_problem(tmp_path, monkeypatch):
     """A no-hint exploit reaches the judge with the category, location and capture point of the attack inspector's
-    experiment that evidenced it, as an inspector's finding does, and its problem keeps it as a case."""
+    experiment that evidenced it and its reading's interpretation, as an inspector's finding does, and its problem keeps
+    it as a case."""
     from test_runner import CONTRACT_TASK
 
     requests = judge_replies(monkeypatch, [said(cause=MECHANISM), said(cause="The grader trusts the answer file.")])
@@ -2512,12 +2588,12 @@ def test_an_attacker_exploit_is_judged_with_its_case_and_becomes_a_case_of_its_p
     send_nudis(CONTRACT_TASK, output_dir=tmp_path / "run", analysis="hacking", minimal_hints=False)
     _, request = [json.loads(item["messages"][-1]["content"]) for item in requests]
     where = {"location": "/app/answer.txt", "capture_point": "verification_start"}
-    assert {key: request["finding"].get(key) for key in ("category", "outcome", *where)} == {
-        "category": "accepted_invalid", "outcome": "accepted_invalid", **where}
+    assert {key: request["finding"].get(key) for key in ("category", "outcome", "interpretation", *where)} == {
+        "category": "accepted_invalid", "outcome": "accepted_invalid", "interpretation": "Scripted reading.", **where}
     saved = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text())
     (episode,) = [item.episode for item in saved.attempts if item.level == "none"]
     found = next(item for item in saved.problems if item.id == "A1")
-    assert found.cases == [{"id": episode, "check": f"check-{episode}", "outcome": "accepted_invalid", "mechanism": "scripted", **where,
+    assert found.cases == [{"id": episode, "check": f"check-{episode}", "outcome": "accepted_invalid", "mechanism": "scripted", "category": "accepted_invalid", **where,
                             "cause": "The grader trusts the answer file.", "reason": "No known problem trusts the pipe bytes."}]
 
 
@@ -2696,7 +2772,7 @@ def test_simulation_hack_and_grader_inspection_share_one_gate_of_the_runs_slots(
     send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
     gate = analyses.gates["simulate"]
     assert set(analyses.gates) == {"simulate", "inspect_hacks", "attack", "inspect_grader"}
-    assert isinstance(gate, inspection.Gate) and all(other is gate for other in analyses.gates.values())
+    assert isinstance(gate, asyncio.Semaphore) and all(other is gate for other in analyses.gates.values())
 
     async def slots():
         taken = 0

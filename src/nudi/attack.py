@@ -22,6 +22,7 @@ from nudi.inspection import (
     at_once,
     evidenced,
     inspect,
+    replaced,
 )
 from nudi.inspector_sandbox import START_FAILURES
 from nudi.records import Assessment, EnvironmentUnavailable, InfrastructureAbort, write_private
@@ -109,6 +110,8 @@ class AttackAttempt(BaseModel):
     error: str | None = None
     assessment: int | None = None
     problem: str | None = None
+    failed: str | None = None
+    """The agent whose failure ended the attempt, `Attacker` or `attack inspector`; None otherwise and in older records."""
 
 
 class AttackFinding(BaseModel):
@@ -221,6 +224,9 @@ def recorded_failure(run, name: str, episode) -> tuple[str, str] | None:
         return "inference_failure", cause
     if error.type in TOOL_TYPES:
         return "tool_failure", cause
+    # Such as an agent setup that failed, or a grader that wrote no reward: nothing ran to a result.
+    if not any(value is not None and math.isfinite(value) for value in episode.rewards.values()):
+        return "episode_failure", f"the episode ended without a reward: {cause}"
     return "unknown", f"unknown cause: {cause}"
 
 
@@ -381,8 +387,8 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
     causes = {finding: problem.cause for problem in result.problems for finding in problem.findings}
     candidate_groups = _candidate_groups(result.candidates, causes)
 
-    # The case of each check the attack inspector measured, for the judge.
-    cases = {}
+    # The case of each check the attack inspector measured, for the judge, and the checks a later experiment replaced.
+    cases, answered, reruns = {}, set(), set()
 
     def owner(name: str | None) -> Problem | None:
         return next((problem for problem in result.problems if name in problem.findings), None)
@@ -451,7 +457,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
         nothing."""
         latest = {}
         for position, (assessment, owner) in enumerate(zip(result.assessments, owners)):
-            if owner == index:
+            if owner == index and assessment.claim.check not in answered:
                 latest[assessment.claim.check or position] = position
         # Package-copy evidence and evidence about another episode never count; rejected valid
         # work counts only for a valid-work candidate's attempts.
@@ -492,7 +498,11 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
             # target's problem reproduces the target.
             def judged(item):
                 assessment = result.assessments[item.assessment]
-                return judge(attempt, assessment, cases.get(assessment.claim.check, {}))
+                case = cases.get(assessment.claim.check, {})
+                # nudi's rerun looks where the target looks, which an exploit of another problem need not.
+                if item.kind == "other" and assessment.claim.check in reruns:
+                    case = {key: value for key, value in case.items() if key not in ("location", "capture_point")}
+                return judge(attempt, assessment, case)
 
             if found := next((item for item in mine if item.kind == "discovery"), None):
                 attempt.problem = await judged(found)
@@ -565,7 +575,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                 result.limits.append(f"{name}: {failure[1]}, but the episode produced a reward, so it was interpreted.")
                 failure, timeout = None, failure
             if failure:
-                attempt.status, attempt.error = failure[0], f"the Attacker failed: {failure[1]}"
+                attempt.status, attempt.error, attempt.failed = failure[0], f"the Attacker failed: {failure[1]}", "Attacker"
                 mark(level, members, failure[0])
                 save()
                 return
@@ -593,6 +603,8 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                 own.update(row["episode"] for row in session.experiments if row.get("episode"))
                 cases.update({row["check"]: {key: row.get(key) for key in ("category", "location", "capture_point")}
                               for row in session.experiments if row.get("check")})
+                answered.update(replaced(session.experiments, session.assessments))
+                reruns.update(row["check"] for row in session.experiments if row.get("case") == "check_rerun" and row.get("check"))
                 # Every interpretation is retained, also one made before the spending cap stopped the session.
                 for assessment in session.assessments:
                     retain(attempt, index, assessment)
@@ -606,6 +618,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                 judged = session.attempts[-1]
                 if attempt.status == "running" and judged.status in SESSION_FAILURES:
                     attempt.status, attempt.error = judged.status, f"the attack inspector failed: {judged.error or judged.status}"
+                    attempt.failed = "attack inspector"
                     mark(level, members, judged.status)
             # Without its trajectory, a timed-out episode with no evidenced issue stays a timeout.
             if attempt.status == "running" and timeout and "trajectory" not in episode.artifacts:
@@ -614,8 +627,8 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
             # A rewarded episode with any assessment or measured experiment left unjudged, or with an open necessary condition, is not a negative result.
             # A check that exited non-zero read nothing; unrepaired, it fails its session or leaves nothing retained.
             retained = [assessment for assessment, owner in zip(result.assessments, owners) if owner == index
-                        and not (assessment.check and assessment.check.exit_code != 0)]
-            # A later reading of a check replaces its earlier one, as in the findings.
+                        and not (assessment.check and assessment.check.exit_code != 0) and assessment.claim.check not in answered]
+            # A later reading of a check replaces its earlier one, as in the findings and in `open`.
             latest = {item.claim.check or position: item for position, item in enumerate(retained)}
             unjudged = unfinished or not retained or any(item.outcome in ("unknown", "ungrounded", "unavailable") or item.claim.unresolved
                                                          for item in latest.values())
@@ -637,7 +650,9 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
             # The readings its attack inspector saved before the stop stay, unjudged, as its returned session's would.
             saved = run.config.output_dir / f"inspection-attack_inspector-{context}.json"
             if index not in owners and saved.is_file():
-                for assessment in InspectionResult.model_validate_json(saved.read_text()).assessments:
+                stopped = InspectionResult.model_validate_json(saved.read_text())
+                answered.update(replaced(stopped.experiments, stopped.assessments))
+                for assessment in stopped.assessments:
                     retain(attempt, index, assessment)
                 await decide(attempt, index, level, members, judging=False)
             if attempt.status != "evidenced_issue":  # an exploit saved before the stop stays evidenced

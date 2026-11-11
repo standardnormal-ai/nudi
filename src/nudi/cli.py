@@ -43,7 +43,7 @@ ANALYSES = ("full", "simulation", "hacking")
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="nudi")
+    parser = argparse.ArgumentParser(prog="nudi", epilog="related commands: nudi-view RUN opens a run in the terminal")
     parser.add_argument("--version", action="version", version=f"nudi {version()}")
     commands = parser.add_subparsers(dest="command", required=True)
     send = commands.add_parser("send-nudis", help="run the selected analyses of one or more Harbor tasks and write their reports")

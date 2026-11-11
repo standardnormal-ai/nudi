@@ -59,6 +59,17 @@ def billed_cost(record: RunRecord) -> float | None:
     return float(sum(costs))
 
 
+async def stop_app(run) -> None:
+    """Stop the run's Modal App, after its sandboxes, so Modal no longer lists it as live; this also ends any
+    sandbox of it still running. A failure is a warning naming the exception type only, as `_guarded` explains."""
+    app = f"nudi-{run.record.run_id}"
+    try:
+        found = await _bounded(modal.App.lookup.aio(app, create_if_missing=False))
+        await _bounded(found.stop.aio())
+    except Exception as error:
+        run.warn(f"Modal app {app} was not stopped ({type(error).__name__}); stop it with `modal app stop {app}`")
+
+
 class ModalFailure(RuntimeError):
     """A Modal SDK or transport failure, named only by its operation and exception type. The
     original text can quote the Modal credential, as grpclib's metadata check does, so it is

@@ -14,16 +14,16 @@ from contextvars import ContextVar
 
 from nudi.assessment import Evidence
 from nudi.episode import grading_bound
-from nudi.inspector_sandbox import CHECK_INPUTS, CHECK_PROGRAM, OUTPUT_LIMIT, sandbox
+from nudi.inspector_sandbox import CHECK_INPUTS, CHECK_PROGRAM, ISOLATED, OUTPUT_LIMIT, sandbox
 from nudi.records import Check, Content, ErrorRecord, StateCopy
 
 
 # What check_submission gives a generated check.
 CHECK_INPUT_CONTRACT = (
     "The check runs in a container started from a state copy of the episode's grading environment and reads the copy's "
-    "paths in place, such as /app/answer.txt, with the copy's own Python. stdin is an uploaded file holding one JSON object "
-    "mapping input names (copy, requirement, and scoring when cited) to UTF-8 strings. requirement and scoring are plain "
-    "source text. Only copy is JSON-encoded: the copy's receipt, with point (verification_start or grading_end), excluded "
+    "paths in place, such as /app/answer.txt, with the copy's own Python, run with -I -S: the standard library only. stdin "
+    "is an uploaded file holding one JSON object mapping input names (copy, requirement, and scoring when cited) to UTF-8 "
+    "strings. requirement and scoring are plain source text. Only copy is JSON-encoded: the copy's receipt, with point (verification_start or grading_end), excluded "
     "(paths the copy omits), episode and ids. Never conclude that anything under an excluded path is missing. An absent "
     "file has no bytes: never measure it as empty content or zero."
 )
@@ -42,7 +42,7 @@ async def python3_runtime(box) -> tuple[str | None, list[dict]]:
     """Share the existing Python 3 capability check across dynamic setup and retained checks."""
     probes = []
     for executable in PYTHON_CANDIDATES:
-        probes.append(await box.exec([executable, "-c", VERSION_PROBE], runtime=None))
+        probes.append(await box.exec([executable, *ISOLATED, "-c", VERSION_PROBE], runtime=None))
         if probes[-1]["exit_code"] == 0 and probes[-1]["output"].strip() == "3":
             box.record.environment["python3"] = executable
             box.save()
@@ -118,7 +118,7 @@ async def check_submission(run, copy: StateCopy, requirement, scoring, program: 
             if executable is None:
                 check.output = f"{UNSUPPORTED_RUNTIME}. Probes: {json.dumps(probes)}"
                 return check
-            check.command = [executable, CHECK_PROGRAM]
+            check.command = [executable, *ISOLATED, CHECK_PROGRAM]
             # The bound grading uses for this task, as the setup program has; a check that never ends measures nothing.
             bound, started = grading_bound(box.task.config.verifier.timeout_sec), time.monotonic()
             try:

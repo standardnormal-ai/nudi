@@ -44,6 +44,9 @@ START_FAILURES = 3
 opened: ContextVar[list[str] | None] = ContextVar("nudi_opened", default=None)
 PACKAGE = "/nudi/package"
 RUNNER = "/nudi/run.py"
+# -I -S keep the copy's site hooks, such as a sitecustomize or .pth file, and modules beside the program or in the
+# working directory out of interpreter start. The interpreter and its standard library are still the copy's own.
+ISOLATED = ["-I", "-S"]
 SETUP = "/nudi/setup.sh"
 CHECK_PROGRAM = "/nudi/check/program.py"
 CHECK_INPUTS = "/nudi/check/inputs.json"
@@ -194,7 +197,7 @@ class Sandbox:
         self.record.commands.append(entry)
         self.save()
         try:
-            command = argv if runtime is None else [runtime, RUNNER, stdin, *argv]
+            command = argv if runtime is None else [runtime, *ISOLATED, RUNNER, stdin, *argv]
             result = await self.environment.exec(shlex.join(command), timeout_sec=timeout)
             output = ((result.stdout or "") + (result.stderr or "")).encode()
             entry["truncated"] = output_limit is not None and len(output) > output_limit

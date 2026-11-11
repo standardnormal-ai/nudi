@@ -1207,3 +1207,20 @@ def test_ordinary_metrics_exclude_package_or_other_episode_evidence(tmp_path, in
     (group,) = metrics["confusion"]
     assert (group["status"], group["episodes"], group["tp"]) == ("unavailable", [], None) and metrics["auroc"] == []
     assert report.reference(supported, run.grader.assessments, run.path)[0] == "unknown"
+
+
+def test_a_flag_states_its_quartiles_fence_minimum_and_what_its_episodes_recorded(tmp_path):
+    run = RunDir(tmp_path)
+    names = ordinary_rewards(run, (1.0, 17), (0.0, 2))
+    names.append(run.episode(rewards={"reward": 0.0}, agent_timeout=True))
+    run.record.simulation.refusals[names[-1]] = ["content_filter"]
+    (flag,) = reward_summary(run.report())["flags"]
+    assert (flag["quartiles"], flag["fence"], flag["minimum"]) == ([1.0, 1.0], 1.0, 10)
+    blank = {"agent_timeout": False, "verifier_timeout": False, "errors": [], "refusals": []}
+    assert flag["recorded"] == {names[17]: blank, names[18]: blank,
+                                names[19]: {**blank, "agent_timeout": True, "refusals": ["content_filter"]}}
+    assert "1 of them recorded an agent timeout, verifier timeout, error or refusal (0019-simulator agent timeout, refusal content_filter)" in flag["text"]
+    same = RunDir(tmp_path / "same")
+    ordinary_rewards(same, (1.0, 10))
+    (identical,) = reward_summary(same.report())["flags"]
+    assert (identical["quartiles"], identical["fence"]) == (None, None)
