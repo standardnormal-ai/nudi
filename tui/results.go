@@ -883,13 +883,25 @@ func workLeft(r Report, found []Finding) [][3]string {
 	for _, source := range []string{"grader_inspector", "hack_inspector"} {
 		out = append(out, openQuestions(r, source)...)
 		if in := r.Inspections[source]; in != nil {
+			name := phases[map[string]int{"grader_inspector": 1, "hack_inspector": 2}[source]].Name
+			// A failed experiment fails only itself, not the search that ran it and went on; its session keeps its error.
+			lost := map[string]bool{}
+			for _, ex := range in.Experiments {
+				if attemptResults[ex.Status] != Failed || ex.Error == "" {
+					continue
+				}
+				lost[ex.Error] = true
+				if !slices.ContainsFunc(in.Open, func(o Open) bool { return o.ID == ex.ID }) { // an open one has its open row
+					out = append(out, [3]string{name, word(checkNames, ex.Category) + " (" + ex.ID + ")", "Error: " + strings.SplitN(ex.Error, "\n", 2)[0]})
+				}
+			}
 			for _, at := range in.Attempts {
 				why := strings.SplitN(at.Error, "\n", 2)[0]
 				if why == "" && slices.Contains(searchFailures, at.Status) {
 					why = strings.ReplaceAll(at.Status, "_", " ")
 				}
-				if why != "" {
-					out = append(out, [3]string{phases[map[string]int{"grader_inspector": 1, "hack_inspector": 2}[source]].Name, "Search: " + searchTarget(at), "Not finished: " + why})
+				if why != "" && !lost[at.Error] {
+					out = append(out, [3]string{name, "Search: " + searchTarget(at), "Not finished: " + why})
 				}
 			}
 		}

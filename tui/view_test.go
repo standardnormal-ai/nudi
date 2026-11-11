@@ -575,9 +575,10 @@ func TestMissingFlagDetailsAreUnavailable(t *testing.T) {
 	}
 }
 
-// An attempt not started for lack of time is not tested; one whose workspace ran out of memory, or whose attack inspector ran out of steps, failed.
+// An attempt not started for lack of time is not tested; one whose workspace ran out of memory, whose attack inspector ran out of steps,
+// or whose episode ended without a reward, failed.
 func TestAttackStopsHaveWords(t *testing.T) {
-	for status, want := range map[string]Result{"insufficient_time": NotTested, "out_of_memory": Failed, "step_limit": Failed} {
+	for status, want := range map[string]Result{"insufficient_time": NotTested, "out_of_memory": Failed, "step_limit": Failed, "episode_failure": Failed} {
 		clear(missed)
 		if res, _ := lookup(attemptResults, status); res != want || missed[status] {
 			t.Errorf("%s shows as %v", status, res)
@@ -1155,5 +1156,27 @@ func TestTriesCountsAssessedTries(t *testing.T) {
 	s := plainTab(r, 3)
 	if got := cells(s, "▾ c1"); !strings.HasSuffix(got, " 0") || !strings.Contains(s, "0001-attacker") {
 		t.Errorf("row %q:\n%s", got, s)
+	}
+}
+
+// A failed experiment fails only itself: Work left names the experiment, once, and never the search session that ran it,
+// which went on. While the experiment is open its open row already says so.
+func TestFailedExperimentIsNamedNotItsSearch(t *testing.T) {
+	for open, want := range map[string]string{
+		`[]`: "Error: the sandbox broke",
+		`[{"id":"experiment-0000","category":"grader_tampering","reason":"experiment-0000: tool_failure: the sandbox broke","next":"replace it"}]`: "Unresolved: experiment-0000: tool_failure: the sandbox broke",
+	} {
+		r, err := load(writeReport(t, `{"answer":["x"],"analyses":{"hack":"complete"},"inspections":{"hack_inspector":{
+            "categories":{"grader_tampering":"no_evidenced_issue"},"open":`+open+`,
+            "experiments":[{"id":"experiment-0000","status":"tool_failure","category":"grader_tampering","error":"the sandbox broke"},
+                           {"id":"experiment-0001","status":"assessed","category":"grader_tampering","check":"check-0001"}],
+            "attempts":[{"phase":"focused","number":1,"category":"grader_tampering","status":"tool_failure","error":"the sandbox broke"}]}}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows := workLeft(r, r.findings())
+		if !slices.Equal(rows, [][3]string{{"Find Hacks", word(checkNames, "grader_tampering") + " (experiment-0000)", want}}) {
+			t.Errorf("open %s: %q", open, rows)
+		}
 	}
 }

@@ -213,6 +213,7 @@ type Experiment struct {
 	Category string `json:"category"`
 	Check    string `json:"check"`
 	Episode  string `json:"episode"`
+	Error    string `json:"error"` // why it failed to run, for a failed experiment
 }
 
 // Open is what kept a category, or a grader inspector's ordinary episode, open when the inspection ended.

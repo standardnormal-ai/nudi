@@ -223,6 +223,7 @@ var attemptResults = map[string]Result{
 	"out_of_memory":          Failed,
 	"step_limit":             Failed,
 	"infrastructure_failure": Failed,
+	"episode_failure":        Failed, // the Attacker's episode ended without a reward: it failed to run
 	"spending_exhausted":     NotTested,
 	"cancelled":              NotTested,
 	"insufficient_time":      NotTested,
