@@ -4,7 +4,6 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 )
@@ -219,14 +218,17 @@ func TestPipelineAttackerProblem(t *testing.T) {
 		ev("03:31", "attempt_result", `, "episode": "0000-attacker", "problem": "A1", "level": "none", "status": "evidenced_issue"`)+
 		ev("04:00", "reproduced", `, "problem": "P1", "result": "not_reproduced"`)+
 		ev("04:00", "phase_end", `, "phase": "hack", "status": "complete", "elapsed": 240`))
-	s := liveScreen(t, l, at9("04:00"), 100, 0)
+	if s := liveScreen(t, l, at9("04:00"), 100, 0); !strings.Contains(s, "FIND HACKS ✓ 4:00") {
+		t.Errorf("screen:\n%s", s)
+	}
+	s := liveKeys(t, l, at9("04:00"), 100, 0, "shift+tab", "shift+tab", "shift+tab")
 	if got := cells(s, "1     Finished"); got != "✓ ✓ Prints the marker early" {
 		t.Errorf("no-information row: %q\n%s", got, s)
 	}
-	if got := cells(s, "C1"); got != "✓ ✗ - -" || !strings.Contains(s, "FIND HACKS ✓ 4:00") || !strings.Contains(s, "FINDINGS SO FAR (1)") {
-		t.Errorf("screen:\n%s", s)
+	if got := cells(s, "C1"); got != "✓ ✗ - -" || !strings.Contains(s, "PROBLEMS (1)") {
+		t.Errorf("Results:\n%s", s)
 	}
-	if !strings.Contains(liveKeys(t, l, at9("04:00"), 100, 0, "shift+tab", "shift+tab", "shift+tab"), "2 problems so far") {
+	if !strings.Contains(s, "2 problems so far") {
 		t.Errorf("Results does not count the Attacker's problem")
 	}
 	if p, x := l.hackCounts(); p != 2 || x != 1 {
@@ -381,10 +383,13 @@ func TestLiveFailedPhase(t *testing.T) {
 		ev("02:10", "run_end", `, "status": "failed", "report": "report.json"`))
 	s := screenLines(t, l, at9("02:10"))
 	for _, want := range []string{"Find Hacks  Error", "FIND HACKS Error 1:00", "Error  hack failed: RuntimeError: out of memory",
-		"The run ended at 2:10. Its report keeps the results so far.", "AGENTS  none running", "None before the error.", "Simulation -"} {
+		"The run ended at 2:10. Its report keeps the results so far.", "AGENTS  none running", "Simulation -"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("lacks %q:\n%s", want, s)
 		}
+	}
+	if s := liveKeys(t, l, at9("02:10"), 100, 0, "tab", "tab"); !strings.Contains(s, "None before the error.") {
+		t.Errorf("Results:\n%s", s)
 	}
 }
 
@@ -528,16 +533,17 @@ func TestLivePartialPhaseIsPartly(t *testing.T) {
 	}
 }
 
-// A long phase error still leaves the findings their rows, or the line that f opens.
-func TestLiveLongErrorKeepsFindingRows(t *testing.T) {
+// A failed phase's tab keeps its whole error and leaves the findings to Results.
+func TestLiveLongErrorLeavesFindingsToResults(t *testing.T) {
 	l := liveFrom(t, ev("00:00", "run_start", `, "backend": "docker"`)+
 		ev("00:00", "phase_start", `, "phase": "hack"`)+
 		ev("00:01", "judged", `, "inspector": "hack", "finding": "hack-1", "problem": "P1", "new": true, "cause": "c1"`)+
 		ev("00:02", "judged", `, "inspector": "hack", "finding": "hack-2", "problem": "P2", "new": true, "cause": "c2"`)+
 		ev("01:00", "phase_end", `, "phase": "hack", "status": "failed", "elapsed": 60, "error": "hack failed: one\ntwo\nthree\nfour\nfive\nsix\nseven"`))
-	lines := splitLines(liveScreen(t, l, at9("01:00"), 100, 24))
-	i := slices.IndexFunc(lines, func(s string) bool { return strings.Contains(s, "FINDINGS SO FAR") })
-	if i < 0 || !strings.Contains(lines[i], "f open") && (i+2 >= len(lines) || !strings.HasPrefix(lines[i+1], " Finding ") || strings.TrimSpace(lines[i+2]) == "") {
-		t.Errorf("findings without rows:\n%s", strings.Join(lines, "\n"))
+	if s := liveScreen(t, l, at9("01:00"), 100, 24); !strings.Contains(s, "seven") || strings.Contains(s, "FINDINGS SO FAR") {
+		t.Errorf("failed tab:\n%s", s)
+	}
+	if s := liveKeys(t, l, at9("01:00"), 100, 0, "tab", "tab"); !strings.Contains(s, "PROBLEMS (2)") || !strings.Contains(s, "C2") {
+		t.Errorf("Results:\n%s", s)
 	}
 }

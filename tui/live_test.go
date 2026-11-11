@@ -142,7 +142,7 @@ func TestLiveScreenNotesLimitAndCost(t *testing.T) {
 }
 
 func TestLiveScreenShowsCleanedText(t *testing.T) {
-	s := liveModel{l: *liveFrom(t, ev("00:00", "run_start", `, "backend": "docker"`)+
+	s := liveModel{l: *liveFrom(t, ev("00:00", "run_start", `, "backend": "docker"`)+ev("00:00", "phase_start", `, "phase": "grader"`)+
 		ev("00:01", "session_start", `, "inspector": "grader", "session": "s", "episode": "a\u001b[2J\u0007b"`)), w: 120}.render(at9("00:02"))
 	if strings.Contains(s, "\x1b[2J") || strings.Contains(s, "\a") || !strings.Contains(ansi.Strip(s), "a[2Jb") {
 		t.Fatalf("%q", s)
@@ -444,5 +444,83 @@ func TestLiveLogSaysWithdrawnAndRevisedInWords(t *testing.T) {
 		if got := plainText(l.logWords(l.Recent[i])); got != want {
 			t.Errorf("event %d says %q, want %q", i, got, want)
 		}
+	}
+}
+
+// A try that exploited another problem than its target demonstrated a hack: the no-information table names the problem
+// the judge put it in, and a guided try the judge put in an existing problem marks that problem.
+func TestLiveTriesAnswerFromJudgeMembership(t *testing.T) {
+	l := liveFrom(t, ev("00:01", "judged", `, "inspector": "hack", "problem": "P1", "finding": "hack-1", "new": true, "cause": "c1"`)+
+		ev("00:02", "judged", `, "inspector": "hack", "problem": "P2", "finding": "hack-2", "new": true, "cause": "c2"`)+
+		ev("00:03", "attempt_start", `, "episode": "0001-attacker", "level": "none", "number": 1, "problem": "P1"`)+
+		ev("00:04", "judged", `, "inspector": "attack", "problem": "A1", "finding": "0001-attacker", "new": true, "cause": "reads answer"`)+
+		ev("00:05", "attempt_result", `, "episode": "0001-attacker", "level": "none", "number": 1, "problem": "P1", "status": "other_exploit"`)+
+		ev("00:06", "attempt_start", `, "episode": "0002-attacker", "level": "full", "number": 1, "problem": "P1"`)+
+		ev("00:07", "judged", `, "inspector": "attack", "problem": "P2", "finding": "0002-attacker", "new": false, "cause": "c2"`)+
+		ev("00:08", "attempt_result", `, "episode": "0002-attacker", "level": "full", "number": 1, "problem": "P1", "status": "other_exploit"`))
+	s := plainText(strings.Join(l.noInfo(at9("00:09"), "", 100), "\n"))
+	if got := cells(s, "1 "); got != "Finished ✓ ✓ Reads answer" {
+		t.Errorf("no-information row %q:\n%s", got, s)
+	}
+	if got := plainText(l.mark(l.lane("P2"), "full", at9("00:09"), "")); got != plainText(glyph("yes")) {
+		t.Errorf("P2 full instructions %q", got)
+	}
+}
+
+// A problem a later reading withdrew says so on its row and leaves the count, unless an Attacker demonstrated it.
+func TestLiveWithdrawnProblemLeavesTheCount(t *testing.T) {
+	log := ev("00:00", "run_start", `, "backend": "docker"`) +
+		ev("00:01", "judged", `, "inspector": "hack", "problem": "P1", "finding": "hack-0", "new": true, "cause": "c1"`) +
+		ev("00:02", "reproduced", `, "problem": "P1", "result": "evidenced"`) +
+		ev("00:03", "revised", `, "inspector": "hack", "id": "check-0", "index": 1, "before": "accepted_invalid", "after": "legitimate"`) +
+		ev("00:04", "withdrawn", `, "candidate": "hack-0", "problem": "P1", "level": "full"`)
+	s := plainText(liveFrom(t, log).resultsBody(Report{}, at9("00:05"), "", 100))
+	if !strings.Contains(s, "0 problems so far") || cells(s, "C1") != "✓ ✗ - -" {
+		t.Errorf("withdrawn P1 row %q:\n%s", cells(s, "C1"), s)
+	}
+	s = plainText(liveFrom(t, log+ev("00:05", "attempt_result", `, "episode": null, "problem": "P1", "level": "none", "number": 1, "status": "evidenced_issue"`)).
+		resultsBody(Report{}, at9("00:06"), "", 100))
+	if !strings.Contains(s, "1 problem so far") {
+		t.Errorf("an Attacker's exploit keeps it:\n%s", s)
+	}
+}
+
+// A phase tab that is not running shows only its phase and its own agents. The findings so far, the Attacker given no
+// information, the related observations and the logs show on the running phase's tab and on Results.
+func TestIdlePhaseTabShowsOnlyItsPhaseAndAgents(t *testing.T) {
+	l := pipelineLive(t, "pipeline-grader")
+	shared := []string{"FINDINGS SO FAR", "CAN AN ATTACKER", "Related observations", "LOGS"}
+	for name, keys := range map[string][]string{"SIMULATION ✓": {"shift+tab"}, "FIND HACKS ✓": {"tab"}, "ATTACK waiting": {"tab", "tab"}} {
+		s := liveKeys(t, l, l.Last.at(), 100, 0, keys...)
+		if !strings.Contains(s, name) || !strings.Contains(s, "AGENTS  none running") {
+			t.Errorf("%s tab:\n%s", name, s)
+		}
+		for _, gone := range append(shared, "General review") {
+			if strings.Contains(s, gone) {
+				t.Errorf("%s tab shows %q:\n%s", name, gone, s)
+			}
+		}
+	}
+	for _, s := range []string{liveScreen(t, l, l.Last.at(), 100, 0), liveKeys(t, l, l.Last.at(), 100, 0, "tab", "tab", "tab")} {
+		if !strings.Contains(s, "CAN AN ATTACKER") || !strings.Contains(s, "Reward reads stdout") {
+			t.Errorf("the running tab or Results lacks the findings:\n%s", s)
+		}
+	}
+}
+
+// Results keeps the finished sections while the run goes on; those the events do not fill say when they come.
+func TestLiveResultsKeepsTheFinishedSections(t *testing.T) {
+	l := pipelineLive(t, "pipeline-grader")
+	s := liveKeys(t, l, l.Last.at(), 100, 0, "tab", "tab", "tab")
+	at := -1
+	for _, h := range []string{"PROBLEMS (5)", "Not counted as problems", "SIMULATION REWARDS", "GRADER ACCURACY", "WORK LEFT", "COST"} {
+		i := strings.Index(s, h)
+		if i < at {
+			t.Fatalf("%s missing or out of order:\n%s", h, s)
+		}
+		at = i
+	}
+	if n := strings.Count(s, "Available when the run ends."); n != 4 || strings.Contains(s, "FINDINGS SO FAR") {
+		t.Errorf("%d sections wait for the end:\n%s", n, s)
 	}
 }

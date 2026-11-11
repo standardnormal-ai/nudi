@@ -172,3 +172,23 @@ func TestWidthSweep(t *testing.T) {
 		}
 	}
 }
+
+// A run stopped after a phase failed headlines the stop, with its reason, and keeps the phase's error as a note,
+// on Results and in the plain output.
+func TestStopAfterAPhaseErrorHeadlinesTheStop(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["Stopped", "x"], "analyses": {"hack": "partial"}, "phase_errors": {"hack": "boom\nmore"},
+		"stop": {"kind": "provider_refused", "reason": "the provider refused it"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{oneLine(plainText(strings.Join(ending(r, r.findings(), 100), "\n"))), oneLine(plainReport(r, 100))} {
+		for _, want := range []string{"Stopped by the model provider", "The provider refused it.", "Error boom"} {
+			if !strings.Contains(s, want) {
+				t.Errorf("lacks %q:\n%s", want, s)
+			}
+		}
+		if strings.Contains(s, "Find Hacks failed") {
+			t.Errorf("headlines the earlier failure:\n%s", s)
+		}
+	}
+}

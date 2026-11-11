@@ -124,6 +124,22 @@ func resultFields(r Report, found []Finding, w int) []string {
 	return append(out, field(w, "  ", "Work left", left))
 }
 
+// level is a problem's step on the exploit chart in words. Correct work the grader fails is no exploit, so it has no
+// step and says how an Attacker reproduced it. A rerun's problem its Attackers did not find again keeps the earlier
+// run's level, and says so.
+func level(r Report, p Problem) string {
+	again := ""
+	if run, ok := strings.CutPrefix(p.Label, "evidenced in run "); ok && strings.HasSuffix(p.Label, "; not found again here") {
+		run, _, _ = strings.Cut(run, " at ")
+		again = " in run " + run + "; not found again here"
+	}
+	if problemType(r, p) == "False negative" {
+		return cmp.Or(capital(strings.TrimPrefix(validWorkWords[p.ladder()], ", ")), "Not reproduced by an Attacker") + again
+	}
+	elsewhere := strings.TrimSuffix(", while aimed at "+r.aimedElsewhere(p), ", while aimed at ")
+	return fmt.Sprintf("%d of 5: %s", p.ladder(), strings.TrimLeft(cmp.Or(ladderWords[p.ladder()], p.Label), "●○ ")) + elsewhere + again
+}
+
 // problemFields are the problems, highest level first, each with its type, level, evidence records and Attacker tries.
 func problemFields(r Report, found []Finding, w int) []string {
 	ps := problems(r)
@@ -142,19 +158,7 @@ func problemFields(r Report, found []Finding, w int) []string {
 			}
 		}
 		kv("Type", typeNames[problemType(r, p)])
-		// Correct work the grader fails is no exploit, so it has no step on the exploit chart.
-		// A rerun's problem its Attackers did not find again keeps the earlier run's level, and says so.
-		again := ""
-		if run, ok := strings.CutPrefix(p.Label, "evidenced in run "); ok && strings.HasSuffix(p.Label, "; not found again here") {
-			run, _, _ = strings.Cut(run, " at ")
-			again = " in run " + run + "; not found again here"
-		}
-		if problemType(r, p) == "False negative" {
-			kv("Level", cmp.Or(capital(strings.TrimPrefix(validWorkWords[p.ladder()], ", ")), "Not reproduced by an Attacker")+again)
-		} else {
-			elsewhere := strings.TrimSuffix(", while aimed at "+r.aimedElsewhere(p), ", while aimed at ")
-			kv("Level", fmt.Sprintf("%d of 5: %s", p.ladder(), strings.TrimLeft(cmp.Or(ladderWords[p.ladder()], p.Label), "●○ "))+elsewhere+again)
-		}
+		kv("Level", level(r, p))
 		kv("Found by", sourceName(p.Source))
 		var evidence []string
 		for _, f := range found {
@@ -218,6 +222,9 @@ func tryResult(r Report, at Attempt) string {
 		res = NotTested
 	}
 	out := triedWords[res]
+	if res == NotTested && r.started(at) {
+		out = strings.ToLower(stoppedWords(at.Status)) // its episode started
+	}
 	if at.Error != nil && res == Failed {
 		out += ": " + strings.SplitN(*at.Error, "\n", 2)[0]
 	}

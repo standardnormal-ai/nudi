@@ -804,13 +804,60 @@ func TestFailedPhaseKeepsItsResults(t *testing.T) {
 	}
 }
 
-// An older report without exploits ties an Attacker finding to the problem its successful try aimed at.
-func TestOlderAttackFindingFollowsItsTry(t *testing.T) {
+// Without exploits, an attack finding is listed under the first problem whose members name its episode, and only
+// there, also when a try aimed at another problem found it; a finding no problem names is not attributed.
+func TestOlderAttackFindingFollowsMembership(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "attack": {"problems": [
+		{"id": "P1", "source": "hack inspector", "cause": "c1", "findings": ["hack-1"], "members": ["hack-1", "0005-attacker"], "level": 3},
+		{"id": "P2", "source": "hack inspector", "cause": "c2", "findings": ["hack-2"], "members": ["hack-2", "0005-attacker"], "level": 3}],
+		"attempts": [{"number": 1, "level": "full", "problem": "P2", "episode": "0005-attacker", "status": "evidenced_issue"},
+			{"number": 2, "level": "full", "problem": "P2", "episode": "0006-attacker", "status": "evidenced_issue"}],
+		"findings": {"evidenced": [{"index": 0, "assessment": {"outcome": "accepted_invalid"}, "claim": {"mechanism": "m5", "episode": "0005-attacker"}},
+			{"index": 1, "assessment": {"outcome": "accepted_invalid"}, "claim": {"mechanism": "m6", "episode": "0006-attacker"}}]}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := map[string][]string{}
+	for _, f := range r.findings() {
+		for _, p := range r.Attack.Problems {
+			if r.demonstrates(f, p) {
+				held[f.Claim.Episode] = append(held[f.Claim.Episode], p.ID)
+			}
+		}
+	}
+	if got := fmt.Sprint(held); got != "map[0005-attacker:[P1]]" {
+		t.Errorf("held: %s", got)
+	}
+	if s := plainTab(r, results, "o"); !strings.Contains(row(s, "m6"), "? Not attributed") {
+		t.Errorf("m6:\n%s", s)
+	}
+}
+
+// Without the Inspector column, the legend leaves it out, and an expanded problem states its level, so a row without
+// a ✓ still says why it counts.
+func TestOlderProblemStatesItsLevel(t *testing.T) {
 	r := fixture(t, "pipeline-full")
-	found := r.findings()
-	i := slices.IndexFunc(found, func(f Finding) bool { return f.Source == "attack" && f.Claim.Episode == "0001-attacker" })
-	if p := findingProblem(r, found[i]); p == nil || p.ID != "P1" {
-		t.Errorf("0001-attacker's finding is held by %v", p)
+	s := plainTab(r, results)
+	if strings.Contains(s, "Inspector: an inspector evidenced it") {
+		t.Errorf("legend names an absent column:\n%s", s)
+	}
+	for _, p := range problems(r) {
+		if want := "Level       " + level(r, p); !strings.Contains(s, want) {
+			t.Errorf("%s lacks %q:\n%s", p.ID, want, s)
+		}
+	}
+	if s := plainTab(fixture(t, "full"), results); !strings.Contains(s, "Inspector: an inspector evidenced it") || strings.Contains(s, "Level       ") {
+		t.Errorf("a report with the Inspector column:\n%s", s)
+	}
+}
+
+// A run that allowed no try without information has no No info column on Results; one that allowed tries keeps it.
+func TestNoInfoColumnOnlyWhenTriesWereAllowed(t *testing.T) {
+	if s := plainTab(fixture(t, "full"), results); strings.Contains(s, "No info") {
+		t.Errorf("full:\n%s", s)
+	}
+	if s := plainTab(fixture(t, "time-limit"), results); !strings.Contains(s, "No info") {
+		t.Errorf("time-limit:\n%s", s)
 	}
 }
 
@@ -879,7 +926,7 @@ func TestStandaloneEvidenceOpens(t *testing.T) {
 // An expanded problem says why each level was not tested.
 func TestExpandedProblemSaysWhyNotTested(t *testing.T) {
 	s := plainTab(fixture(t, "full"), results)
-	for _, want := range []string{"No info -   Not tested: no Attacker attempt recorded", "Not tested: no guidance for an Attacker"} {
+	for _, want := range []string{"Hint -      Not tested: no Attacker attempt recorded", "Not tested: no guidance for an Attacker"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("results lack %q:\n%s", want, s)
 		}
@@ -1041,7 +1088,7 @@ func TestSuspectedExploitIsNotCountedAsAProblem(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := plainTab(r, results, "o")
-	for _, want := range []string{"Not counted as problems (2 suspected exploit", "Reads solution files", "check-0", "check-1"} {
+	for _, want := range []string{"Not counted as problems (2 suspected exploits)", "Reads solution files", "check-0", "check-1"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("Results misses %q:\n%s", want, s)
 		}
@@ -1049,5 +1096,64 @@ func TestSuspectedExploitIsNotCountedAsAProblem(t *testing.T) {
 	plain := plainReport(r, 100)
 	if !strings.Contains(plain, "State             Suspected exploit") || !strings.Contains(plain, "Reference         check-0") {
 		t.Errorf("plain:\n%s", plain)
+	}
+}
+
+// The plain output says how a started try stopped, in its problem and among the attempts.
+func TestPlainSaysHowAStartedTryStopped(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "other_episodes": {"attacker": ["0001-attacker"]}, "attack": {
+		"problems": [{"id": "P1", "source": "hack inspector", "cause": "c1", "level": 2, "findings": ["hack-0"]}],
+		"attempts": [{"number": 1, "level": "full", "problem": "P1", "candidate": "hack-0", "episode": "0001-attacker", "rewards": {"reward": 1}, "status": "cancelled"}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := plainReport(r, 120)
+	if strings.Contains(s, "not started") || !strings.Contains(s, "full instructions: stopped, 0001-attacker") || !strings.Contains(oneLine(row(s, "0001-attacker ")), "stopped") {
+		t.Errorf("plain:\n%s", s)
+	}
+}
+
+// A suspected exploit that is also an unresolved finding of the same check is one row, in the suspected state.
+func TestSuspectedReadingIsOneRow(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"hack": "complete"}, "inspections": {"hack_inspector": {
+		"suspected": [{"category": "package_oracles", "check": "check-0"}],
+		"findings": {"inconclusive": [{"index": 0, "captured": {"check": {"id": "check-0"}}, "claim": {"mechanism": "reads the answer"}}]}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := plainTab(r, results, "o")
+	if !strings.Contains(s, "Not counted as problems (1 suspected exploit)") || strings.Count(s, "Suspected exploit") != 1 || strings.Contains(s, "Unresolved") {
+		t.Errorf("Results:\n%s", s)
+	}
+}
+
+// A condition with an assessed try and a failed one answers from the assessed try; "not tested" is for none.
+func TestAssessedTryOutweighsAFailure(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "attack": {
+		"problems": [{"id": "P1", "source": "hack inspector", "cause": "c1", "level": 2, "findings": ["hack-0"],
+			"conditions": [{"condition": "minimal", "attempts": 1, "exploited": 0, "status": "inference_failure"}]}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.tried(r.Attack.Problems[0], "minimal"); got != "no" {
+		t.Errorf("hint answers %q", got)
+	}
+	if s := plainTab(r, results); !strings.HasPrefix(cells(s, "▾ c1"), "Unavailable - ✗ -") || strings.Contains(s, "Hint -") {
+		t.Errorf("Results:\n%s", s)
+	}
+}
+
+// The Attack table's Tries counts the assessed tries; a failed one stays in the expanded list.
+func TestTriesCountsAssessedTries(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "other_episodes": {"attacker": ["0001-attacker"]}, "attack": {
+		"problems": [{"id": "P1", "source": "hack inspector", "cause": "c1", "level": 2, "findings": ["hack-0"],
+			"conditions": [{"condition": "full", "attempts": 0, "exploited": 0, "status": "native_timeout"}]}],
+		"attempts": [{"number": 1, "level": "full", "problem": "P1", "candidate": "hack-0", "episode": "0001-attacker", "status": "native_timeout"}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := plainTab(r, 3)
+	if got := cells(s, "▾ c1"); !strings.HasSuffix(got, " 0") || !strings.Contains(s, "0001-attacker") {
+		t.Errorf("row %q:\n%s", got, s)
 	}
 }

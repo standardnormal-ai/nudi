@@ -152,16 +152,14 @@ func endingParts(r Report) (string, []string) {
 	var notes []string
 	failed := slices.DeleteFunc(slices.Clone(phases), func(p struct{ Name, Analysis string }) bool { return r.PhaseErrors[p.Analysis] == "" })
 	amber, verdict := yellowStyle.Bold(true), r.verdict()
+	var errs []string
+	for _, p := range failed {
+		errs = append(errs, redStyle.Bold(true).Render("Error")+"  "+strings.SplitN(r.PhaseErrors[p.Analysis], "\n", 2)[0], failedNote(r, p.Name, p.Analysis))
+	}
 	switch {
-	case len(failed) > 0:
-		head = redStyle.Bold(true).Render(failed[0].Name + " failed")
-		for _, p := range failed {
-			notes = append(notes, redStyle.Bold(true).Render("Error")+"  "+strings.SplitN(r.PhaseErrors[p.Analysis], "\n", 2)[0], failedNote(r, p.Name, p.Analysis))
-		}
-		notes = append(notes, verdict)
-	case r.Stop != nil:
+	case r.Stop != nil: // a stop ends the run even after a phase failed; the failure stays a note
 		words, _ := lookup(stopWords, r.Stop.Kind)
-		head, notes = amber.Render(words[0]), []string{verdict, words[1]}
+		head, notes = amber.Render(words[0]), append(errs, verdict, words[1])
 		switch c := r.Configuration; r.Stop.Kind {
 		case "time_limit":
 			beside = clock
@@ -173,7 +171,7 @@ func endingParts(r Report) (string, []string) {
 				beside = dollars(*c.KnownCost) + " of " + dollars(*c.SpendingCap)
 			}
 		case "stopped":
-			notes = append([]string{words[1]}, r.Stop.Reason, verdict, dim("If it is still going:")+"  nudi-view --follow "+r.Dir)
+			notes = append(append([]string{words[1], r.Stop.Reason}, errs...), verdict, dim("If it is still going:")+"  nudi-view --follow "+r.Dir)
 		case "provider_refused":
 			notes = append([]string{capital(strings.TrimSuffix(r.Stop.Reason, ".")) + "."}, notes...)
 			fallthrough
@@ -182,6 +180,8 @@ func endingParts(r Report) (string, []string) {
 				beside = "at " + clock
 			}
 		}
+	case len(failed) > 0:
+		head, notes = redStyle.Bold(true).Render(failed[0].Name+" failed"), append(errs, verdict)
 	case strings.HasPrefix(r.Answer[0], "Could not start"):
 		head, notes = amber.Render("Could not start"), []string{strings.TrimPrefix(r.Answer[0], "Could not start: ")}
 	case r.Status == "complete":
@@ -307,7 +307,8 @@ func (r Report) tried(p Problem, level string) string {
 				answer = "yes"
 			default:
 				res, _ := lookup(attemptResults, c.Status)
-				answer = best(answer, answers[res])
+				// A failed try beside the assessed ones leaves their answer: none of them exploited it.
+				answer = best(answer, cmp.Or(answers[res], "no"))
 			}
 		}
 		return answer
@@ -371,9 +372,17 @@ func problemsTable(r Report, found []Finding, p *page) {
 	}
 	attacked := len(r.Attack.Attempts) > 0 || slices.ContainsFunc(ps, func(p Problem) bool { return p.Conditions != nil })
 	inspected := slices.ContainsFunc(ps, func(p Problem) bool { return p.EvidencedByInspector != nil })
-	heads, widths := []string{"Problem", "Type"}, []int{44, 16}
+	// The columns of how much an Attacker was told. No info goes when the run allowed no try without information.
+	var levels []string
 	if attacked {
-		heads, widths = append(heads, "No info", "Hint", "Full"), append(widths, 9, 6, 6)
+		levels = []string{"none", "minimal", "full"}
+		if d := r.Attack.Discovery; d != nil && d.MaximumAttempts == 0 && !slices.ContainsFunc(ps, func(p Problem) bool { return r.tried(p, "none") != "-" }) {
+			levels = levels[1:]
+		}
+	}
+	heads, widths := []string{"Problem", "Type"}, []int{44, 16}
+	for _, level := range levels {
+		heads, widths = append(heads, helpWords[level]), append(widths, map[string]int{"none": 9, "minimal": 6, "full": 6}[level])
 	}
 	if inspected {
 		heads, widths = append(heads, "Inspector"), append(widths, 11)
@@ -396,8 +405,8 @@ func problemsTable(r Report, found []Finding, p *page) {
 				name = bold(name)
 			}
 			cells := []string{name, redStyle.Render(problemType(r, pr))}
-			if attacked {
-				cells = append(cells, under("No info", glyph(r.tried(pr, "none"))), under("Hint", glyph(r.tried(pr, "minimal"))), under("Full", glyph(r.tried(pr, "full"))))
+			for _, level := range levels {
+				cells = append(cells, under(helpWords[level], glyph(r.tried(pr, level))))
 			}
 			if inspected {
 				answer := "-"
@@ -410,15 +419,25 @@ func problemsTable(r Report, found []Finding, p *page) {
 		})
 		if p.open[key] {
 			evidenceRows(r, found, pr, p)
-			untestedRows(r, pr, attacked, inspected, p)
+			untestedRows(r, pr, levels, inspected, p)
 		}
 	}
 	if p.lines[len(p.lines)-1] != "" { // an expanded last problem already ends in a blank line
 		p.add("")
 	}
 	p.add(" " + dim("✓ yes   ✗ no   - not tested   ? unresolved"))
-	if attacked {
-		p.add(wrap("No info, Hint, Full: an Attacker, by how much it was told. Inspector: an inspector evidenced it.", p.w, " ", dim))
+	var legend, told []string
+	for _, level := range levels {
+		told = append(told, helpWords[level])
+	}
+	if len(told) > 0 {
+		legend = append(legend, strings.Join(told, ", ")+": an Attacker, by how much it was told.")
+	}
+	if inspected {
+		legend = append(legend, "Inspector: an inspector evidenced it.")
+	}
+	if len(legend) > 0 {
+		p.add(wrap(strings.Join(legend, " "), p.w, " ", dim))
 	}
 }
 
@@ -437,14 +456,18 @@ func evidenceRows(r Report, found []Finding, pr Problem, p *page) {
 	}
 }
 
-// untestedRows say, under an expanded problem's evidence records, why each of its cells shows - for not tested.
-func untestedRows(r Report, pr Problem, attacked, inspected bool, p *page) {
+// untestedRows say, under an expanded problem's evidence records, why each of its cells of levels shows - for not
+// tested. Without the Inspector column, the problem's level says why it counts.
+func untestedRows(r Report, pr Problem, levels []string, inspected bool, p *page) {
 	var rows [][2]string
-	if attacked {
+	if !inspected {
+		rows = append(rows, [2]string{"Level", level(r, pr)})
+	}
+	if len(levels) > 0 {
 		if target := r.aimedElsewhere(pr); target != "" {
 			rows = append(rows, [2]string{helpWords[strings.TrimPrefix(pr.why(), "elsewhere_")] + " ✓", "Demonstrated while aimed at " + target})
 		}
-		for _, level := range []string{"none", "minimal", "full"} {
+		for _, level := range levels {
 			if r.tried(pr, level) == "-" {
 				rows = append(rows, [2]string{helpWords[level] + " -", "Not tested: " + r.untested(pr, level)})
 			}
@@ -477,13 +500,12 @@ func (r Report) untested(p Problem, level string) string {
 
 // demonstrates says whether Attacker finding f demonstrated problem pr, by its own exploit entry: the problem the judge
 // named for another mechanism, else the problem its attempt aimed at or was judged to find, else one of the problem's
-// findings it reproduced. A finding without an entry, or not attributed, demonstrates none. Reports without exploits
-// have only the problem's sessions and the successful attempts aimed at it.
+// findings it reproduced. A finding without an entry, or not attributed, demonstrates none. In reports without exploits,
+// it demonstrates only the first problem whose members name its session.
 func (r Report) demonstrates(f Finding, pr Problem) bool {
 	if r.Attack.Exploits == nil {
-		return f.Claim.Episode != "" && (slices.Contains(pr.Members, f.Claim.Episode) || slices.ContainsFunc(r.aimed(pr), func(at Attempt) bool {
-			return at.Episode != nil && *at.Episode == f.Claim.Episode && at.Status == "evidenced_issue"
-		}))
+		i := slices.IndexFunc(r.Attack.Problems, func(p Problem) bool { return slices.Contains(p.Members, f.Claim.Episode) })
+		return f.Claim.Episode != "" && i >= 0 && r.Attack.Problems[i].ID == pr.ID && r.Attack.Problems[i].Cause == pr.Cause
 	}
 	for kind, exploits := range r.Attack.Exploits {
 		for _, e := range exploits {
@@ -542,6 +564,7 @@ func findingsTable(found []Finding, source string, p *page) {
 // finding number in r.findings(), the one Enter opens, or 0 for a row with no detail.
 func otherFindings(r Report) (out [][4]string, opens []int) {
 	states := [][2]string{{"legitimate", dim("✗") + " Not reproduced"}, {"inconclusive", yellowStyle.Render("?") + " Unresolved"}}
+	read := map[string]bool{} // the inspector and check of each unresolved finding that is also a suspected exploit
 	for _, state := range states {
 		for _, source := range sources {
 			for _, f := range r.section(source)[state[0]] {
@@ -550,7 +573,11 @@ func otherFindings(r Report) (out [][4]string, opens []int) {
 					if f.Index != nil && source != "attack" {
 						f.ID = fmt.Sprintf("%s-%d", strings.TrimSuffix(source, "_inspector"), *f.Index)
 					}
-					out, opens = append(out, [4]string{title(f), state[1], jobNames[source], ref(f)}), append(opens, 0)
+					shown := state[1]
+					if in := r.Inspections[source]; in != nil && state[0] == "inconclusive" && slices.ContainsFunc(in.Suspected, func(x Suspected) bool { return x.Check == f.check() }) {
+						shown, read[source+" "+f.check()] = "Suspected exploit", true
+					}
+					out, opens = append(out, [4]string{title(f), shown, jobNames[source], ref(f)}), append(opens, 0)
 				}
 			}
 		}
@@ -558,6 +585,9 @@ func otherFindings(r Report) (out [][4]string, opens []int) {
 	for _, source := range sources[:2] {
 		if in := r.Inspections[source]; in != nil {
 			for _, x := range in.Suspected {
+				if read[source+" "+x.Check] {
+					continue
+				}
 				name := cmp.Or(checkNames[deref(x.Category)], deref(x.Category), "No category")
 				out, opens = append(out, [4]string{name, "Suspected exploit", jobNames[source], x.Check}), append(opens, 0)
 			}
@@ -578,7 +608,8 @@ func otherFindings(r Report) (out [][4]string, opens []int) {
 			continue
 		}
 		state := "Standalone evidence"
-		if slices.ContainsFunc(r.Attack.Exploits["unattributed"], func(e *Exploit) bool {
+		// Without exploits, a finding no problem names has no attribution at all.
+		if r.Attack.Exploits == nil || slices.ContainsFunc(r.Attack.Exploits["unattributed"], func(e *Exploit) bool {
 			return e != nil && e.Assessment != nil && f.Index != nil && *f.Index == *e.Assessment
 		}) {
 			state = yellowStyle.Render("?") + " Not attributed"
@@ -603,6 +634,10 @@ func stateCounts(rows [][4]string) string {
 	}
 	slices.SortStableFunc(states, func(a, b string) int { return counts[b] - counts[a] })
 	for i, state := range states {
+		if counts[state] > 1 && strings.HasSuffix(state, "exploit") {
+			states[i] = fmt.Sprintf("%d %ss", counts[state], state)
+			continue
+		}
 		states[i] = fmt.Sprintf("%d %s", counts[state], state)
 	}
 	return strings.Join(states, ", ")

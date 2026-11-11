@@ -142,7 +142,7 @@ func (m liveModel) parts(now time.Time) (top, body string) {
 	case m.ui.overlay == "c":
 		body = costPanel(r, w)
 	case m.ui.open["f"]:
-		body = strings.Join(l.findings(now, sp, w, -1), "\n")
+		body = strings.Join(l.findings("FINDINGS SO FAR", now, sp, w, -1), "\n")
 	case m.view() == results:
 		body = l.resultsBody(r, now, sp, w)
 	default:
@@ -190,11 +190,10 @@ func running(c color.Color, sp string, d time.Duration) string {
 func (l *Live) stage(i int, sp string) (string, bool) {
 	name := phases[i].Analysis
 	p := l.phase(name)
-	attacking := slices.ContainsFunc(l.Agents, func(a Agent) bool { return a.Who == "attacker" || a.Who == "attack" })
 	switch {
 	case p == nil && len(l.Start.Analyses) > 0 && !slices.Contains(l.Start.Analyses, name):
 		return "", true
-	case p == nil && name == "attack" && attacking, p != nil && p.Kind == "phase_start":
+	case l.runs(i):
 		return fg(phaseColors[i], sp), false
 	case p == nil && l.End != nil, p != nil && p.Status == "not run":
 		return dim("-"), false
@@ -208,6 +207,14 @@ func (l *Live) stage(i int, sp string) (string, bool) {
 		return amber("partly"), false
 	}
 	return amber("stopped"), false
+}
+
+// runs says whether phase i is running: it started and has not ended, or it is Attack and Attackers work before it.
+func (l *Live) runs(i int) bool {
+	name := phases[i].Analysis
+	p := l.phase(name)
+	attacking := slices.ContainsFunc(l.Agents, func(a Agent) bool { return a.Who == "attacker" || a.Who == "attack" })
+	return p != nil && p.Kind == "phase_start" || p == nil && name == "attack" && attacking
 }
 
 // phaseLine names phase i with its mark and time, then who works in it.
@@ -228,7 +235,8 @@ func (l *Live) phaseLine(i int, now time.Time, sp string) string {
 
 // stageBody is a phase tab: the phase, why it failed, the agents, the findings so far, the related observations,
 // the Attacker with no information and the logs. When it does not fit in room rows, one row of agent tiles shows
-// and the findings keep the rows left, at least two, or else a line that f opens.
+// and the findings keep the rows left, at least two, or else a line that f opens. A tab whose phase is not running
+// shows only the phase and its own agents.
 func (m liveModel) stageBody(now time.Time, sp string, room int) string {
 	l, w, i := &m.l, m.w, m.view()
 	head := []string{l.phaseLine(i, now, sp)}
@@ -244,17 +252,26 @@ func (m liveModel) stageBody(now time.Time, sp string, room int) string {
 			"The run reached its time limit of "+strconv.FormatFloat(*l.Limit.Minutes, 'f', -1, 64)+" minutes. Its report keeps the results so far."))
 	}
 	head = append(head, "")
+	if !l.runs(i) {
+		own := *l
+		own.Agents = slices.DeleteFunc(slices.Clone(l.Agents), func(a Agent) bool { return !slices.Contains(phaseAgents[phases[i].Analysis], a.Who) })
+		agents := own.agentsBlock(now, sp, w, -1)
+		if room > 0 && len(head)+len(agents) > room {
+			agents = own.agentsBlock(now, sp, w, m.ui.agents)
+		}
+		return strings.Join(append(head, agents...), "\n")
+	}
 	rest := l.rest(now, sp, w, m.ui.open)
 	join := func(agents, findings []string) string {
 		return strings.Join(slices.Concat(head, agents, []string{""}, findings, rest), "\n")
 	}
 	agents := l.agentsBlock(now, sp, w, -1)
-	findings := l.findings(now, sp, w, -1)
+	findings := l.findings("FINDINGS SO FAR", now, sp, w, -1)
 	if s := join(agents, findings); room == 0 || len(splitLines(s)) <= room {
 		return s
 	}
 	agents = l.agentsBlock(now, sp, w, m.ui.agents)
-	return join(agents, l.findings(now, sp, w, max(0, room-len(splitLines(strings.Join(head, "\n")))-len(agents)-1)))
+	return join(agents, l.findings("FINDINGS SO FAR", now, sp, w, max(0, room-len(splitLines(strings.Join(head, "\n")))-len(agents)-1)))
 }
 
 // rest is what follows the findings on a phase tab: the related observations, the Attacker with no information
@@ -394,12 +411,12 @@ func (l *Live) problemLanes() []*Lane {
 	return out
 }
 
-// findings is the FINDINGS SO FAR section: one row per problem in problemLanes, with whether the novelty_judge
+// findings is the section of that name: one row per problem in problemLanes, with whether the novelty_judge
 // named it new, the inspector reproduced it and an Attacker demonstrated it with full instructions and with a hint.
 // With room from 0 it keeps to that many rows: the rows that fit, at least two, then how many more; else one line.
-func (l *Live) findings(now time.Time, sp string, w, room int) []string {
+func (l *Live) findings(name string, now time.Time, sp string, w, room int) []string {
 	lanes := l.problemLanes()
-	title := titled("FINDINGS SO FAR", len(lanes))
+	title := titled(name, len(lanes))
 	if len(lanes) == 0 {
 		none := "None yet."
 		if slices.ContainsFunc(l.Phases, func(p Event) bool { return p.Error != "" }) {
@@ -412,7 +429,11 @@ func (l *Live) findings(now time.Time, sp string, w, room int) []string {
 	out := []string{title, cols(w, " ", widths, dim("Finding"), dim("New?"), dim("Inspector?"), dim("Full instr.?"), dim("Hint?"))}
 	var rows [][]string
 	for _, n := range lanes {
-		rows = append(rows, splitLines(cols(w, " ", widths, capital(n.Cause), under("New?", "✓"), under("Inspector?", l.inspected(n, now, sp)),
+		inspector := under("Inspector?", l.inspected(n, now, sp))
+		if n.Withdrawn {
+			inspector = under("Inspector?", glyph("no")) // a later reading withdrew its findings
+		}
+		rows = append(rows, splitLines(cols(w, " ", widths, capital(n.Cause), under("New?", "✓"), inspector,
 			under("Full instr.?", l.mark(n, "full", now, sp)), under("Hint?", l.mark(n, "minimal", now, sp)))))
 	}
 	if all := slices.Concat(rows...); room < 0 || len(out)+len(all) <= room {
@@ -430,13 +451,26 @@ func (l *Live) findings(now time.Time, sp string, w, room int) []string {
 	return append(append(out, slices.Concat(rows[:k]...)...), " "+dim(fmt.Sprintf("+%d more ↓", len(rows)-k))+"   "+open)
 }
 
-// mark is whether an Attacker told as much as level demonstrated problem n: its latest try aimed at n, or for an
-// Attacker's problem the try that found it.
+// mark is whether an Attacker told as much as level demonstrated problem n: a try at that level the judge put in n,
+// else its latest try aimed at n.
 func (l *Live) mark(n *Lane, level string, now time.Time, sp string) string {
-	if t := l.try(n.From); strings.HasPrefix(n.ID, "A") && t != nil && t.Start.Level == level {
+	if slices.ContainsFunc(l.Tries, func(t *Try) bool { return t.Start.Level == level && l.judgedIn(t) == n }) {
 		return glyph("yes")
 	}
 	return tryMark(l.latest(n.ID, level), now, sp)
+}
+
+// judgedIn is the problem the judge put try t's episode in, as new or the same as a known one, or nil.
+func (l *Live) judgedIn(t *Try) *Lane {
+	episode := text(t.Start.Episode)
+	if episode == "" {
+		return nil
+	}
+	i := slices.IndexFunc(l.Lanes, func(n *Lane) bool { return n.From == episode || slices.Contains(n.Members, episode) })
+	if i < 0 {
+		return nil
+	}
+	return l.Lanes[i]
 }
 
 // inspected says whether the inspector reproduced problem n: a grader finding is its own reproduction, an Attacker's
@@ -533,13 +567,20 @@ func (l *Live) noInfo(now time.Time, sp string, w int) []string {
 			status = running(c, sp, since(t.Start.at(), now))
 		} else {
 			res, _ := lookup(attemptResults, t.Status)
-			status, shown = resultWords[res], under("Hack demonstrated?", glyph(answer(t)))
+			hack := answer(t)
+			if res == Elsewhere { // the question is any hack, so one other than its target counts
+				hack = "yes"
+			}
+			status, shown = resultWords[res], under("Hack demonstrated?", glyph(hack))
 			if res == NotTested && t.Start.Kind == "attempt_start" {
 				status = stoppedWords(t.Status)
 			}
 		}
-		if p := t.Start.Problem; p != "" {
-			n := l.lane(p)
+		n := l.lane(t.Start.Problem)
+		if t.Status != "" { // the judge's problem counts once nudi settled the try
+			n = cmp.Or(l.judgedIn(t), n)
+		}
+		if n != nil || t.Start.Problem != "" {
 			isNew = under("New finding?", map[bool]string{true: "✓", false: glyph("no")}[n != nil && n.From == text(t.Start.Episode)])
 			if n != nil {
 				cause = capital(n.Cause)
@@ -723,21 +764,30 @@ func (l *Live) tryAim(e Event) string {
 	return out
 }
 
-// resultsBody is the Results tab while the run goes on: the findings so far, the Attacker with no information and
-// the cost.
+// resultsBody is the Results tab while the run goes on, in the sections of a finished run: the problems so far, the
+// Attacker with no information and the cost; the sections the events do not fill say they come at the end.
 func (l *Live) resultsBody(r Report, now time.Time, sp string, w int) string {
 	n := 0
 	for _, lane := range l.Lanes {
-		n += boolInt(lane.Same == "")
+		n += boolInt(lane.Same == "" && (!lane.Withdrawn || l.exploited(lane))) // an Attacker's exploit outlasts a withdrawal
 	}
 	out := []string{
 		spread(" "+bold("Run not finished")+"  "+dim("running for "+elapsed(l.ran(now).Seconds())), dim(fmt.Sprintf("%d problem%s so far", n, plural(n))), w),
 		" " + dim("Findings so far. The result is final when the run ends."), "",
 	}
-	out = append(out, l.findings(now, sp, w, -1)...)
+	out = append(out, l.findings("PROBLEMS", now, sp, w, -1)...)
 	if block := l.noInfo(now, sp, w); len(block) > 0 {
 		out = append(append(out, ""), block...)
 	}
+	later := " " + dim("Available when the run ends.")
+	out = append(out, "", " "+bold("Not counted as problems"), later, "")
+	left, right := heading("SIMULATION REWARDS", "")+"\n"+later, heading("GRADER ACCURACY", "")+"\n"+later
+	if w >= 100 {
+		out = append(out, lipgloss.JoinHorizontal(lipgloss.Top, lipgloss.NewStyle().Width(48).Render(left), right))
+	} else {
+		out = append(out, left, "", right)
+	}
+	out = append(out, "", heading("WORK LEFT", ""), later)
 	out = append(append(out, "", heading("COST", "")), costRows(r, w, false)...)
 	return strings.Join(out, "\n")
 }
@@ -757,6 +807,11 @@ func (l *Live) running(name string) bool {
 	return p != nil && p.Kind == "phase_start"
 }
 
+// exploited is whether an Attacker exploited problem n at any level.
+func (l *Live) exploited(n *Lane) bool {
+	return n.Alone || slices.ContainsFunc(l.Tries, func(t *Try) bool { return t.Start.Problem == n.ID && t.result() == Evidenced })
+}
+
 // hackCounts are the problems so far, the P and A rows, and how many of them an Attacker exploited at any level.
 func (l *Live) hackCounts() (problems, exploited int) {
 	for _, n := range l.Lanes {
@@ -764,7 +819,7 @@ func (l *Live) hackCounts() (problems, exploited int) {
 			continue
 		}
 		problems++
-		if n.Alone || slices.ContainsFunc(l.Tries, func(t *Try) bool { return t.Start.Problem == n.ID && t.result() == Evidenced }) {
+		if l.exploited(n) {
 			exploited++
 		}
 	}

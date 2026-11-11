@@ -17,9 +17,9 @@
    ▸ rejects leading zeros                       Unavailable        -      -     -    G2
 
  ✓ yes   ✗ no   - not tested   ? unresolved
- No info, Hint, Full: an Attacker, by how much it was told. Inspector: an inspector evidenced it.
+ No info, Hint, Full: an Attacker, by how much it was told.
 
- ▸ Not counted as problems (1 unresolved, 1 suspected only)                                o expand
+ ▸ Not counted as problems (4 not attributed, 1 unresolved, 1 suspected only)              o expand
  ▸ What the references mean (P1, G1, hack-1 and others)                                    i expand
 
  SIMULATION REWARDS                              GRADER ACCURACY

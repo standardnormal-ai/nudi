@@ -190,6 +190,7 @@ type Lane struct {
 	Alone      bool      // an Attacker with no extra information of this run exploited it, by its attempt_result
 	Replayed   bool      // a rerun repeated it from the earlier run
 	From       string    // the finding or Attacker episode the judge named it new for
+	Withdrawn  bool      // a later reading withdrew its findings, by a withdrawn event
 }
 
 // Agent is a running inspector session or Attacker attempt.
@@ -300,6 +301,10 @@ func (l *Live) apply(e Event) {
 	case "reproduced":
 		if n := l.lane(e.Problem); n != nil {
 			n.Reproduced = e.Result
+		}
+	case "withdrawn":
+		if n := l.lane(e.Problem); n != nil {
+			n.Withdrawn = true
 		}
 	case "warning":
 		l.Warnings++

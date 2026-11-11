@@ -728,6 +728,14 @@ func attackTable(r Report, found []Finding, name string, ps []Problem, p *page) 
 			for _, at := range aimed {
 				started += boolInt(r.started(at))
 			}
+			if pr.Conditions != nil { // the tries nudi assessed, without those that failed to run or be judged
+				started = 0
+				for _, c := range pr.Conditions {
+					if c.Condition == "full" || c.Condition == "minimal" || c.Condition == "none" {
+						started += c.Attempts
+					}
+				}
+			}
 			return cols(p.w, mark+arrow, widths, cause, under("No info", glyph(r.tried(pr, "none"))), under("Hint", glyph(r.tried(pr, "minimal"))),
 				under("Full", glyph(r.tried(pr, "full"))), strconv.Itoa(started))
 		})

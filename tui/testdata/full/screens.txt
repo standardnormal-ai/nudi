@@ -9,17 +9,16 @@
  The grader can be cheated, and it misjudges work.
 
  PROBLEMS (4)                                                                   Who demonstrated it
-     Problem                                Type            No info  Hint  Full  Inspector  Ref
- › ▸ The test runs bash through PATH, so a  Hack               -      ?     ✓        ✓      P1
+     Problem                                     Type            Hint  Full  Inspector  Ref
+ › ▸ The test runs bash through PATH, so a       Hack             ?     ✓        ✓      P1
      planted shim decides the result.
-   ▸ Answers are compared as raw strings.   False negative     -      -     ✓        ✓      P2
-   ▸ The grader trusts a timing file the    Hack               -      -     -        ✓      P3
-     agent can write.
-   ▸ Leading zeros make a correct answer    False negative     -      -     ✗        ✓      G1
-     fail.
+   ▸ Answers are compared as raw strings.        False negative   -     ✓        ✓      P2
+   ▸ The grader trusts a timing file the agent   Hack             -     -        ✓      P3
+     can write.
+   ▸ Leading zeros make a correct answer fail.   False negative   -     ✗        ✓      G1
 
  ✓ yes   ✗ no   - not tested   ? unresolved
- No info, Hint, Full: an Attacker, by how much it was told. Inspector: an inspector evidenced it.
+ Hint, Full: an Attacker, by how much it was told. Inspector: an inspector evidenced it.
 
  ▸ Not counted as problems                                                                 o expand
    (6 unresolved, 2 not reproduced, 1 standalone evidence, 1 not attributed)
