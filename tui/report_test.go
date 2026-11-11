@@ -60,34 +60,37 @@ func TestLoadKeepsLegitimateNulls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s := card(r, 100, false); strings.Contains(s, "$0.00") || !strings.Contains(s, "known model cost unavailable") {
+	if s := plainReport(r, 100); strings.Contains(s, "$0.00") || !strings.Contains(oneLine(s), "Model cost unavailable") {
 		t.Fatalf("an absent cost is shown as a number:\n%s", s)
 	}
-	if s := header(r, 100); strings.Contains(s, "$0.00") {
+	if s := header(r, false, 100); strings.Contains(s, "$0.00") {
 		t.Fatalf("header: %q", s)
 	}
 }
 
 // A call cancelled in flight is counted apart from one without a price.
-func TestCostLineCountsCancelledCallsApart(t *testing.T) {
+func TestCostCountsCancelledCallsApart(t *testing.T) {
 	r, err := load(writeReport(t, `{"answer": ["x"], "configuration": {"known_cost": 1.5, "unknown_cost_calls": 2, "cancelled_calls": 1}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s := costLine(r); !strings.Contains(s, "2 calls without a price · 1 call cancelled in flight") {
-		t.Fatalf("cost line: %q", s)
+	s := oneLine(plainText(strings.Join(costRows(r, 100, true), "\n")))
+	if !strings.Contains(s, "Calls without a price 2 Not counted in model cost") || !strings.Contains(s, "Calls cancelled in flight 1") {
+		t.Fatalf("cost rows:\n%s", s)
 	}
 }
 
 // The Modal estimate names each figure and where the bill comes from.
-func TestCostLineNamesEachModalFigure(t *testing.T) {
+func TestCostNamesEachModalFigure(t *testing.T) {
 	r, err := load(writeReport(t, `{"answer": ["x"], "configuration": {"known_cost": 1.5, "modal_cost": {"at_requests": 0.37, "at_limits": 6.69}}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "Modal sandboxes about $0.37 at requested CPU and memory, $6.69 if all used their limits; outside the cap; bill: nudi cost " + r.Dir
-	if s := costLine(r); !strings.Contains(s, want) {
-		t.Fatalf("cost line: %q", s)
+	s := oneLine(plainText(strings.Join(costRows(r, 300, true), "\n")))
+	for _, want := range []string{"Modal sandbox estimate $0.37 to $6.69", "At requested CPU and memory, then at their limits", "separate from the cap", "Run nudi cost " + r.Dir} {
+		if !strings.Contains(s, want) {
+			t.Errorf("lacks %q:\n%s", want, s)
+		}
 	}
 }
 
@@ -149,7 +152,7 @@ func TestLoadCleansKeysAndValues(t *testing.T) {
 	if r.Answer[0] != "ab]0;titlec" || categories["x[31myz"] != "evidenced_issue" || len(categories) != 1 {
 		t.Fatalf("%q %q", r.Answer[0], categories)
 	}
-	for _, s := range []string{card(r, 100, true), renderPhase(r, nil, 2, 100)} {
+	for _, s := range []string{plainReport(r, 100), drawTab(r, 2, 100)} {
 		if strings.ContainsAny(s, "\u202e\u0007") || strings.Contains(s, "\x1b]") || strings.Contains(s, "x\x1b[31my") {
 			t.Fatalf("%q", s)
 		}
@@ -168,16 +171,65 @@ func TestFindingsAreCurrentEvidencedInSourceOrder(t *testing.T) {
 	}
 }
 
-// A level the run did not request does not hide that a finding has no guidance for the requested ones.
-func TestUntestedCountsFindingsWithoutGuidanceForRequestedLevels(t *testing.T) {
-	r, err := load(writeReport(t, `{"answer": ["x"], "attack": {"attempts": [], "candidates": [
-		{"id": "hack-0", "conditions": {"full": {"status": "unavailable"}, "minimal": {"status": "not_requested"}}},
-		{"id": "hack-1", "conditions": {"full": {"status": "unattempted"}, "minimal": {"status": "not_requested"}}},
-		{"id": "hack-2", "conditions": {"full": {"status": "unavailable"}, "minimal": {"status": "unavailable"}}}]}}`))
+// How the run ended, its time, cost and capacity come as data; a report written before a field reads it as not recorded.
+func TestLoadReadsRunFactsAndOlderReportsLackThem(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "unfinished": {"hack": "cancelled"}, "unresolved": ["grader"], "elapsed": 760.5,
+		"stop": {"kind": "time_limit", "phase": "hack", "minutes": 30, "reason": null}, "phase_errors": {"attack": "RuntimeError: boom"},
+		"ungrouped": ["grader-1"], "configuration": {"capacity": {"concurrency": 12}, "unknown_reasons": {"no price": 3},
+		"modal_cost": {"at_requests": 0.31, "at_limits": 0.41, "sandboxes": 5, "without_limits": 1, "still_running": 2}}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s := untested(r); s != "3 findings not tested, 2 of them without guidance" {
-		t.Fatalf("untested: %q", s)
+	c := r.Configuration
+	if r.Unfinished["hack"] != "cancelled" || r.Unresolved[0] != "grader" || *r.Elapsed != 760.5 || r.PhaseErrors["attack"] != "RuntimeError: boom" ||
+		r.Ungrouped[0] != "grader-1" || c.Capacity.Concurrency != 12 || c.UnknownReasons["no price"] != 3 ||
+		c.ModalCost.Sandboxes != 5 || c.ModalCost.WithoutLimits != 1 || c.ModalCost.StillRunning != 2 {
+		t.Fatalf("%+v", r)
+	}
+	if s := r.Stop; s.Kind != "time_limit" || s.Phase != "hack" || *s.Minutes != 30 || s.Reason != "" {
+		t.Fatalf("stop: %+v", s)
+	}
+	old := fixture(t, "full-0.0.0")
+	if old.Elapsed != nil || old.Stop != nil || old.PhaseErrors != nil || old.Ungrouped != nil {
+		t.Fatalf("an older report reads fields it lacks as recorded: %+v", old)
+	}
+	if s := fixture(t, "time-limit").Stop; s == nil || s.Kind != "time_limit" || s.Minutes != nil {
+		t.Fatalf("time-limit stop: %+v", s)
+	}
+}
+
+// The screens' tables read Python's facts: problem outcomes, condition counts, flag rules, per-episode rewards and
+// labels, open questions, the no-hint search and each attempt's reward.
+func TestLoadReadsTheFactsTheScreensTabulate(t *testing.T) {
+	r := fixture(t, "full")
+	ps := r.Attack.Problems
+	if ps[0].ID != "P1" || ps[0].Outcome != "accepted_invalid" || ps[0].EvidencedByInspector == nil || !*ps[0].EvidencedByInspector ||
+		ps[3].ID != "G1" || ps[3].Outcome != "rejected_valid" || ps[0].Conditions[0].Attempts != 1 || ps[0].Conditions[0].Status == "" {
+		t.Fatalf("problems: %+v", ps)
+	}
+	if strings.Join(r.Ungrouped, ",") != "grader-6" {
+		t.Fatalf("ungrouped: %v", r.Ungrouped)
+	}
+	group := r.Ordinary.Groups[0]
+	flag := group.Rewards["reward"].Flags[0]
+	if *flag.Flag != "low_minority" || len(flag.Quartiles) != 2 || *flag.Fence != 1 || *flag.Minimum != 10 || len(flag.Recorded) != 2 ||
+		len(flag.Episodes) != 2 || flag.Recorded[flag.Episodes[0]].Errors == nil {
+		t.Fatalf("flag: %+v", flag)
+	}
+	if len(group.Episodes) != 12 || len(group.EpisodeRewards) != 12 || *group.EpisodeRewards[group.Episodes[0]]["reward"] != 1 {
+		t.Fatalf("episodes: %+v", group)
+	}
+	if r.Labels.Episodes[group.Episodes[0]].Label == "" || r.Labels.Review.Attempted == nil || r.Metrics.Coverage.Eligible != 6 ||
+		r.Metrics.Coverage.Ordinary != 12 || r.Metrics.Episodes[group.Episodes[0]].Completion == "" {
+		t.Fatalf("labels %+v metrics %+v", r.Labels, r.Metrics.Coverage)
+	}
+	hack := r.Inspections["hack_inspector"]
+	if hack.Open == nil || hack.Experiments[0].ID == "" || hack.Experiments[0].Status == "" {
+		t.Fatalf("hack inspection: %+v", hack)
+	}
+	a := r.Attack
+	if a.Discovery == nil || a.Discovery.Status == "" || a.Attempts[0].Number != 1 || *a.Attempts[0].Rewards["reward"] != 1 ||
+		a.Exploits["reproduction"][0].Attempt == nil {
+		t.Fatalf("attack: %+v", a)
 	}
 }

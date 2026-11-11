@@ -1,0 +1,92 @@
+=== tab 4
+ nudi  task                                                                Docker     Concurrency 4
+ m Models                                        Model cost $0.00 of $5.00  ━━━━━━━━━━━━     c Cost
+
+ Simulation ✓ ── Grade Simulations ── Find Hacks ✓ ── Attack                          │    Results
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ ✓ Finished                                                                         1 open question
+ No problems demonstrated in this run.
+
+ FINDINGS (0)
+ None evidenced in this run.
+
+ ▸ Not counted as problems (1 unresolved)                                                  o expand
+ ▸ What the references mean (P1, G1, hack-1 and others)                                    i expand
+
+ SIMULATION REWARDS                              GRADER ACCURACY
+ Reward   Episodes                               Not available: Grade Simulations not selected
+ 0        ██ 1
+ 0.5      ██ 1
+ 1        ████ 2
+
+ Episodes   Mean         Median       SD
+ 4/4        0.625        0.75         0.4787
+
+ WORK LEFT (1)
+ Where              What                                  Why
+ Find Hacks         unchecked requirement (hack-0)        Unresolved: Reason not recorded
+
+ COST
+ Model cost                  $0.00 of $5.00 cap    ━━━━━━━━━━━━━━━━
+=== tab 0
+ nudi  task                                                                Docker     Concurrency 4
+ m Models                                        Model cost $0.00 of $5.00  ━━━━━━━━━━━━     c Cost
+
+  Simulation  ✓ ── Grade Simulations ── Find Hacks ✓ ── Attack                      │   [ Results ]
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ SIMULATION ✓                                                                     Reward key reward
+
+ REWARDS
+ Reward   Episodes
+ 0        █████ 1
+ 0.5      █████ 1
+ 1        ██████████ 2
+
+ STATISTICS
+ Usable / attempted   Requested   Mean         Median       Sample SD    Skewness
+ 4/4                  4           0.625        0.75         0.4787       -0.8546
+
+ REWARD PATTERN                                                           Enter episodes   ? method
+ Distribution flags are not evaluated for 'reward': 4 usable rewards, fewer than 10.
+=== tab 1
+ nudi  task                                                                Docker     Concurrency 4
+ m Models                                        Model cost $0.00 of $5.00  ━━━━━━━━━━━━     c Cost
+
+ Simulation ✓ ──  Grade Simulations  ── Find Hacks ✓ ── Attack                      │   [ Results ]
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ GRADE SIMULATIONS  not selected for this run
+
+ The run did not select this phase.
+=== tab 2
+ nudi  task                                                                Docker     Concurrency 4
+ m Models                                        Model cost $0.00 of $5.00  ━━━━━━━━━━━━     c Cost
+
+ Simulation ✓ ── Grade Simulations ──  Find Hacks  ✓ ── Attack                      │   [ Results ]
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ FIND HACKS ✓                                                                        Hack Inspector
+
+ FINDINGS (0)
+ None evidenced in this run.
+
+ IDEAS NOT REPRODUCED (0)
+ None recorded.
+
+ OPEN QUESTIONS (1)
+   Question                                      Why it is open
+   unchecked requirement (hack-0)                Reason not recorded
+
+ ▸ Search scope (3 categories)                                                             s expand
+=== tab 3
+ nudi  task                                                                Docker     Concurrency 4
+ m Models                                        Model cost $0.00 of $5.00  ━━━━━━━━━━━━     c Cost
+
+ Simulation ✓ ── Grade Simulations ── Find Hacks ✓ ──  Attack                       │   [ Results ]
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ ATTACK  not selected for this run
+
+ The run did not select this phase.

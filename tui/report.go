@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +32,22 @@ type Report struct {
 		Attacker []string `json:"attacker"`
 	} `json:"other_episodes"`
 	Warnings []string `json:"warnings"`
+
+	// Absent in reports written before them, which leaves these nil: not recorded, never none.
+	Unfinished  map[string]string `json:"unfinished"`   // each step that did not run to its end, by its status
+	Unresolved  []string          `json:"unresolved"`   // each step that ran to its end with evidence left unresolved
+	Elapsed     *float64          `json:"elapsed"`      // the run's seconds, also null when a time was not recorded
+	Stop        *Stop             `json:"stop"`         // nil for a run that ended on its own; a report without PhaseErrors predates it
+	PhaseErrors map[string]string `json:"phase_errors"` // the error each analysis raised
+	Ungrouped   []string          `json:"ungrouped"`    // evidenced inspector findings no problem holds
+}
+
+// Stop is why a run stopped before its end.
+type Stop struct {
+	Kind    string   `json:"kind"`    // cancelled, terminated, time_limit, spending_cap, provider_refused or stopped
+	Phase   string   `json:"phase"`   // the analysis it stopped, when known
+	Minutes *float64 `json:"minutes"` // the time limit, when known
+	Reason  string   `json:"reason"`  // why nudi report wrote the report of a run that did not close out, or the provider's refusal
 }
 
 type Configuration struct {
@@ -40,10 +57,17 @@ type Configuration struct {
 	KnownCost        *float64         `json:"known_cost"`
 	UnknownCostCalls int              `json:"unknown_cost_calls"`
 	CancelledCalls   int              `json:"cancelled_calls"`
-	Backend          string           `json:"backend"`
-	ModalCost        *struct {
-		AtRequests float64 `json:"at_requests"`
-		AtLimits   float64 `json:"at_limits"`
+	UnknownReasons   map[string]int   `json:"unknown_reasons"`
+	Capacity         struct {
+		Concurrency int `json:"concurrency"`
+	} `json:"capacity"`
+	Backend   string `json:"backend"`
+	ModalCost *struct {
+		AtRequests    float64 `json:"at_requests"`
+		AtLimits      float64 `json:"at_limits"`
+		Sandboxes     int     `json:"sandboxes"`
+		WithoutLimits int     `json:"without_limits"`
+		StillRunning  int     `json:"still_running"`
 	} `json:"modal_cost"`
 }
 
@@ -60,7 +84,9 @@ type Ordinary struct {
 		Configuration struct {
 			Model string `json:"model"`
 		} `json:"configuration"`
-		Rewards map[string]Rewards `json:"rewards"`
+		Rewards        map[string]Rewards             `json:"rewards"`
+		Episodes       []string                       `json:"episodes"`
+		EpisodeRewards map[string]map[string]*float64 `json:"episode_rewards"` // null for a value that is not a finite number
 	} `json:"groups"`
 }
 
@@ -78,16 +104,48 @@ type Rewards struct {
 
 // Flag is a reward pattern Python names, with its reason; it is never a finding.
 type Flag struct {
-	Flag *string `json:"flag"`
-	Text *string `json:"text"`
+	Flag      *string             `json:"flag"`
+	Text      *string             `json:"text"`
+	Episodes  []string            `json:"episodes"`
+	Quartiles []float64           `json:"quartiles"` // Q1 and Q3 of a minority flag
+	Fence     *float64            `json:"fence"`     // the outer fence a minority flag's rewards lie beyond
+	Minimum   *int                `json:"minimum"`   // the usable rewards a flag needs
+	Recorded  map[string]Recorded `json:"recorded"`  // what each of its episodes recorded
+}
+
+type Recorded struct {
+	AgentTimeout    bool     `json:"agent_timeout"`
+	VerifierTimeout bool     `json:"verifier_timeout"`
+	Errors          []string `json:"errors"`   // error types
+	Refusals        []string `json:"refusals"` // refusal signals
 }
 
 type Labels struct {
-	Counts map[string]int `json:"counts"`
+	Counts   map[string]int `json:"counts"`
+	Episodes map[string]struct {
+		Label string  `json:"label"`
+		Basis *string `json:"basis"`
+	} `json:"episodes"`
+	Review struct {
+		Attempted  []string          `json:"attempted"`
+		Unresolved []string          `json:"unresolved"`
+		Supported  []string          `json:"supported"`
+		Unreviewed map[string]string `json:"unreviewed"`
+	} `json:"review"`
 }
 
 type Metrics struct {
 	Confusion []Agreement `json:"confusion"`
+	Episodes  map[string]struct {
+		Completion string  `json:"completion"` // complete, incomplete or unknown
+		Decision   *string `json:"decision"`   // pass or fail
+	} `json:"episodes"`
+	Coverage struct {
+		Ordinary int                 `json:"ordinary"`
+		Resolved int                 `json:"resolved"`
+		Eligible int                 `json:"eligible"` // the episodes in grader agreement
+		Excluded map[string][]string `json:"excluded"` // the others, by why
+	} `json:"coverage"`
 }
 
 // Agreement is one confusion group: the grader's native decision against the grader inspector's reference.
@@ -131,15 +189,38 @@ type SearchAttempt struct {
 }
 
 type Inspection struct {
-	Applicability map[string]string `json:"applicability"`
-	Attempts      []SearchAttempt   `json:"attempts"`
-	Experiments   []struct {
-		Category string `json:"category"`
-	} `json:"experiments"`
-	Limits     []string             `json:"limits"`
-	Status     string               `json:"status"`
-	Categories map[string]string    `json:"categories"`
-	Findings   map[string][]Finding `json:"findings"` // evidenced, inconclusive, legitimate
+	Applicability map[string]string    `json:"applicability"`
+	Attempts      []SearchAttempt      `json:"attempts"`
+	Experiments   []Experiment         `json:"experiments"`
+	Open          []Open               `json:"open"`      // nil in older reports: not recorded
+	Suspected     []Suspected          `json:"suspected"` // absent in older reports
+	Limits        []string             `json:"limits"`
+	Status        string               `json:"status"`
+	Categories    map[string]string    `json:"categories"`
+	Findings      map[string][]Finding `json:"findings"` // evidenced, inconclusive, legitimate
+}
+
+// Suspected is a suspected exploit: a measured check whose reading ended unknown, never a problem.
+type Suspected struct {
+	Category *string `json:"category"`
+	Check    string  `json:"check"`
+}
+
+// Experiment is one idea an inspector tested.
+type Experiment struct {
+	ID       string `json:"id"`
+	Status   string `json:"status"`
+	Category string `json:"category"`
+	Check    string `json:"check"`
+	Episode  string `json:"episode"`
+}
+
+// Open is what kept a category, or a grader inspector's ordinary episode, open when the inspection ended.
+type Open struct {
+	ID       string  `json:"id"` // an experiment, episode or category
+	Category *string `json:"category"`
+	Reason   string  `json:"reason"`
+	Next     string  `json:"next"`
 }
 
 type Finding struct {
@@ -147,6 +228,7 @@ type Finding struct {
 	SupersededBy   *struct{} `json:"superseded_by"`
 	ExecutionScope string    `json:"execution_scope"`
 	Category       *string   `json:"category"`
+	Experiment     string    `json:"experiment"` // the inspector's experiment that tested it
 	Claim          struct {
 		Mechanism  string   `json:"mechanism"`
 		Episode    string   `json:"episode"`
@@ -191,6 +273,11 @@ type Attack struct {
 	Attempts        []Attempt             `json:"attempts"`
 	Findings        map[string][]Finding  `json:"findings"`
 	Exploits        map[string][]*Exploit `json:"exploits"` // by kind; absent from pooled attack records
+	Discovery       *struct {
+		Status          string `json:"status"`
+		Attempts        int    `json:"attempts"`
+		MaximumAttempts int    `json:"maximum_attempts"`
+	} `json:"discovery"` // the no-hint search; absent from pooled attack records
 }
 
 // Exploit is an attack finding that Python counts as an Attacker exploit, by its assessment index.
@@ -198,6 +285,8 @@ type Exploit struct {
 	Assessment *int     `json:"assessment"`
 	Candidate  *string  `json:"candidate"`
 	Sources    []string `json:"sources"`
+	Attempt    *int     `json:"attempt"` // its index in the attack's attempts
+	Problem    *string  `json:"problem"` // for `other`, the problem the judge named
 }
 
 type Candidate struct {
@@ -227,12 +316,20 @@ type Problem struct {
 	// The least information under which an Attacker exploit was observed, or why none was; absent in older reports.
 	ExploitedWith string      `json:"exploited_with"`
 	Conditions    []Condition `json:"conditions"` // nil in older reports
+	ExploitedBy   []struct {
+		Episode string  `json:"episode"`
+		Target  *string `json:"target"`
+	} `json:"exploited_by"` // attempts aimed at another problem that exploited this one
+	Outcome              string `json:"outcome"`                // accepted_invalid or rejected_valid; empty when not recorded or mixed
+	EvidencedByInspector *bool  `json:"evidenced_by_inspector"` // nil when not recorded or without the inspections
 }
 
 // Condition is one condition an Attacker tried a problem under.
 type Condition struct {
 	Condition string `json:"condition"` // full, minimal, none (aimed at the problem), elsewhere_LEVEL (aimed at another) or independent
 	Exploited int    `json:"exploited"` // how many of its attempts exploited the problem
+	Attempts  int    `json:"attempts"`  // its started attempts
+	Status    string `json:"status"`
 }
 
 // why is the problem's `exploited_with`, or in older reports its `help_needed`.
@@ -243,12 +340,25 @@ func (p Problem) why() string {
 	return p.HelpNeeded
 }
 
-// independent says whether a no-hint Attacker not aimed at the problem exploited it; in older reports, level 5 says so.
-func (p Problem) independent() bool {
-	if p.Conditions == nil {
-		return p.ladder() == 5
+// aimedElsewhere is the problem an Attacker was aimed at when, told as much as its rung says, it demonstrated p: set
+// for an `exploited_with` of elsewhere_minimal or elsewhere_full, by the try `exploited_by` names, else "".
+func (r Report) aimedElsewhere(p Problem) string {
+	level, ok := strings.CutPrefix(p.why(), "elsewhere_")
+	if !ok || r.Attack == nil {
+		return ""
 	}
-	return slices.ContainsFunc(p.Conditions, func(c Condition) bool { return c.Condition == "independent" && c.Exploited > 0 })
+	for _, by := range p.ExploitedBy {
+		if slices.ContainsFunc(r.Attack.Attempts, func(at Attempt) bool { return at.Episode != nil && *at.Episode == by.Episode && at.Level == level }) {
+			return cmp.Or(deref(by.Target), "another problem")
+		}
+	}
+	return "another problem"
+}
+
+// byRung orders problems highest on the exploit chart first and, on one rung, an exploit aimed at the problem before
+// one found while aimed at another, as the report lists them.
+func byRung(a, b Problem) int {
+	return cmp.Or(b.ladder()-a.ladder(), boolInt(strings.HasPrefix(a.why(), "elsewhere_"))-boolInt(strings.HasPrefix(b.why(), "elsewhere_")))
 }
 
 // lead says whether a problem is a lead, one no evidence confirmed: level 1 in reports written before leads.
@@ -276,12 +386,15 @@ func (r Report) validWork(p Problem) bool {
 }
 
 type Attempt struct {
-	Level     string   `json:"level"`   // none, full or minimal
-	Problem   string   `json:"problem"` // the problem it attacked; absent before problems formed during the run
-	Candidate *string  `json:"candidate"`
-	Sources   []string `json:"sources"`
-	Episode   *string  `json:"episode"`
-	Status    string   `json:"status"`
+	Number    int                 `json:"number"`
+	Rewards   map[string]*float64 `json:"rewards"`
+	Error     *string             `json:"error"`
+	Level     string              `json:"level"`   // none, full or minimal
+	Problem   string              `json:"problem"` // the problem it attacked; absent before problems formed during the run
+	Candidate *string             `json:"candidate"`
+	Sources   []string            `json:"sources"`
+	Episode   *string             `json:"episode"`
+	Status    string              `json:"status"`
 }
 
 // load reads DIR/report.json, never through a link that leads out of DIR. A report without an answer
@@ -494,25 +607,6 @@ func (r Report) started(a Attempt) bool {
 	return false
 }
 
-// attempted says whether any started attempt tested candidate id.
-func (r Report) attempted(id string) bool {
-	for _, a := range r.Attack.Attempts {
-		if r.started(a) && (slices.Contains(a.Sources, id) || a.Candidate != nil && *a.Candidate == id) {
-			return true
-		}
-	}
-	return false
-}
-
-// reproduced says whether the attack reproduced finding id of p. A report without reproduced_findings
-// has only the problem's flag, which stands for its candidate.
-func reproduced(p Problem, id string) bool {
-	if p.ReproducedFindings == nil {
-		return p.Reproduced && p.Candidate != nil && *p.Candidate == id
-	}
-	return slices.Contains(p.ReproducedFindings, id)
-}
-
 // problemOf is the problem whose findings include id, or -1.
 func (r Report) problemOf(id string) int {
 	if r.Attack == nil {
@@ -551,7 +645,7 @@ func (r Report) topProblem(found []Finding) (*Problem, int) {
 		return nil, 1
 	}
 	ps := slices.DeleteFunc(slices.Clone(r.Attack.Problems), Problem.lead)
-	slices.SortStableFunc(ps, func(a, b Problem) int { return b.ladder() - a.ladder() })
+	slices.SortStableFunc(ps, byRung)
 	for _, p := range ps {
 		if n := evidenceOf(found, p); n > 0 && p.ID != "" {
 			return &p, n

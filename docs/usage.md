@@ -248,7 +248,7 @@ It prints Modal's bill for that run's sandboxes and exits `0`, or prints one lin
 
 ## Viewer
 
-`nudi-view` shows a finished run in the terminal: the answer and findings card, each phase with the findings beside it, and the evidence for each finding. It reads only the run's `report.json`, which nudi 0.0.0 or later must have written, and its `events.jsonl` when it follows a run that is still going. Build it from the repository root with Go 1.27.3 or later, as `tui/go.mod` requires:
+`nudi-view` shows a finished run in the terminal: the result with its problems, each phase with the findings beside it, and the evidence, limitations and references of each finding. It reads only the run's `report.json`, which nudi 0.0.0 or later must have written, and its `events.jsonl` when it follows a run that is still going. Build it from the repository root with Go 1.27.3 or later, as `tui/go.mod` requires:
 
 ```sh
 (cd tui && go build -o nudi-view .)
@@ -264,7 +264,7 @@ tui/nudi-view runs/first 3
 
 A problem id, P, G or A with its number as the report names it, opens the finding that shows the problem: the one the attack tested, else its first finding, else for a problem an Attacker found the attack finding of its episode.
 
-Use `←` and `→`, or `h` and `l`, to move between phases or findings, `↑` and `↓` to scroll, `enter` to open the evidence, `tab` to switch between evidence and limitations, `esc` or backspace to go back and `q` or Ctrl-C to quit. Pass `--no-intro` to skip the opening animation, which is also skipped when `CI` is set. In a pipe the viewer prints plain text, the card, or the finding a problem id or N names, for scripts and agents. It exits `0` for a complete run, whose steps all ran, `1` for any other run, such as one in which a step failed or stopped or one that reached its time limit, and `2` when the folder holds no readable report.
+The viewer opens on Results, with the four phase tabs to its left. Use `tab`, `←` and `→`, or `h` and `l`, to move between tabs, `↑` and `↓` to select a row, `enter` to expand it or open its evidence, and the key shown beside a section to expand it. `m` shows the models, `c` the cost and `?` what every symbol means. On a finding, `←` and `→` move between findings, `tab` switches between Evidence, Limitations and References, and `esc` or backspace goes back. `q` or Ctrl-C quits. Pass `--no-intro` to skip the opening animation, which is also skipped when `CI` is set. In a pipe the viewer prints plain text for scripts and agents: the whole report in sections, in the order of the Results tab, or the finding a problem id or N names. `nudi-view --help` lists its options and the related `nudi` commands. It exits `0` for a complete run, whose steps all ran, `1` for any other run, such as one in which a step failed or stopped or one that reached its time limit, and `2` when the folder holds no readable report.
 
 A run with `--backend modal` keeps its folder on the machine that ran nudi. If nudi itself ran on Modal and wrote to a Modal Volume, download the folder first:
 
@@ -273,13 +273,13 @@ modal volume get VOLUME RUN runs/RUN
 tui/nudi-view runs/RUN
 ```
 
-To watch a run that is still going, follow its folder. The viewer shows the running sessions and Attacker attempts, the attack and what was found so far, from the run's `events.jsonl`, and the card once nudi writes the report:
+To watch a run that is still going, follow its folder. The viewer shows the running sessions and Attacker attempts, the attack, the findings so far and whether an Attacker succeeds without any information, from the run's `events.jsonl`, and the finished viewer once nudi writes the report:
 
 ```sh
 tui/nudi-view --follow runs/first
 ```
 
-Press `q` to stop following; the viewer then exits `2`, since the run had no report yet. It also exits `2` when nudi's process on this host ended without closing out the run, or when no log began in the folder within 2 minutes. A run on Modal is followed from a copy of its folder downloaded as above, and shows the run as far as that copy goes.
+The tabs are the same as for a finished run. The logs say in words what each job worked on and how it ended. `?` explains every column and symbol of the live screen, `l` expands the logs, `o` the related observations and `f` every finding so far; `←` and `→` page the agents in a narrow window. Press `q` to stop following; the viewer then exits `2`, since the run had no report yet. It also exits `2` when nudi's process on this host ended without closing out the run, or when no log began in the folder within 2 minutes. A run on Modal is followed from a copy of its folder downloaded as above, and shows the run as far as that copy goes.
 
 [Viewer contract](viewer.md) lists the fields it reads.
 

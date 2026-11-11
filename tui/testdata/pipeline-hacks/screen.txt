@@ -1,31 +1,41 @@
- nudi  testdata/pipeline-hacks                           ⏱ 0:08:50   $0.33 ━━━━━━━━━━━━ $3   docker
- concurrency 12 of 12
+ nudi  testdata/pipeline-hacks   following live          Docker     Elapsed 8:50     Concurrency 12
+                                                 Model cost $0.33 of $3.00  ━━━━━━━━━━━━     c Cost
 
- HACKS ⣾ 8:50
- hack inspector
+ Simulation ── Grade Simulations ──  Find Hacks  ⣾ ── Attack ⣾                      │   [ Results ]
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- AGENTS  5 of 6 slots
- ╭──────────────────────╮╭──────────────────────╮╭──────────────────────╮╭──────────────────────╮
- │ ⣾ hack inspector     ││ ⣾ Attacker           ││ ⣾ hack inspector     ││ ⣾ Attacker           │
- │ hack-broad           ││ 0000-attacker        ││ hack-grader_tamperi… ││ P2 full instructions │
- │ 8m 50s               ││ 8m 49s               ││ 3m 50s               ││ 3m 20s               │
- │ started              ││ no extra informatio… ││ started              ││ 0002-attacker, try 1 │
- ╰──────────────────────╯╰──────────────────────╯╰──────────────────────╯╰──────────────────────╯
- ╭──────────────────────╮
- │ ⣾ attack inspector   │
- │ P1 only a hint       │
- │ 0m 00s               │
- │ started              │
- ╰──────────────────────╯
+ FIND HACKS ⣾ 8:50     Hack Inspector
 
- FINDINGS                          judge       reproduce    full instructions  only a hint
- no extra information              ·           ·            try 1 ⣾ 8m
- P1 reward reads stdout            new         ✓            ✓ exploited        ⣾ 2m
-    + experiment-0002, experiment-0005 same as P1
- P2 skips the test file            new         ✓            ⣾ 3m               ·
- P3 writes expected output         new         ⣾ 3m         ·                  ·
- P4 timeout counts as pass         new         ✗ not reproduced
+ AGENTS  5 running
+ ╭─ Hack Inspector ──── ⣾ 8:50 ─╮ ╭─ Attacker ────────── ⣾ 8:49 ─╮ ╭─ Hack Inspector ──── ⣾ 3:50 ─╮
+ │ General search               │ │ No information               │ │ Focused search               │
+ │ All categories               │ │ Looking for any hack         │ │ Edits grader or tests        │
+ │                              │ │ Try 1                        │ │                              │
+ ╰──────────────────────────────╯ ╰──────────────────────────────╯ ╰──────────────────────────────╯
+ ╭─ Attacker ────────── ⣾ 3:20 ─╮ ╭─ Attack Inspector ── ⣾ 0:00 ─╮
+ │ Skips the test file          │ │ Checks try 1, hint           │
+ │ Full instructions, try 1     │ │ Reward reads stdout          │
+ │                              │ │                              │
+ ╰──────────────────────────────╯ ╰──────────────────────────────╯
 
- nudi: 10:08:10 hack inspector did not evidence P4
- nudi: 10:08:50 Attacker 0003-attacker finished after 0:02:04: rewards [1.0]
- nudi: 10:08:50 attack inspector attack_inspector-attacker-P1-minimal-1 started
+ FINDINGS SO FAR (4)
+ Finding                                       New?   Inspector?  Full instr.?  Hint?
+ Reward reads stdout                            ✓         ✓            ✓          ⣾ 2:04
+ Skips the test file                            ✓         ✓            ⣾ 3:20     -
+ Writes expected output                         ✓         ⣾ 3:10       -          -
+ Timeout counts as pass                         ✓         ✗            -          -
+
+ ▸ Related observations (2)                                                                o expand
+
+ CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?
+   Try   Status        Hack demonstrated?  New finding?  Problem
+   1     ⣾ 8:49
+
+ LOGS                                                                                      l expand
+ 10:07:30  novelty_judge     Same as an earlier finding: reward reads stdout
+ 10:08:10  nudi              Not reproduced: timeout counts as pass
+ 10:08:50  Attacker          Episode returned after 2:04, reward 1: try 1 with only a hint, for
+                             reward reads stdout
+ 10:08:50  Attack Inspector  Started: check of try 1 with only a hint, for reward reads stdout
+
+ ? Help   Tab next tab   Up/Down scroll   l logs   q Stop following

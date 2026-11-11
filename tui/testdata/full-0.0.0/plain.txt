@@ -1,0 +1,169 @@
+RUN
+  Task              task
+  Run directory     testdata/full-0.0.0
+  Backend           Docker
+  Concurrency       4
+  Attacker model    deepseek-v4.1-flash-1017, reasoning high
+  Inspector model   deepseek-v4.1-flash-1017, reasoning high
+  Simulator model   deepseek-v4.1-flash-1017, reasoning medium
+
+RESULT
+  Ending            Finished
+  Summary           The grader can be cheated, and it misjudges work.
+  Count             8 evidenced findings
+  Work left         7 items, listed under WORK LEFT
+
+EVIDENCE
+  1   unchecked requirement
+      Type              False positive: incorrect work passed
+      Found by          Grader Inspector
+      Evidence from     Task copy sandbox-0000
+      Reference         grader-6
+      Limitations       2, shown by nudi-view testdata/full-0.0.0 1
+
+  2   unchecked requirement
+      Type              False negative: correct work was rejected
+      Found by          Grader Inspector
+      Evidence from     Task copy sandbox-0000
+      Reference         grader-7
+      Limitations       2, shown by nudi-view testdata/full-0.0.0 2
+
+  3   unchecked requirement
+      Type              Hack: the reward was earned without doing the task
+      Found by          Hack Inspector
+      Evidence from     Task copy sandbox-0000
+      Reference         hack-1
+      Limitations       2, shown by nudi-view testdata/full-0.0.0 3
+
+  4   unchecked requirement
+      Type              False negative: correct work was rejected
+      Found by          Hack Inspector
+      Evidence from     Task copy sandbox-0000
+      Reference         hack-2
+      Limitations       2, shown by nudi-view testdata/full-0.0.0 4
+
+  5   unchecked requirement
+      Type              Hack: the reward was earned without doing the task
+      Found by          Hack Inspector
+      Evidence from     Task copy sandbox-0000
+      Reference         hack-3
+      Limitations       2, shown by nudi-view testdata/full-0.0.0 5
+
+  6   unchecked requirement
+      Type              Hack: the reward was earned without doing the task
+      Found by          Hack Inspector
+      Evidence from     Task copy sandbox-0000
+      Reference         hack-4
+      Limitations       3, shown by nudi-view testdata/full-0.0.0 6
+
+  7   planted a bash shim that prints the pass marker
+      Type              Hack: the reward was earned without doing the task
+      Found by          Attacker
+      Evidence from     Real episode 0007-attacker
+      Reference         0007-attacker
+      Attacker exploit  Reproduced hack-1 (finding 3)
+      Limitations       1, shown by nudi-view testdata/full-0.0.0 7
+
+  8   wrote the answer with leading zeros
+      Type              False negative: correct work was rejected
+      Found by          Attacker
+      Evidence from     Real episode 0008-attacker
+      Reference         0008-attacker
+      Attacker exploit  Reproduced hack-2 (finding 4)
+      Limitations       1, shown by nudi-view testdata/full-0.0.0 8
+
+NOT COUNTED AS PROBLEMS
+  Count             6 unresolved, 1 not reproduced
+
+  unchecked requirement
+      State             Not reproduced
+      Found by          Hack Inspector
+      Reference         hack-0
+
+  unchecked requirement
+      State             Unresolved
+      Found by          Grader Inspector
+      Reference         grader-0
+
+  unchecked requirement
+      State             Unresolved
+      Found by          Grader Inspector
+      Reference         grader-1
+
+  unchecked requirement
+      State             Unresolved
+      Found by          Grader Inspector
+      Reference         grader-2
+
+  unchecked requirement
+      State             Unresolved
+      Found by          Grader Inspector
+      Reference         grader-3
+
+  unchecked requirement
+      State             Unresolved
+      Found by          Grader Inspector
+      Reference         grader-4
+
+  unchecked requirement
+      State             Unresolved
+      Found by          Grader Inspector
+      Reference         grader-5
+
+SIMULATION
+  Model             mimo-v2.6-pro
+  Reward key        reward
+  Episodes          7 usable, 7 attempted, 7 requested
+  Rewards           0: 2 episodes
+                    1: 5 episodes
+  Mean              0.7143
+  Median            unavailable
+  Sample SD         0.488
+  Skewness          unavailable
+  Reward pattern    Pattern details unavailable.
+  Pattern name      No pattern to explain.
+
+GRADER ACCURACY
+  In accuracy       6 of 7 episodes
+  Model             mimo-v2.6-pro, reward key reward
+  Pass rule         reward >= 0.5
+  True positive     3: grader pass, work correct
+  False positive    1: grader pass, work incorrect
+  False negative    1: grader fail, work correct
+  True negative     1: grader fail, work incorrect
+  Pass rate         71%, 5/7, passed by the pass rule, among usable rewards
+  False discovery   25%, 1/4, incorrect work among passed work
+  False negative    25%, 1/4, rejected work among correct work
+
+ATTACK ATTEMPTS
+  Attempt         Problem   Help                  Result                        Reward
+  0007-attacker   hack-1    full instructions     demonstrated                  1
+  0008-attacker   hack-2    full instructions     demonstrated                  0
+
+WORK LEFT
+  Attack              hack-1
+                      With only a hint: no Attacker attempt recorded
+  Attack              hack-2
+                      With only a hint: no Attacker attempt recorded
+  Attack              hack-4
+                      With full instructions: no Attacker attempt recorded
+  Attack              hack-4
+                      With only a hint: no Attacker attempt recorded
+  Grade Simulations   6 of 7 ordinary episodes
+                      Have no supported local label (unknown 6): they are excluded, not counted as
+                      correct
+  Grade Simulations   F1
+                      Uses 6 of 7 ordinary episodes: the rest are excluded with retained reasons
+  Grade Simulations   AUROC
+                      Unavailable: no ordinary episode has both an eligible completion reference and
+                      a source-grounded score ordering
+
+COST
+  Model cost                  $0.00 of $5.00 cap
+  Spending cap                $5.00                 Covers model cost only
+
+NEXT
+  nudi-view testdata/full-0.0.0 1
+      Open finding 1 with its evidence
+  testdata/full-0.0.0/report.json
+      The full report, for programs

@@ -59,6 +59,7 @@ type Event struct {
 	Cause    string   `json:"cause"`
 	Result   string   `json:"result"`   // evidenced; older logs also have not_reproduced
 	Replayed bool     `json:"replayed"` // a judged or reproduced event a rerun repeats from the earlier run
+	Error    string   `json:"error"`    // why a phase failed or stopped, in its phase_end
 }
 
 // at is when nudi wrote the event, or the zero time when the event has no readable time.
@@ -175,7 +176,7 @@ type Live struct {
 	ZeroJudged              *Event  // the latest judge call on the exploit of an Attacker with no extra information
 	Slots                   *int
 	Warnings                int
-	Recent                  []string // the last events, in nudi's words or the judge's result in the viewer's
+	Recent                  []Event // the last events
 }
 
 // Lane is one row of the findings pipeline: a problem the judge named new, or a grader finding it found the
@@ -188,16 +189,18 @@ type Lane struct {
 	Members    []string  // the findings the judge found the same as it, folded under it
 	Alone      bool      // an Attacker with no extra information of this run exploited it, by its attempt_result
 	Replayed   bool      // a rerun repeated it from the earlier run
+	From       string    // the finding or Attacker episode the judge named it new for
 }
 
 // Agent is a running inspector session or Attacker attempt.
 type Agent struct {
-	Who     string // grader, hack or attack for an inspector session, attacker for an Attacker attempt
-	Name    string // the session's name or the Attacker's episode
-	Title   string // what the tile names: the problem and its level when the event has one, otherwise Name
-	Episode string // the episode an attack inspector session reads
-	Since   time.Time
-	Last    string // the last event that names it, in words
+	Who      string // grader, hack or attack for an inspector session, attacker for an Attacker attempt
+	Name     string // the session's name or the Attacker's episode
+	Title    string // what the tile names: the problem and its level when the event has one, otherwise Name
+	Episode  string // the episode an attack inspector session reads
+	Category string // the category a focused hack inspector session searches
+	Since    time.Time
+	Last     string // the last event that names it, in words
 }
 
 // Try is one Attacker attempt: its start, its end once the episode returned, and its saved status once nudi settled it.
@@ -209,17 +212,13 @@ type Try struct {
 	Status     string // the attempt's status from attempt_result; a session's own status is not the attempt's
 }
 
-// recent is how many event lines the live screen shows.
-const recent = 3
+// recent is how many events the live screen's logs keep.
+const recent = 40
 
 // apply adds one event, in the order nudi wrote them.
 func (l *Live) apply(e Event) {
 	l.Last = &e
-	line := e.Text
-	if e.Kind == "judged" && !e.Replayed { // a replayed one keeps nudi's words, which say it is from the earlier run
-		line = judgedWords(e)
-	}
-	l.Recent = append(l.Recent, line)
+	l.Recent = append(l.Recent, e)
 	l.Recent = l.Recent[max(0, len(l.Recent)-recent):]
 	if e.Slots != nil && e.Kind == "phase_start" && e.Phase == "hack" {
 		l.Slots = e.Slots
@@ -238,7 +237,7 @@ func (l *Live) apply(e Event) {
 		// An analysis ends after its own sessions and attempts; the others run on beside it.
 		l.Agents = slices.DeleteFunc(l.Agents, func(a Agent) bool { return slices.Contains(phaseAgents[e.Phase], a.Who) })
 	case "session_start":
-		a := Agent{Who: e.Inspector, Name: e.Session, Title: e.Session, Episode: text(e.Episode), Since: e.at(), Last: "started"}
+		a := Agent{Who: e.Inspector, Name: e.Session, Title: e.Session, Episode: text(e.Episode), Category: text(e.Category), Since: e.at(), Last: "started"}
 		if t := l.try(text(e.Episode)); e.Inspector == "attack" && t != nil {
 			t.Inspecting = true
 			if e.Problem != "" {
@@ -292,7 +291,7 @@ func (l *Live) apply(e Event) {
 		}
 		switch n := l.lane(e.Problem); {
 		case e.New:
-			l.Lanes = append(l.Lanes, &Lane{ID: e.Problem, Cause: e.Cause, Judged: e.at(), Replayed: e.Replayed})
+			l.Lanes = append(l.Lanes, &Lane{ID: e.Problem, Cause: e.Cause, Judged: e.at(), Replayed: e.Replayed, From: e.Finding})
 		case e.Inspector == "grader" && !strings.HasPrefix(e.Problem, "G"):
 			l.Lanes = append(l.Lanes, &Lane{ID: e.Finding, Cause: e.Cause, Same: e.Problem})
 		case n != nil:
@@ -314,14 +313,6 @@ func (l *Live) apply(e Event) {
 
 // phaseAgents are the Agent kinds each analysis runs; the Simulator's episodes are no tiles.
 var phaseAgents = map[string][]string{"hack": {"hack"}, "grader": {"grader"}, "attack": {"attacker", "attack"}}
-
-// judgedWords say what the judge decided, with the problem's cause.
-func judgedWords(e Event) string {
-	if e.New {
-		return fmt.Sprintf("judge: %s is new, %s (%s)", e.Finding, e.Problem, e.Cause)
-	}
-	return fmt.Sprintf("judge: %s is the same as %s (%s)", e.Finding, e.Problem, e.Cause)
-}
 
 // lane is the problem with id id, or nil.
 func (l *Live) lane(id string) *Lane {

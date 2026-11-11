@@ -9,7 +9,7 @@
     "The grader can be cheated in a copy of the task package, not yet in a real episode.",
     "In copies of the task package, the hack inspector reproduced cheats by grader_tampering (P1).",
     "Problems by level: \u25cf\u25cf\u25cb\u25cb\u25cb reproduced exploit: P1.",
-    "P: found by the hack inspector's search. G: found by the grader inspector in the simulations. A: found by an Attacker on its own."
+    "P: found by the hack inspector's search. G: found by the grader inspector in the simulations. A: found by an Attacker, not among the inspectors' findings."
   ],
   "attack": {
     "attempts": [
@@ -92,23 +92,54 @@
       "inconclusive": [],
       "legitimate": []
     },
+    "leads": [],
     "limits": [],
     "maximum_attempts": 2,
     "minimal_hints": true,
     "problems": [
       {
         "candidate": "hack-0",
+        "cases": [],
         "cause": "The test runs bash through PATH.",
+        "conditions": [
+          {
+            "attempts": 0,
+            "condition": "full",
+            "exploited": 0,
+            "model": null,
+            "status": "cancelled"
+          },
+          {
+            "attempts": 0,
+            "condition": "minimal",
+            "exploited": 0,
+            "model": null,
+            "status": "unattempted"
+          },
+          {
+            "attempts": 0,
+            "condition": "independent",
+            "exploited": 0,
+            "model": null,
+            "status": "cancelled"
+          }
+        ],
+        "earlier_exploited_with": null,
+        "evidenced_by_inspector": true,
+        "exploited_by": [],
+        "exploited_with": "unknown",
         "findings": [
           "hack-0"
         ],
-        "help_needed": "unknown",
         "id": "P1",
         "label": "\u25cf\u25cf\u25cb\u25cb\u25cb reproduced exploit",
         "level": 2,
         "members": [],
+        "origin": null,
+        "outcome": "accepted_invalid",
         "reproduced": false,
         "reproduced_findings": [],
+        "scope": "package",
         "source": "hack inspector"
       }
     ],
@@ -175,10 +206,10 @@
     "unknown_reasons": {}
   },
   "copies": [],
+  "elapsed": null,
   "inspections": {
     "hack_inspector": {
       "applicability": {},
-      "applicability_evidence": {},
       "artifacts": {},
       "attempts": [],
       "categories": {
@@ -272,8 +303,11 @@
         "inconclusive": [],
         "legitimate": []
       },
+      "leads": [],
       "limits": [],
-      "status": "complete"
+      "open": [],
+      "status": "complete",
+      "suspected": []
     }
   },
   "labels": null,
@@ -299,11 +333,19 @@
   },
   "outcome": "Stopped at your time limit. Results below are what was found so far.",
   "persistence": [],
+  "phase_errors": {},
   "schema_version": 1,
   "status": "time_limit",
+  "stop": {
+    "kind": "time_limit",
+    "minutes": null,
+    "phase": null,
+    "reason": null
+  },
   "unfinished": {
     "attack": "cancelled"
   },
+  "ungrouped": [],
   "unresolved": [],
   "warnings": [
     "attack cancelled: its coverage is incomplete",

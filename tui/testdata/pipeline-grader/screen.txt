@@ -1,28 +1,36 @@
- nudi  testdata/pipeline-grader                          ⏱ 0:25:01   $1.15 ━━━━━━━━━━━━ $3   docker
- concurrency 12 of 12
+ nudi  testdata/pipeline-grader   following live        Docker     Elapsed 25:01     Concurrency 12
+                                                 Model cost $1.15 of $3.00  ━━━━━━━━━━━━     c Cost
 
- HACKS ✓ 18:00  4 problems, 2 exploited   GRADER ⣾ 6:59
- hack inspector                           Simulate · Inspect · Attack
+ Simulation ✓ ──  Grade Simulations  ⣾ ── Find Hacks ✓ ── Attack waiting            │   [ Results ]
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ GRADE SIMULATIONS ⣾ 3:59     Grader Inspector
 
  AGENTS  1 running
- ╭──────────────────────╮
- │ ⣾ grader inspector   │
- │ grader-broad         │
- │ 3m 59s               │
- │ started              │
- ╰──────────────────────╯
+ ╭─ Grader Inspector ── ⣾ 3:59 ─╮
+ │ General review               │
+ │ All simulated episodes       │
+ │                              │
+ ╰──────────────────────────────╯
 
- FINDINGS                          judge       reproduce    full instructions  only a hint
- no extra information              same as P1  ·            try 1 ✓ exploited
- P1 reward reads stdout            new         ✓            ✓ exploited        ✓ another way
-    + experiment-0002, experiment-0005, 0000-attacker same as P1
- P2 skips the test file            new         ✓            ✓ exploited        ✗ not exploited
- P3 writes expected output         new         ✓            ✗ not exploited    –
- P4 timeout counts as pass         new         ✓            ·                  ·
- G1 accepts empty answer           new         ✓ (grader)   ·                  ·
- grader-5 reward reads stdout      same as P1, attacked in hacks
- grader-6 timeout counts as pass   same as P4
+ FINDINGS SO FAR (5)
+ Finding                                       New?   Inspector?  Full instr.?  Hint?
+ Reward reads stdout                            ✓         ✓            ✓          ✗
+ Skips the test file                            ✓         ✓            ✓          ✗
+ Writes expected output                         ✓         ✓            ✗          -
+ Timeout counts as pass                         ✓         ✓            -          -
+ Accepts empty answer                           ✓         ✓            -          -
 
- nudi: 10:25:00 grader inspector evidenced accepted_invalid (check-0010)
- judge: grader-6 is the same as P4 (timeout counts as pass)
- nudi: 10:25:01 grader inspector evidenced P4
+ ▸ Related observations (5)                                                                o expand
+
+ CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?
+   Try   Status        Hack demonstrated?  New finding?  Problem
+   1     Finished              ✓                ✗        Reward reads stdout
+
+ LOGS                                                                                      l expand
+ 10:24:10  novelty_judge     Same as an earlier finding: reward reads stdout
+ 10:25:00  Grader Inspector  Evidence confirmed: incorrect work passed
+ 10:25:00  novelty_judge     Same as an earlier finding: timeout counts as pass
+ 10:25:01  nudi              Reproduced: timeout counts as pass
+
+ ? Help   Tab next tab   Up/Down scroll   l logs   q Stop following

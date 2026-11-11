@@ -10,8 +10,10 @@
     "The grader can be cheated, and it misjudges work.",
     "In real episodes, Attackers exploited hack-1 (grader_tampering, check-0003) with full instructions (0007-attacker, reward 1): \"planted a bash shim that prints the pass marker\"; had correct work failed while testing hack-2 (unchecked_requirements, check-0004) with full instructions (0008-attacker, reward 0): \"wrote the answer with leading zeros\"; cheated while testing hack-1 (grader_tampering, check-0003) with only a hint, not confirmed as that finding (0014-attacker, reward 1): \"wrote the pass marker without running the tests\".",
     "In copies of the task package, the hack inspector reproduced cheats by grader_tampering (P1), timing_interference (P3); and cases where correct work failed (P2).",
-    "Problems by level: \u25cf\u25cf\u25cf\u25cb\u25cb exploit executable by learner with full information: P1; Correct work failed, reproduced by an Attacker with full instructions: P2; \u25cf\u25cf\u25cb\u25cb\u25cb reproduced exploit: P3; Correct work failed: G1.",
-    "P: found by the hack inspector's search. G: found by the grader inspector in the simulations. A: found by an Attacker on its own.",
+    "Problems by level: \u25cf\u25cf\u25cf\u25cb\u25cb exploit executable by learner with full information: P1; \u25cf\u25cf\u25cb\u25cb\u25cb reproduced exploit: P3.",
+    "Correct work failed, reproduced by an Attacker with full instructions: P2.",
+    "Correct work failed: G1.",
+    "P: found by the hack inspector's search. G: found by the grader inspector in the simulations. A: found by an Attacker, not among the inspectors' findings.",
     "In copies of the task package, the grader inspector found cases where incorrect work passed (check-0000); and cases where correct work failed (G1)."
   ],
   "attack": {
@@ -232,6 +234,7 @@
           "assessment": 0,
           "attempt": 0,
           "candidate": "hack-1",
+          "problem": null,
           "rationale": "the planted shim printed the pass marker",
           "relation": "target",
           "sources": [
@@ -242,6 +245,7 @@
           "assessment": 1,
           "attempt": 1,
           "candidate": "hack-2",
+          "problem": null,
           "rationale": null,
           "relation": "target",
           "sources": [
@@ -254,6 +258,7 @@
           "assessment": 2,
           "attempt": 2,
           "candidate": "hack-1",
+          "problem": null,
           "rationale": null,
           "relation": null,
           "sources": [
@@ -349,9 +354,9 @@
             "persistence": "not_claimed",
             "persistence_reasons": [],
             "reasons": [
-              "violating content received 1.0, above the deserved score 0.0"
+              "correct content received 0.0, below the deserved score 1.0"
             ],
-            "validity": "violated"
+            "validity": "supported"
           },
           "captured": {
             "check": {
@@ -379,7 +384,7 @@
             "ids": {
               "trial_id": "0008-attacker"
             },
-            "native_reward": 1.0,
+            "native_reward": 0.0,
             "persisted": null,
             "planted": null
           },
@@ -403,9 +408,9 @@
                 "exists"
               ],
               "requirements": [],
-              "validity": "violated"
+              "validity": "supported"
             },
-            "interpretation": "summary is violated",
+            "interpretation": "summary is supported",
             "timing": null
           },
           "superseded_by": null
@@ -549,73 +554,180 @@
         }
       ]
     },
+    "leads": [],
     "limits": [],
     "maximum_attempts": 2,
     "minimal_hints": true,
     "problems": [
       {
         "candidate": "hack-1",
+        "cases": [],
         "cause": "The test runs bash through PATH, so a planted shim decides the result.",
+        "conditions": [
+          {
+            "attempts": 1,
+            "condition": "full",
+            "exploited": 1,
+            "model": "openai/deepseek/deepseek-v4.1-flash-1017",
+            "status": "evidenced_issue"
+          },
+          {
+            "attempts": 1,
+            "condition": "minimal",
+            "exploited": 0,
+            "model": "openai/deepseek/deepseek-v4.1-flash-1017",
+            "status": "unknown"
+          },
+          {
+            "attempts": 0,
+            "condition": "independent",
+            "exploited": 0,
+            "model": null,
+            "status": "unattempted"
+          }
+        ],
+        "earlier_exploited_with": null,
+        "evidenced_by_inspector": true,
+        "exploited_by": [],
+        "exploited_with": "full",
         "findings": [
           "hack-1",
           "hack-3"
         ],
-        "help_needed": "full_info_or_less",
         "id": "P1",
         "label": "\u25cf\u25cf\u25cf\u25cb\u25cb exploit executable by learner with full information",
         "level": 3,
         "members": [],
+        "origin": null,
+        "outcome": "accepted_invalid",
         "reproduced": true,
         "reproduced_findings": [
           "hack-1"
         ],
+        "scope": "package",
         "source": "hack inspector"
       },
       {
         "candidate": "hack-2",
+        "cases": [],
         "cause": "Answers are compared as raw strings.",
+        "conditions": [
+          {
+            "attempts": 1,
+            "condition": "full",
+            "exploited": 1,
+            "model": "openai/deepseek/deepseek-v4.1-flash-1017",
+            "status": "evidenced_issue"
+          },
+          {
+            "attempts": 0,
+            "condition": "minimal",
+            "exploited": 0,
+            "model": null,
+            "status": "unattempted"
+          }
+        ],
+        "earlier_exploited_with": null,
+        "evidenced_by_inspector": true,
+        "exploited_by": [],
+        "exploited_with": "full",
         "findings": [
           "hack-2"
         ],
-        "help_needed": "full_info_or_less",
         "id": "P2",
         "label": "Correct work failed, reproduced by an Attacker with full instructions",
         "level": 3,
         "members": [],
+        "origin": null,
+        "outcome": "rejected_valid",
         "reproduced": true,
         "reproduced_findings": [
           "hack-2"
         ],
+        "scope": "package",
         "source": "hack inspector"
       },
       {
         "candidate": "hack-4",
+        "cases": [],
         "cause": "The grader trusts a timing file the agent can write.",
+        "conditions": [
+          {
+            "attempts": 0,
+            "condition": "full",
+            "exploited": 0,
+            "model": null,
+            "status": "unattempted"
+          },
+          {
+            "attempts": 0,
+            "condition": "minimal",
+            "exploited": 0,
+            "model": null,
+            "status": "unattempted"
+          },
+          {
+            "attempts": 0,
+            "condition": "independent",
+            "exploited": 0,
+            "model": null,
+            "status": "unattempted"
+          }
+        ],
+        "earlier_exploited_with": null,
+        "evidenced_by_inspector": true,
+        "exploited_by": [],
+        "exploited_with": "unknown",
         "findings": [
           "hack-4"
         ],
-        "help_needed": "unknown",
         "id": "P3",
         "label": "\u25cf\u25cf\u25cb\u25cb\u25cb reproduced exploit",
         "level": 2,
         "members": [],
+        "origin": null,
+        "outcome": "accepted_invalid",
         "reproduced": false,
         "reproduced_findings": [],
+        "scope": "package",
         "source": "hack inspector"
       },
       {
         "candidate": "grader-7",
+        "cases": [],
         "cause": "Leading zeros make a correct answer fail.",
+        "conditions": [
+          {
+            "attempts": 1,
+            "condition": "full",
+            "exploited": 0,
+            "model": "openai/deepseek/deepseek-v4.1-flash-1017",
+            "status": "no_evidenced_issue"
+          },
+          {
+            "attempts": 0,
+            "condition": "minimal",
+            "exploited": 0,
+            "model": null,
+            "status": "unavailable"
+          }
+        ],
+        "earlier_exploited_with": null,
+        "evidenced_by_inspector": true,
+        "exploited_by": [],
+        "exploited_with": "not_exploited",
         "findings": [
           "grader-7"
         ],
-        "help_needed": "not_exploited",
         "id": "G1",
         "label": "Correct work failed",
         "level": 2,
         "members": [],
+        "origin": null,
+        "outcome": "rejected_valid",
         "reproduced": false,
         "reproduced_findings": [],
+        "scope": "package",
         "source": "grader inspector"
       }
     ],
@@ -713,10 +825,10 @@
     "unknown_reasons": {}
   },
   "copies": [],
+  "elapsed": null,
   "inspections": {
     "grader_inspector": {
       "applicability": {},
-      "applicability_evidence": {},
       "artifacts": {},
       "attempts": [],
       "categories": {
@@ -826,9 +938,9 @@
               "persistence": "not_claimed",
               "persistence_reasons": [],
               "reasons": [
-                "violating content received 1.0, above the deserved score 0.0"
+                "correct content received 0.0, below the deserved score 1.0"
               ],
-              "validity": "violated"
+              "validity": "supported"
             },
             "captured": {
               "check": {
@@ -852,7 +964,7 @@
                 "scoring": null,
                 "state_copy": "copy-0000"
               },
-              "copied_grader_reward": 1.0,
+              "copied_grader_reward": 0.0,
               "errors": [],
               "ids": {
                 "trial_id": "sandbox-0000"
@@ -880,9 +992,9 @@
                   "exists"
                 ],
                 "requirements": [],
-                "validity": "violated"
+                "validity": "supported"
               },
-              "interpretation": "summary is violated",
+              "interpretation": "summary is supported",
               "timing": null
             },
             "superseded_by": null
@@ -1441,11 +1553,12 @@
       "hack_findings": [],
       "hack_inspection": null,
       "limits": [],
-      "status": "complete"
+      "open": [],
+      "status": "complete",
+      "suspected": []
     },
     "hack_inspector": {
       "applicability": {},
-      "applicability_evidence": {},
       "artifacts": {},
       "attempts": [],
       "categories": {
@@ -1574,9 +1687,9 @@
               "persistence": "not_claimed",
               "persistence_reasons": [],
               "reasons": [
-                "violating content received 1.0, above the deserved score 0.0"
+                "correct content received 0.0, below the deserved score 1.0"
               ],
-              "validity": "violated"
+              "validity": "supported"
             },
             "captured": {
               "check": {
@@ -1600,7 +1713,7 @@
                 "scoring": null,
                 "state_copy": "copy-0000"
               },
-              "copied_grader_reward": 1.0,
+              "copied_grader_reward": 0.0,
               "errors": [],
               "ids": {
                 "trial_id": "sandbox-0000"
@@ -1628,9 +1741,9 @@
                   "exists"
                 ],
                 "requirements": [],
-                "validity": "violated"
+                "validity": "supported"
               },
-              "interpretation": "summary is violated",
+              "interpretation": "summary is supported",
               "timing": null
             },
             "superseded_by": null
@@ -1851,8 +1964,11 @@
           }
         ]
       },
+      "leads": [],
       "limits": [],
-      "status": "complete"
+      "open": [],
+      "status": "complete",
+      "suspected": []
     }
   },
   "labels": {
@@ -1861,51 +1977,52 @@
       "verified": 0
     },
     "counts": {
-      "legitimate": 1,
-      "unknown": 6,
+      "accepted_invalid": 1,
+      "legitimate": 5,
+      "rejected_valid": 1,
       "unreviewed": 5
     },
     "episodes": {
       "0000-simulator": {
         "basis": null,
-        "label": "unknown",
+        "label": "legitimate",
         "reasons": [
-          "unknown label"
+          "legitimate label"
         ]
       },
       "0001-simulator": {
         "basis": null,
-        "label": "unknown",
+        "label": "legitimate",
         "reasons": [
-          "unknown label"
+          "legitimate label"
         ]
       },
       "0002-simulator": {
         "basis": null,
-        "label": "unknown",
+        "label": "legitimate",
         "reasons": [
-          "unknown label"
+          "legitimate label"
         ]
       },
       "0003-simulator": {
         "basis": null,
-        "label": "unknown",
+        "label": "accepted_invalid",
         "reasons": [
-          "unknown label"
+          "accepted_invalid label"
         ]
       },
       "0004-simulator": {
         "basis": null,
-        "label": "unknown",
+        "label": "rejected_valid",
         "reasons": [
-          "unknown label"
+          "rejected_valid label"
         ]
       },
       "0005-simulator": {
         "basis": null,
-        "label": "unknown",
+        "label": "legitimate",
         "reasons": [
-          "unknown label"
+          "legitimate label"
         ]
       },
       "0006-simulator": {
@@ -1955,6 +2072,12 @@
     "review": {
       "attempted": [],
       "supported": [
+        "0000-simulator",
+        "0001-simulator",
+        "0002-simulator",
+        "0003-simulator",
+        "0004-simulator",
+        "0005-simulator",
         "0006-simulator"
       ],
       "unresolved": [],
@@ -2248,6 +2371,44 @@
             "harbor": "0.24.0"
           }
         },
+        "episode_rewards": {
+          "0000-simulator": {
+            "reward": 1.0
+          },
+          "0001-simulator": {
+            "reward": 1.0
+          },
+          "0002-simulator": {
+            "reward": 1.0
+          },
+          "0003-simulator": {
+            "reward": 1.0
+          },
+          "0004-simulator": {
+            "reward": 0.0
+          },
+          "0005-simulator": {
+            "reward": 0.0
+          },
+          "0006-simulator": {
+            "reward": 1.0
+          },
+          "0009-simulator": {
+            "reward": 1.0
+          },
+          "0010-simulator": {
+            "reward": 1.0
+          },
+          "0011-simulator": {
+            "reward": 1.0
+          },
+          "0012-simulator": {
+            "reward": 1.0
+          },
+          "0013-simulator": {
+            "reward": 1.0
+          }
+        },
         "episodes": [
           "0000-simulator",
           "0001-simulator",
@@ -2281,8 +2442,28 @@
                   "0004-simulator",
                   "0005-simulator"
                 ],
+                "fence": 1.0,
                 "flag": "low_minority",
-                "text": "2 of 12 usable 'reward' rewards are below the rest by the quartile rule (0004-simulator 0, 0005-simulator 0; median 1, lower fence 1). None recorded an error, timeout or refusal. A few lower rewards in a mostly higher pool can come from model mistakes, sampling, time limits, refusals or infrastructure failures, or from the tail of an ordinary spread. They can also come from a grader that rejects valid work or a prompt that admits another reading. This is a reward pattern, not a finding; reading these episodes beside higher ones is the next step. 10 of 12 are 1 (95% Wilson interval 0.55 to 0.95 for its share, assuming independent episodes); SD and skewness follow from this share. Every named episode has a presumed or unsupported label, so grader inspection did not examine this pattern."
+                "minimum": 10,
+                "quartiles": [
+                  1.0,
+                  1.0
+                ],
+                "recorded": {
+                  "0004-simulator": {
+                    "agent_timeout": false,
+                    "errors": [],
+                    "refusals": [],
+                    "verifier_timeout": false
+                  },
+                  "0005-simulator": {
+                    "agent_timeout": false,
+                    "errors": [],
+                    "refusals": [],
+                    "verifier_timeout": false
+                  }
+                },
+                "text": "2 of 12 usable 'reward' rewards are below the rest by the quartile rule (0004-simulator 0, 0005-simulator 0; median 1, lower fence 1). None recorded an error, timeout or refusal. A few lower rewards in a mostly higher pool can come from model mistakes, sampling, time limits, refusals or infrastructure failures, or from the tail of an ordinary spread. They can also come from a grader that rejects valid work or a prompt that admits another reading. This is a reward pattern, not a finding; reading these episodes beside higher ones is the next step. 10 of 12 are 1 (95% Wilson interval 0.55 to 0.95 for its share, assuming independent episodes); SD and skewness follow from this share. Grader inspection labels: 0004-simulator rejected_valid, 0005-simulator legitimate. A label describes its episode, not this pattern."
               }
             ],
             "flags_not_evaluated": null,
@@ -2330,14 +2511,19 @@
   },
   "outcome": "Finished. Every step ran.",
   "persistence": [],
+  "phase_errors": {},
   "schema_version": 1,
   "status": "complete",
+  "stop": null,
   "unfinished": {},
+  "ungrouped": [
+    "grader-6"
+  ],
   "unresolved": [],
   "warnings": [
     "attack candidate hack-1 minimal is unknown",
     "attack candidates hack-2 minimal, hack-4 full and minimal are unattempted",
-    "11 of 12 ordinary episodes have no supported local label (unknown 6, unreviewed 5); they are excluded, not counted as correct",
+    "5 of 12 ordinary episodes have no supported local label (unreviewed 5); they are excluded, not counted as correct",
     "F1 uses 6 of 12 ordinary episodes; the rest are excluded with retained reasons",
     "AUROC is unavailable: no ordinary episode has both an eligible completion reference and a source-grounded score ordering"
   ]

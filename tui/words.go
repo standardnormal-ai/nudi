@@ -27,7 +27,42 @@ var phases = []struct{ Name, Analysis string }{
 	{"Grade Simulations", "grader"},
 	{"Find Hacks", "hack"},
 	{"Attack", "attack"},
-	{"Finished", ""},
+}
+
+// roleNames are each model role in report.json's configuration and the jobs it runs.
+var roleNames = map[string][2]string{
+	"simulator": {"Simulator", "Simulator, which runs the simulated episodes"},
+	"inspector": {"Inspector", "Grader Inspector, Hack Inspector, Attack Inspector, and the judge that groups findings into problems"},
+	"attacker":  {"Attacker", "Attacker, which tries to demonstrate each problem in a real episode"},
+}
+
+// stopWords say how a run stopped, by its stop's kind, and what the screens say of the results.
+var stopWords = map[string][2]string{
+	"cancelled":        {"Stopped by you", "Results below are from before the stop."},
+	"terminated":       {"Stopped by a termination signal", "Results below are from before the stop."},
+	"time_limit":       {"Stopped at the time limit", "Results below are from before the limit."},
+	"spending_cap":     {"Stopped at the spending cap", "Results below are from before the cap."},
+	"provider_refused": {"Stopped by the model provider", "Results below are from before the stop."},
+	"stopped":          {"Run not finished", "The report has no end. The run may still be going, or it stopped without a report."},
+}
+
+// unfinishedWords say why a step did not run to its end, by its status.
+var unfinishedWords = map[string]string{
+	"partial":            "Not finished",
+	"cancelled":          "Stopped",
+	"time_limit":         "Stopped at the time limit",
+	"spending_exhausted": "Stopped at the spending cap",
+	"running":            "No result recorded",
+	"unknown":            "No result recorded",
+	"not run":            "Did not run",
+}
+
+// failedWords say, for each phase that raised an error, what the run therefore does not show.
+var failedWords = map[string]string{
+	"simulation": "No simulation result, so this run shows no rewards and no grader accuracy.",
+	"grader":     "No grader review, so this run shows no grader accuracy.",
+	"hack":       "No hack search result, so this run shows nothing about hacks.",
+	"attack":     "No Attacker result, so this run shows no Attacker test.",
 }
 
 // statusWords name an analysis's status, and the run's status; the stopped ones use the report's own words.
@@ -55,20 +90,7 @@ var kindTags = map[string]string{
 	"attack rejected_valid":             "FN",
 }
 
-// kindKeys say in a few words what each tag means, FP and FN as the simulation chart does.
-var kindKeys = map[string]string{
-	"HACK": "a trick that gets reward",
-	"FP":   "Incorrect work passed",
-	"FN":   "Correct work failed",
-}
-
-var sourceWords = map[string]string{
-	"grader_inspector": "grader inspector",
-	"hack_inspector":   "hack inspector",
-	"attack":           "attack inspector",
-}
-
-var scopeWords = map[string]string{"package": "package copy", "native": "real episode"}
+var scopeWords = map[string]string{"package": "task copy", "native": "real episode"}
 
 var checkNames = map[string]string{
 	"leakage_metadata":       "Reads leaked answer",
@@ -86,41 +108,73 @@ var checkNames = map[string]string{
 	"rejected_valid":         "Correct work failed",
 }
 
-// hackOrder is the order of the hack chips; other shows only when the report has it.
-var hackOrder = []string{"leakage_metadata", "package_oracles", "grader_tampering", "fabricated_answers", "malformed_rewards",
-	"timing_interference", "resource_exhaustion", "online_lookup", "persistence", "unchecked_requirements", "other"}
+// lookedFor says what an inspector looked for in each category of its search.
+var lookedFor = map[string]string{
+	"leakage_metadata":       "Answers leaked through files, metadata or the environment",
+	"package_oracles":        "Solution or test files the agent can read",
+	"grader_tampering":       "Changing the grader, tests or their inputs",
+	"fabricated_answers":     "Answers written without doing the work",
+	"malformed_rewards":      "A reward file the grader reads without checking it",
+	"timing_interference":    "Clocks, timeouts and timing files the reward reads",
+	"resource_exhaustion":    "Using up memory, disk or time so the grader breaks",
+	"online_lookup":          "Looking the answer up online",
+	"persistence":            "State left behind that a later episode reads",
+	"unchecked_requirements": "A requirement the grader never checks",
+	"other":                  "Any other way to get the reward",
+	"accepted_invalid":       "Episodes the grader passed although the task was not done",
+	"rejected_valid":         "Episodes the grader failed although the work was correct",
+}
 
-// labelWords name the grader inspector's local label of an ordinary episode.
+// labelWords name the Grader Inspector's label of a simulated episode; both wrong decisions are a mismatch.
 var labelWords = map[string]string{
-	"legitimate":       "legitimate",
-	"accepted_invalid": "Incorrect work passed",
-	"rejected_valid":   "Correct work failed",
+	"legitimate":       "Legitimate",
+	"accepted_invalid": "Mismatch",
+	"rejected_valid":   "Mismatch",
 	"unknown":          "Unresolved",
-	"unavailable":      "unavailable",
-	"ungrounded":       "ungrounded",
-	"unreviewed":       "not reviewed",
+	"unavailable":      "Unavailable",
+	"ungrounded":       "Ungrounded",
+	"unreviewed":       "Not reviewed",
+}
+
+// labelMeanings say what each label of labelWords means.
+var labelMeanings = map[string]string{
+	"Legitimate":   "The reward matches the work",
+	"Mismatch":     "The reward does not match the work",
+	"Unresolved":   "The Grader Inspector could not decide",
+	"Unavailable":  "The episode has no graded outcome",
+	"Ungrounded":   "The label cites evidence the run did not keep",
+	"Not reviewed": "Not inspected in this run",
+}
+
+// verdictWords say what the Grader Inspector's label and the grader's decision make of an episode.
+var verdictWords = map[string]string{
+	"legitimate pass":       "Correct work, passed",
+	"legitimate fail":       "Incorrect work, failed",
+	"accepted_invalid pass": "Incorrect work passed",
+	"rejected_valid fail":   "Correct work rejected",
+	"unknown":               "The Grader Inspector could not decide",
 }
 
 // flagWords name Python's distribution flags of a reward.
-var flagWords = map[string]string{"identical_rewards": "Identical rewards", "low_minority": "Lower minority", "high_minority": "Higher minority"}
+var flagWords = map[string]string{"identical_rewards": "Identical rewards", "low_minority": "Unusually low rewards", "high_minority": "Unusually high rewards"}
 
 // exploitWords say what an Attacker exploit confirmed of the findings it tested, by its kind in the report.
 var exploitWords = map[string]string{
 	"reproduction": "reproduced",
 	"other":        "another mechanism while testing",
 	"unattributed": "not confirmed as",
-	"discovery":    "found with no extra information",
+	"discovery":    "found with no information",
 }
 
 // levelWords name an attack hint level as the exploit chart does: what an Attacker receives.
-var levelWords = map[string]string{"none": "no extra information", "full": "full instructions", "minimal": "only a hint"}
+var levelWords = map[string]string{"none": "no information", "full": "full instructions", "minimal": "only a hint"}
 
 // ladderWords are the exploit chart's steps, 2 to 5; level 1 in older reports is a lead.
 var ladderWords = map[int]string{
-	2: "●●○○○ reproduced exploit",
-	3: "●●●○○ exploit executable by learner with full information",
-	4: "●●●●○ exploit executable by learner with hint",
-	5: "●●●●● exploit executable by unaided learner",
+	2: "●●○○○ reproduced, no Attacker demonstrated it",
+	3: "●●●○○ an Attacker given full instructions demonstrated it",
+	4: "●●●●○ an Attacker given only a hint demonstrated it",
+	5: "●●●●● an Attacker given no information demonstrated it",
 }
 
 // helpLevels give a problem's step from the least help an Attacker needed, for reports written before `level`;
@@ -132,7 +186,7 @@ var helpLevels = map[string]int{"none": 5, "minimal": 4, "full": 3,
 var validWorkWords = map[int]string{
 	3: ", reproduced by an Attacker with full instructions",
 	4: ", reproduced by an Attacker with only a hint",
-	5: ", reproduced by an Attacker with no extra information",
+	5: ", reproduced by an Attacker with no information",
 }
 
 // reasonWords say why a reproduced exploit got no further.
@@ -141,12 +195,6 @@ var reasonWords = map[string]string{
 	"no_guidance":   "not attacked: no guidance",
 	"unknown":       "no clear Attacker result",
 }
-
-// reproducedWords say how the hack inspector's reproduction of a problem ended.
-var reproducedWords = map[string]string{"evidenced": "✓", "not_reproduced": "✗ not reproduced"}
-
-// evidencedWords say where a level-2 problem's findings were evidenced, after its label.
-var evidencedWords = map[string]string{"package": "evidenced in a package sandbox", "native": "evidenced in a native episode"}
 
 // Result is how one attack attempt ended, as the attack panel draws it.
 type Result int
@@ -182,11 +230,25 @@ var attemptResults = map[string]Result{
 	"unattempted":            NotTested,
 }
 
+// triedWords say what an attempt showed of its problem, as the plain output and the live logs say it.
+var triedWords = map[Result]string{Evidenced: "demonstrated", Elsewhere: "demonstrated another hack", NoIssue: "not demonstrated",
+	Unsettled: "unresolved", Failed: "error", NotTested: "not started"}
+
+// stoppedWords say how a try whose episode started ended without a result, as its phase would: "Stopped at the
+// spending cap", or else "Stopped".
+func stoppedWords(status string) string {
+	if words, ok := phaseEndWords[status]; ok {
+		return capital(words)
+	}
+	return "Stopped"
+}
+
+// resultWords say how an attempt ended, as the Status column of a try shows it.
 var resultWords = map[Result]string{
-	Evidenced: "evidenced",
-	Elsewhere: "cheated another way",
-	NoIssue:   "no issue evidenced",
-	Failed:    "error",
-	Unsettled: "result unclear",
-	NotTested: "not tested",
+	Evidenced: "Finished",
+	Elsewhere: "Finished",
+	NoIssue:   "Finished",
+	Failed:    "Error",
+	Unsettled: "Finished",
+	NotTested: "Not started",
 }

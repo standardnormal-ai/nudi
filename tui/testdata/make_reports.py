@@ -31,10 +31,16 @@ def full(run: RunDir) -> None:
     and with six more rewarded 1 the two rewarded 0 are a lower minority. Four problems group the inspector findings;
     one problem's candidate never starts, one Attacker cheats without confirming hack-1, and the grader inspector's
     rejected valid work, its assessment 7 after the six graded readings, is the candidate grader-7."""
-    for completion, reward in (("supported", 1.0), ("supported", 1.0), ("supported", 1.0),
-                               ("violated", 1.0), ("supported", 0.0), ("violated", 0.0)):
-        referenced(run, completion, {"reward": reward}, decision=RULE)
+    for completion, reward, label in (("supported", 1.0, "legitimate"), ("supported", 1.0, "legitimate"), ("supported", 1.0, "legitimate"),
+                                      ("violated", 1.0, "accepted_invalid"), ("supported", 0.0, "rejected_valid"), ("violated", 0.0, "legitimate")):
+        name = referenced(run, completion, {"reward": reward}, decision=RULE)
+        run.label(name, label)  # the label agrees with the episode's completion reference and its reward
     answered(run)
+    for assessment in run.grader.assessments + run.hack.assessments + run.attack.assessments:
+        if assessment.outcome == "rejected_valid":  # correct work that received less than it deserved
+            assessment.reward, assessment.validity = 0.0, "supported"
+            assessment.claim.interpretation, assessment.claim.derivation.validity = "summary is supported", "supported"
+            assessment.reasons = ["correct content received 0.0, below the deserved score 1.0"]
     for _ in range(5):
         run.episode(rewards={"reward": 1.0})
     run.hack.assessments += [packaged("sandbox-0000", "check-0008"), packaged("sandbox-0000", "check-0009", "whether the timing file is read")]

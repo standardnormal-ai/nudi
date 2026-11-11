@@ -5,11 +5,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -28,17 +30,41 @@ func at9(ms string) time.Time {
 	return t
 }
 
-// screenLines draws l at both widths, checks that no line is wider than the window, and returns the wide screen as plain text.
-func screenLines(t *testing.T, l *Live, now time.Time) string {
+// liveScreen is the live screen of l at time now, w columns wide and h rows high, 0 for no limit, as plain text. It
+// checks that no line is wider than the window.
+func liveScreen(t *testing.T, l *Live, now time.Time, w, h int) string {
 	t.Helper()
-	for _, w := range []int{80, 120} {
-		for _, line := range splitLines(renderLive(l, now, w, 0)) {
-			if width(line) > w {
-				t.Errorf("%d columns at width %d: %q", width(line), w, ansi.Strip(line))
-			}
+	return liveKeys(t, l, now, w, h)
+}
+
+// liveKeys is liveScreen after the keys were pressed.
+func liveKeys(t *testing.T, l *Live, now time.Time, w, h int, keys ...string) string {
+	t.Helper()
+	var m tea.Model = liveModel{l: *l, w: w, h: h}
+	for _, k := range keys {
+		m, _ = m.Update(keyMsg(k))
+	}
+	s := m.(liveModel).render(now)
+	for _, line := range splitLines(s) {
+		if width(line) > w {
+			t.Errorf("%d columns at width %d: %q", width(line), w, ansi.Strip(line))
 		}
 	}
-	return ansi.Strip(renderLive(l, now, 120, 0))
+	// View adds a blank row above and the cursor's row below.
+	if h > 0 && lipgloss.Height(s)+2 > h {
+		t.Errorf("%d rows at height %d:\n%s", lipgloss.Height(s)+2, h, ansi.Strip(s))
+	}
+	return plainText(s)
+}
+
+// screenLines draws l at 60, 80 and 120 columns, also 24 rows high, and returns the screen at 100 columns.
+func screenLines(t *testing.T, l *Live, now time.Time) string {
+	t.Helper()
+	for _, w := range []int{60, 80, 120} {
+		liveScreen(t, l, now, w, 0)
+		liveScreen(t, l, now, w, 24)
+	}
+	return liveScreen(t, l, now, 100, 0)
 }
 
 // An attack in progress: two attempts still run, others returned, one is read by its attack inspector.
@@ -66,20 +92,22 @@ var attackLog = ev("00:00", "run_start", `, "backend": "modal", "spending_cap": 
 func TestLiveScreen(t *testing.T) {
 	s := screenLines(t, liveFrom(t, attackLog), at9("04:00"))
 	for _, want := range []string{
-		"nudi  runs/x", "⏱ 0:04:00", "$0.62", "$4", "modal",
-		"concurrency 8 of 8 · 2 calls without a price",
-		"HACKS ▲ some results unclear  0 problems, 0 exploited", "GRADER ⣾ 2:00", "Simulate · Inspect · Attack",
-		"AGENTS  2 running", "Attacker", "0001-attacker", "1m 59s", "no extra informatio…",
-		"attack inspector", "attack_inspector-at…", "1m 00s", "evidenced check-0002",
-		"FINDINGS", "no extra information", "try 1 ⣾ 1m",
-		" nudi: attempt_end\n nudi: session_start\n nudi: session_end",
+		"nudi  runs/x   following live", "Modal     Elapsed 4:00     Concurrency 8", "Model cost $0.62 of $4.00",
+		"Simulation waiting", "Find Hacks partly", "ATTACK ⣾ 2:00     Attackers + Attack Inspector",
+		"AGENTS  2 running", "Attacker", "No information", "Looking for any hack", "Try 1",
+		"Attack Inspector", "Checks try 1, full",
+		"FINDINGS SO FAR (0)", "None yet.",
+		"CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?", "Try   Status        Hack demonstrated?  New finding?  Problem",
+		"LOGS", "l expand", "Attack Inspector  Ended, no evidence found: check of try 2 with only a hint",
+		"Attacker          Episode returned, reward 1: try 2 with only a hint",
+		"? Help   Tab next tab   Up/Down scroll   l logs   q Stop following",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("lacks %q:\n%s", want, s)
 		}
 	}
-	// Attempts from before problems formed during the run name no problem, so only the no extra information row shows them.
-	for _, gone := range []string{"FOUND", "ATTACK ", "hack-0  ", "duplicate_case"} {
+	// Attempts from before problems formed during the run name no problem, so only the no-information block shows them.
+	for _, gone := range []string{"·", "▲", "duplicate_case", "m Models", "0000-attacker"} {
 		if strings.Contains(s, gone) {
 			t.Errorf("shows %q:\n%s", gone, s)
 		}
@@ -88,29 +116,34 @@ func TestLiveScreen(t *testing.T) {
 
 // Before nudi writes the log, the screen says what it waits for.
 func TestLiveScreenWaitsForTheLog(t *testing.T) {
-	if s := screenLines(t, &Live{Dir: "runs/x"}, at9("00:00")); !strings.Contains(s, "waiting for runs/x/events.jsonl") {
+	if s := screenLines(t, &Live{Dir: "runs/x"}, at9("00:00")); !strings.Contains(s, "Waiting for runs/x/events.jsonl") {
 		t.Fatal(s)
 	}
 }
 
-func TestLiveScreenNotesLimitCostAndWarnings(t *testing.T) {
-	s := screenLines(t, liveFrom(t, ev("00:00", "run_start", `, "backend": "docker", "spending_cap": null, "concurrency": 2, "concurrency_setting": 4`)+
+func TestLiveScreenNotesLimitAndCost(t *testing.T) {
+	l := liveFrom(t, ev("00:00", "run_start", `, "backend": "docker", "spending_cap": null, "concurrency": 2, "concurrency_setting": 4`)+
 		ev("00:00", "phase_start", `, "phase": "simulation"`)+
 		ev("00:01", "warning", `, "message": "w"`)+
-		ev("05:00", "time_limit", `, "phase": "simulation", "minutes": 5, "known_cost": 1.5, "cancelled_calls": 1`)), at9("05:00"))
-	for _, want := range []string{"$1.50   docker", "concurrency 2 of 4 · 1 call cancelled in flight · time limit of 5 minutes reached · 1 warning", "AGENTS  none running", "GRADER ⣾ 5:00"} {
+		ev("05:00", "time_limit", `, "phase": "simulation", "minutes": 5, "known_cost": 1.5, "cancelled_calls": 1`))
+	s := screenLines(t, l, at9("05:00"))
+	for _, want := range []string{"Docker     Elapsed 5:00     Concurrency 2", "Model cost $1.50", "SIMULATION ⣾ 5:00     Simulator",
+		"Limit  The run reached its time limit of 5 minutes. Its report keeps the results so far.", "AGENTS  none running"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("lacks %q:\n%s", want, s)
 		}
 	}
-	if strings.Contains(s, "FINDINGS") || strings.Contains(s, "HACKS") {
-		t.Errorf("a findings pipeline before any attempt or problem:\n%s", s)
+	if strings.Contains(s, "1 warning") || strings.Contains(s, "CAN AN ATTACKER") {
+		t.Errorf("an orphan count or an empty block:\n%s", s)
+	}
+	if c := liveKeys(t, l, at9("05:00"), 100, 0, "c"); !strings.Contains(c, "Calls cancelled in") {
+		t.Errorf("cost panel:\n%s", c)
 	}
 }
 
 func TestLiveScreenShowsCleanedText(t *testing.T) {
-	s := renderLive(liveFrom(t, ev("00:00", "run_start", `, "backend": "docker"`)+
-		ev("00:01", "session_start", `, "inspector": "hack", "session": "a\u001b[2J\u0007b"`)), at9("00:02"), 120, 0)
+	s := liveModel{l: *liveFrom(t, ev("00:00", "run_start", `, "backend": "docker"`)+
+		ev("00:01", "session_start", `, "inspector": "grader", "session": "s", "episode": "a\u001b[2J\u0007b"`)), w: 120}.render(at9("00:02"))
 	if strings.Contains(s, "\x1b[2J") || strings.Contains(s, "\a") || !strings.Contains(ansi.Strip(s), "a[2Jb") {
 		t.Fatalf("%q", s)
 	}
@@ -129,7 +162,7 @@ func copyReport(t *testing.T, from, dir string) {
 
 var runEnd = ev("05:00", "phase_end", `, "phase": "attack", "status": "complete"`) + ev("05:01", "run_end", `, "status": "complete", "report": "report.json"`)
 
-// In a pipe, --follow prints each event's line as nudi writes it, then the card once the report is whole.
+// In a pipe, --follow prints each event's line as nudi writes it, then the plain report once it is whole.
 func TestFollowPipe(t *testing.T) {
 	dir := t.TempDir()
 	addLog(t, dir, attackLog+runEnd)
@@ -141,7 +174,7 @@ func TestFollowPipe(t *testing.T) {
 	}
 	lines := strings.Count(attackLog+runEnd, "\n")
 	if code != 0 || errs != "" || !strings.HasPrefix(out, "nudi: run_start\nnudi: phase_start\nnudi: evidenced\n") ||
-		strings.Count(out, "nudi: ") != lines || !strings.HasSuffix(out, "nudi: run_end\n"+card(r, plainW, false)+"\n") {
+		strings.Count(out, "nudi: ") != lines || !strings.HasSuffix(out, "nudi: run_end\n"+plainReport(r, plainW)+"\n") {
 		t.Fatalf("exit %d %q:\n%s", code, errs, out)
 	}
 }
@@ -212,11 +245,11 @@ func TestFollowEndsForARunThatIsGone(t *testing.T) {
 }
 
 // In a terminal the live screen reads the log once a second and gives way to the viewer once the report is whole.
-func TestFollowScreenGivesWayToTheCard(t *testing.T) {
+func TestFollowScreenGivesWayToTheViewer(t *testing.T) {
 	dir := t.TempDir()
 	addLog(t, dir, attackLog)
 	m, _ := newLive(dir).Update(liveTick{})
-	if s := ansi.Strip(m.View().Content); !strings.Contains(s, "AGENTS  2 running") || !strings.Contains(s, "q quit") {
+	if s := ansi.Strip(m.View().Content); !strings.Contains(s, "AGENTS  2 running") || !strings.Contains(s, "q Stop following") {
 		t.Fatalf("live screen:\n%s", s)
 	}
 	addLog(t, dir, runEnd)
@@ -229,7 +262,7 @@ func TestFollowScreenGivesWayToTheCard(t *testing.T) {
 	m, _ = m.Update(liveTick{})
 	v, ok := m.(model)
 	if !ok || !strings.Contains(v.View().Content, "The grader can be cheated") {
-		t.Fatalf("%T does not show the card", m)
+		t.Fatalf("%T does not show the viewer", m)
 	}
 }
 
@@ -285,9 +318,9 @@ func TestReplayRecordedLog(t *testing.T) {
 	}
 	s := seen.String()
 	for _, want := range []string{
-		"AGENTS  4 running", "hack-broad", "hack-leakage_metada…", "grader-episode-0004…", "Attacker", "only a hint",
-		"evidenced check-0031", "HACKS", "GRADER", "Simulate · Inspect · Attack", "no extra information",
-		"⏱ 0:59:21", "$1.20", "$3", "docker", "concurrency 4 of 4",
+		"AGENTS  4 running", "General search", "Focused search", "Reads leaked answer", "Episode review", "Only a hint, try",
+		"FIND HACKS ⣾", "GRADE SIMULATIONS ⣾", "ATTACK ⣾", "CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?", "Hack Inspector    Started: general search of all categories",
+		"Elapsed 59:21", "Model cost $1.20 of $3.00", "Docker", "Concurrency 4",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("no screen shows %q", want)
@@ -295,8 +328,87 @@ func TestReplayRecordedLog(t *testing.T) {
 	}
 }
 
-// The attack runs on after the hack inspection ends, so the hacks piece counts what Attackers exploit after its end too,
-// and names only the hack inspector.
+// The live logs and findings name jobs, targets, help and outcomes in words: no session ids, no outcome labels and
+// no problem ids as names. Related observations are listed by their reference.
+func TestLiveWordsOnly(t *testing.T) {
+	ids := regexp.MustCompile(`\bP\d+\b`)
+	for _, name := range []string{"pipeline-hacks", "pipeline-grader"} {
+		l := pipelineLive(t, name)
+		for _, s := range []string{liveKeys(t, l, l.Last.at(), 100, 0, "l"), liveKeys(t, l, l.Last.at(), 100, 0, "tab", "l")} {
+			for _, gone := range []string{"attack_inspector-attacker", "accepted_invalid", "rejected_valid", "nudi: "} {
+				if strings.Contains(s, gone) {
+					t.Errorf("%s shows %q:\n%s", name, gone, s)
+				}
+			}
+			if id := ids.FindString(s); id != "" {
+				t.Errorf("%s names %s:\n%s", name, id, s)
+			}
+		}
+	}
+	if s := liveKeys(t, pipelineLive(t, "pipeline-hacks"), time.Time{}, 100, 0, "o"); !strings.Contains(s, "Reference") || strings.Contains(s, "Observation ") {
+		t.Errorf("related observations:\n%s", s)
+	}
+}
+
+// The live Help lists only what works while the run goes on, says what partly means and what the references are.
+func TestLiveHelp(t *testing.T) {
+	s := plainText(helpPanel(wideAt, true))
+	for _, want := range []string{"partly", "unresolved", "REFERENCES", "FINDINGS SO FAR"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("live help lacks %q:\n%s", want, s)
+		}
+	}
+	for _, gone := range []string{"i lists", "Work left", "◆", "›"} {
+		if strings.Contains(s, gone) {
+			t.Errorf("live help shows %q:\n%s", gone, s)
+		}
+	}
+}
+
+// Log lines say only what the events record: a reproduction has no scope, an attempt stopped after its episode
+// started was started, a session's evidence is its result, and a grader session's end reviewed what its start named.
+func TestLiveLogSaysWhatEventsRecord(t *testing.T) {
+	l := liveFrom(t, ev("00:01", "judged", `, "inspector": "grader", "problem": "P4", "finding": "grader-1", "new": true, "cause": "c4"`)+
+		ev("00:02", "reproduced", `, "problem": "P4", "result": "evidenced"`)+
+		ev("00:03", "attempt_start", `, "episode": "0001-attacker", "level": "full", "number": 1, "problem": "P4"`)+
+		ev("00:04", "attempt_end", `, "episode": "0001-attacker", "rewards": [1.0]`)+
+		ev("00:05", "attempt_result", `, "episode": "0001-attacker", "level": "full", "number": 1, "problem": "P4", "status": "spending_exhausted"`)+
+		ev("00:06", "attempt_result", `, "episode": "0002-attacker", "level": "full", "number": 2, "problem": "P4", "status": "spending_exhausted"`)+
+		ev("00:07", "session_start", `, "inspector": "hack", "session": "hack-other", "category": "other"`)+
+		ev("00:08", "session_end", `, "inspector": "hack", "session": "hack-other", "category": "other", "elapsed": 60, "status": "no_evidenced_issue", "result": "evidenced_issue"`)+
+		ev("00:09", "session_start", `, "inspector": "grader", "session": "grader-episode-0005-simulator", "episode": "0005-simulator"`)+
+		ev("00:10", "session_end", `, "inspector": "grader", "session": "grader-episode-0005-simulator", "elapsed": 60, "status": "evidenced_issue"`)+
+		ev("00:11", "session_end", `, "inspector": "grader", "session": "grader-episode-0006-simulator", "elapsed": 60, "status": "evidenced_issue"`))
+	want := map[int]string{
+		1:  "Reproduced: c4",
+		4:  "Stopped at the spending cap: try 1 with full instructions",
+		5:  "Not started: try 2 with full instructions",
+		7:  "Ended after 1:00, evidence found: focused search for",
+		9:  "Ended after 1:00, evidence found: review of episode 0005-simulator",
+		10: "",
+	}
+	for i, w := range want {
+		if got := plainText(l.logWords(l.Recent[i])); !strings.HasPrefix(got, w) || w == "" && got != "" {
+			t.Errorf("event %d says %q, want %q", i, got, w)
+		}
+	}
+}
+
+// The live no-information table says how a try stopped once its episode started, and "Not started" only for one
+// that never started.
+func TestLiveNoInfoSaysHowAStartedTryStopped(t *testing.T) {
+	l := liveFrom(t, ev("00:01", "attempt_start", `, "episode": "0001-attacker", "level": "none", "number": 1`)+
+		ev("00:02", "attempt_end", `, "episode": "0001-attacker", "rewards": [1.0]`)+
+		ev("00:03", "attempt_result", `, "episode": "0001-attacker", "level": "none", "number": 1, "status": "spending_exhausted"`)+
+		ev("00:04", "attempt_result", `, "episode": null, "level": "none", "number": 2, "status": "spending_exhausted"`))
+	s := strings.Join(l.noInfo(at9("00:05"), "", 100), "\n")
+	if first, second := row(plainText(s), "1 "), row(plainText(s), "2 "); !strings.Contains(first, "Stopped at") || strings.Contains(first, "Not started") || !strings.Contains(second, "Not started") {
+		t.Errorf("first %q, second %q:\n%s", first, second, plainText(s))
+	}
+}
+
+// The attack runs on after the hack inspection ends, so the hacks count what Attackers exploit after its end too,
+// and the Find Hacks tab names only the Hack Inspector.
 func TestTheHacksCountUpdatesAfterTheHackPhaseEnd(t *testing.T) {
 	log := ev("00:00", "run_start", `, "backend": "docker", "analyses": ["hack", "attack"]`) +
 		ev("00:00", "phase_start", `, "phase": "hack"`) +
@@ -304,9 +416,11 @@ func TestTheHacksCountUpdatesAfterTheHackPhaseEnd(t *testing.T) {
 		ev("00:10", "judged", `, "inspector": "hack", "finding": "hack-0", "problem": "P1", "new": true, "cause": "forge"`) +
 		ev("01:00", "phase_end", `, "phase": "hack", "status": "complete", "elapsed": 60`)
 	l := liveFrom(t, log)
-	stepper := func() string { return plainText(liveStepper(l, at9("03:00"), "")) }
-	if s := stepper(); !strings.Contains(s, "1 problem, 0 exploited") || strings.Contains(s, "Attackers") || !strings.Contains(s, "hack inspector") {
-		t.Fatalf("at the hack phase end:\n%s", s)
+	if p, x := l.hackCounts(); p != 1 || x != 0 {
+		t.Fatalf("at the hack phase end: %d problems, %d exploited", p, x)
+	}
+	if s := plainText(l.phaseLine(2, at9("03:00"), "")); strings.Contains(s, "Attackers") || !strings.Contains(s, "Hack Inspector") {
+		t.Fatalf("Find Hacks line: %s", s)
 	}
 	for _, e := range readAll(t, ev("01:10", "attempt_start", `, "episode": "0000-attacker", "problem": "P1", "level": "full", "number": 1`)+
 		ev("02:00", "attempt_end", `, "episode": "0000-attacker", "problem": "P1", "level": "full", "number": 1`)+
@@ -314,7 +428,21 @@ func TestTheHacksCountUpdatesAfterTheHackPhaseEnd(t *testing.T) {
 		ev("02:40", "judged", `, "inspector": "grader", "finding": "grader-0", "problem": "P2", "new": true, "cause": "skip"`)) {
 		l.apply(e)
 	}
-	if s := stepper(); !strings.Contains(s, "2 problems, 1 exploited") {
-		t.Fatalf("after the hack phase end:\n%s", s)
+	if p, x := l.hackCounts(); p != 2 || x != 1 {
+		t.Fatalf("after the hack phase end: %d problems, %d exploited", p, x)
+	}
+}
+
+// A finding a later reading withdrew, and a reading that revises an earlier one, are logged in words, without outcome
+// labels or check ids.
+func TestLiveLogSaysWithdrawnAndRevisedInWords(t *testing.T) {
+	l := liveFrom(t, ev("00:01", "judged", `, "inspector": "hack", "problem": "P1", "finding": "hack-0", "new": true, "cause": "c1"`)+
+		ev("00:02", "revised", `, "inspector": "hack", "id": "check-7", "index": 1, "before": "accepted_invalid", "after": "legitimate"`)+
+		ev("00:03", "withdrawn", `, "candidate": "hack-0", "problem": "P1", "level": "full"`))
+	for i, want := range map[int]string{1: "Read a check again: its earlier finding is withdrawn or corrected",
+		2: "Not started, a later reading withdrew the finding: with full instructions, for c1"} {
+		if got := plainText(l.logWords(l.Recent[i])); got != want {
+			t.Errorf("event %d says %q, want %q", i, got, want)
+		}
 	}
 }

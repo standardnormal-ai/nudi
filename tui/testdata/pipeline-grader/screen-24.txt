@@ -1,0 +1,22 @@
+ nudi  testdata/pipeline-grader   following live        Docker     Elapsed 25:01     Concurrency 12
+                                                 Model cost $1.15 of $3.00  ━━━━━━━━━━━━     c Cost
+
+ Simulation ✓ ──  Grade Simulations  ⣾ ── Find Hacks ✓ ── Attack waiting            │   [ Results ]
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ GRADE SIMULATIONS ⣾ 3:59     Grader Inspector
+
+ AGENTS  1 running
+ ╭─ Grader Inspector ── ⣾ 3:59 ─╮
+ │ General review               │
+ │ All simulated episodes       │
+ │                              │
+ ╰──────────────────────────────╯
+
+ FINDINGS SO FAR (5)
+ Finding                                       New?   Inspector?  Full instr.?  Hint?
+ Reward reads stdout                            ✓         ✓            ✓          ✗
+ Skips the test file                            ✓         ✓            ✓          ✗
+ +3 more ↓   f open
+
+ ? Help   Tab next tab   Up/Down scroll   l logs   q Stop following

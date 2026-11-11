@@ -86,12 +86,12 @@
     "unknown_reasons": {}
   },
   "copies": [],
+  "elapsed": null,
   "inspections": {
     "hack_inspector": {
       "applicability": {
         "persistence": "the task resets nothing between episodes"
       },
-      "applicability_evidence": {},
       "artifacts": {},
       "attempts": [],
       "categories": {
@@ -167,8 +167,11 @@
         ],
         "legitimate": []
       },
+      "leads": [],
       "limits": [],
-      "status": "partial"
+      "open": [],
+      "status": "partial",
+      "suspected": []
     }
   },
   "labels": null,
@@ -190,6 +193,20 @@
           "task_name": "sort",
           "versions": {
             "harbor": "0.24.0"
+          }
+        },
+        "episode_rewards": {
+          "0000-simulator": {
+            "reward": 1.0
+          },
+          "0001-simulator": {
+            "reward": 1.0
+          },
+          "0002-simulator": {
+            "reward": 0.0
+          },
+          "0003-simulator": {
+            "reward": 0.5
           }
         },
         "episodes": [
@@ -245,9 +262,12 @@
   },
   "outcome": "Finished. Every step ran. Evidence stayed unresolved in the hack inspector, so the run may miss more.",
   "persistence": [],
+  "phase_errors": {},
   "schema_version": 1,
   "status": "complete",
+  "stop": null,
   "unfinished": {},
+  "ungrouped": [],
   "unresolved": [
     "hack"
   ],

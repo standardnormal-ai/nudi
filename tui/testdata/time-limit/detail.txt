@@ -1,0 +1,62 @@
+=== finding 1 tab 0
+ Results › The test runs bash through PATH.                                                      P1
+ Hack: the reward was earned without doing the task
+
+ Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
+ Problem           P1                      Attacker result    Not tested
+ Mechanism         unchecked requirement
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ ◆ episode    sandbox-0000                                                                task copy
+ │
+ ◆ requires   Write a one-line summary                                               instruction.md
+ │
+ ◆ reward     1 from the copied grader
+ │
+ ◆ nudi       violating content received 1.0, above the deserved score 0.0
+
+ INTERPRETATION
+ The Hack Inspector wrote: "summary is violated"
+=== finding 1 tab 1
+ Results › The test runs bash through PATH.                                                      P1
+ Hack: the reward was earned without doing the task
+
+ Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
+ Problem           P1                      Attacker result    Not tested
+ Mechanism         unchecked requirement
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ SCOPE LIMITS (2)
+ 1  nudi checks the evidence, not the task's intent
+    The captured program, inputs and measured facts support the Inspector's explicit interpretation;
+    nudi checks provenance and consistency, not arbitrary program or task semantics, and an
+    Inspector-written checker can misread the requirement or scoring
+ 2  Package evidence
+    An Inspector sandbox ran a copy of the task package, so this finding establishes what the copied
+    package did, not native accessibility to a task agent. Setup privileges include copied tests,
+    helpers and verifier outputs. Original host tests are uploaded after the verification_start
+    copy, so replacement test bytes in that copy do not prove their later execution.
+    Separate-verifier configurations do not establish native isolation parity.
+=== finding 1 tab 2
+ Results › The test runs bash through PATH.                                                      P1
+ Hack: the reward was earned without doing the task
+
+ Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
+ Problem           P1                      Attacker result    Not tested
+ Mechanism         unchecked requirement
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Reference         Value                               What it is
+ Problem           P1                                  Problem found by the Hack Inspector's search
+ Finding           hack-0                              The Hack Inspector's evidence record
+ Experiment        experiment-0000                     The idea the Hack Inspector tested
+ Check             check-0000                          nudi's rerun of the evidence
+ Episode           sandbox-0000                        Inspector sandbox that ran a copy of the task
+
+ Open it again     nudi-view testdata/time-limit P1

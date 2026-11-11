@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -11,22 +13,22 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
-// renderAll draws every screen of r at two widths and checks that no line is wider than the window.
+// renderAll draws every screen of r at two widths, with every row and section expanded, and checks that no line
+// is wider than the window.
 func renderAll(t *testing.T, r Report) {
 	t.Helper()
 	found := r.findings()
 	for _, w := range []int{80, 120} {
-		screens := []string{card(r, w, true), card(r, w, false)}
-		for p := range phases {
-			screens = append(screens, renderPhase(r, found, p, w))
+		screens := []string{plainReport(r, w), modelsPanel(r, w), costPanel(r, w), helpPanel(w, false), helpPanel(w, true), drawTab(r, 0, w, "episodes")}
+		for s := 0; s <= results; s++ {
+			screens = append(screens, drawTab(r, s, w))
 		}
 		for n := range found {
-			screens = append(screens, renderShow(r, found, n+1, 0, w), renderShow(r, found, n+1, 1, w), plainShow(r, found, n+1, w))
-		}
-		for i, s := range screens[2:] {
-			if i >= len(phases) && (i-len(phases))%3 == 2 {
-				continue // a pipe gets whole lines
+			for tab := range 3 {
+				screens = append(screens, renderShow(r, found, n+1, tab, "Results", w))
 			}
+		}
+		for _, s := range screens {
 			for _, line := range splitLines(s) {
 				if width(line) > w {
 					t.Errorf("%d columns at width %d: %q", width(line), w, ansi.Strip(line))
@@ -65,82 +67,26 @@ func TestRealReports(t *testing.T) {
 	}
 }
 
-func plainPhase(r Report, phase int) string {
-	return plainText(renderPhase(r, r.findings(), phase, wideAt-1))
+// drawTab draws tab s of r w columns wide with nothing selected and every row and section expanded, or only the ones
+// named when open names some.
+func drawTab(r Report, s, w int, open ...string) string {
+	m := newModel(r, 0, false)
+	m.w, m.screen = w, s
+	if open == nil {
+		open = []string{"o", "i", "s", "x", "?"}
+		m.page()
+		for _, it := range m.items {
+			open = append(open, it.key)
+		}
+	}
+	for _, k := range open {
+		m.open[fmt.Sprint(s)+k] = true
+	}
+	return m.tabPage(-1).String()
 }
 
-// Only a problem's candidate is attacked, so only it is marked; the other members stay listed unmarked.
-func TestProblemMarksOnlyTheCandidate(t *testing.T) {
-	r := fixture(t, "full-before-levels")
-	attack := plainPhase(r, 3)
-	for _, want := range []string{
-		"#3 hack-1 (selected · attempted · reproduced)   #5 hack-3\n",
-		"#4 hack-2 (selected · attempted · reproduced)\n",
-		"#6 hack-4 (selected · not tested)\n",
-		"1 finding not tested",
-	} {
-		if !strings.Contains(attack, want) {
-			t.Errorf("attack panel lacks %q:\n%s", want, attack)
-		}
-	}
-	if n := strings.Count(attack, "· reproduced)"); n != 2 {
-		t.Errorf("%d reproduced marks, want 2", n)
-	}
-	found := r.findings()
-	for n, want := range map[int]string{
-		3: "problem 1 of 4 · this finding (selected · attempted · reproduced)",
-		5: "problem 1 of 4 · the attack tests #3 hack-1 for it",
-		6: "problem 3 of 4 · this finding (selected · not tested)",
-		1: "",
-	} {
-		show := ansi.Strip(renderShow(r, found, n, 0, 120))
-		if want == "" && strings.Contains(show, "problem") || !strings.Contains(show, want) {
-			t.Errorf("finding %d lacks %q:\n%s", n, want, show)
-		}
-	}
-	// Python's answer counts the problems; the card adds no count of its own, and the hack panel keeps one.
-	if s := card(r, 120, false); strings.Count(s, "problems from") != 1 || !strings.Contains(s, "4 problems from 4 hack inspector findings and 1 grader inspector finding; the attack selects") {
-		t.Errorf("card counts the problems other than once, in Python's words:\n%s", s)
-	}
-	if !strings.Contains(plainPhase(r, 2), "4 problems from 4 hack inspector findings and 1 grader inspector finding") {
-		t.Error("the hack panel does not count the problems")
-	}
-}
-
-// A finding is marked reproduced only when reproduced_findings names it; a report without that field
-// marks the candidate of a reproduced problem, as before.
-func TestReproducedFindingsMarkOnlyThose(t *testing.T) {
-	report := func(field string) Report {
-		r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "other_episodes": {"attacker": ["e"]},
-			"inspections": {"hack_inspector": {"findings": {"evidenced": [
-				{"index": 1, "assessment": {"outcome": "accepted_invalid"}, "claim": {"mechanism": "m1"}},
-				{"index": 2, "assessment": {"outcome": "accepted_invalid"}, "claim": {"mechanism": "m2"}}]}}},
-			"attack": {"candidates": [{"id": "hack-1"}],
-				"attempts": [{"level": "full", "candidate": "hack-1", "sources": ["hack-1", "hack-2"], "episode": "e", "status": "evidenced_issue"}],
-				"problems": [{"cause": "c", "findings": ["hack-1", "hack-2"], "candidate": "hack-1", "reproduced": true`+field+`}]}}`))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return r
-	}
-	for field, want := range map[string][3]string{
-		``: {"#1 hack-1 (selected · attempted · reproduced)   #2 hack-2\n",
-			"this finding (selected · attempted · reproduced)\n", "the attack tests #1 hack-1 for it\n"},
-		`, "reproduced_findings": ["hack-2"]`: {"#1 hack-1 (selected · attempted)   #2 hack-2 (reproduced)\n",
-			"this finding (selected · attempted)\n", "the attack tests #1 hack-1 for it (reproduced)\n"},
-		`, "reproduced_findings": ["hack-1", "hack-2"]`: {"#1 hack-1 (selected · attempted · reproduced)   #2 hack-2 (reproduced)\n",
-			"this finding (selected · attempted · reproduced)\n", "the attack tests #1 hack-1 for it (reproduced)\n"},
-		`, "reproduced_findings": []`: {"#1 hack-1 (selected · attempted)   #2 hack-2\n",
-			"this finding (selected · attempted)\n", "the attack tests #1 hack-1 for it\n"},
-	} {
-		r := report(field)
-		found := r.findings()
-		for i, s := range []string{plainPhase(r, 3), plainShow(r, found, 1, 100), plainShow(r, found, 2, 100)} {
-			if !strings.Contains(s, want[i]) {
-				t.Errorf("%q: lacks %q:\n%s", field, want[i], s)
-			}
-		}
-	}
+func plainTab(r Report, s int, open ...string) string {
+	return plainText(drawTab(r, s, wideAt-1, open...))
 }
 
 func TestReportWithoutProblems(t *testing.T) {
@@ -148,28 +94,31 @@ func TestReportWithoutProblems(t *testing.T) {
 	if r.Attack.Problems != nil || r.problemOf("hack-1") != -1 {
 		t.Fatalf("problems: %v", r.Attack.Problems)
 	}
-	for _, s := range []string{plainPhase(r, 2), plainPhase(r, 3), card(r, 120, false), plainShow(r, r.findings(), 3, 120)} {
-		if strings.Contains(s, "problem") || strings.Contains(s, "PROBLEMS") {
+	for _, s := range []string{plainTab(r, 2), plainTab(r, 3), plainTab(r, results), plainReport(r, 120), plainShow(r, r.findings(), 3, 120)} {
+		if strings.Contains(s, "\nPROBLEMS\n") || strings.Contains(s, "PROBLEMS (") || strings.Contains(s, "Who demonstrated it") {
 			t.Errorf("a report without problems shows some:\n%s", s)
 		}
 	}
-	if !strings.Contains(plainPhase(r, 3), "#3 hack-1          full instructions") {
-		t.Error("attempts are missing")
+	if s := plainTab(r, 3); !strings.Contains(s, "TRIES (2)") || !strings.Contains(s, "hack-1") || !strings.Contains(plainTab(r, results), "FINDINGS (") {
+		t.Errorf("attempts or findings are missing:\n%s", s)
 	}
 }
 
 // A run stopped before the attack reached its candidate says so; nothing in it failed.
 func TestStoppedRunSaysNotTested(t *testing.T) {
 	r := fixture(t, "time-limit-before-levels")
-	attack := plainPhase(r, 3)
-	for _, want := range []string{"ATTACK  stopped", "#1 hack-0 (selected · not tested)", "·· not tested", "1 finding not tested"} {
+	attack := plainTab(r, 3)
+	for _, want := range []string{"ATTACK stopped", "Not started", "Not tested: stopped."} {
 		if !strings.Contains(attack, want) {
 			t.Errorf("attack panel lacks %q:\n%s", want, attack)
 		}
 	}
-	for _, s := range []string{attack, card(r, 120, false), plainShow(r, r.findings(), 1, 120)} {
-		for _, bad := range []string{"fail", "error", "reproduced", " attempted"} { // Python's warnings say "unattempted"
-			if strings.Contains(strings.ToLower(s), bad) {
+	for _, s := range []string{attack, plainReport(r, 120), plainShow(r, r.findings(), 1, 120)} {
+		// The exploit chart's "reproduced, no Attacker demonstrated it" is the Hack Inspector's reproduction, which the
+		// run did finish.
+		s = strings.ReplaceAll(strings.ToLower(s), "reproduced, no attacker demonstrated it", "")
+		for _, bad := range []string{"fail", "error", " reproduced", " attempted"} { // Python's warnings say "unattempted"
+			if strings.Contains(s, bad) {
 				t.Errorf("%q in:\n%s", bad, s)
 			}
 		}
@@ -180,43 +129,44 @@ func TestStoppedRunSaysNotTested(t *testing.T) {
 }
 
 func TestAgreementTable(t *testing.T) {
-	grader := plainPhase(fixture(t, "full"), 1)
+	grader := plainTab(fixture(t, "full"), 1)
 	for _, want := range []string{
-		"Type │ Meaning               │ Episodes",
-		"TP   │ Correct work passed   │ ███████████████ 3",
-		"FP   │ Incorrect work passed │ █████ 1",
-		"pass means reward >= 0.5",
-		"FDR (Of accepted work, how much was incorrect?)  FP / (TP + FP)  1/4  25%",
-		"FNR (Of correct work, how much was rejected?)    FN / (TP + FN)  1/4  25%",
-		"Searched: Incorrect work passed; Correct work failed",
+		"Type             Grader   Work was     Episodes",
+		"True positive    Pass     Correct      ███████████████ 3",
+		"False positive   Pass     Incorrect    █████ 1",
+		"Pass rule              reward >= 0.5",
+		"False discovery rate   25%          1/4        Incorrect work among passed work",
+		"False negative rate    25%          1/4        Rejected work among correct work",
+		"Incorrect work passed     Episodes the grader passed although the task was not done   1",
 	} {
 		if !strings.Contains(grader, want) {
-			t.Errorf("grader panel lacks %q:\n%s", want, grader)
+			t.Errorf("grader tab lacks %q:\n%s", want, grader)
 		}
 	}
 }
 
-// The grounded native pass rate stands with its 95% Wilson interval, as report.md words it, on the card and the
-// Grade Simulations screen; a missing or unavailable rate reads unavailable, and an older one without its interval shows none.
+// The grounded native pass rate stands with its 95% Wilson interval on the card and the Grade Simulations tab; a missing
+// or unavailable rate reads unavailable with its reason, and an older one without its interval shows none.
 func TestNativePassRate(t *testing.T) {
 	r := fixture(t, "full")
-	for _, s := range []string{plainPhase(r, 1), card(r, 120, false)} {
-		if want := "native pass rate 83% (10/12), 95% Wilson interval 0.55 to 0.95"; !strings.Contains(oneLine(s), want) {
-			t.Errorf("lacks %q:\n%s", want, s)
-		}
+	if s := oneLine(plainReport(r, 120)); !strings.Contains(s, "Pass rate 83%, 10/12, passed by the pass rule") || !strings.Contains(s, "95% interval 55% to 95%, Wilson interval") {
+		t.Errorf("plain report:\n%s", s)
+	}
+	if s := oneLine(plainTab(r, 1)); !strings.Contains(s, "Pass rate 83% 10/12") || !strings.Contains(s, "95% interval 55% to 95% Wilson interval") {
+		t.Errorf("grader tab:\n%s", s)
 	}
 	for rate, want := range map[string][2]string{
-		``: {"native pass rate unavailable", "native pass rate unavailable"},
+		``: {"Pass rate unavailable", "Pass rate unavailable"},
 		`, "pass_rate": {"value": null, "numerator": null, "denominator": null, "unavailable": "native pass rate is unavailable: no source-grounded native decision rule", "interval": null}`: {
-			"native pass rate is unavailable: no source-grounded native decision rule", "native pass rate unavailable"},
-		`, "pass_rate": {"value": 0.5, "numerator": 1, "denominator": 2}`: {"native pass rate 50% (1/2)", "native pass rate 50% (1/2)"},
+			"Pass rate unavailable native pass rate is unavailable: no source-", "Pass rate unavailable: native pass rate is unavailable: no source-grounded"},
+		`, "pass_rate": {"value": 0.5, "numerator": 1, "denominator": 2}`: {"Pass rate 50% 1/2", "Pass rate 50%, 1/2"},
 	} {
 		r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"grader": "complete"},
 			"metrics": {"confusion": [{"status": "unsupported", "reasons": ["r"]`+rate+`}]}}`))
 		if err != nil {
 			t.Fatal(err)
 		}
-		for i, s := range []string{oneLine(plainPhase(r, 1)), oneLine(card(r, 100, false))} {
+		for i, s := range []string{oneLine(plainTab(r, 1)), oneLine(plainReport(r, 100))} {
 			if !strings.Contains(s, want[i]) || strings.Contains(s, "Wilson") {
 				t.Errorf("%q: lacks %q:\n%s", rate, want[i], s)
 			}
@@ -224,12 +174,12 @@ func TestNativePassRate(t *testing.T) {
 	}
 }
 
-// Without grader agreement the pass rate still names its rule, as report.md does; a group without a rule names none.
+// Without grader agreement the pass rate still names its rule; a group without a rule names none.
 func TestPassRateKeepsItsRuleWithoutAgreement(t *testing.T) {
 	for _, status := range []string{"unsupported", "unavailable"} {
 		for rule, want := range map[string]string{
-			`, "rule": {"comparison": ">=", "threshold": 0.5, "pass_values": []}`: "pass means reward >= 0.5 native pass rate 67% (2/3)",
-			``: "r native pass rate 67% (2/3)",
+			`, "rule": {"comparison": ">=", "threshold": 0.5, "pass_values": []}`: "Pass rule reward >= 0.5",
+			``: "Pass rule no native decision rule",
 		} {
 			r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"grader": "complete"},
 				"metrics": {"confusion": [{"reward": "reward", "status": "`+status+`", "reasons": ["r"]`+rule+`,
@@ -237,7 +187,7 @@ func TestPassRateKeepsItsRuleWithoutAgreement(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if s := oneLine(plainPhase(r, 1)); !strings.Contains(s, want) {
+			if s := oneLine(plainTab(r, 1)); !strings.Contains(s, want) || !strings.Contains(s, "Pass rate 67% 2/3") || !strings.Contains(s, "Not available: r") {
 				t.Errorf("%s %q: lacks %q:\n%s", status, rule, want, s)
 			}
 		}
@@ -245,7 +195,7 @@ func TestPassRateKeepsItsRuleWithoutAgreement(t *testing.T) {
 }
 
 func TestCategoriesShowOnlyWhatWasSearched(t *testing.T) {
-	r, err := load(writeReport(t, `{"answer":["x"], "inspections":{"hack_inspector":{
+	r, err := load(writeReport(t, `{"answer":["x"], "analyses":{"hack":"complete"}, "inspections":{"hack_inspector":{
         "categories":{"grader_tampering":"no_evidenced_issue","online_lookup":"unknown","persistence":"restricted"},
         "applicability":{"persistence":"the task resets nothing between episodes"},
         "attempts":[{"phase":"focused","number":1,"category":"grader_tampering","status":"no_evidenced_issue"}],
@@ -254,9 +204,9 @@ func TestCategoriesShowOnlyWhatWasSearched(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := plainText(hackPanel(r, 160))
-	for _, want := range []string{"Searched: Edits grader or tests\n", "Looks answer up online: no search attempt recorded",
-		"Files survive reset: the task resets nothing between episodes", "focused attempt 1 (Edits grader or tests): completed",
+	s := plainTab(r, 2, "s")
+	for _, want := range []string{"Edits grader or tests     Changing the grader, tests or their inputs", "Not searched: Looks answer up online: no search attempt recorded",
+		"Not searched: Files survive reset: the task resets nothing between episodes", "focused 1     Edits grader or tests         completed",
 		"Search stopped at the spending cap."} {
 		if !strings.Contains(s, want) {
 			t.Errorf("lacks %q:\n%s", want, s)
@@ -279,9 +229,9 @@ func TestCategoriesShowOnlyWhatWasSearched(t *testing.T) {
 func TestOldReportsRenderWithoutCategoryVerdicts(t *testing.T) {
 	for _, name := range fixtures {
 		r := fixture(t, name)
-		screens := []string{card(r, 120, false), card(r, 120, true)}
-		for p := range phases {
-			screens = append(screens, plainPhase(r, p))
+		screens := []string{plainReport(r, 120), plainReport(r, 120)}
+		for s := 0; s <= results; s++ {
+			screens = append(screens, plainTab(r, s))
 		}
 		for _, s := range screens {
 			for _, unwanted := range []string{"grader is safe", "inspector category ", "inspector categories ", "nothing found", "could not tell ·", " skipped"} {
@@ -301,14 +251,16 @@ func run(args ...string) (int, string, string) {
 
 func TestPipe(t *testing.T) {
 	code, out, _ := run("testdata/full")
-	if code != 0 || out != card(fixture(t, "full"), plainW, false)+"\n" || strings.Contains(out, "\x1b") {
+	if code != 0 || out != plainReport(fixture(t, "full"), plainW)+"\n" || strings.Contains(out, "\x1b") {
 		t.Fatalf("exit %d:\n%s", code, out)
 	}
-	if !strings.Contains(out, "next › nudi-view testdata/full P1") {
-		t.Error("the card does not say what to run next")
+	if !strings.Contains(out, "NEXT\n  nudi-view testdata/full P1\n") {
+		t.Error("the plain report does not say what to run next")
 	}
 	code, out, _ = run("testdata/full", "6")
-	for _, want := range []string{"finding 6 of 9", "HACK", "hack-4", "◆ open", "whether the timing file is read", "Limitations 2"} {
+	// Finding 6 belongs to P3: the problem's cause names it, and its own mechanism stays on a line of its own.
+	for _, want := range []string{"Results › The grader trusts a timing file the agent can write.", "Mechanism", "unchecked requirement", "Hack: the reward was earned without doing the task", "hack-4",
+		"◆ open", "whether the timing file is read", "LIMITATIONS 3", "REFERENCES"} {
 		if code != 0 || !strings.Contains(out, want) {
 			t.Errorf("exit %d, lacks %q:\n%s", code, want, out)
 		}
@@ -340,21 +292,23 @@ func TestUsageErrors(t *testing.T) {
 
 func press(m model, keys ...string) model {
 	for _, k := range keys {
-		msg := tea.KeyPressMsg{Text: k}
-		switch k {
-		case "enter":
-			msg = tea.KeyPressMsg{Code: tea.KeyEnter}
-		case "esc":
-			msg = tea.KeyPressMsg{Code: tea.KeyEscape}
-		case "tab":
-			msg = tea.KeyPressMsg{Code: tea.KeyTab}
-		case "left":
-			msg = tea.KeyPressMsg{Code: tea.KeyLeft}
-		}
-		next, _ := m.Update(msg)
+		next, _ := m.Update(keyMsg(k))
 		m = next.(model)
 	}
 	return m
+}
+
+// keyMsg is the key press named k: a letter, or a named key such as enter or shift+tab.
+func keyMsg(k string) tea.KeyPressMsg {
+	codes := map[string]rune{"enter": tea.KeyEnter, "esc": tea.KeyEscape, "tab": tea.KeyTab, "left": tea.KeyLeft,
+		"right": tea.KeyRight, "up": tea.KeyUp, "down": tea.KeyDown}
+	if k == "shift+tab" {
+		return tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift}
+	}
+	if c, ok := codes[k]; ok {
+		return tea.KeyPressMsg{Code: c}
+	}
+	return tea.KeyPressMsg{Text: k}
 }
 
 func TestKeys(t *testing.T) {
@@ -362,22 +316,37 @@ func TestKeys(t *testing.T) {
 	if m = press(m, "x"); m.intro != nil {
 		t.Fatal("a key does not skip the intro")
 	}
-	if m.phase != len(phases)-1 || !strings.Contains(m.View().Content, "The grader can be cheated") {
-		t.Fatal("the viewer does not open on the card")
+	if m.screen != results || !strings.Contains(m.View().Content, "The grader can be cheated") {
+		t.Fatal("the viewer does not open on Results")
 	}
-	// Enter opens the card's next finding, the one that shows problem P1, finding 3.
-	m = press(m, "enter", "l", "l", "tab")
-	if m.n != 5 || m.tab != 1 || !strings.Contains(ansi.Strip(m.View().Content), "finding 5 of 9") {
+	// Enter expands the first problem, P1; Down and Enter open its first evidence record, hack-1, finding 3.
+	m = press(m, "enter", "down", "enter")
+	if m.n != 3 || !strings.Contains(ansi.Strip(m.View().Content), "Results › "+detailName(m.r, m.found[2])) {
+		t.Fatalf("finding %d", m.n)
+	}
+	m = press(m, "right", "right", "tab")
+	if m.n != 5 || m.tab != 1 || !strings.Contains(ansi.Strip(m.View().Content), "Results › "+detailName(m.r, m.found[4])) {
 		t.Fatalf("finding %d tab %d", m.n, m.tab)
 	}
-	m = press(m, "esc", "left", "h")
-	if m.n != 0 || m.phase != 2 || !strings.Contains(ansi.Strip(m.View().Content), "FIND HACKS  done") {
-		t.Fatalf("finding %d phase %d", m.n, m.phase)
+	m = press(m, "esc", "tab", "tab", "tab")
+	if m.n != 0 || m.screen != 2 || !strings.Contains(ansi.Strip(m.View().Content), "FIND HACKS ✓") {
+		t.Fatalf("finding %d screen %d", m.n, m.screen)
+	}
+	for _, k := range []string{"m", "c", "?"} {
+		if m = press(m, k); m.overlay != k {
+			t.Fatalf("%s opens no panel", k)
+		}
+		if m = press(m, "esc"); m.overlay != "" {
+			t.Fatalf("Esc does not close panel %s", k)
+		}
+	}
+	if m = press(m, "s"); !strings.Contains(ansi.Strip(m.View().Content), "▾ Search scope") {
+		t.Fatal("s does not expand the search scope")
 	}
 	if m = press(m, "q"); !m.exited || m.View().Content != "" {
 		t.Fatal("q does not quit")
 	}
-	if m := newModel(fixture(t, "full"), 6, false); !strings.Contains(ansi.Strip(m.View().Content), "finding 6 of 9") {
+	if m := newModel(fixture(t, "full"), 6, false); !strings.Contains(ansi.Strip(m.View().Content), detailName(m.r, m.found[5])) {
 		t.Fatal("N does not open on finding N")
 	}
 }
@@ -388,19 +357,26 @@ func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
 // The rewards show Python's summaries and its flags with their reasons as written, on the card and the Simulation screen.
 func TestRewardSummariesAndFlags(t *testing.T) {
 	r := fixture(t, "full")
-	for _, s := range []string{plainPhase(r, 0), card(r, 120, false)} {
-		for _, want := range []string{
-			"mean 0.8333 · median 1 · sample SD 0.3892 · skewness -2.055",
-			"▲ Lower minority",
-			"2 of 12 usable 'reward' rewards are below the rest by the quartile rule (0004-simulator 0, 0005-simulator 0; median 1, lower fence 1).",
-			"Every named episode has a presumed or unsupported label, so grader inspection did not examine this pattern.",
-		} {
-			if !strings.Contains(oneLine(s), want) {
-				t.Errorf("lacks %q:\n%s", want, s)
-			}
+	if s := oneLine(plainReport(r, 120)); !strings.Contains(s, "0.8333") || !strings.Contains(s, "2 episodes received 0; the other 10 received 1.") {
+		t.Errorf("plain report:\n%s", s)
+	}
+	s := plainTab(r, 0, "?")
+	for _, want := range []string{
+		"12/12                12          0.8333       1            0.3892       -2.055",
+		"2 episodes received 0; the other 10 received 1.",
+		"Pattern    Unusually low rewards",
+		"A reward is unusually low when it is below Q1 - 3 x IQR.",
+		"Q1 is 1 and Q3 is 1, so the fence is 1.",
+		"0004-simulator   Correct work rejected",
+		"No error, timeout or refusal in these episodes.",
+		"2 of 12 usable 'reward' rewards are below the rest by the quartile rule",
+		"nudi checks this only with 10 or more usable rewards.",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("simulation tab lacks %q:\n%s", want, s)
 		}
 	}
-	if s := oneLine(plainPhase(fixture(t, "clean"), 0)); !strings.Contains(s, "Distribution flags are not evaluated for 'reward': 4 usable rewards, fewer than 10.") {
+	if s := oneLine(plainTab(fixture(t, "clean"), 0)); !strings.Contains(s, "Distribution flags are not evaluated for 'reward': 4 usable rewards, fewer than 10.") {
 		t.Errorf("the reason flags were not evaluated is missing:\n%s", s)
 	}
 }
@@ -413,8 +389,8 @@ func TestMissingRewardStatisticsAreUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := plainPhase(r, 0)
-	if !strings.Contains(s, "mean 1 · median unavailable · sample SD unavailable · skewness unavailable") || strings.Contains(s, " 0 ") {
+	s := plainTab(r, 0)
+	if !strings.Contains(oneLine(s), "1/1 1 1 unavailable unavailable unavailable") || strings.Contains(s, " 0 ") {
 		t.Errorf("rewards:\n%s", s)
 	}
 }
@@ -422,19 +398,13 @@ func TestMissingRewardStatisticsAreUnavailable(t *testing.T) {
 // A grader-N candidate is the grader inspector's finding with index N, as Python names it, so the attack names that finding's number.
 func TestGraderCandidateNamesItsFinding(t *testing.T) {
 	r := fixture(t, "full-before-levels")
-	attack := plainPhase(r, 3)
-	for _, want := range []string{"#2 grader-7 (selected · attempted)\n", "#2 grader-7        full instructions valid work"} {
-		if !strings.Contains(attack, want) {
-			t.Errorf("attack panel lacks %q:\n%s", want, attack)
-		}
-	}
-	if show := plainShow(r, r.findings(), 2, 120); !strings.Contains(show, "grader-7") || !strings.Contains(show, "problem 4 of 4 · this finding (selected · attempted)") {
+	if show := plainShow(r, r.findings(), 2, 120); !strings.Contains(show, "grader-7") || !strings.Contains(show, "Problem 4 of 4") || !strings.Contains(show, "Attacker try 1, full instructions") {
 		t.Errorf("finding 2:\n%s", show)
 	}
 }
 
-// A pipe gets the card at most 100 columns wide: a long finding or warning line breaks at spaces, a
-// finding continuing under its mechanism, every word kept; the next command moves whole to its own line.
+// A pipe gets the report at most 100 columns wide: long text breaks at spaces with every word kept, and a path too
+// long for its column moves whole to a line of its own, so the commands under NEXT can be copied.
 func TestPlainCardKeepsItsWidth(t *testing.T) {
 	long := strings.TrimSpace(strings.Repeat("the grader reads a file the agent can write ", 6))
 	r, err := load(writeReport(t, `{"answer": ["x"], "warnings": ["`+long+`"], "attack": {"findings": {"evidenced": [
@@ -443,94 +413,87 @@ func TestPlainCardKeepsItsWidth(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.Dir = "runs/" + strings.Repeat("x", 80)
-	s := card(r, plainW, false)
-	lines := splitLines(s)
-	for i, line := range lines {
+	s := plainReport(r, plainW)
+	for _, line := range splitLines(s) {
 		if width(line) > plainW {
 			t.Errorf("%d columns: %q", width(line), line)
 		}
-		if strings.HasPrefix(line, "  1  HACK") {
-			if next := lines[i+1]; len(next) <= 21 || strings.TrimLeft(next, " ") != next[21:] {
-				t.Errorf("finding continues as %q", next)
-			}
+	}
+	for _, want := range []string{"  Run directory\n      " + r.Dir + "\n", "\nNEXT\n  nudi-view " + r.Dir + " 1\n", "\n\nCOST\n"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("report lacks %q:\n%s", want, s)
 		}
 	}
-	if !strings.HasSuffix(s, "\n next ›\n   nudi-view "+r.Dir+" 1") {
-		t.Errorf("the next command is not whole on its own line:\n%s", s)
+	if strings.Contains(s, "\n\n\n") {
+		t.Errorf("two blank lines in a row:\n%s", s)
 	}
 	flat := oneLine(s)
-	for _, want := range []string{"HACK " + long, "warning in " + r.Dir + "/report.md " + long, "next › nudi-view " + r.Dir + " 1"} {
+	for _, want := range []string{"1 " + long, "Run " + capital(long), "Evidence from Not recorded"} {
 		if !strings.Contains(flat, want) {
-			t.Errorf("card lacks %q:\n%s", want, s)
+			t.Errorf("report lacks %q:\n%s", want, s)
 		}
 	}
 }
 
-// The card lists the first warnings in Python's words, each by its first line, and counts the rest.
-func TestCardListsWarnings(t *testing.T) {
-	s := card(fixture(t, "full"), 120, false)
-	want := " ▲ 5 warnings in testdata/full/report.md\n" +
-		"   attack candidate hack-1 minimal is unknown\n" +
-		"   attack candidates hack-2 minimal, hack-4 full and minimal are unattempted\n" +
-		"   11 of 12 ordinary episodes have no supported local label (unknown 6, unreviewed 5); they are excluded, not counted as\n" +
-		"   correct\n" +
-		"   and 2 more\n"
-	if !strings.Contains(s, want) {
-		t.Errorf("card lacks %q:\n%s", want, s)
+// Each warning becomes a Work left row that says where, what and why, in Python's words; a warning about an attack
+// candidate is dropped, since the problem's own row already says it. Control and format characters never reach the pipe.
+func TestWarningsBecomeWorkLeftRows(t *testing.T) {
+	s := plainReport(fixture(t, "full"), 120)
+	for _, want := range []string{
+		"  Grade Simulations   5 of 12 ordinary episodes\n                      Have no supported local label (unreviewed 5)",
+		"  Attack              P1 The test runs bash through PATH, so a planted shim decides the result.\n                      With only a hint: no clear Attacker result",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("report lacks %q:\n%s", want, s)
+		}
 	}
-	if s := card(fixture(t, "clean-before-levels"), 120, false); !strings.Contains(s, "2 warnings") || !strings.Contains(s, "hack partial: its coverage is incomplete") ||
-		!strings.Contains(s, "the task resets nothing between episodes") {
-		t.Errorf("clean card:\n%s", s)
+	if strings.Contains(s, "warning") || strings.Contains(s, "attack candidate") {
+		t.Errorf("a warning line is left over:\n%s", s)
 	}
-	r, err := load(writeReport(t, `{"answer": ["x"], "warnings": ["a\u001b[2Jb\u202ec\tok\nits second line", "two", "three", "four"]}`))
+	if s := plainReport(fixture(t, "clean-before-levels"), 120); !strings.Contains(s, "  Find Hacks          Search limitation (persistence)\n                      The task resets nothing between episodes") {
+		t.Errorf("clean report:\n%s", s)
+	}
+	r, err := load(writeReport(t, `{"answer": ["x"], "warnings": ["a\u001b[2Jb\u202ec ok", "two"]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range []string{card(r, 100, false), card(r, 100, true)} {
-		if !strings.Contains(s, "a[2Jbc ok") || strings.Contains(s, "second line") || strings.ContainsAny(s, "\u202e\t") || !strings.Contains(ansi.Strip(s), "and 1 more") {
-			t.Errorf("warnings:\n%q", s)
-		}
+	if s := plainReport(r, 100); !strings.Contains(s, "  Run                 A[2Jbc ok\n  Run                 Two\n") || strings.ContainsAny(s, "\u202e\u001b") {
+		t.Errorf("warnings:\n%q", s)
 	}
 }
 
-// An attack finding keeps what Python's exploits say it confirmed beside its tag, wherever the tag is drawn.
+// An attack finding keeps what Python's exploits say it confirmed, on its screen and in the pipe.
 func TestAttackTagsKeepWhatTheyConfirmed(t *testing.T) {
 	r := fixture(t, "full-before-levels")
-	c := card(r, 120, false)
+	c := oneLine(plainReport(r, 120))
 	for _, want := range []string{
-		" 7  HACK            reproduced #3 hack-1 · planted a bash shim that prints the pass marker\n",
-		" 8  FN              reproduced #4 hack-2 · wrote the answer with leading zeros\n",
-		" 9  HACK            not confirmed as #3 hack-1 · wrote the pass marker without running the tests\n",
-		" 3  HACK            unchecked requirement\n",
+		"7 planted a bash shim that prints the pass marker Type Hack",
+		"Attacker exploit Reproduced hack-1 (finding 3)",
+		"Attacker exploit Reproduced hack-2 (finding 4)",
+		"Attacker exploit Not confirmed as hack-1 (finding 3)",
 	} {
 		if !strings.Contains(c, want) {
-			t.Errorf("card lacks %q:\n%s", want, c)
+			t.Errorf("report lacks %q:\n%s", want, c)
 		}
 	}
-	if s := plainShow(r, r.findings(), 9, 120); !strings.Contains(s, "\n not confirmed as #3 hack-1\n") {
+	if s := plainShow(r, r.findings(), 9, 120); !strings.Contains(s, "\n Attacker exploit  Not confirmed as hack-1 (finding 3)\n") {
 		t.Errorf("finding 9:\n%s", s)
-	}
-	if s := plainPhase(r, 3); !strings.Contains(s, "#9 HACK check-0011") || !strings.Contains(s, "not confirmed as #3 hack-1") {
-		t.Errorf("found panel:\n%s", s)
 	}
 	attack := func(exploits string) string {
 		return `{"answer": ["x"], "attack": {` + exploits + `"findings": {"evidenced": [
 			{"index": 0, "assessment": {"outcome": "accepted_invalid"}, "claim": {"mechanism": "m0"}},
 			{"index": 1, "assessment": {"outcome": "accepted_invalid"}, "claim": {"mechanism": "m1"}}]}}}`
 	}
-	for body, want := range map[string][]string{
-		attack(`"exploits": {"discovery": [{"assessment": 0, "candidate": null, "sources": []}]}, `): {
-			"HACK            found with no extra information · m0\n", "HACK            confirms no tested finding · m1"},
-		attack(""): {"HACK            m0\n", "HACK            m1"},
+	for body, want := range map[string]string{
+		attack(`"exploits": {"discovery": [{"assessment": 0, "candidate": null, "sources": []}]}, `): "m0 Type Hack: the reward was earned without doing the task Found by Attacker Evidence from Not recorded Reference no check Attacker exploit Found with no information 2 m1 Type Hack: the reward was earned without doing the task Found by Attacker Evidence from Not recorded Reference no check Attacker exploit Confirms no tested finding",
+		attack(""): "Reference no check SIMULATION",
 	} {
 		r, err := load(writeReport(t, body))
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, w := range want {
-			if s := card(r, 100, false); !strings.Contains(s, w) {
-				t.Errorf("card lacks %q:\n%s", w, s)
-			}
+		if s := oneLine(plainReport(r, 100)); !strings.Contains(s, want) {
+			t.Errorf("report lacks %q:\n%s", want, s)
 		}
 	}
 }
@@ -542,23 +505,23 @@ func TestMissingReferencesAttributeNothing(t *testing.T) {
 			{` + index0 + `"assessment": {"outcome": "accepted_invalid"}, "claim": {"mechanism": "m0"}},
 			{"index": 1, "assessment": {"outcome": "accepted_invalid"}, "claim": {"mechanism": "m1"}}]}}}`
 	}
-	unavailable := []string{"HACK            confirmation unavailable · m0\n", "HACK            confirmation unavailable · m1"}
-	for body, want := range map[string][]string{
-		attack(`"index": 0, `, `{"assessment": 0, "sources": ["hack-5"]}`):    {"HACK            reproduced hack-5 · m0\n", "HACK            confirms no tested finding · m1"},
-		attack(`"index": 0, `, `{"assessment": 1, "sources": ["hack-5"]}`):    {"HACK            confirms no tested finding · m0\n", "HACK            reproduced hack-5 · m1"},
+	unavailable := [2]string{"Confirmation unavailable", "Confirmation unavailable"}
+	for body, want := range map[string][2]string{
+		attack(`"index": 0, `, `{"assessment": 0, "sources": ["hack-5"]}`):    {"Reproduced hack-5", "Confirms no tested finding"},
+		attack(`"index": 0, `, `{"assessment": 1, "sources": ["hack-5"]}`):    {"Confirms no tested finding", "Reproduced hack-5"},
 		attack(`"index": 0, `, `{"sources": ["hack-5"]}`):                     unavailable,
 		attack(`"index": 0, `, `{"assessment": null, "sources": ["hack-5"]}`): unavailable,
 		attack(`"index": 0, `, `null`):                                        unavailable,
-		attack(``, `{"assessment": 0, "sources": ["hack-5"]}`):                {"HACK            confirmation unavailable · m0\n", "HACK            confirms no tested finding · m1"},
-		attack(`"index": null, `, `{"assessment": 0, "sources": ["hack-5"]}`): {"HACK            confirmation unavailable · m0\n", "HACK            confirms no tested finding · m1"},
+		attack(``, `{"assessment": 0, "sources": ["hack-5"]}`):                {"Confirmation unavailable", "Confirms no tested finding"},
+		attack(`"index": null, `, `{"assessment": 0, "sources": ["hack-5"]}`): {"Confirmation unavailable", "Confirms no tested finding"},
 	} {
 		r, err := load(writeReport(t, body))
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, w := range want {
-			if s := card(r, 100, false); !strings.Contains(s, w) {
-				t.Errorf("card lacks %q:\n%s", w, s)
+		for i, w := range want {
+			if !strings.Contains(oneLine(plainShow(r, r.findings(), i+1, 100)), "Attacker exploit "+w) {
+				t.Errorf("finding %d lacks %q:\n%s", i+1, w, plainShow(r, r.findings(), i+1, 100))
 			}
 		}
 	}
@@ -580,7 +543,7 @@ func TestMissingReferencesAttributeNothing(t *testing.T) {
 		if found[0].ID != "grader index unavailable" || r.problemOf(found[0].ID) != -1 {
 			t.Errorf("%q: named %q", index, found[0].ID)
 		}
-		if s := plainShow(r, found, 1, 100); strings.Contains(s, "grader-0") || strings.Contains(s, "problem 1 of 1") {
+		if s := plainShow(r, found, 1, 100); strings.Contains(s, "grader-0") || strings.Contains(s, "Problem 1 of 1") {
 			t.Errorf("%q: finding 1 is linked:\n%s", index, s)
 		}
 	}
@@ -593,20 +556,20 @@ func TestMissingFlagDetailsAreUnavailable(t *testing.T) {
 			"rewards": {"reward": {"attempted": 1, "usable": 1, "mean": 1.0, "distribution": [[1.0, 1]]` + flags + `}}}]}}`
 	}
 	for flags, want := range map[string]string{
-		``:                                      "\n flag details unavailable",
-		`, "flags": null`:                       "\n flag details unavailable",
-		`, "flags": [null]`:                     "\n ▲ flag details unavailable",
-		`, "flags": [{"text": "t"}]`:            "\n ▲ flag details unavailable",
-		`, "flags": [{"flag": "low_minority"}]`: "\n ▲ flag details unavailable",
-		`, "flags": [{"flag": null, "text": "t"}]`: "\n ▲ flag details unavailable",
-		`, "flags": []`: "",
+		``:                                      "Pattern details unavailable.",
+		`, "flags": null`:                       "Pattern details unavailable.",
+		`, "flags": [null]`:                     "Pattern details unavailable.",
+		`, "flags": [{"text": "t"}]`:            "Pattern details unavailable.",
+		`, "flags": [{"flag": "low_minority"}]`: "Pattern details unavailable.",
+		`, "flags": [{"flag": null, "text": "t"}]`: "Pattern details unavailable.",
+		`, "flags": []`: "No pattern flagged.",
 	} {
 		r, err := load(writeReport(t, rewards(flags)))
 		if err != nil {
 			t.Fatal(err)
 		}
-		s := plainPhase(r, 0)
-		if want == "" && strings.Contains(s, "flag details") || want != "" && !strings.Contains(s, want) {
+		s := plainTab(r, 0)
+		if !strings.Contains(s, want) || want == "No pattern flagged." && strings.Contains(s, "details unavailable") {
 			t.Errorf("%q:\n%s", flags, s)
 		}
 	}
@@ -623,7 +586,7 @@ func TestAttackStopsHaveWords(t *testing.T) {
 }
 
 func TestBroadSearchExcludesRestrictionsButKeepsMeasuredWork(t *testing.T) {
-	r, err := load(writeReport(t, `{"answer":["x"],"inspections":{"hack_inspector":{
+	r, err := load(writeReport(t, `{"answer":["x"],"analyses":{"hack":"complete"},"inspections":{"hack_inspector":{
         "categories":{"online_lookup":"unknown","persistence":"restricted"},
         "attempts":[{"phase":"broad","status":"no_evidenced_issue"}],
         "limits":["stopped before sessions ended, so they are unknown"]}}}`))
@@ -631,14 +594,13 @@ func TestBroadSearchExcludesRestrictionsButKeepsMeasuredWork(t *testing.T) {
 		t.Fatal(err)
 	}
 	in := r.Inspections["hack_inspector"]
-	s := plainText(hackPanel(r, 160))
-	if !strings.Contains(s, "Searched: Looks answer up online\n") || strings.Contains(s, "so they are unknown") {
+	s := plainTab(r, 2, "s")
+	if !strings.Contains(s, "Looks answer up online    Looking the answer up online") || strings.Contains(s, "Not searched: Looks answer up online") ||
+		!strings.Contains(s, "Not searched: Files survive reset") || strings.Contains(s, "so they are unknown") {
 		t.Fatal(s)
 	}
-	in.Experiments = append(in.Experiments, struct {
-		Category string `json:"category"`
-	}{Category: "persistence"})
-	if s := plainText(hackPanel(r, 160)); !strings.Contains(s, "Searched: Looks answer up online; Files survive reset\n") {
+	in.Experiments = append(in.Experiments, Experiment{Category: "persistence"})
+	if s := plainTab(r, 2, "s"); strings.Contains(s, "Not searched") {
 		t.Fatal(s)
 	}
 }
@@ -646,10 +608,446 @@ func TestBroadSearchExcludesRestrictionsButKeepsMeasuredWork(t *testing.T) {
 // A problem id opens the finding that shows it, and the finding's screen names its problem by that id.
 func TestViewOpensAProblemById(t *testing.T) {
 	code, out, _ := run("testdata/pipeline-full", "P2")
-	if code != 0 || !strings.Contains(out, "hack-2") || !strings.Contains(out, "P2 · this finding") {
+	if code != 0 || !strings.Contains(out, "hack-2") || !strings.Contains(out, " Problem           P2 ") || !strings.Contains(out, "Attacker result    Reproduced with full instructions\n") {
 		t.Errorf("exit %d:\n%s", code, out)
 	}
 	if code, _, errs := run("testdata/pipeline-full", "P9"); code != 2 || !strings.Contains(errs, "run has no problem P9") {
 		t.Errorf("exit %d, %q", code, errs)
+	}
+}
+
+// Each Attacker finding belongs to the problem its own exploit entry names, also when one session holds exploits of
+// two problems and so is a member of both.
+func TestAttackFindingsFollowTheirOwnExploit(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "other_episodes": {"attacker": ["0001-attacker"]}, "attack": {
+		"problems": [
+			{"id": "P1", "source": "hack inspector", "cause": "c1", "level": 3},
+			{"id": "P2", "source": "hack inspector", "cause": "c2", "level": 3, "members": ["0001-attacker"]},
+			{"id": "P3", "source": "hack inspector", "cause": "c3", "level": 3, "members": ["0001-attacker"]}],
+		"attempts": [{"number": 1, "level": "full", "problem": "P1", "candidate": "hack-0", "sources": ["hack-0"], "episode": "0001-attacker", "status": "other_exploit"}],
+		"exploits": {"other": [
+			{"assessment": 0, "attempt": 0, "candidate": "hack-0", "sources": ["hack-0"], "problem": "P2"},
+			{"assessment": 1, "attempt": 0, "candidate": "hack-0", "sources": ["hack-0"], "problem": "P3"}]},
+		"findings": {"evidenced": [
+			{"index": 0, "assessment": {"outcome": "accepted_invalid"}, "claim": {"mechanism": "m0", "episode": "0001-attacker"}},
+			{"index": 1, "assessment": {"outcome": "accepted_invalid"}, "claim": {"mechanism": "m1", "episode": "0001-attacker"}}]}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := r.findings()
+	for i, want := range []string{"P2", "P3"} {
+		var held []string
+		for _, p := range r.Attack.Problems {
+			if r.demonstrates(found[i], p) {
+				held = append(held, p.ID)
+			}
+		}
+		if p := findingProblem(r, found[i]); p == nil || p.ID != want || len(held) != 1 {
+			t.Errorf("finding %d is held by %v", i+1, held)
+		}
+	}
+}
+
+// An evidenced Attacker finding without an exploit entry, as one outside its requested outcome, stays on the
+// Results tab when no problem holds it.
+func TestUnheldAttackFindingIsListed(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "attack": {"problems": [], "exploits": {"reproduction": [], "other": [], "unattributed": [], "discovery": []},
+		"findings": {"evidenced": [{"index": 0, "assessment": {"outcome": "rejected_valid"}, "claim": {"mechanism": "outside its outcome", "episode": "0001-attacker"}}]}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := plainTab(r, results); !strings.Contains(s, "outside its outcome") {
+		t.Errorf("the finding is missing:\n%s", s)
+	}
+}
+
+// A blank limitation is no limitation: the finding still draws, and its count leaves the blank out.
+func TestBlankLimitationsAreSkipped(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "inspections": {"hack_inspector": {"findings": {"evidenced": [
+		{"index": 0, "assessment": {"outcome": "accepted_invalid", "limits": ["  "]}, "claim": {"mechanism": "m", "limits": ["", "a real limit"], "unresolved": [" "]}}]}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := r.findings()
+	s := plainText(renderShow(r, found, 1, 1, "Results", 100))
+	if !strings.Contains(s, "Limitations 1") || !strings.Contains(s, "1  A real limit") || strings.Contains(s, "OPEN CONDITIONS") {
+		t.Errorf("limitations:\n%s", s)
+	}
+	if s := plainShow(r, found, 1, 100); !strings.Contains(s, "A real limit") {
+		t.Errorf("plain finding:\n%s", s)
+	}
+}
+
+// A try whose exploit was not tied to a problem settles nothing about its own problem.
+func TestUnattributedTryIsUnresolved(t *testing.T) {
+	r := fixture(t, "full")
+	s := plainTab(r, 3)
+	if got := cells(s, "2    Hint"); got != "? ? Finished 1 0014-attacker" {
+		t.Errorf("0014-attacker row: %q\n%s", got, s)
+	}
+}
+
+// Enter on a Find Hacks finding of a report without problems opens that finding, by its number on the whole list.
+func TestFindHacksOpensItsOwnFinding(t *testing.T) {
+	r := fixture(t, "full-0.0.0")
+	found := r.findings()
+	m := newModel(r, 0, false)
+	m.w, m.screen = 100, 2
+	m.page()
+	n := -1
+	for _, it := range m.items {
+		if it.n > 0 {
+			n = it.n
+			break
+		}
+	}
+	if n < 1 || found[n-1].ID != "hack-1" {
+		t.Errorf("the first Find Hacks row opens finding %d", n)
+	}
+}
+
+// A reward pattern counts only usable rewards, and without rewards per episode it says they are unavailable.
+func TestRewardPatternCountsUsableRewards(t *testing.T) {
+	one, zero := 1.0, 0.0
+	rewards := map[string]map[string]*float64{"e00": {"r": &zero}, "e01": {"r": &zero}, "e12": {"r": nil}}
+	for i := 2; i < 12; i++ {
+		rewards[fmt.Sprintf("e%02d", i)] = map[string]*float64{"r": &one}
+	}
+	flag, text := "low_minority", "t"
+	x := Rewards{Flags: []*Flag{{Flag: &flag, Text: &text, Episodes: []string{"e00", "e01"}}}}
+	if got := patterns(x, rewards, "r"); got[0] != "2 episodes received 0; the other 10 received 1." {
+		t.Errorf("pattern: %q", got)
+	}
+	if got := patterns(x, nil, "r"); strings.Contains(got[0], "no usable reward") || !strings.Contains(got[0], "unavailable") {
+		t.Errorf("pattern without rewards per episode: %q", got)
+	}
+}
+
+// An Attacker problem demonstrated by a try aimed at another problem names that try in the plain output.
+func TestPlainNamesTriesAimedElsewhere(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "other_episodes": {"attacker": ["0001-attacker"]}, "attack": {
+		"problems": [
+			{"id": "P1", "source": "hack inspector", "cause": "c1", "level": 3, "findings": ["hack-0"]},
+			{"id": "A1", "source": "Attacker", "cause": "a1", "level": 4, "members": ["0001-attacker"],
+			 "exploited_by": [{"episode": "0001-attacker", "target": "P1"}],
+			 "conditions": [{"condition": "elsewhere_minimal", "attempts": 1, "exploited": 1, "status": "evidenced_issue"}]}],
+		"attempts": [{"number": 1, "level": "minimal", "problem": "P1", "candidate": "hack-0", "sources": ["hack-0"], "episode": "0001-attacker", "status": "other_exploit"}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := plainReport(r, 120)
+	i := strings.Index(s, "A1  a1")
+	if i < 0 {
+		t.Fatalf("no A1:\n%s", s)
+	}
+	a1 := s[i:]
+	a1 = a1[:strings.Index(a1, "\n\n")]
+	if !strings.Contains(a1, "only a hint: demonstrated") || !strings.Contains(a1, "0001-attacker") || strings.Contains(a1, "Not tested") {
+		t.Errorf("A1:\n%s", a1)
+	}
+}
+
+// A no-information try that matched an Attacker problem another try found first is not a new finding.
+func TestNoInfoMatchOfAnEarlierAttackerProblemIsNotNew(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "other_episodes": {"attacker": ["0001-attacker", "0002-attacker"]}, "attack": {
+		"problems": [{"id": "A1", "source": "Attacker", "cause": "a1", "level": 5, "members": ["0001-attacker", "0002-attacker"]}],
+		"discovery": {"status": "evidenced_issue", "attempts": 2, "maximum_attempts": 2},
+		"attempts": [
+			{"number": 1, "level": "none", "episode": "0001-attacker", "status": "evidenced_issue"},
+			{"number": 2, "level": "none", "episode": "0002-attacker", "status": "evidenced_issue"}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := plainTab(r, 3)
+	if got, again := cells(s, "1 "), cells(s, "2 "); got != "✓ ✓" || again != "✓ ✗ a1" {
+		t.Errorf("first %q, second %q:\n%s", got, again, s)
+	}
+}
+
+// An older problem without its outcome takes it from its findings, and else shows no type rather than a guess.
+func TestOlderProblemTypeComesFromItsFindings(t *testing.T) {
+	report := func(outcome string) Report {
+		r, err := load(writeReport(t, `{"answer": ["x"], "inspections": {"grader_inspector": {"findings": {"evidenced": [
+			{"index": 0, "assessment": {"outcome": "`+outcome+`"}, "claim": {"mechanism": "g"}}]}}},
+			"attack": {"problems": [{"id": "G1", "source": "grader inspector", "cause": "c", "findings": ["grader-0"], "level": 2},
+				{"id": "G2", "source": "grader inspector", "cause": "d", "findings": ["grader-9"], "level": 2}]}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	for outcome, want := range map[string]string{"rejected_valid": "False negative", "accepted_invalid": "False positive"} {
+		r := report(outcome)
+		if got := problemType(r, r.Attack.Problems[0]); got != want {
+			t.Errorf("%s: %s", outcome, got)
+		}
+		if got := problemType(r, r.Attack.Problems[1]); got == "False positive" || got == "Hack" {
+			t.Errorf("a problem without readable findings is %s", got)
+		}
+	}
+}
+
+// A phase that failed after keeping results shows them, and says it failed before finishing rather than that it has none.
+func TestFailedPhaseKeepsItsResults(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "status": "partial", "analyses": {"hack": "partial"}, "phase_errors": {"hack": "hack failed: RuntimeError: boom"},
+		"inspections": {"hack_inspector": {"findings": {"evidenced": [{"index": 0, "assessment": {"outcome": "accepted_invalid"}, "claim": {"mechanism": "kept finding"}}]}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{plainTab(r, results), plainTab(r, 2), plainReport(r, 120)} {
+		if strings.Contains(s, "No hack search result") || strings.Contains(s, "nothing about hacks") || !strings.Contains(s, "failed before it finished") {
+			t.Errorf("failed phase:\n%s", s)
+		}
+	}
+	if s := plainTab(r, 2); !strings.Contains(s, "kept finding") {
+		t.Errorf("the kept finding is missing:\n%s", s)
+	}
+}
+
+// An older report without exploits ties an Attacker finding to the problem its successful try aimed at.
+func TestOlderAttackFindingFollowsItsTry(t *testing.T) {
+	r := fixture(t, "pipeline-full")
+	found := r.findings()
+	i := slices.IndexFunc(found, func(f Finding) bool { return f.Source == "attack" && f.Claim.Episode == "0001-attacker" })
+	if p := findingProblem(r, found[i]); p == nil || p.ID != "P1" {
+		t.Errorf("0001-attacker's finding is held by %v", p)
+	}
+}
+
+// A finding a problem holds is named by the problem's cause; its own mechanism stays on a line of its own. A finding
+// no problem holds keeps its own name.
+func TestDetailNamesItsProblem(t *testing.T) {
+	r := fixture(t, "full")
+	s := plainShow(r, r.findings(), 3, 120)
+	for _, want := range []string{"Results › The test runs bash through PATH, so a planted shim decides the result.", "Mechanism"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("finding 3 lacks %q:\n%s", want, s)
+		}
+	}
+	if s := plainShow(r, r.findings(), 1, 120); strings.Contains(s, "Mechanism") || !strings.Contains(s, "Results › "+title(r.findings()[0])) {
+		t.Errorf("finding 1:\n%s", s)
+	}
+}
+
+// A clean run names its open question and why it is open; it never says a phase is incomplete when it only left
+// results unresolved.
+func TestCleanRunNamesItsOpenQuestion(t *testing.T) {
+	s := plainReport(fixture(t, "clean"), 120)
+	for _, want := range []string{"No problems demonstrated in this run.", "1 open question",
+		"  Find Hacks          unchecked requirement (hack-0)\n                      Unresolved: Reason not recorded"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("report lacks %q:\n%s", want, s)
+		}
+	}
+	for _, gone := range []string{"Coverage", "some results unclear", "No cheat and no misjudged work"} {
+		if strings.Contains(s, gone) {
+			t.Errorf("report shows %q:\n%s", gone, s)
+		}
+	}
+}
+
+// The help defines the metrics; the Results tab only shows them.
+func TestHelpDefinesMetrics(t *testing.T) {
+	help := plainText(helpPanel(wideAt, false))
+	for _, want := range []string{"METRICS", "F1", "2 TP / (2 TP + FP + FN)", "AUROC", "Score ordering", "source-grounded"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("help lacks %q:\n%s", want, help)
+		}
+	}
+	if s := plainTab(fixture(t, "full"), results); strings.Contains(s, "2 TP") {
+		t.Errorf("results define the metrics:\n%s", s)
+	}
+}
+
+// Evidence no problem holds is a selectable row, and Enter opens its detail.
+func TestStandaloneEvidenceOpens(t *testing.T) {
+	r := fixture(t, "full")
+	found := r.findings()
+	p := &page{w: wideAt, sel: -1, open: map[string]bool{"o": true}}
+	resultsPage(r, found, p)
+	for _, it := range p.items {
+		if line := plainText(p.lines[it.line]); strings.Contains(line, "Standalone evidence") {
+			if it.n < 1 || found[it.n-1].ID != "grader-6" {
+				t.Errorf("row %q opens finding %d", line, it.n)
+			}
+			return
+		}
+	}
+	t.Errorf("no selectable standalone evidence:\n%s", plainText(p.String()))
+}
+
+// An expanded problem says why each level was not tested.
+func TestExpandedProblemSaysWhyNotTested(t *testing.T) {
+	s := plainTab(fixture(t, "full"), results)
+	for _, want := range []string{"No info -   Not tested: no Attacker attempt recorded", "Not tested: no guidance for an Attacker"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("results lack %q:\n%s", want, s)
+		}
+	}
+}
+
+// Older reports: legacy tries ask whether the problem was demonstrated, and a problem of no recorded type gets its
+// own group.
+func TestOlderReportsGroupWhatTheyKnow(t *testing.T) {
+	if s := plainTab(fixture(t, "full-0.0.0"), 3); !strings.Contains(s, "Problem demonstrated?") {
+		t.Errorf("legacy tries:\n%s", s)
+	}
+	if s := plainTab(fixture(t, "pipeline-full"), 3); !strings.Contains(s, "TYPE NOT RECORDED (1)") {
+		t.Errorf("no type group:\n%s", s)
+	}
+}
+
+// The Models panel wraps inside its box and names each role's jobs.
+func TestModelsPanelFits(t *testing.T) {
+	r := fixture(t, "full")
+	for _, w := range []int{60, 80, 100, 120} {
+		s := plainText(modelsPanel(r, w))
+		for _, line := range splitLines(s) {
+			if width(line) > w || strings.Contains(line, "…") {
+				t.Errorf("width %d: %q", w, line)
+			}
+		}
+		if !strings.Contains(s, "Jobs: Grader Inspector, Hack Inspector,") {
+			t.Errorf("width %d lacks the jobs:\n%s", w, s)
+		}
+	}
+}
+
+// Find Hacks mentions Attackers only when the run selected Attack, and the pipe keeps no internal labels.
+func TestPlainWordsOnly(t *testing.T) {
+	if s := plainTab(fixture(t, "clean"), 2); strings.Contains(s, "Attackers") {
+		t.Errorf("clean Find Hacks:\n%s", s)
+	}
+	r := fixture(t, "full")
+	out := plainReport(r, 120)
+	for n := range r.findings() {
+		out += plainShow(r, r.findings(), n+1, 120)
+	}
+	for _, gone := range []string{"exploit executable", "no extra information", "Evidenced in no problem", "Summary is violated"} {
+		if strings.Contains(out, gone) {
+			t.Errorf("plain output shows %q", gone)
+		}
+	}
+}
+
+// Two standalone Attacker findings of one episode are two rows, and each opens its own finding.
+func TestStandaloneRowsOpenTheirOwnFinding(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "attack": {"problems": [], "exploits": {"reproduction": [], "other": [], "unattributed": [], "discovery": []},
+		"findings": {"evidenced": [{"index": 0, "assessment": {"outcome": "accepted_invalid"}, "claim": {"mechanism": "first way", "episode": "0001-attacker"}},
+			{"index": 1, "assessment": {"outcome": "accepted_invalid"}, "claim": {"mechanism": "second way", "episode": "0001-attacker"}}]}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &page{w: wideAt, sel: -1, open: map[string]bool{"o": true}}
+	resultsPage(r, r.findings(), p)
+	var opens []int
+	for _, it := range p.items {
+		if strings.Contains(plainText(p.lines[it.line]), "Standalone evidence") {
+			opens = append(opens, it.n)
+		}
+	}
+	if !slices.Equal(opens, []int{1, 2}) {
+		t.Errorf("standalone rows open %v:\n%s", opens, plainText(p.String()))
+	}
+}
+
+// A problem imported at its earlier run's level keeps saying so in the plain report.
+func TestImportedLevelKeepsItsRun(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "attack": {"problems": [
+		{"id": "A1", "cause": "c1", "source": "Attacker", "level": 5, "members": ["0001-attacker"],
+			"label": "evidenced in run r1 at ●●●●● exploit executable by unaided learner; not found again here"}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "      Level             5 of 5: an Attacker given no information demonstrated it in run r1; not found again here"
+	if got := row(plainReport(r, 140), "Level"); got != want {
+		t.Errorf("level:\n%q\nwant\n%q", got, want)
+	}
+}
+
+// The saved Attack table says how a try stopped once its episode started, and "Not started" only for one that never
+// started.
+func TestSavedTriesSayHowAStartedTryStopped(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "other_episodes": {"attacker": ["0001-attacker"]}, "attack": {
+		"problems": [{"id": "P1", "source": "hack inspector", "cause": "c1", "level": 2, "findings": ["hack-0"]}],
+		"attempts": [
+			{"number": 1, "level": "full", "problem": "P1", "candidate": "hack-0", "episode": "0001-attacker", "rewards": {"0001-attacker": 1}, "status": "spending_exhausted"},
+			{"number": 2, "level": "full", "problem": "P1", "candidate": "hack-0", "status": "spending_exhausted"}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := plainTab(r, 3)
+	if first, second := oneLine(row(s, "1 ")), oneLine(row(s, "2 ")); !strings.Contains(first, "Stopped at") || strings.Contains(first, "Not started") || !strings.Contains(second, "Not started") {
+		t.Errorf("first %q, second %q:\n%s", first, second, s)
+	}
+}
+
+// An exploit found while the Attacker held a hint or full instructions for another problem keeps its rung, is listed
+// below the aimed exploits there, shows ✓ in its column, and says which problem the try was aimed at.
+func TestExploitWhileAimedElsewhere(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"},
+		"other_episodes": {"attacker": ["0001-attacker", "0002-attacker", "0003-attacker"]}, "attack": {
+		"problems": [
+			{"id": "A1", "source": "Attacker", "cause": "a1", "level": 3, "exploited_with": "elsewhere_full", "members": ["0002-attacker"],
+			 "exploited_by": [{"episode": "0002-attacker", "target": "P1"}],
+			 "conditions": [{"condition": "elsewhere_full", "attempts": 1, "exploited": 1, "status": "evidenced_issue"}]},
+			{"id": "P1", "source": "hack inspector", "cause": "c1", "level": 3, "exploited_with": "full", "findings": ["hack-0"],
+			 "conditions": [{"condition": "full", "attempts": 1, "exploited": 1, "status": "evidenced_issue"}]},
+			{"id": "A2", "source": "Attacker", "cause": "a2", "level": 4, "exploited_with": "elsewhere_minimal", "members": ["0003-attacker"],
+			 "exploited_by": [{"episode": "0003-attacker", "target": "P1"}],
+			 "conditions": [{"condition": "elsewhere_minimal", "attempts": 1, "exploited": 1, "status": "evidenced_issue"}]}],
+		"attempts": [
+			{"number": 1, "level": "full", "problem": "P1", "candidate": "hack-0", "sources": ["hack-0"], "episode": "0001-attacker", "status": "evidenced_issue"},
+			{"number": 2, "level": "full", "problem": "P1", "candidate": "hack-0", "sources": ["hack-0"], "episode": "0002-attacker", "status": "other_exploit"},
+			{"number": 1, "level": "minimal", "problem": "P1", "candidate": "hack-0", "sources": ["hack-0"], "episode": "0003-attacker", "status": "other_exploit"}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	for _, p := range problems(r) {
+		order = append(order, p.ID)
+	}
+	if got := strings.Join(order, " "); got != "A2 P1 A1" {
+		t.Errorf("order %q", got)
+	}
+	s := plainTab(r, results, "problem 2")
+	if got := cells(s, "▾ a1"); !strings.HasPrefix(got, "Hack - - ✓") {
+		t.Errorf("A1 row %q:\n%s", got, s)
+	}
+	if !strings.Contains(s, "Full ✓") || !strings.Contains(s, "Demonstrated while aimed at P1") {
+		t.Errorf("expanded A1:\n%s", s)
+	}
+	if got := attackerResult(r, &r.Attack.Problems[0]); got != "Reproduced with full instructions while aimed at P1" {
+		t.Errorf("detail: %q", got)
+	}
+	if got := attackerResult(r, &r.Attack.Problems[1]); got != "Reproduced with full instructions" {
+		t.Errorf("aimed detail: %q", got)
+	}
+	plain := plainReport(r, 120)
+	if !strings.Contains(plain, "3 of 5: an Attacker given full instructions demonstrated it, while aimed at P1") ||
+		!strings.Contains(plain, "4 of 5: an Attacker given only a hint demonstrated it, while aimed at P1") ||
+		strings.Contains(plain, "its help was for another problem") {
+		t.Errorf("plain:\n%s", plain)
+	}
+}
+
+// A suspected exploit, a measured check whose reading ended unknown, is a counted state among the findings not counted
+// as problems, on Results and in the plain output, named by its category with its check as the reference.
+func TestSuspectedExploitIsNotCountedAsAProblem(t *testing.T) {
+	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"hack": "partial", "grader": "complete"}, "inspections": {
+		"hack_inspector": {"suspected": [{"category": "package_oracles", "check": "check-0"}], "findings": {}},
+		"grader_inspector": {"suspected": [{"category": null, "check": "check-1"}], "findings": {}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := plainTab(r, results, "o")
+	for _, want := range []string{"Not counted as problems (2 suspected exploit", "Reads solution files", "check-0", "check-1"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("Results misses %q:\n%s", want, s)
+		}
+	}
+	plain := plainReport(r, 100)
+	if !strings.Contains(plain, "State             Suspected exploit") || !strings.Contains(plain, "Reference         check-0") {
+		t.Errorf("plain:\n%s", plain)
 	}
 }

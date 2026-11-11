@@ -1,0 +1,32 @@
+usage: nudi-view [-h] [-v] [--follow] [--no-intro] RUN [N | PROBLEM]
+
+open a nudi run in the terminal; in a pipe, print the whole report as plain text
+
+positional arguments:
+  RUN                   a run directory that nudi send-nudis wrote
+  N | PROBLEM           open finding N, or the evidence of problem PROBLEM such as P1
+
+options:
+  -h, --help            show this help message and exit
+  -v, --version         show the version and exit
+  --follow              follow a run that is still going, from its events.jsonl, until nudi writes
+                        its report
+  --no-intro            open without the intro animation
+
+commands:
+  completion SHELL      print a shell completion script
+
+examples:
+  nudi-view runs/git-multibranch            open the run
+  nudi-view runs/git-multibranch P1         open problem P1 with its evidence
+  nudi-view runs/git-multibranch 1          open finding 1 with its evidence
+  nudi-view --follow runs/git-multibranch   follow a run that is still going
+
+in a pipe:
+  nudi-view RUN prints every section of the report as plain text, nudi-view RUN N one finding;
+  with --follow it prints each event's line, then the report
+
+related commands:
+  nudi send-nudis TASK  run nudi on one or more Harbor tasks and write their reports
+  nudi report RUN       write a run's report again from its records
+  nudi cost RUN         print Modal's bill for a run's sandboxes

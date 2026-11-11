@@ -4,10 +4,9 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
-
-	"github.com/charmbracelet/x/ansi"
 )
 
 var update = flag.Bool("update", false, "rewrite the snapshots of the pipeline fixtures")
@@ -44,15 +43,12 @@ func snapshot(t *testing.T, name, file, s string) {
 	}
 }
 
-// checkWidths draws l at 100, 80 and 60 columns and checks that no line is wider than the window.
+// checkWidths draws l at 120, 100, 80 and 60 columns, also 24 rows high, where liveScreen checks the lines fit.
 func checkWidths(t *testing.T, l *Live) {
 	t.Helper()
-	for _, w := range []int{100, 80, 60} {
-		for _, line := range splitLines(renderLive(l, l.Last.at(), w, 0)) {
-			if width(line) > w {
-				t.Errorf("%d columns at width %d: %q", width(line), w, ansi.Strip(line))
-			}
-		}
+	for _, w := range []int{120, 100, 80, 60} {
+		liveScreen(t, l, l.Last.at(), w, 0)
+		liveScreen(t, l, l.Last.at(), w, 24)
 	}
 }
 
@@ -67,6 +63,11 @@ func row(s, prefix string) string {
 }
 
 // Problems form as the judge names them: the same ones fold under their problem, the reproduction settles each.
+// cells are the words of the first row of s that starts with prefix, after it.
+func cells(s, prefix string) string {
+	return strings.Join(strings.Fields(strings.TrimPrefix(strings.TrimSpace(row(s, prefix)), prefix)), " ")
+}
+
 func TestPipelineLanesFromEvents(t *testing.T) {
 	l := pipelineLive(t, "pipeline-hacks")
 	var got []string
@@ -94,74 +95,118 @@ func TestPipelineLanesFromEvents(t *testing.T) {
 func TestPipelineHacksScreen(t *testing.T) {
 	l := pipelineLive(t, "pipeline-hacks")
 	checkWidths(t, l)
-	s := plainText(renderLive(l, l.Last.at(), 100, 0))
+	s := liveScreen(t, l, l.Last.at(), 100, 0)
 	snapshot(t, "pipeline-hacks", "screen.txt", s)
 	for _, want := range []string{
-		"HACKS ⣾ 8:50", "hack inspector", "AGENTS  5 of 6 slots",
-		"hack-broad", "hack-grader_tamperi…", "no extra informatio…", "P2 full instructions", "0002-attacker, try 1", "P1 only a hint",
-		"FINDINGS", "judge", "reproduce", "full instructions", "only a hint",
-		"+ experiment-0002, experiment-0005 same as P1",
+		"FIND HACKS ⣾ 8:50     Hack Inspector", "Find Hacks  ⣾ ── Attack ⣾", "Simulation ── Grade Simulations ──", "AGENTS  5 running",
+		"General search", "Focused search", "Edits grader or tests", "No information", "Skips the test file", "Full instructions, try 1",
+		"Checks try 1, hint", "FINDINGS SO FAR (4)", "Finding", "New?", "Inspector?", "Full instr.?", "Hint?",
+		"Related observations (2)", "CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("lacks %q:\n%s", want, s)
 		}
 	}
-	for prefix, cells := range map[string][]string{
-		"no extra information":      {"·", "·", "try 1 ⣾ 8m"},
-		"P1 reward reads stdout":    {"new", "✓", "✓ exploited", "⣾ 2m"},
-		"P2 skips the test file":    {"new", "✓", "⣾ 3m", "·"},
-		"P3 writes expected output": {"new", "⣾ 3m", "·", "·"},
-		"P4 timeout counts as pass": {"new", "✗ not reproduced"},
+	for prefix, want := range map[string]string{
+		"Reward reads stdout":    "✓ ✓ ✓ ⣾ 2:04",
+		"Skips the test file":    "✓ ✓ ⣾ 3:20 -",
+		"Writes expected output": "✓ ⣾ 3:10 - -",
+		"Timeout counts as pass": "✓ ✗ - -",
+		"1     ⣾ 8:49":           "",
 	} {
-		r := row(s, prefix)
-		if got := strings.Fields(strings.TrimPrefix(strings.TrimSpace(r), prefix)); strings.Join(got, " ") != strings.Join(cells, " ") {
-			t.Errorf("%s row: %q", prefix, r)
+		if got := cells(s, prefix); got != want || row(s, prefix) == "" {
+			t.Errorf("%s row: %q", prefix, row(s, prefix))
 		}
 	}
-	if strings.Index(s, "no extra information  ") > strings.Index(s, "P1 reward") || strings.Contains(s, "GRADER") || strings.Contains(s, "FOUND") {
-		t.Errorf("layout:\n%s", s)
+	for _, gone := range []string{"experiment-", "·", "same as P1", "✓ another way", "✗ not reproduced", "(grader)", "judge:"} {
+		if strings.Contains(s, gone) {
+			t.Errorf("shows %q:\n%s", gone, s)
+		}
 	}
-	if narrow := plainText(renderLive(l, l.Last.at(), 80, 0)); strings.Contains(narrow, "judge") || !strings.Contains(row(narrow, "P4"), "✗ not reproduced") {
-		t.Errorf("at 80 columns:\n%s", narrow)
+	open := liveKeys(t, l, l.Last.at(), 100, 0, "o")
+	if got := cells(open, "experiment-0002"); got != "Hack Inspector ✗ Reward reads stdout" {
+		t.Errorf("related observation: %q\n%s", got, open)
+	}
+}
+
+// In 24 rows the agents keep one row of tiles with the others a key away, and the findings keep the rows that fit.
+func TestPipelineHacksShortScreen(t *testing.T) {
+	l := pipelineLive(t, "pipeline-hacks")
+	s := liveScreen(t, l, l.Last.at(), 100, 24)
+	snapshot(t, "pipeline-hacks", "screen-24.txt", s)
+	if !strings.Contains(s, "Agents 1-3 of 5  ←/→ more") || strings.Contains(s, "Skips the test file\n") {
+		t.Errorf("agents:\n%s", s)
+	}
+	if s := liveKeys(t, l, l.Last.at(), 100, 24, "right", "right"); !strings.Contains(s, "Agents 4-5 of 5") || !strings.Contains(s, "Checks try 1, hint") {
+		t.Errorf("the next agents:\n%s", s)
+	}
+	if s := liveKeys(t, l, l.Last.at(), 100, 24, "down", "down", "down"); !strings.HasPrefix(row(s, "FIND"), "") || strings.Contains(s, "FIND HACKS ⣾") {
+		t.Errorf("scrolled:\n%s", s)
+	}
+	if s := liveKeys(t, l, l.Last.at(), 100, 24, "f"); !strings.Contains(s, "Timeout counts as pass") || strings.Contains(s, "AGENTS") {
+		t.Errorf("all findings:\n%s", s)
+	}
+}
+
+// At any size the findings show a header only over rows: the rows that fit, at least two, or one line that f opens.
+func TestLiveFindingsNeverShowAnEmptyHeader(t *testing.T) {
+	for _, name := range []string{"pipeline-hacks", "pipeline-grader"} {
+		l := pipelineLive(t, name)
+		for _, w := range []int{60, 80, 100, 120} {
+			for h := 20; h <= 40; h++ {
+				lines := splitLines(liveScreen(t, l, l.Last.at(), w, h))
+				for i, line := range lines {
+					if strings.HasPrefix(line, " Finding ") && (i+1 == len(lines) || strings.TrimSpace(lines[i+1]) == "" || strings.Contains(lines[i+1], "more ↓")) {
+						t.Errorf("%s at %dx%d: a header without rows:\n%s", name, w, h, strings.Join(lines, "\n"))
+					}
+				}
+			}
+		}
 	}
 }
 
 func TestPipelineGraderScreen(t *testing.T) {
 	l := pipelineLive(t, "pipeline-grader")
 	checkWidths(t, l)
-	s := plainText(renderLive(l, l.Last.at(), 100, 0))
+	s := liveScreen(t, l, l.Last.at(), 100, 0)
 	snapshot(t, "pipeline-grader", "screen.txt", s)
+	snapshot(t, "pipeline-grader", "screen-24.txt", liveScreen(t, l, l.Last.at(), 100, 24))
 	for _, want := range []string{
-		"HACKS ✓ 18:00  4 problems, 2 exploited", "GRADER ⣾ 6:59", "Simulate · Inspect · Attack",
-		"AGENTS  1 running", "grader-broad",
-		"judge: grader-6 is the same as P4 (timeout counts as pass)",
-		"+ experiment-0002, experiment-0005, 0000-attacker same as P1",
+		"Find Hacks ✓", "GRADE SIMULATIONS ⣾", "Grader Inspector", "AGENTS  1 running", "General review",
+		"novelty_judge     Same as an earlier finding: timeout counts as pass", "Related observations (5)",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("lacks %q:\n%s", want, s)
 		}
 	}
-	for prefix, cells := range map[string]string{
-		"no extra information":            "same as P1 · try 1 ✓ exploited",
-		"P1 reward reads stdout":          "new ✓ ✓ exploited ✓ another way",
-		"P2 skips the test file":          "new ✓ ✓ exploited ✗ not exploited",
-		"P3 writes expected output":       "new ✓ ✗ not exploited –",
-		"G1 accepts empty answer":         "new ✓ (grader) · ·",
-		"grader-5 reward reads stdout":    "same as P1, attacked in hacks",
-		"grader-6 timeout counts as pass": "same as P4",
-		"P4 timeout counts as pass":       "new ✓ · ·",
+	for prefix, want := range map[string]string{
+		"Reward reads stdout":    "✓ ✓ ✓ ✗",
+		"Skips the test file":    "✓ ✓ ✓ ✗",
+		"Writes expected output": "✓ ✓ ✗ -",
+		"Accepts empty answer":   "✓ ✓ - -",
+		"Timeout counts as pass": "✓ ✓ - -",
+		"1     Finished":         "✓ ✗ Reward reads stdout",
 	} {
-		r := row(s, prefix)
-		if got := strings.Join(strings.Fields(strings.TrimPrefix(strings.TrimSpace(r), prefix)), " "); got != cells {
-			t.Errorf("%s row: %q", prefix, r)
+		if got := cells(s, prefix); got != want {
+			t.Errorf("%s row: %q", prefix, row(s, prefix))
 		}
 	}
-	if strings.Index(s, "P4 timeout") > strings.Index(s, "G1 accepts") {
+	if strings.Index(s, "Timeout counts") > strings.Index(s, "Accepts empty") {
 		t.Errorf("grader rows come before the hacks':\n%s", s)
+	}
+	open := liveKeys(t, l, l.Last.at(), 100, 0, "o")
+	for prefix, want := range map[string]string{
+		"grader-6":      "Grader Inspector ✗ Timeout counts as pass",
+		"0000-attacker": "Attacker ✗ Reward reads stdout",
+	} {
+		if got := cells(open, prefix); got != want {
+			t.Errorf("%s: %q", prefix, got)
+		}
 	}
 }
 
-// A zero-info Attacker's exploit judged new is a problem of its own, an A row after the P rows: it has no finding to hint from.
+// A zero-info Attacker's exploit judged new is a problem of its own, in the no-information block: it has no
+// finding to hint from.
 func TestPipelineAttackerProblem(t *testing.T) {
 	l := liveFrom(t, ev("00:00", "run_start", `, "backend": "docker"`)+
 		ev("00:00", "phase_start", `, "phase": "hack"`)+
@@ -174,17 +219,18 @@ func TestPipelineAttackerProblem(t *testing.T) {
 		ev("03:31", "attempt_result", `, "episode": "0000-attacker", "problem": "A1", "level": "none", "status": "evidenced_issue"`)+
 		ev("04:00", "reproduced", `, "problem": "P1", "result": "not_reproduced"`)+
 		ev("04:00", "phase_end", `, "phase": "hack", "status": "complete", "elapsed": 240`))
-	s := plainText(renderLive(l, at9("04:00"), 100, 0))
-	for prefix, cells := range map[string]string{
-		"no extra information":       "new A1 · try 1 ✓ exploited",
-		"A1 prints the marker early": "new ✓ (Attacker) found with no extra information",
-	} {
-		if got := strings.Join(strings.Fields(strings.TrimPrefix(strings.TrimSpace(row(s, prefix)), prefix)), " "); got != cells {
-			t.Errorf("%s row: %q", prefix, row(s, prefix))
-		}
+	s := liveScreen(t, l, at9("04:00"), 100, 0)
+	if got := cells(s, "1     Finished"); got != "✓ ✓ Prints the marker early" {
+		t.Errorf("no-information row: %q\n%s", got, s)
 	}
-	if !strings.Contains(s, "HACKS ✓ 4:00  2 problems, 1 exploited") || strings.Index(s, "P1 c1") > strings.Index(s, "A1 prints") {
+	if got := cells(s, "C1"); got != "✓ ✗ - -" || !strings.Contains(s, "FIND HACKS ✓ 4:00") || !strings.Contains(s, "FINDINGS SO FAR (1)") {
 		t.Errorf("screen:\n%s", s)
+	}
+	if !strings.Contains(liveKeys(t, l, at9("04:00"), 100, 0, "shift+tab", "shift+tab", "shift+tab"), "2 problems so far") {
+		t.Errorf("Results does not count the Attacker's problem")
+	}
+	if p, x := l.hackCounts(); p != 2 || x != 1 {
+		t.Errorf("%d problems, %d exploited", p, x)
 	}
 }
 
@@ -202,24 +248,21 @@ func TestPipelineFinalResult(t *testing.T) {
 		ev("03:00", "session_start", `, "inspector": "attack", "session": "s1", "episode": "0001-attacker", "problem": "P1"`) +
 		ev("03:30", "session_end", `, "inspector": "attack", "session": "s1", "status": "evidenced_issue"`) +
 		ev("04:00", "attempt_end", `, "episode": "0002-attacker", "level": "full", "number": 1, "problem": "P2", "rewards": [0.0]`)
-	cells := func(l *Live, prefix string) string {
-		s := plainText(renderLive(l, at9("05:00"), 100, 0))
-		return strings.Join(strings.Fields(strings.TrimPrefix(strings.TrimSpace(row(s, prefix)), prefix)), " ")
-	}
+	at := func(l *Live, prefix string) string { return cells(liveScreen(t, l, at9("05:00"), 100, 0), prefix) }
 	l := liveFrom(t, log)
-	if got := cells(l, "P1 c1"); got != "new ✓ ⣾ 4m ·" {
+	if got := at(l, "C1"); got != "✓ ✓ ⣾ 4:55 -" {
 		t.Errorf("before its result P1 reads %q", got)
 	}
-	if got := cells(l, "P2 c2"); got != "new ✓ ⣾ 4m ·" {
+	if got := at(l, "C2"); got != "✓ ✓ ⣾ 4:54 -" {
 		t.Errorf("before its result P2 reads %q", got)
 	}
 	l = liveFrom(t, log+
 		ev("03:31", "attempt_result", `, "episode": "0001-attacker", "problem": "P1", "level": "full", "status": "other_exploit"`)+
 		ev("04:00", "attempt_result", `, "episode": "0002-attacker", "problem": "P2", "level": "full", "status": "no_evidenced_issue"`))
-	if got := cells(l, "P1 c1"); got != "new ✓ ✓ another way –" {
+	if got := at(l, "C1"); got != "✓ ✓ ✗ -" {
 		t.Errorf("P1 reads %q", got)
 	}
-	if got := cells(l, "P2 c2"); got != "new ✓ ✗ not exploited –" {
+	if got := at(l, "C2"); got != "✓ ✓ ✗ -" {
 		t.Errorf("P2 reads %q", got)
 	}
 	if p, x := l.hackCounts(); p != 2 || x != 0 {
@@ -235,8 +278,7 @@ func TestPipelineUnattributedIsNotSettled(t *testing.T) {
 		ev("00:02", "reproduced", `, "problem": "P1", "result": "evidenced"`) +
 		ev("00:03", "attempt_start", `, "episode": "0001-attacker", "level": "full", "number": 1, "problem": "P1"`) +
 		ev("03:00", "attempt_result", `, "episode": "0001-attacker", "problem": "P1", "level": "full", "number": 1, "status": "unattributed_exploit"`)
-	s := plainText(renderLive(liveFrom(t, log), at9("04:00"), 100, 0))
-	if got := strings.Join(strings.Fields(strings.TrimPrefix(strings.TrimSpace(row(s, "P1 c1")), "P1 c1")), " "); got != "new ✓ ? result unclear –" {
+	if got := cells(liveScreen(t, liveFrom(t, log), at9("04:00"), 100, 0), "C1"); got != "✓ ✓ ? -" {
 		t.Errorf("P1 row: %q", got)
 	}
 	if res, _ := lookup(attemptResults, "other_exploit"); res != Elsewhere {
@@ -244,44 +286,47 @@ func TestPipelineUnattributedIsNotSettled(t *testing.T) {
 	}
 }
 
-// A rerun's log repeats the earlier run's problems: they make rows, but only this run's attempts find anything with zero info.
+// A rerun's log repeats the earlier run's problems: they make rows that never turn, an earlier finding with no
+// information among them, and only this run's attempts find anything with no information.
 func TestPipelineReplayedProblems(t *testing.T) {
 	replay := ev("00:00", "run_start", `, "backend": "docker", "analyses": ["attack"]`) +
 		ev("00:00", "phase_start", `, "phase": "attack"`) +
 		ev("00:01", "judged", `, "inspector": "hack", "finding": "experiment-0000", "problem": "P1", "new": true, "cause": "c1", "replayed": true`) +
 		ev("00:01", "reproduced", `, "problem": "P1", "result": "evidenced", "replayed": true`) +
+		ev("00:01", "judged", `, "inspector": "hack", "finding": "experiment-0001", "problem": "P2", "new": true, "cause": "c4", "replayed": true`) +
 		ev("00:01", "judged", `, "inspector": "attack", "finding": "0000-attacker", "problem": "A1", "new": true, "cause": "c2", "replayed": true`)
 	l := liveFrom(t, replay)
-	if l.ZeroJudged != nil || l.lane("A1").Alone || strings.Contains(strings.Join(l.Recent, "\n"), "judge:") {
-		t.Errorf("replayed judgements: zero judged %v, A1 %+v, recent %q", l.ZeroJudged, l.lane("A1"), l.Recent)
+	if log := plainText(l.logRow(l.Recent[2], 100)); l.ZeroJudged != nil || l.lane("A1").Alone || strings.TrimSpace(log) != "novelty_judge     nudi: judged" {
+		t.Errorf("replayed judgements: zero judged %v, A1 %+v, log %q", l.ZeroJudged, l.lane("A1"), log)
 	}
-	cells := func(s, prefix string) string {
-		return strings.Join(strings.Fields(strings.TrimPrefix(strings.TrimSpace(row(s, prefix)), prefix)), " ")
-	}
-	s := plainText(renderLive(liveFrom(t, replay+
+	s := liveScreen(t, liveFrom(t, replay+
 		ev("00:02", "attempt_start", `, "episode": "0001-attacker", "level": "none", "number": 1`)+
 		ev("03:00", "attempt_end", `, "episode": "0001-attacker", "level": "none", "number": 1, "rewards": [0.0]`)+
-		ev("03:00", "attempt_result", `, "episode": "0001-attacker", "problem": null, "level": "none", "number": 1, "status": "no_evidenced_issue"`)), at9("04:00"), 100, 0))
+		ev("03:00", "attempt_result", `, "episode": "0001-attacker", "problem": null, "level": "none", "number": 1, "status": "no_evidenced_issue"`)), at9("04:00"), 100, 0)
 	for prefix, want := range map[string]string{
-		"no extra information": "· · try 1 ✗ not exploited",
-		"A1 c2":                "new kept from the earlier run",
-		"P1 c1":                "new ✓ · ·",
+		"1     Finished": "✗",
+		"C2":             "✓ - - -",
+		"C1":             "✓ ✓ - -",
+		"C4":             "✓ - - -",
+		"Simulation":     "── Grade Simulations ── Find Hacks ── ATTACK ⣾ │ [ Results ]",
 	} {
-		if got := cells(s, prefix); got != want {
+		if got := cells(s, prefix); got != want && prefix != "Simulation" {
 			t.Errorf("%s row: %q", prefix, got)
 		}
 	}
-	// A fresh zero-info exploit is found alone once its attempt_result says so, not at its judge call.
+	if strings.Contains(s, "Simulation waiting") || !strings.Contains(s, "Attack  ⣾") {
+		t.Errorf("a phase the rerun left out shows as waiting:\n%s", s)
+	}
+	// A fresh zero-info exploit is new once its attempt_result says so.
 	fresh := replay +
 		ev("00:02", "attempt_start", `, "episode": "0001-attacker", "level": "none", "number": 1`) +
 		ev("03:01", "judged", `, "inspector": "attack", "finding": "0001-attacker", "problem": "A2", "new": true, "cause": "c3"`)
-	if got := cells(plainText(renderLive(liveFrom(t, fresh), at9("04:00"), 100, 0)), "A2 c3"); strings.Contains(got, "zero info") {
+	if got := cells(liveScreen(t, liveFrom(t, fresh), at9("04:00"), 100, 0), "1     ⣾ 3:58"); got != "" {
 		t.Errorf("A2 before its result: %q", got)
 	}
 	l = liveFrom(t, fresh+ev("03:01", "attempt_result", `, "episode": "0001-attacker", "problem": "A2", "level": "none", "number": 1, "status": "evidenced_issue"`))
-	s = plainText(renderLive(l, at9("04:00"), 100, 0))
-	if got := cells(s, "A2 c3"); got != "new ✓ (Attacker) found with no extra information" || cells(s, "no extra information") != "new A2 · try 1 ✓ exploited" || cells(s, "A1 c2") != "new kept from the earlier run" {
-		t.Errorf("after the result:\n%s", s)
+	if got := cells(liveScreen(t, l, at9("04:00"), 100, 0), "1     Finished"); got != "✓ ✓ C3" {
+		t.Errorf("after the result: %q", got)
 	}
 }
 
@@ -297,9 +342,9 @@ func TestPipelineResultWithoutStart(t *testing.T) {
 		log += ev("00:03", "attempt_result", `, "episode": null, "problem": "`+p+`", "level": "full", "number": 1, "status": "spending_exhausted"`)
 	}
 	l := liveFrom(t, log)
-	s := plainText(renderLive(l, at9("01:00"), 100, 0))
-	for _, prefix := range []string{"P1 c1", "P2 c2"} {
-		if got := strings.Join(strings.Fields(strings.TrimPrefix(strings.TrimSpace(row(s, prefix)), prefix)), " "); got != "new ✓ · not tested –" {
+	s := liveScreen(t, l, at9("01:00"), 100, 0)
+	for _, prefix := range []string{"C1", "C2"} {
+		if got := cells(s, prefix); got != "✓ ✓ - -" {
 			t.Errorf("%s row: %q", prefix, got)
 		}
 	}
@@ -308,27 +353,38 @@ func TestPipelineResultWithoutStart(t *testing.T) {
 	}
 }
 
-// The pieces a run selected show from its start, pending until their phases start; an attack alone has no grader piece.
-func TestPipelinePendingPieces(t *testing.T) {
+// The phases a run selected wait from its start until they start; the others are off.
+func TestLiveTabsShowSelectedPhases(t *testing.T) {
 	start := func(analyses string) string {
 		return ev("00:00", "run_start", `, "backend": "docker", "analyses": `+analyses)
 	}
-	screen := func(log string) string { return plainText(renderLive(liveFrom(t, log), at9("00:30"), 100, 0)) }
+	screen := func(log string) string { return liveScreen(t, liveFrom(t, log), at9("00:30"), 120, 0) }
 	full := start(`["hack", "simulation", "grader", "attack"]`)
-	if s := screen(full); !strings.Contains(s, "HACKS ○") || !strings.Contains(s, "GRADER ○") || !strings.Contains(s, "Simulate · Inspect · Attack") {
+	if s := screen(full); !strings.Contains(s, "Grade Simulations waiting") || !strings.Contains(s, "Find Hacks waiting") || !strings.Contains(s, "Attack waiting") {
 		t.Errorf("before the hacks:\n%s", s)
 	}
 	s := screen(full + ev("00:01", "phase_start", `, "phase": "hack", "slots": 6`))
-	if !strings.Contains(s, "HACKS ⣾ 0:29") || !strings.Contains(s, "GRADER ○") || strings.Contains(s, "problems") {
+	if !strings.Contains(s, "FIND HACKS ⣾ 0:29") || !strings.Contains(s, "Simulation waiting") {
 		t.Errorf("during the hacks:\n%s", s)
 	}
-	for _, analyses := range []string{`["hack", "attack"]`, `["attack"]`} {
-		if s := screen(start(analyses)); strings.Contains(s, "GRADER") {
-			t.Errorf("%s shows the grader piece:\n%s", analyses, s)
-		}
+	if s := screen(start(`["hack", "attack"]`)); strings.Contains(s, "Simulation waiting") || !strings.Contains(s, "Attack waiting") {
+		t.Errorf("a hacks run:\n%s", s)
 	}
-	if s := screen(start(`["grader"]`)); strings.Contains(s, "HACKS") || !strings.Contains(s, "GRADER ○") {
-		t.Errorf("a grader run:\n%s", s)
+}
+
+// A failed phase says Error on its tab and why under it, and the run's end once it came.
+func TestLiveFailedPhase(t *testing.T) {
+	l := liveFrom(t, ev("00:00", "run_start", `, "backend": "modal", "concurrency": 4`)+
+		ev("00:00", "phase_start", `, "phase": "hack"`)+
+		ev("00:04", "session_start", `, "inspector": "hack", "session": "hack-broad"`)+
+		ev("01:00", "phase_end", `, "phase": "hack", "status": "failed", "elapsed": 60, "error": "hack failed: RuntimeError: out of memory"`)+
+		ev("02:10", "run_end", `, "status": "failed", "report": "report.json"`))
+	s := screenLines(t, l, at9("02:10"))
+	for _, want := range []string{"Find Hacks  Error", "FIND HACKS Error 1:00", "Error  hack failed: RuntimeError: out of memory",
+		"The run ended at 2:10. Its report keeps the results so far.", "AGENTS  none running", "None before the error.", "Simulation -"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("lacks %q:\n%s", want, s)
+		}
 	}
 }
 
@@ -350,21 +406,21 @@ func TestPipelineHackCountsFollowTheAttack(t *testing.T) {
 		ev("03:00", "attempt_result", `, "episode": "0001-attacker", "problem": "P1", "level": "full", "status": "evidenced_issue"`)+
 		ev("03:30", "judged", `, "inspector": "attack", "finding": "0000-attacker", "problem": "A1", "new": true, "cause": "c2"`)+
 		ev("03:30", "attempt_result", `, "episode": "0000-attacker", "problem": "A1", "level": "none", "status": "evidenced_issue"`))
-	s := plainText(renderLive(l, at9("04:00"), 100, 0))
-	if !strings.Contains(s, "HACKS ✓ 1:00  2 problems, 2 exploited") {
-		t.Errorf("hacks counts:\n%s", s)
+	if p, x := l.hackCounts(); p != 2 || x != 2 {
+		t.Errorf("hacks counts: %d problems, %d exploited", p, x)
 	}
-	if got := strings.Join(strings.Fields(strings.TrimPrefix(strings.TrimSpace(row(s, "grader-0 c1")), "grader-0 c1")), " "); got != "same as P1" {
+	s := liveKeys(t, l, at9("04:00"), 100, 0, "o")
+	if got := cells(s, "grader-0"); got != "Grader Inspector ✗ C1" {
 		t.Errorf("grader-0 row: %q", got)
 	}
-	if got := strings.Join(strings.Fields(strings.TrimPrefix(strings.TrimSpace(row(s, "P1 c1")), "P1 c1")), " "); got != "new ✓ ✓ exploited ·" {
+	if got := cells(s, "C1"); got != "✓ ✓ ✓ -" {
 		t.Errorf("P1 row: %q", got)
 	}
 }
 
-// The card lists the problems by their step on the exploit chart, highest first, from `level`, or from the help an
-// Attacker needed in older reports, where an unknown value is an evidenced exploit; leads, problems no evidence
-// confirmed, are counted after them.
+// The plain report lists the problems by their step on the exploit chart, highest first, from `level`, or from the
+// help an Attacker needed in older reports, where an unknown value is an evidenced exploit; leads, problems no
+// evidence confirmed, are not counted as problems.
 func TestProblemsByHelpNeeded(t *testing.T) {
 	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "attack": {"problems": [
 		{"id": "P1", "cause": "c1", "source": "hack inspector", "help_needed": "not_reproduced"},
@@ -380,116 +436,38 @@ func TestProblemsByHelpNeeded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A full-hint reproduction whose single hint did not settle is at full information.
-	want := " PROBLEMS  level\n" +
-		" A1 c4     ●●●●● exploit executable by unaided learner\n   from Attacker\n" +
-		" P4 c6     ●●●●● exploit executable by unaided learner\n   from hack inspector + independent attacker\n" +
-		" P5 c7     ●●●●○ exploit executable by learner with hint\n   from hack inspector\n" +
-		" P8 c10    ●●●●○ exploit executable by learner with hint\n   from hack inspector\n" +
-		" P3 c5     ●●●○○ exploit executable by learner with full information\n   from hack inspector\n" +
-		" P7 c9     ●●●○○ exploit executable by learner with full information\n   from hack inspector\n" +
-		" P2 c2     ●●○○○ reproduced exploit\n   from hack inspector\n" +
-		" G1 c3     ●●○○○ reproduced exploit, no clear Attacker result\n   from grader inspector\n" +
-		" P6 c8     ●●○○○ reproduced exploit, Attackers did not exploit it\n   from hack inspector\n" +
-		" 1 lead, which no evidence confirmed\n"
-	for _, s := range []string{card(r, 100, false), plainPhase(r, 3)} {
-		if !strings.Contains(s, want) {
-			t.Errorf("lacks\n%s\nin:\n%s", want, s)
+	plain := plainReport(r, 100)
+	levels := map[string]string{"A1": "5 of 5: an Attacker given no information demonstrated it", "P4": "5 of 5", "P5": "4 of 5: an Attacker given only a hint demonstrated it",
+		"P8": "4 of 5", "P3": "3 of 5: an Attacker given full instructions demonstrated it", "P7": "3 of 5", "P2": "2 of 5: reproduced, no Attacker demonstrated it", "G1": "2 of 5", "P6": "2 of 5"}
+	at := -1
+	for _, id := range []string{"A1", "P4", "P5", "P8", "P3", "P7", "P2", "G1", "P6"} {
+		i := strings.Index(plain, "\n  "+id+"  ")
+		if i < at || !strings.HasPrefix(row(plain[i+1:], "Level"), "      Level             "+levels[id]) {
+			t.Fatalf("%s out of order or at the wrong level:\n%s", id, plain)
 		}
+		at = i
 	}
-	if s := card(r, 60, true); strings.Contains(s, "\n\n\n") {
-		t.Errorf("at 60 columns:\n%s", s)
+	if !strings.Contains(plain, "Count             9 problems") || strings.Contains(plain, "  P1  c1") || !strings.Contains(plain, "State             Suspected only") {
+		t.Errorf("the lead:\n%s", plain)
 	}
-}
-
-// A problem exploited only by a no-hint attempt aimed at it or at another problem names no independent attacker; one
-// the independent no-hint search exploited does. Without an exploit, the scope of its evidence and `exploited_with`
-// follow the label.
-func TestOnlyAnUnaimedNoHintExploitNamesTheIndependentAttacker(t *testing.T) {
-	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "attack": {"problems": [
-		{"id": "P1", "cause": "c1", "source": "hack inspector", "exploited_with": "none", "level": 5, "label": "●●●●● exploit executable by unaided learner",
-		 "conditions": [{"condition": "none", "exploited": 1}, {"condition": "independent", "exploited": 0}]},
-		{"id": "P2", "cause": "c2", "source": "hack inspector", "exploited_with": "none", "level": 5, "label": "●●●●● exploit executable by unaided learner",
-		 "conditions": [{"condition": "independent", "exploited": 1}]},
-		{"id": "P3", "cause": "c3", "source": "hack inspector", "exploited_with": "not_exploited", "level": 2, "label": "●●○○○ reproduced exploit",
-		 "scope": "native", "findings": ["hack-3"], "conditions": []},
-		{"id": "P4", "cause": "c4", "source": "hack inspector", "exploited_with": "none", "level": 5, "label": "●●●●● exploit executable by unaided learner",
-		 "conditions": [{"condition": "elsewhere_none", "exploited": 1}, {"condition": "independent", "exploited": 0}]}]}}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := card(r, 100, false)
-	for _, want := range []string{" P1 c1     ●●●●● exploit executable by unaided learner\n   from hack inspector\n",
-		" P2 c2     ●●●●● exploit executable by unaided learner\n   from hack inspector + independent attacker\n",
-		" P3 c3     ●●○○○ reproduced exploit, evidenced in a native episode, Attackers did not exploit it\n",
-		" P4 c4     ●●●●● exploit executable by unaided learner\n   from hack inspector\n"} {
-		if !strings.Contains(s, want) {
-			t.Errorf("lacks %q in:\n%s", want, s)
+	// Results lists the same problems in the same order, and the lead among the other findings.
+	s := plainTab(r, results, "o")
+	at = -1
+	for _, id := range []string{"A1", "P4", "P5", "P8", "P3", "P7", "P2", "G1", "P6"} {
+		i := strings.Index(s, "  "+id+"\n")
+		if i < at {
+			t.Fatalf("%s out of order:\n%s", id, s)
 		}
+		at = i
 	}
-}
-
-// Reports whose problems lack the help needed render as before: no PROBLEMS block on the card.
-func TestOldReportsHaveNoProblemsBlock(t *testing.T) {
-	for _, name := range []string{"full-before-levels", "full-0.0.0", "clean", "time-limit-before-levels"} {
-		if s := card(fixture(t, name), 100, false); strings.Contains(s, "PROBLEMS") || strings.Contains(s, "help an Attacker needed") {
-			t.Errorf("%s card:\n%s", name, s)
-		}
-	}
-}
-
-// With problems, the card shows them after the answer and no list of findings: each finding is still on its own screen.
-func TestCardProblemsFollowTheAnswer(t *testing.T) {
-	s := card(fixture(t, "pipeline-full"), plainW, false)
-	// Every source of a problem is named: P1 holds a grader inspector finding and an exploit with no extra information too.
-	if !strings.Contains(s, " ●●●●● exploit executable by unaided learner\n   from hack inspector + grader inspector + independent attacker\n") {
-		t.Errorf("sources:\n%s", s)
-	}
-	// A problem whose finding gave no guidance was not attacked, and says so.
-	if !strings.Contains(s, "  ●●○○○ reproduced exploit, not attacked: no guidance\n   from grader inspector\n") {
-		t.Errorf("no guidance:\n%s", s)
-	}
-	// A problem no evidence confirmed is a lead, counted, not listed.
-	if !strings.Contains(s, "\n 1 lead, which no evidence confirmed\n") || strings.Contains(s, "P4 timeout") {
-		t.Errorf("leads:\n%s", s)
-	}
-	if !strings.Contains(s, "See report.md for the evidence and limits.\n\n PROBLEMS") || strings.Contains(s, "FP  ") ||
-		strings.Contains(s, "HACK ") || strings.Contains(s, "inconclusive") || !strings.Contains(s, "next › nudi-view testdata/pipeline-full P1") {
-		t.Errorf("card:\n%s", s)
-	}
-	if old := card(fixture(t, "full-before-levels"), plainW, false); !strings.Contains(old, "  1  ") {
-		t.Errorf("a report without problems keeps its list of findings:\n%s", old)
-	}
-}
-
-// The terminal card clips each line at its width, so a long cause gives way to the level; every source is named on
-// the line under it, wrapped when it does not fit.
-func TestCardShowsEverySourceAtTerminalWidth(t *testing.T) {
-	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "attack": {"problems": [
-		{"id": "P1", "cause": "`+strings.Repeat("Write the expected digest into the reward file. ", 4)+`", "source": "hack inspector",
-		 "members": ["experiment-0000", "grader-1"], "help_needed": "found_alone"},
-		{"id": "G1", "cause": "c2", "source": "grader inspector", "members": ["grader-2"], "help_needed": "full_info_or_less"}]}}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, w := range []int{100, 60} {
-		s := card(r, w, true)
-		for _, line := range splitLines(s) {
-			if width(line) > w {
-				t.Errorf("%d columns at width %d: %q", width(line), w, ansi.Strip(line))
-			}
-		}
-		if plain := ansi.Strip(s); !strings.Contains(plain, " P1 Write") || !strings.Contains(plain, "●●●●● exploit") ||
-			!strings.Contains(plain, "hack inspector +") || !strings.Contains(plain, "grader inspector +") ||
-			!strings.Contains(plain, "independent") || !strings.Contains(plain, "●●●○○ exploit") {
-			t.Errorf("at %d columns:\n%s", w, plain)
-		}
+	if !strings.Contains(s, "c1                                  Suspected only              Hack Inspector    P1") {
+		t.Errorf("lead missing:\n%s", s)
 	}
 }
 
 // A problem of correct work the grader fails is named with the simulation chart's FN words, never an exploit step;
 // an older problem without findings or levels is a lead.
-func TestCardNamesCorrectWorkFailedAndCountsOlderPendingProblemsAsLeads(t *testing.T) {
+func TestPlainNamesCorrectWorkFailedAndCountsOlderPendingProblemsAsLeads(t *testing.T) {
 	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "attack": {
 		"candidates": [{"id": "grader-0", "valid_work": true}],
 		"problems": [{"id": "G1", "cause": "rejects zeros", "source": "grader inspector", "findings": ["grader-0"], "help_needed": "full_info"},
@@ -497,46 +475,69 @@ func TestCardNamesCorrectWorkFailedAndCountsOlderPendingProblemsAsLeads(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := ansi.Strip(card(r, 120, true))
-	if !strings.Contains(s, "Correct work failed, reproduced by an Attacker with full instructions") || strings.Contains(s, "●●●○○") {
+	s := plainReport(r, 120)
+	if !strings.Contains(s, "False negative: correct work was rejected") || !strings.Contains(s, "Level             Reproduced by an Attacker with full instructions") ||
+		strings.Contains(s, "exploit executable") {
 		t.Errorf("correct work failed:\n%s", s)
 	}
-	if !strings.Contains(s, " 1 lead, which no evidence confirmed") || strings.Contains(s, "pending") {
+	if !strings.Contains(s, "Count             1 problem\n") || strings.Contains(s, "  P1  pending") {
 		t.Errorf("older pending problem:\n%s", s)
 	}
 }
 
-func TestPipelineFullCard(t *testing.T) {
+func TestPipelineFullPlain(t *testing.T) {
 	r := fixture(t, "pipeline-full")
-	s := card(r, plainW, false)
-	snapshot(t, "pipeline-full", "card.txt", s)
-	for _, w := range []int{100, 80, 60} {
-		for _, line := range splitLines(card(r, w, true)) {
-			if width(line) > w {
-				t.Errorf("%d columns at width %d: %q", width(line), w, ansi.Strip(line))
-			}
-		}
-	}
-	if a := plainPhase(r, 3); !strings.Contains(a, "P1                 no extra information") || !strings.Contains(a, "G1                 only a hint") ||
-		strings.Contains(a, "selected") || strings.Contains(plainPhase(r, 2), "problems from") {
-		t.Errorf("attack panel:\n%s", a)
+	if a := plainTab(r, 3); strings.Contains(a, "selected") || strings.Contains(plainTab(r, 2), "problems from") {
+		t.Errorf("attack tab:\n%s", a)
 	}
 }
 
-// The headline says how the run ended, so it stays neutral; red marks only the count of problems found, after it.
-func TestBannerKeepsTheHeadlineNeutralAndMarksOnlyTheProblemCountRed(t *testing.T) {
-	const redBackground, greyBackground = "48;2;255;95;109", "48;2;110;118;129"
-	top := splitLines(card(fixture(t, "pipeline-full"), 120, true))[0]
-	headline, count := strings.Index(top, "Finished. Every step ran."), strings.Index(top, redBackground)
-	if !strings.HasPrefix(top[:headline], "\x1b") || !strings.Contains(top[:headline], greyBackground) || count < headline ||
-		!strings.HasSuffix(strings.TrimRight(ansi.Strip(top), " "), "5 problems") {
-		t.Errorf("banner %q", top)
+// A guided try that finds another mechanism, judged a new Attacker problem, shows that problem on the phase tab and on
+// Results; a later no-information try that matches it is not new.
+func TestLiveAttackerProblemFromAGuidedTry(t *testing.T) {
+	l := liveFrom(t, ev("00:00", "run_start", `, "backend": "docker"`)+
+		ev("00:00", "phase_start", `, "phase": "hack"`)+
+		ev("00:01", "judged", `, "inspector": "hack", "finding": "hack-1", "problem": "P1", "new": true, "cause": "c1"`)+
+		ev("00:02", "attempt_start", `, "episode": "0000-attacker", "level": "full", "number": 1, "problem": "P1", "candidate": "hack-1"`)+
+		ev("03:00", "attempt_end", `, "episode": "0000-attacker", "rewards": [1.0]`)+
+		ev("03:31", "judged", `, "inspector": "attack", "finding": "0000-attacker", "problem": "A1", "new": true, "cause": "prints the marker early"`)+
+		ev("03:31", "attempt_result", `, "episode": "0000-attacker", "problem": "P1", "level": "full", "status": "other_exploit"`)+
+		ev("03:32", "attempt_start", `, "episode": "0001-attacker", "level": "none", "number": 1`)+
+		ev("05:00", "attempt_end", `, "episode": "0001-attacker", "rewards": [1.0]`)+
+		ev("05:01", "judged", `, "inspector": "attack", "finding": "0001-attacker", "problem": "A1", "new": false, "cause": "prints the marker early"`)+
+		ev("05:01", "attempt_result", `, "episode": "0001-attacker", "problem": "A1", "level": "none", "status": "evidenced_issue"`))
+	s := liveScreen(t, l, at9("05:01"), 100, 0)
+	if got := cells(s, "Prints the marker early"); !strings.HasPrefix(got, "✓ - ✓") {
+		t.Errorf("A1 row: %q\n%s", got, s)
 	}
-	r, err := load(writeReport(t, `{"answer": ["Finished. Every step ran."], "analyses": {"attack": "complete"}, "attack": {"problems": []}}`))
-	if err != nil {
-		t.Fatal(err)
+	if got := cells(s, "1     Finished"); got != "✓ ✗ Prints the marker early" {
+		t.Errorf("no-information row: %q\n%s", got, s)
 	}
-	if top := splitLines(card(r, 120, true))[0]; strings.Contains(top, redBackground) || strings.Contains(ansi.Strip(top), "problem") {
-		t.Errorf("a run without problems has no red: %q", top)
+	if r := liveKeys(t, l, at9("05:01"), 100, 0, "tab", "tab"); !strings.Contains(r, "2 problems so far") || !strings.Contains(row(r, "Prints the marker early"), "✓") {
+		t.Errorf("Results:\n%s", r)
+	}
+}
+
+// A phase that ended partial may have left an attempt that failed to run, so its tab says partly, not done.
+func TestLivePartialPhaseIsPartly(t *testing.T) {
+	l := liveFrom(t, ev("00:00", "run_start", `, "backend": "docker"`)+
+		ev("00:00", "phase_start", `, "phase": "hack"`)+
+		ev("01:00", "phase_end", `, "phase": "hack", "status": "partial", "elapsed": 60`))
+	if s := screenLines(t, l, at9("01:00")); !strings.Contains(s, "FIND HACKS partly") || strings.Contains(s, "✓") {
+		t.Errorf("partial phase:\n%s", s)
+	}
+}
+
+// A long phase error still leaves the findings their rows, or the line that f opens.
+func TestLiveLongErrorKeepsFindingRows(t *testing.T) {
+	l := liveFrom(t, ev("00:00", "run_start", `, "backend": "docker"`)+
+		ev("00:00", "phase_start", `, "phase": "hack"`)+
+		ev("00:01", "judged", `, "inspector": "hack", "finding": "hack-1", "problem": "P1", "new": true, "cause": "c1"`)+
+		ev("00:02", "judged", `, "inspector": "hack", "finding": "hack-2", "problem": "P2", "new": true, "cause": "c2"`)+
+		ev("01:00", "phase_end", `, "phase": "hack", "status": "failed", "elapsed": 60, "error": "hack failed: one\ntwo\nthree\nfour\nfive\nsix\nseven"`))
+	lines := splitLines(liveScreen(t, l, at9("01:00"), 100, 24))
+	i := slices.IndexFunc(lines, func(s string) bool { return strings.Contains(s, "FINDINGS SO FAR") })
+	if i < 0 || !strings.Contains(lines[i], "f open") && (i+2 >= len(lines) || !strings.HasPrefix(lines[i+1], " Finding ") || strings.TrimSpace(lines[i+2]) == "") {
+		t.Errorf("findings without rows:\n%s", strings.Join(lines, "\n"))
 	}
 }

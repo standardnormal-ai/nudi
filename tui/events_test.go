@@ -133,7 +133,7 @@ func TestLiveTracksWhatRuns(t *testing.T) {
 	for _, a := range l.Agents {
 		running = append(running, a.Who+" "+a.Name+" "+a.Last)
 	}
-	if got := strings.Join(running, ", "); got != "attacker 0001-attacker no extra information, try 1, attack attack_inspector-attacker-hack-0-full-1 evidenced check-0002" {
+	if got := strings.Join(running, ", "); got != "attacker 0001-attacker no information, try 1, attack attack_inspector-attacker-hack-0-full-1 evidenced check-0002" {
 		t.Fatalf("running: %s", got)
 	}
 	if len(l.Tries) != 2 || l.Tries[0].Returned == nil || !l.Tries[0].Inspecting || l.Tries[1].Returned != nil {
@@ -203,7 +203,7 @@ func TestLegacySessionEndTextInFollowAndLive(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if len(live.Recent) != 1 || live.Recent[0] != want {
+				if len(live.Recent) != 1 || live.Recent[0].Text != want {
 					t.Errorf("recent: %v", live.Recent)
 				}
 				if len(events) != 1 || events[0].Status != tc.status || text(events[0].Category) != tc.category {

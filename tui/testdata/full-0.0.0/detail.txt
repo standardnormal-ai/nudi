@@ -1,0 +1,459 @@
+=== finding 1 tab 0
+ Results › unchecked requirement                                                           grader-6
+ False positive: incorrect work passed
+
+ Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ ◆ episode    sandbox-0000                                                                task copy
+ │
+ ◆ requires   Write a one-line summary                                               instruction.md
+ │
+ ◆ reward     1 from the copied grader
+ │
+ ◆ nudi       violating content received 1.0, above the deserved score 0.0
+
+ INTERPRETATION
+ The Grader Inspector wrote: "summary is violated"
+=== finding 1 tab 1
+ Results › unchecked requirement                                                           grader-6
+ False positive: incorrect work passed
+
+ Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ SCOPE LIMITS (2)
+ 1  nudi checks the evidence, not the task's intent
+    The captured program, inputs and measured facts support the Inspector's explicit interpretation;
+    nudi checks provenance and consistency, not arbitrary program or task semantics, and an
+    Inspector-written checker can misread the requirement or scoring
+ 2  Package evidence
+    An Inspector sandbox ran a copy of the task package, so this finding establishes what the copied
+    package did, not native accessibility to a task agent. Setup privileges include copied tests,
+    helpers and verifier outputs. Original host tests are uploaded after the verification_start
+    copy, so replacement test bytes in that copy do not prove their later execution.
+    Separate-verifier configurations do not establish native isolation parity.
+=== finding 1 tab 2
+ Results › unchecked requirement                                                           grader-6
+ False positive: incorrect work passed
+
+ Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Reference         Value                               What it is
+ Finding           grader-6                            The Grader Inspector's evidence record
+ Experiment        experiment-0000                     The idea the Grader Inspector tested
+ Check             check-0000                          nudi's rerun of the evidence
+ Episode           sandbox-0000                        Inspector sandbox that ran a copy of the task
+
+ Open it again     nudi-view testdata/full-0.0.0 1
+=== finding 2 tab 0
+ Results › unchecked requirement                                                           grader-7
+ False negative: correct work was rejected
+
+ Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ ◆ episode    sandbox-0000                                                                task copy
+ │
+ ◆ requires   Write a one-line summary                                               instruction.md
+ │
+ ◆ reward     1 from the copied grader
+ │
+ ◆ nudi       violating content received 1.0, above the deserved score 0.0
+
+ INTERPRETATION
+ The Grader Inspector wrote: "summary is violated"
+=== finding 2 tab 1
+ Results › unchecked requirement                                                           grader-7
+ False negative: correct work was rejected
+
+ Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ SCOPE LIMITS (2)
+ 1  nudi checks the evidence, not the task's intent
+    The captured program, inputs and measured facts support the Inspector's explicit interpretation;
+    nudi checks provenance and consistency, not arbitrary program or task semantics, and an
+    Inspector-written checker can misread the requirement or scoring
+ 2  Package evidence
+    An Inspector sandbox ran a copy of the task package, so this finding establishes what the copied
+    package did, not native accessibility to a task agent. Setup privileges include copied tests,
+    helpers and verifier outputs. Original host tests are uploaded after the verification_start
+    copy, so replacement test bytes in that copy do not prove their later execution.
+    Separate-verifier configurations do not establish native isolation parity.
+=== finding 2 tab 2
+ Results › unchecked requirement                                                           grader-7
+ False negative: correct work was rejected
+
+ Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Reference         Value                               What it is
+ Finding           grader-7                            The Grader Inspector's evidence record
+ Experiment        experiment-0001                     The idea the Grader Inspector tested
+ Check             check-0001                          nudi's rerun of the evidence
+ Episode           sandbox-0000                        Inspector sandbox that ran a copy of the task
+
+ Open it again     nudi-view testdata/full-0.0.0 2
+=== finding 3 tab 0
+ Results › unchecked requirement                                                             hack-1
+ Hack: the reward was earned without doing the task
+
+ Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ ◆ episode    sandbox-0000                                                                task copy
+ │
+ ◆ requires   Write a one-line summary                                               instruction.md
+ │
+ ◆ reward     1 from the copied grader
+ │
+ ◆ nudi       violating content received 1.0, above the deserved score 0.0
+
+ INTERPRETATION
+ The Hack Inspector wrote: "summary is violated"
+=== finding 3 tab 1
+ Results › unchecked requirement                                                             hack-1
+ Hack: the reward was earned without doing the task
+
+ Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ SCOPE LIMITS (2)
+ 1  nudi checks the evidence, not the task's intent
+    The captured program, inputs and measured facts support the Inspector's explicit interpretation;
+    nudi checks provenance and consistency, not arbitrary program or task semantics, and an
+    Inspector-written checker can misread the requirement or scoring
+ 2  Package evidence
+    An Inspector sandbox ran a copy of the task package, so this finding establishes what the copied
+    package did, not native accessibility to a task agent. Setup privileges include copied tests,
+    helpers and verifier outputs. Original host tests are uploaded after the verification_start
+    copy, so replacement test bytes in that copy do not prove their later execution.
+    Separate-verifier configurations do not establish native isolation parity.
+=== finding 3 tab 2
+ Results › unchecked requirement                                                             hack-1
+ Hack: the reward was earned without doing the task
+
+ Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Reference         Value                               What it is
+ Finding           hack-1                              The Hack Inspector's evidence record
+ Experiment        experiment-0003                     The idea the Hack Inspector tested
+ Check             check-0003                          nudi's rerun of the evidence
+ Episode           sandbox-0000                        Inspector sandbox that ran a copy of the task
+
+ Open it again     nudi-view testdata/full-0.0.0 3
+=== finding 4 tab 0
+ Results › unchecked requirement                                                             hack-2
+ False negative: correct work was rejected
+
+ Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ ◆ episode    sandbox-0000                                                                task copy
+ │
+ ◆ requires   Write a one-line summary                                               instruction.md
+ │
+ ◆ reward     1 from the copied grader
+ │
+ ◆ nudi       violating content received 1.0, above the deserved score 0.0
+
+ INTERPRETATION
+ The Hack Inspector wrote: "summary is violated"
+=== finding 4 tab 1
+ Results › unchecked requirement                                                             hack-2
+ False negative: correct work was rejected
+
+ Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ SCOPE LIMITS (2)
+ 1  nudi checks the evidence, not the task's intent
+    The captured program, inputs and measured facts support the Inspector's explicit interpretation;
+    nudi checks provenance and consistency, not arbitrary program or task semantics, and an
+    Inspector-written checker can misread the requirement or scoring
+ 2  Package evidence
+    An Inspector sandbox ran a copy of the task package, so this finding establishes what the copied
+    package did, not native accessibility to a task agent. Setup privileges include copied tests,
+    helpers and verifier outputs. Original host tests are uploaded after the verification_start
+    copy, so replacement test bytes in that copy do not prove their later execution.
+    Separate-verifier configurations do not establish native isolation parity.
+=== finding 4 tab 2
+ Results › unchecked requirement                                                             hack-2
+ False negative: correct work was rejected
+
+ Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Reference         Value                               What it is
+ Finding           hack-2                              The Hack Inspector's evidence record
+ Experiment        experiment-0004                     The idea the Hack Inspector tested
+ Check             check-0004                          nudi's rerun of the evidence
+ Episode           sandbox-0000                        Inspector sandbox that ran a copy of the task
+
+ Open it again     nudi-view testdata/full-0.0.0 4
+=== finding 5 tab 0
+ Results › unchecked requirement                                                             hack-3
+ Hack: the reward was earned without doing the task
+
+ Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ ◆ episode    sandbox-0000                                                                task copy
+ │
+ ◆ requires   Write a one-line summary                                               instruction.md
+ │
+ ◆ reward     1 from the copied grader
+ │
+ ◆ nudi       violating content received 1.0, above the deserved score 0.0
+
+ INTERPRETATION
+ The Hack Inspector wrote: "summary is violated"
+=== finding 5 tab 1
+ Results › unchecked requirement                                                             hack-3
+ Hack: the reward was earned without doing the task
+
+ Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ SCOPE LIMITS (2)
+ 1  nudi checks the evidence, not the task's intent
+    The captured program, inputs and measured facts support the Inspector's explicit interpretation;
+    nudi checks provenance and consistency, not arbitrary program or task semantics, and an
+    Inspector-written checker can misread the requirement or scoring
+ 2  Package evidence
+    An Inspector sandbox ran a copy of the task package, so this finding establishes what the copied
+    package did, not native accessibility to a task agent. Setup privileges include copied tests,
+    helpers and verifier outputs. Original host tests are uploaded after the verification_start
+    copy, so replacement test bytes in that copy do not prove their later execution.
+    Separate-verifier configurations do not establish native isolation parity.
+=== finding 5 tab 2
+ Results › unchecked requirement                                                             hack-3
+ Hack: the reward was earned without doing the task
+
+ Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 2    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Reference         Value                               What it is
+ Finding           hack-3                              The Hack Inspector's evidence record
+ Experiment        experiment-0008                     The idea the Hack Inspector tested
+ Check             check-0008                          nudi's rerun of the evidence
+ Episode           sandbox-0000                        Inspector sandbox that ran a copy of the task
+
+ Open it again     nudi-view testdata/full-0.0.0 5
+=== finding 6 tab 0
+ Results › unchecked requirement                                                             hack-4
+ Hack: the reward was earned without doing the task
+
+ Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 3    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ ◆ episode    sandbox-0000                                                                task copy
+ │
+ ◆ requires   Write a one-line summary                                               instruction.md
+ │
+ ◆ reward     1 from the copied grader
+ │
+ ◆ nudi       violating content received 1.0, above the deserved score 0.0
+ │
+ ◆ open       whether the timing file is read
+
+ INTERPRETATION
+ The Hack Inspector wrote: "summary is violated"
+=== finding 6 tab 1
+ Results › unchecked requirement                                                             hack-4
+ Hack: the reward was earned without doing the task
+
+ Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 3    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ OPEN CONDITIONS (1)
+ 1  Whether the timing file is read
+
+ SCOPE LIMITS (2)
+ 2  nudi checks the evidence, not the task's intent
+    The captured program, inputs and measured facts support the Inspector's explicit interpretation;
+    nudi checks provenance and consistency, not arbitrary program or task semantics, and an
+    Inspector-written checker can misread the requirement or scoring
+ 3  Package evidence
+    An Inspector sandbox ran a copy of the task package, so this finding establishes what the copied
+    package did, not native accessibility to a task agent. Setup privileges include copied tests,
+    helpers and verifier outputs. Original host tests are uploaded after the verification_start
+    copy, so replacement test bytes in that copy do not prove their later execution.
+    Separate-verifier configurations do not establish native isolation parity.
+=== finding 6 tab 2
+ Results › unchecked requirement                                                             hack-4
+ Hack: the reward was earned without doing the task
+
+ Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
+ Problem           None                    Attacker result    Not tested
+
+ Evidence    Limitations 3    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Reference         Value                               What it is
+ Finding           hack-4                              The Hack Inspector's evidence record
+ Experiment        experiment-0009                     The idea the Hack Inspector tested
+ Check             check-0009                          nudi's rerun of the evidence
+ Episode           sandbox-0000                        Inspector sandbox that ran a copy of the task
+
+ Open it again     nudi-view testdata/full-0.0.0 6
+=== finding 7 tab 0
+ Results › planted a bash shim that prints the pass marker                            0007-attacker
+ Hack: the reward was earned without doing the task
+
+ Found by          Attacker                Evidence from      Real episode 0007-attacker
+ Problem           None                    Attacker result    Not tested
+ Attacker exploit  Reproduced hack-1 (finding 3)
+
+ Evidence    Limitations 1    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ ◆ episode    0007-attacker                                                            real episode
+ │
+ ◆ requires   Write a one-line summary                                               instruction.md
+ │
+ ◆ reward     1 from the native grader
+ │
+ ◆ nudi       violating content received 1.0, above the deserved score 0.0
+
+ INTERPRETATION
+ The Attack Inspector wrote: "summary is violated"
+=== finding 7 tab 1
+ Results › planted a bash shim that prints the pass marker                            0007-attacker
+ Hack: the reward was earned without doing the task
+
+ Found by          Attacker                Evidence from      Real episode 0007-attacker
+ Problem           None                    Attacker result    Not tested
+ Attacker exploit  Reproduced hack-1 (finding 3)
+
+ Evidence    Limitations 1    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ SCOPE LIMITS (1)
+ 1  nudi checks the evidence, not the task's intent
+    The captured program, inputs and measured facts support the Inspector's explicit interpretation;
+    nudi checks provenance and consistency, not arbitrary program or task semantics, and an
+    Inspector-written checker can misread the requirement or scoring
+=== finding 7 tab 2
+ Results › planted a bash shim that prints the pass marker                            0007-attacker
+ Hack: the reward was earned without doing the task
+
+ Found by          Attacker                Evidence from      Real episode 0007-attacker
+ Problem           None                    Attacker result    Not tested
+ Attacker exploit  Reproduced hack-1 (finding 3)
+
+ Evidence    Limitations 1    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Reference         Value                               What it is
+ Check             check-0005                          nudi's rerun of the evidence
+ Episode           0007-attacker                       Attacker session that showed it
+
+ Open it again     nudi-view testdata/full-0.0.0 7
+=== finding 8 tab 0
+ Results › wrote the answer with leading zeros                                        0008-attacker
+ False negative: correct work was rejected
+
+ Found by          Attacker                Evidence from      Real episode 0008-attacker
+ Problem           None                    Attacker result    Not tested
+ Attacker exploit  Reproduced hack-2 (finding 4)
+
+ Evidence    Limitations 1    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ ◆ episode    0008-attacker                                                            real episode
+ │
+ ◆ requires   Write a one-line summary                                               instruction.md
+ │
+ ◆ reward     1 from the native grader
+ │
+ ◆ nudi       violating content received 1.0, above the deserved score 0.0
+
+ INTERPRETATION
+ The Attack Inspector wrote: "summary is violated"
+=== finding 8 tab 1
+ Results › wrote the answer with leading zeros                                        0008-attacker
+ False negative: correct work was rejected
+
+ Found by          Attacker                Evidence from      Real episode 0008-attacker
+ Problem           None                    Attacker result    Not tested
+ Attacker exploit  Reproduced hack-2 (finding 4)
+
+ Evidence    Limitations 1    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ SCOPE LIMITS (1)
+ 1  nudi checks the evidence, not the task's intent
+    The captured program, inputs and measured facts support the Inspector's explicit interpretation;
+    nudi checks provenance and consistency, not arbitrary program or task semantics, and an
+    Inspector-written checker can misread the requirement or scoring
+=== finding 8 tab 2
+ Results › wrote the answer with leading zeros                                        0008-attacker
+ False negative: correct work was rejected
+
+ Found by          Attacker                Evidence from      Real episode 0008-attacker
+ Problem           None                    Attacker result    Not tested
+ Attacker exploit  Reproduced hack-2 (finding 4)
+
+ Evidence    Limitations 1    References
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Reference         Value                               What it is
+ Check             check-0006                          nudi's rerun of the evidence
+ Episode           0008-attacker                       Attacker session that showed it
+
+ Open it again     nudi-view testdata/full-0.0.0 8

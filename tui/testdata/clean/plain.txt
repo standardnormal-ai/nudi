@@ -1,0 +1,56 @@
+RUN
+  Task              task
+  Run directory     testdata/clean
+  Backend           Docker
+  Concurrency       4
+  Attacker model    deepseek-v4.1-flash-1017, reasoning high
+  Inspector model   deepseek-v4.1-flash-1017, reasoning high
+  Simulator model   deepseek-v4.1-flash-1017, reasoning medium
+
+RESULT
+  Ending            Finished
+  Summary           No problems demonstrated in this run.
+  Count             1 open question
+  Work left         1 item, listed under WORK LEFT
+
+EVIDENCE
+  None evidenced in this run.
+
+NOT COUNTED AS PROBLEMS
+  Count             1 unresolved
+
+  unchecked requirement
+      State             Unresolved
+      Found by          Hack Inspector
+      Reference         hack-0
+
+SIMULATION
+  Model             mimo-v2.6-pro
+  Reward key        reward
+  Episodes          4 usable, 4 attempted, 4 requested
+  Rewards           0: 1 episode
+                    0.5: 1 episode
+                    1: 2 episodes
+  Mean              0.625
+  Median            0.75
+  Sample SD         0.4787
+  Skewness          -0.8546
+  Reward pattern
+                    Distribution flags are not evaluated for 'reward': 4 usable rewards, fewer than
+                    10.
+  Pattern name      No pattern to explain.
+
+GRADER ACCURACY
+  Not available     Grade Simulations not selected
+
+WORK LEFT
+  Find Hacks          unchecked requirement (hack-0)
+                      Unresolved: Reason not recorded
+
+COST
+  Model cost                  $0.00 of $5.00 cap
+  Spending cap                $5.00                 Covers model cost only
+
+NEXT
+  testdata/clean/report.json
+      The full report, for programs

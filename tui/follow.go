@@ -8,10 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	"charm.land/bubbles/v2/help"
-	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 )
 
 // startWait is how long a follow waits for nudi to begin the run's log.
@@ -80,13 +77,13 @@ type liveModel struct {
 	frame int
 	w, h  int // h is 0 until the terminal reports its size
 	err   error
-	help  help.Model
+	ui    liveUI
 }
 
 type liveTick struct{}
 
 func newLive(dir string) liveModel {
-	return liveModel{f: &follower{dir: dir}, l: Live{Dir: shown(dir)}, w: 100, help: help.New()}
+	return liveModel{f: &follower{dir: dir}, l: Live{Dir: shown(dir)}, w: 100}
 }
 
 // Init reads the log at once.
@@ -97,11 +94,8 @@ func (m liveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = min(msg.Width, maxW), msg.Height
-		m.help.SetWidth(m.w)
 	case tea.KeyPressMsg:
-		if key.Matches(msg, keys.quit) {
-			return m, tea.Quit
-		}
+		return m.press(msg)
 	case liveTick:
 		if m.frame%10 == 0 {
 			_, r, err := m.f.poll(&m.l)
@@ -126,11 +120,7 @@ func (m liveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m liveModel) View() tea.View {
 	var v tea.View
 	v.WindowTitle = "nudi " + m.l.Dir
-	s := renderLive(&m.l, time.Now(), m.w, m.frame)
-	if m.h > 0 {
-		s = lipgloss.NewStyle().MaxHeight(max(3, m.h-4)).Render(s)
-	}
-	v.SetContent("\n" + s + "\n\n " + m.help.ShortHelpView([]key.Binding{keys.quit}) + "\n")
+	v.SetContent("\n" + m.render(time.Now()) + "\n")
 	return v
 }
 
