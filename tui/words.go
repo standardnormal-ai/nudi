@@ -1,5 +1,7 @@
 package main
 
+import "path"
+
 // The screens turn each label of report.json into words through one table per label set.
 // A label missing from its table shows as itself and is recorded in missed, which the
 // fixture tests check, so a new Python label fails them until it has words.
@@ -155,8 +157,10 @@ var verdictWords = map[string]string{
 	"unknown":               "The Grader Inspector could not decide",
 }
 
-// flagWords name Python's distribution flags of a reward.
-var flagWords = map[string]string{"identical_rewards": "Identical rewards", "low_minority": "Unusually low rewards", "high_minority": "Unusually high rewards"}
+// group names a group of simulated episodes by its Simulator model and the reward it reads.
+func group(model, reward string) string {
+	return "Simulator " + path.Base(model) + ", reward " + reward
+}
 
 // exploitWords say what an Attacker exploit confirmed of the findings it tested, by its kind in the report.
 var exploitWords = map[string]string{

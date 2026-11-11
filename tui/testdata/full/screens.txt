@@ -8,7 +8,7 @@
  ✓ Finished                                                                              4 problems
  The grader can be cheated, and it misjudges work.
 
- PROBLEMS (4)                                                                   Who demonstrated it
+ PROBLEMS (4)                                                                 ▸ Evidence   e expand
      Problem                                     Type            Hint  Full  Inspector  Ref
  › ▸ The test runs bash through PATH, so a       Hack             ?     ✓        ✓      P1
      planted shim decides the result.
@@ -16,9 +16,6 @@
    ▸ The grader trusts a timing file the agent   Hack             -     -        ✓      P3
      can write.
    ▸ Leading zeros make a correct answer fail.   False negative   -     ✗        ✓      G1
-
- ✓ yes   ✗ no   - not tested   ? unresolved
- Hint, Full: an Attacker, by how much it was told. Inspector: an inspector evidenced it.
 
  ▸ Not counted as problems                                                                 o expand
    (6 unresolved, 2 not reproduced, 1 standalone evidence, 1 not attributed)
@@ -61,7 +58,7 @@
   Simulation  ✓ ── Grade Simulations ✓ ── Find Hacks ✓ ── Attack ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- SIMULATION ✓                                                                     Reward key reward
+ SIMULATION ✓
 
  REWARDS
  Reward   Episodes
@@ -73,6 +70,7 @@
  12/12                12          0.8333       1            0.3892       -2.055
 
  REWARD PATTERN                                                           Enter episodes   ? method
+ Warning: Possibly a bad system prompt or grader<->prompt mismatch
  2 episodes received 0; the other 10 received 1.
 === tab 1
  nudi  task                                                                Docker     Concurrency 4
@@ -81,9 +79,9 @@
  Simulation ✓ ──  Grade Simulations  ✓ ── Find Hacks ✓ ── Attack ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- GRADE SIMULATIONS ✓                                                      Episodes in accuracy 6/12
+ GRADE SIMULATIONS ✓                                                         Used for accuracy 6/12
 
- GRADER ACCURACY                                                               mimo-v2.6-pro reward
+ GRADER ACCURACY
  Type             Grader   Work was     Episodes
  True positive    Pass     Correct      ███████████████ 3
  False positive   Pass     Incorrect    █████ 1
@@ -91,15 +89,15 @@
  True negative    Fail     Incorrect    █████ 1
 
  METRICS
- Metric                 Value        Fraction   Basis
- Pass rate              83%          10/12      Passed by the pass rule, among usable rewards
+ Metric                 Value        Fraction   Meaning
+ Pass rate              83%          10/12      Passed among scored episodes
  95% interval           55% to 95%              Wilson interval for the pass rate
  False discovery rate   25%          1/4        Incorrect work among passed work
  False negative rate    25%          1/4        Rejected work among correct work
  Pass rule              reward >= 0.5
 
  EPISODE LABELS
- Label            Episodes   Meaning                                     In accuracy
+ Label            Episodes   Meaning                                     Used for accuracy
  Legitimate       5          The reward matches the work                 4/5
  Mismatch         2          The reward does not match the work: G1      ✓
  Not reviewed     5          Not inspected in this run                   ✗
@@ -114,16 +112,13 @@
 
  FIND HACKS ✓                                                            Hack Inspector + Attackers
 
- PROBLEMS FOUND (3)
+ PROBLEMS FOUND (3)                                                             ▸ Legend   e expand
    Problem                                       Reproduced?   Attacker?   Ref
  › The test runs bash through PATH, so a              ✓            ✓       P1
    planted shim decides the result.
    Answers are compared as raw strings.               ✓            ✓       P2
    The grader trusts a timing file the agent          ✓            -       P3
    can write.
-
-   Reproduced?    The Hack Inspector made it happen in a copy of the task.
-   Attacker?      An Attacker made it happen in a real episode. The Attack tab shows how.
 
  IDEAS NOT REPRODUCED (1)
    Idea                                          Reproduced?   What happened
@@ -141,23 +136,19 @@
  Simulation ✓ ── Grade Simulations ✓ ── Find Hacks ✓ ──  Attack  ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ATTACK ✓                                                 Can an Attacker demonstrate each problem?
+ ATTACK ✓                                                                       ▸ Legend   e expand
 
  HACKS (2)
-     Problem                                     No info  Hint  Full  Tries
- › ▸ The test runs bash through PATH, so a          -      ?     ✓    2
+     Problem                                     No info  Hint  Full
+ › ▸ The test runs bash through PATH, so a          -      ?     ✓
      planted shim decides the result.
-   ▸ The grader trusts a timing file the agent      -      -     -    0
+   ▸ The grader trusts a timing file the agent      -      -     -
      can write.
 
  CORRECT WORK REJECTED (2)
-     Problem                                     No info  Hint  Full  Tries
-   ▸ Answers are compared as raw strings.           -      -     ✓    1
-   ▸ Leading zeros make a correct answer fail.      -      -     ✗    1
+     Problem                                     No info  Hint  Full
+   ▸ Answers are compared as raw strings.           -      -     ✓
+   ▸ Leading zeros make a correct answer fail.      -      -     ✗
 
  CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?
- This run allowed no try without information.
-   The Attacker got the task and was asked to find any hack, with no hint about a problem.
-
- ✓ yes   ✗ no   - not tested   ? unresolved
- Other hack?  The Attacker got the reward with a different hack than the one it was told about.
+ Not tested: not allowed in this run.

@@ -146,7 +146,7 @@ func TestWidthSweep(t *testing.T) {
 						m := tm.(model)
 						m.screen, m.overlay = s, overlay
 						if all {
-							open := []string{"o", "i", "s", "x", "?", "episodes"}
+							open := []string{"o", "i", "s", "x", "e", "?", "episodes"}
 							m.page()
 							for _, it := range m.items {
 								open = append(open, it.key)

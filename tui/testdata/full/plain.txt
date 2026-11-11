@@ -180,7 +180,7 @@ NOT COUNTED AS PROBLEMS
 
 SIMULATION
   Model             mimo-v2.6-pro
-  Reward key        reward
+  Reward name       reward
   Episodes          12 usable, 12 attempted, 12 requested
   Rewards           0: 2 episodes
                     1: 10 episodes
@@ -189,7 +189,8 @@ SIMULATION
   Sample SD         0.3892
   Skewness          -2.055
   Reward pattern    2 episodes received 0; the other 10 received 1.
-  Pattern name      Unusually low rewards
+  Warning           Possibly a bad system prompt or grader<->prompt mismatch
+  Reason            A few rewards far below the rest
   Rule              A reward is unusually low when it is below Q1 - 3 x IQR.
   Terms             Q1 is the first quartile and Q3 the third. IQR is Q3 - Q1, the spread of the
                     middle half.
@@ -208,18 +209,17 @@ SIMULATION
                     independent episodes); SD and skewness follow from this share. Grader inspection
                     labels: 0004-simulator rejected_valid, 0005-simulator legitimate. A label
                     describes its episode, not this pattern.
-  Meaning           A pattern to read, not a finding. It changes no rate and no result.
   Minimum           nudi checks this only with 10 or more usable rewards.
 
 GRADER ACCURACY
-  In accuracy       6 of 12 episodes
-  Model             mimo-v2.6-pro, reward key reward
+  Accuracy uses     6 of 12 episodes
+  Model             mimo-v2.6-pro, reward name reward
   Pass rule         reward >= 0.5
   True positive     3: grader pass, work correct
   False positive    1: grader pass, work incorrect
   False negative    1: grader fail, work correct
   True negative     1: grader fail, work incorrect
-  Pass rate         83%, 10/12, passed by the pass rule, among usable rewards
+  Pass rate         83%, 10/12, passed among scored episodes
   95% interval      55% to 95%, Wilson interval for the pass rate
   False discovery   25%, 1/4, incorrect work among passed work
   False negative    25%, 1/4, rejected work among correct work

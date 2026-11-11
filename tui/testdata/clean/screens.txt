@@ -36,7 +36,7 @@
   Simulation  ✓ ── Grade Simulations ── Find Hacks ✓ ── Attack                      │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- SIMULATION ✓                                                                     Reward key reward
+ SIMULATION ✓
 
  REWARDS
  Reward   Episodes

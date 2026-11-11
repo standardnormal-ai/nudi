@@ -26,7 +26,7 @@ NOT COUNTED AS PROBLEMS
 
 SIMULATION
   Model             mimo-v2.6-pro
-  Reward key        reward
+  Reward name       reward
   Episodes          4 usable, 4 attempted, 4 requested
   Rewards           0: 1 episode
                     0.5: 1 episode
@@ -38,7 +38,6 @@ SIMULATION
   Reward pattern
                     Distribution flags are not evaluated for 'reward': 4 usable rewards, fewer than
                     10.
-  Pattern name      No pattern to explain.
 
 GRADER ACCURACY
   Not available     Grade Simulations not selected

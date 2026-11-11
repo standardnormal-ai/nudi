@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"fmt"
 	"maps"
-	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -78,15 +77,7 @@ func leftOut(r Report) string {
 // Enter lists the episodes.
 func simulationPage(r Report, found []Finding, p *page) {
 	o := r.Ordinary
-	keys := []string{}
-	if o != nil && len(o.Groups) > 0 {
-		keys = slices.Sorted(maps.Keys(o.Groups[0].Rewards))
-	}
-	note := ""
-	if len(keys) > 0 {
-		note = dim("Reward key ") + strings.Join(keys, ", ")
-	}
-	if !stageHead(r, 0, note, p) {
+	if !stageHead(r, 0, "", p) {
 		return
 	}
 	if o == nil || len(o.Groups) == 0 {
@@ -101,7 +92,7 @@ func simulationPage(r Report, found []Finding, p *page) {
 		for _, name := range slices.Sorted(maps.Keys(g.Rewards)) {
 			x := g.Rewards[name]
 			if len(o.Groups) > 1 || len(g.Rewards) > 1 {
-				p.add(" "+dim(path.Base(g.Configuration.Model)+" "+name), "")
+				p.add(" "+dim(group(g.Configuration.Model, name)), "")
 			}
 			widths := []int{21, 12, 13, 13, 13}
 			p.add(heading("REWARDS", ""))
@@ -113,6 +104,9 @@ func simulationPage(r Report, found []Finding, p *page) {
 				p.add(wrap(fmt.Sprintf("%d episode%s without a usable reward, not counted.", left, plural(left)), p.w, " ", dim))
 			}
 			p.add("", spread(heading("REWARD PATTERN", ""), bold("Enter")+" "+dim("episodes")+"   "+bold("?")+" "+dim("method"), p.w))
+			for _, line := range warnings(x) {
+				p.add(wrap(line, p.w, " ", amber))
+			}
 			for _, line := range patterns(x, g.EpisodeRewards, name) {
 				p.add(wrap(line, p.w, " ", plain))
 			}
@@ -162,6 +156,34 @@ func patterns(x Rewards, rewards map[string]map[string]*float64, key string) []s
 	return out
 }
 
+// flagWarnings are what each reward pattern may point to, and flagReasons why nudi flagged it.
+var (
+	flagWarnings = map[string]string{
+		"low_minority":      "Possibly a bad system prompt or grader<->prompt mismatch",
+		"high_minority":     "Possibly a hack or a grader that passes wrong work",
+		"identical_rewards": "Possibly a task that is too easy or too hard, or a grader that ignores the work",
+	}
+	flagReasons = map[string]string{
+		"low_minority":      "A few rewards far below the rest",
+		"high_minority":     "A few rewards far above the rest",
+		"identical_rewards": "Every usable reward is the same",
+	}
+)
+
+// warnings are one line for each kind of reward pattern flagged; none when nothing is flagged.
+func warnings(x Rewards) []string {
+	var out []string
+	for _, f := range x.Flags {
+		if f == nil || f.Flag == nil || f.Text == nil {
+			continue
+		}
+		if w, ok := lookup(flagWarnings, *f.Flag); ok && !slices.Contains(out, "Warning: "+w) {
+			out = append(out, "Warning: "+w)
+		}
+	}
+	return out
+}
+
 // values is the range of the rewards given, or one reward when they are all the same.
 func values(xs []*float64) string {
 	var known []float64
@@ -180,16 +202,26 @@ func values(xs []*float64) string {
 	return strconv.FormatFloat(lo, 'g', 4, 64) + " to " + strconv.FormatFloat(hi, 'g', 4, 64)
 }
 
-// method explains how nudi reads the first flagged pattern, with this run's numbers and its episodes.
+// method explains how nudi reads the first flagged pattern, its reason first, with this run's numbers and its episodes.
+// Python's text, which repeats the rows and the warning, is left to the plain output.
 func method(r Report, found []Finding, x Rewards, w int) string {
 	var rows []string
 	for _, kv := range methodRows(r, found, x) {
-		rows = append(rows, cols(w-4, "", []int{11}, dim(kv[0]), kv[1]))
+		switch kv[0] {
+		case "Reason":
+			rows = append(rows, wrap("Reason for warning: "+kv[1], w-4, "", plain), "")
+		case "Details":
+		default:
+			rows = append(rows, cols(w-4, "", []int{11}, dim(kv[0]), kv[1]))
+		}
+	}
+	if rows == nil {
+		rows = []string{dim("No pattern to explain.")}
 	}
 	return box("How nudi reads a reward pattern", bold("?")+" "+dim("close"), w-1, rows...)
 }
 
-// methodRows are the method's rows, each a name and its text.
+// methodRows are the method's rows, each a name and its text; none without a flagged pattern.
 func methodRows(r Report, found []Finding, x Rewards) [][2]string {
 	var f *Flag
 	for _, g := range x.Flags {
@@ -199,14 +231,14 @@ func methodRows(r Report, found []Finding, x Rewards) [][2]string {
 		}
 	}
 	if f == nil {
-		return [][2]string{{"Pattern", "No pattern to explain."}}
+		return nil
 	}
 	rules := map[string]string{
 		"low_minority":      "A reward is unusually low when it is below Q1 - 3 x IQR.",
 		"high_minority":     "A reward is unusually high when it is above Q3 + 3 x IQR.",
 		"identical_rewards": "Every usable reward has the same value.",
 	}
-	rows := [][2]string{{"Pattern", word(flagWords, *f.Flag)}, {"Rule", rules[*f.Flag]}}
+	rows := [][2]string{{"Reason", word(flagReasons, *f.Flag)}, {"Rule", rules[*f.Flag]}}
 	if len(f.Quartiles) == 2 && f.Fence != nil {
 		rows = append(rows, [2]string{"Terms", "Q1 is the first quartile and Q3 the third. IQR is Q3 - Q1, the spread of the middle half."},
 			[2]string{"This run", fmt.Sprintf("Q1 is %s and Q3 is %s, so the fence is %s.", num(&f.Quartiles[0]), num(&f.Quartiles[1]), num(f.Fence))})
@@ -229,8 +261,7 @@ func methodRows(r Report, found []Finding, x Rewards) [][2]string {
 			recorded = "At least one episode recorded an error, timeout or refusal."
 		}
 	}
-	rows = append(rows, [2]string{"Recorded", recorded}, [2]string{"Details", *f.Text},
-		[2]string{"Meaning", "A pattern to read, not a finding. It changes no rate and no result."})
+	rows = append(rows, [2]string{"Recorded", recorded}, [2]string{"Details", *f.Text})
 	if f.Minimum != nil {
 		rows = append(rows, [2]string{"Minimum", fmt.Sprintf("nudi checks this only with %d or more usable rewards.", *f.Minimum)})
 	}
@@ -313,7 +344,6 @@ func episodesTable(r Report, found []Finding, p *page) {
 		}
 		p.add(cols(p.w, "   ", widths, e, num(reward(e)), label, what, dim(problem)))
 	}
-	p.add("", " "+dim("- not recorded for this episode"))
 }
 
 func boolInt(b bool) int {
@@ -328,7 +358,7 @@ func boolInt(b bool) int {
 func gradePage(r Report, p *page) {
 	note := ""
 	if m := r.Metrics; m != nil && m.Coverage.Ordinary > 0 {
-		note = dim("Episodes in accuracy ") + fmt.Sprintf("%d/%d", m.Coverage.Eligible, m.Coverage.Ordinary)
+		note = dim("Used for accuracy ") + fmt.Sprintf("%d/%d", m.Coverage.Eligible, m.Coverage.Ordinary)
 	}
 	if !stageHead(r, 1, note, p) {
 		return
@@ -338,13 +368,13 @@ func gradePage(r Report, p *page) {
 	}
 	if m := r.Metrics; m != nil {
 		for _, a := range m.Confusion {
-			agreement(a, p)
+			agreement(a, len(m.Confusion) > 1, p)
 		}
 	}
 	if l := r.Labels; l != nil && len(l.Counts) > 0 {
 		p.add(heading("EPISODE LABELS", ""))
 		widths := []int{17, 11, 44}
-		p.add(cols(p.w, " ", widths, dim("Label"), dim("Episodes"), dim("Meaning"), dim("In accuracy")))
+		p.add(cols(p.w, " ", widths, dim("Label"), dim("Episodes"), dim("Meaning"), dim("Used for accuracy")))
 		var excluded []string
 		if r.Metrics != nil {
 			for _, es := range r.Metrics.Coverage.Excluded {
@@ -400,9 +430,13 @@ func graderProblems(r Report) string {
 
 // agreement draws one confusion group: the four kinds of decision, then the metrics. Without grader agreement it
 // says why, and the pass rate still stands with its rule.
-func agreement(a Agreement, p *page) {
-	head := "GRADER ACCURACY"
-	p.add(spread(heading(head, ""), dim(path.Base(a.Configuration.Model)+" "+a.Reward), p.w))
+// With several groups, each names its Simulator model and reward.
+func agreement(a Agreement, several bool, p *page) {
+	note := ""
+	if several {
+		note = dim(group(a.Configuration.Model, a.Reward))
+	}
+	p.add(spread(heading("GRADER ACCURACY", ""), note, p.w))
 	if a.Status == "supported" {
 		widths := []int{17, 9, 13}
 		p.add(cols(p.w, " ", widths, dim("Type"), dim("Grader"), dim("Work was"), dim("Episodes")))
@@ -413,7 +447,7 @@ func agreement(a Agreement, p *page) {
 		p.add(wrap("Not available: "+strings.Join(a.Reasons, " "), p.w, " ", amber))
 	}
 	widths := []int{23, 13, 11}
-	p.add("", heading("METRICS", ""), cols(p.w, " ", widths, dim("Metric"), dim("Value"), dim("Fraction"), dim("Basis")))
+	p.add("", heading("METRICS", ""), cols(p.w, " ", widths, dim("Metric"), dim("Value"), dim("Fraction"), dim("Meaning")))
 	metric := func(name string, x Rate, basis string) {
 		value, fraction := "unavailable", ""
 		if x.Unavailable != nil {
@@ -423,7 +457,7 @@ func agreement(a Agreement, p *page) {
 		}
 		p.add(cols(p.w, " ", widths, name, value, fraction, dim(basis)))
 	}
-	metric("Pass rate", a.PassRate, "Passed by the pass rule, among usable rewards")
+	metric("Pass rate", a.PassRate, "Passed among scored episodes")
 	if x := a.PassRate.Interval; len(x) == 2 {
 		p.add(cols(p.w, " ", widths, "95% interval", fmt.Sprintf("%.0f%% to %.0f%%", 100*x[0], 100*x[1]), "", dim("Wilson interval for the pass rate")))
 	}
@@ -483,7 +517,6 @@ func scope(r Report, in *Inspection, job, key string, p *page) {
 	if !p.toggle(key, "Search scope", fmt.Sprintf("(%d categor%s)", len(codes), map[bool]string{true: "y", false: "ies"}[len(codes) == 1])) {
 		return
 	}
-	p.add(wrap("What the "+job+" looked for. It describes the search, not a result.", p.w, "   ", dim))
 	done := searched(in)
 	widths := []int{26, 60}
 	var skipped []string
@@ -547,10 +580,14 @@ func hacksPage(r Report, found []Finding, p *page) {
 			return strings.HasPrefix(p.ID, "G") || p.Source == "grader inspector" || p.Source == "Attacker"
 		})
 		widths := []int{46, 14, 12}
-		p.add(titled("PROBLEMS FOUND", len(ps)))
 		if len(ps) == 0 {
-			p.add(" None found in this run.")
+			p.add(titled("PROBLEMS FOUND", 0), " None found in this run.")
 		} else {
+			p.add(spread(titled("PROBLEMS FOUND", len(ps)), p.fold("e", "Legend"), p.w))
+			if p.open["e"] {
+				p.add(cols(p.w, "   ", []int{15}, dim("Reproduced?"), dim("The Hack Inspector made it happen in a copy of the task.")),
+					cols(p.w, "   ", []int{15}, dim("Attacker?"), dim("An Attacker made it happen in a real episode. The Attack tab shows how.")), "")
+			}
 			p.add(cols(p.w, "   ", widths, dim("Problem"), dim("Reproduced?"), dim("Attacker?"), dim("Ref")))
 		}
 		for _, pr := range ps {
@@ -566,10 +603,6 @@ func hacksPage(r Report, found []Finding, p *page) {
 				attacker := best(r.tried(pr, "none"), r.tried(pr, "minimal"), r.tried(pr, "full"))
 				return cols(p.w, mark, widths, name, under("Reproduced?", glyph(reproduced)), under("Attacker?", glyph(attacker)), dim(pr.ID))
 			})
-		}
-		if len(ps) > 0 {
-			p.add("", cols(p.w, "   ", []int{15}, dim("Reproduced?"), dim("The Hack Inspector made it happen in a copy of the task.")),
-				cols(p.w, "   ", []int{15}, dim("Attacker?"), dim("An Attacker made it happen in a real episode. The Attack tab shows how.")))
 		}
 		p.add("")
 	}
@@ -615,12 +648,27 @@ func hacksPage(r Report, found []Finding, p *page) {
 	p.add("")
 	scope(r, in, "Hack Inspector", "s", p)
 	if len(in.Experiments) > 0 && p.toggle("x", "Experiments", fmt.Sprintf("(%d)", len(in.Experiments))) {
-		widths := []int{18, 26, 22}
-		p.add(cols(p.w, "   ", widths, dim("Experiment"), dim("Category"), dim("Ended"), dim("Episode")))
+		widths := []int{18, 26, 16}
+		p.add(cols(p.w, "   ", widths, dim("Experiment"), dim("Category"), dim("Status"), dim("Episode")))
 		for _, ex := range in.Experiments {
-			p.add(cols(p.w, "   ", widths, ex.ID, word(checkNames, ex.Category), strings.ReplaceAll(ex.Status, "_", " "), ex.Episode))
+			p.add(cols(p.w, "   ", widths, ex.ID, word(checkNames, ex.Category), experimentEnd(ex.Status), ex.Episode))
 		}
 	}
+}
+
+// experimentWords say how an inspector's experiment ended, when it did not fail or stop.
+var experimentWords = map[string]string{"assessed": "Done", "measured": "Ran, not read", "unfinished": "Ran, not read",
+	"incomplete": "Check broken", "known_problem": "Known problem", "running": "Not finished"}
+
+// experimentEnd is how an experiment ended: its words, else an error, whose cause Work left names, else stopped.
+func experimentEnd(status string) string {
+	if w, ok := experimentWords[status]; ok {
+		return w
+	}
+	if res, _ := lookup(attemptResults, status); res == Failed {
+		return "Error"
+	}
+	return "Stopped"
 }
 
 // helpWords name an attempt's hint level as the tables' columns do.
@@ -630,13 +678,20 @@ var helpWords = map[string]string{"none": "No info", "minimal": "Hint", "full": 
 // not record, whether an Attacker demonstrated it, by how much it was told, with its tries behind Enter; then whether
 // an Attacker told nothing succeeded.
 func attackPage(r Report, found []Finding, p *page) {
-	if !stageHead(r, 3, "Can an Attacker demonstrate each problem?", p) {
+	a := r.Attack
+	note := ""
+	if a != nil {
+		note = p.fold("e", "Legend")
+	}
+	if !stageHead(r, 3, note, p) {
 		return
 	}
-	a := r.Attack
 	if a == nil {
 		p.add(" " + dim("No Attacker result recorded."))
 		return
+	}
+	if p.open["e"] {
+		p.add(symbols, wrap("✓* The Attacker got the reward with a different hack than the one it was told about.", p.w, " ", dim), "")
 	}
 	if a.Problems == nil {
 		triesTable(r, found, a.Attempts, true, p)
@@ -694,24 +749,22 @@ func attackPage(r Report, found []Finding, p *page) {
 	case d == nil:
 		p.add(" No try recorded.")
 	case d.MaximumAttempts == 0:
-		p.add(" This run allowed no try without information.")
+		p.add(" Not tested: not allowed in this run.")
 	default:
 		p.add(" Not tested: " + word(notTestedWords, d.Status) + ".")
 	}
-	p.add(wrap("The Attacker got the task and was asked to find any hack, with no hint about a problem.", p.w, "   ", dim), "",
-		" "+dim("✓ yes   ✗ no   - not tested   ? unresolved"),
-		cols(p.w, " ", []int{13}, dim("Other hack?"), dim("The Attacker got the reward with a different hack than the one it was told about.")))
 }
 
-// attackTable lists problems with the answer under each hint level and their tries, which Enter expands.
+// attackTable lists problems with the answer under each hint level; Enter expands a row into its tries, which then
+// carry its answers.
 func attackTable(r Report, found []Finding, name string, ps []Problem, p *page) {
 	p.add(titled(name, len(ps)))
 	if len(ps) == 0 {
 		p.add(" None in this run.", "")
 		return
 	}
-	widths := []int{44, 9, 6, 6}
-	p.add(cols(p.w, "     ", widths, dim("Problem"), dim("No info"), dim("Hint"), dim("Full"), dim("Tries")))
+	widths := []int{44, 9, 6}
+	p.add(cols(p.w, "     ", widths, dim("Problem"), dim("No info"), dim("Hint"), dim("Full")))
 	for _, pr := range ps {
 		key := "tries " + pr.ID + " " + pr.Cause
 		aimed := r.aimed(pr)
@@ -724,20 +777,11 @@ func attackTable(r Report, found []Finding, name string, ps []Problem, p *page) 
 			if on {
 				cause = bold(cause)
 			}
-			started := 0
-			for _, at := range aimed {
-				started += boolInt(r.started(at))
-			}
-			if pr.Conditions != nil { // the tries nudi assessed, without those that failed to run or be judged
-				started = 0
-				for _, c := range pr.Conditions {
-					if c.Condition == "full" || c.Condition == "minimal" || c.Condition == "none" {
-						started += c.Attempts
-					}
-				}
+			if p.open[key] {
+				return cols(p.w, mark+arrow, widths, cause, "")
 			}
 			return cols(p.w, mark+arrow, widths, cause, under("No info", glyph(r.tried(pr, "none"))), under("Hint", glyph(r.tried(pr, "minimal"))),
-				under("Full", glyph(r.tried(pr, "full"))), strconv.Itoa(started))
+				under("Full", glyph(r.tried(pr, "full"))))
 		})
 		if p.open[key] {
 			triesTable(r, found, aimed, false, p)
@@ -746,7 +790,7 @@ func attackTable(r Report, found []Finding, name string, ps []Problem, p *page) 
 	p.add("")
 }
 
-// triesTable lists attempts: their hint level, whether each demonstrated its problem or another hack, how it ended,
+// triesTable lists attempts: their hint level, whether each succeeded, with * for another hack than its own, how it ended,
 // its reward and its session; Enter opens an attempt's finding. Reports without problems also name what it tested.
 func triesTable(r Report, found []Finding, attempts []Attempt, flat bool, p *page) {
 	indent := "       "
@@ -758,11 +802,11 @@ func triesTable(r Report, found []Finding, attempts []Attempt, flat bool, p *pag
 		p.add(indent+dim("No try recorded."), "")
 		return
 	}
-	question, widths := "This problem?", []int{5, 9, 15, 13, 13, 8}
-	heads := []string{"Try", "Help", question, "Other hack?", "Status", "Reward", "Attempt"}
+	widths := []int{5, 9, 12, 13, 8}
+	heads := []string{"Try", "Help", "Succeeded", "Status", "Reward", "Attempt"}
 	if flat {
-		question, widths = "Problem demonstrated?", []int{5, 12, 9, 23, 13, 13, 8}
-		heads = []string{"Try", "Tested", "Help", question, "Other hack?", "Status", "Reward", "Attempt"}
+		widths = []int{5, 12, 9, 12, 13, 8}
+		heads = slices.Insert(heads, 1, "Tested")
 	}
 	var cells []string
 	for _, h := range heads {
@@ -771,15 +815,14 @@ func triesTable(r Report, found []Finding, attempts []Attempt, flat bool, p *pag
 	p.add(cols(p.w, indent, widths, cells...))
 	for i, at := range attempts {
 		res, _ := lookup(attemptResults, at.Status)
-		this, other, status := "-", "-", resultWords[res]
+		succeeded, status := glyph("-"), resultWords[res]
 		if r.started(at) {
 			if res == NotTested {
 				status = stoppedWords(at.Status) // its episode started
 			}
-			this = map[Result]string{Evidenced: "yes", NoIssue: "no", Elsewhere: "no", Unsettled: "?"}[res]
-			other = map[Result]string{Evidenced: "no", NoIssue: "no", Elsewhere: "yes", Unsettled: "?"}[res]
-			if res == Failed {
-				this, other = "-", "-"
+			succeeded = glyph(answers[res])
+			if res == Elsewhere {
+				succeeded = glyph("yes") + dim("*")
 			}
 		} else {
 			status = resultWords[NotTested]
@@ -799,7 +842,7 @@ func triesTable(r Report, found []Finding, attempts []Attempt, flat bool, p *pag
 		if help == "" {
 			help = "-"
 		}
-		row := []string{strconv.Itoa(i + 1), help, under(question, glyph(this)), under("Other hack?", glyph(other)), status, reward, dim(episode)}
+		row := []string{strconv.Itoa(i + 1), help, under("Succeeded", succeeded), status, reward, dim(episode)}
 		if flat {
 			row = slices.Insert(row, 1, strings.Join(tested(at), ", "))
 		}

@@ -112,7 +112,7 @@ NOT COUNTED AS PROBLEMS
 
 SIMULATION
   Model             mimo-v2.6-pro
-  Reward key        reward
+  Reward name       reward
   Episodes          7 usable, 7 attempted, 7 requested
   Rewards           0: 2 episodes
                     1: 5 episodes
@@ -121,17 +121,16 @@ SIMULATION
   Sample SD         0.488
   Skewness          unavailable
   Reward pattern    Pattern details unavailable.
-  Pattern name      No pattern to explain.
 
 GRADER ACCURACY
-  In accuracy       6 of 7 episodes
-  Model             mimo-v2.6-pro, reward key reward
+  Accuracy uses     6 of 7 episodes
+  Model             mimo-v2.6-pro, reward name reward
   Pass rule         reward >= 0.5
   True positive     3: grader pass, work correct
   False positive    1: grader pass, work incorrect
   False negative    1: grader fail, work correct
   True negative     1: grader fail, work incorrect
-  Pass rate         71%, 5/7, passed by the pass rule, among usable rewards
+  Pass rate         71%, 5/7, passed among scored episodes
   False discovery   25%, 1/4, incorrect work among passed work
   False negative    25%, 1/4, rejected work among correct work
 

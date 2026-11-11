@@ -272,7 +272,7 @@ func simulationFields(r Report, found []Finding, w int) []string {
 			if len(out) > 0 {
 				out = append(out, "")
 			}
-			out = append(out, field(w, "  ", "Model", path.Base(g.Configuration.Model)), field(w, "  ", "Reward key", name),
+			out = append(out, field(w, "  ", "Model", path.Base(g.Configuration.Model)), field(w, "  ", "Reward name", name),
 				field(w, "  ", "Episodes", fmt.Sprintf("%d usable, %d attempted, %d requested", x.Usable, x.Attempted, o.Requested)))
 			var values []string
 			for _, d := range x.Distribution {
@@ -284,10 +284,12 @@ func simulationFields(r Report, found []Finding, w int) []string {
 			if x.FlagsNotEvaluated != nil {
 				out = append(out, field(w, "  ", "", *x.FlagsNotEvaluated))
 			}
-			// The method panel's rows, which the screen opens with ?, under names of their own here.
+			for i, line := range warnings(x) {
+				out = append(out, field(w, "  ", map[bool]string{true: "Warning", false: ""}[i == 0], strings.TrimPrefix(line, "Warning: ")))
+			}
+			// The method panel's rows, which the screen opens with ?, with Python's details as well.
 			for _, kv := range methodRows(r, found, x) {
-				name, ok := map[string]string{"Pattern": "Pattern name", "Episodes": "Flagged episodes"}[kv[0]]
-				out = append(out, field(w, "  ", map[bool]string{true: name, false: kv[0]}[ok], kv[1]))
+				out = append(out, field(w, "  ", strings.Replace(kv[0], "Episodes", "Flagged episodes", 1), kv[1]))
 			}
 		}
 	}
@@ -299,10 +301,10 @@ func accuracyFields(r Report, w int) []string {
 		return []string{field(w, "  ", "Not available", r.missing(1))}
 	}
 	m := r.Metrics
-	out := []string{field(w, "  ", "In accuracy", fmt.Sprintf("%d of %d episodes", m.Coverage.Eligible, m.Coverage.Ordinary))}
+	out := []string{field(w, "  ", "Accuracy uses", fmt.Sprintf("%d of %d episodes", m.Coverage.Eligible, m.Coverage.Ordinary))}
 	for _, a := range m.Confusion {
 		if a.Configuration.Model != "" {
-			out = append(out, field(w, "  ", "Model", path.Base(a.Configuration.Model)+", reward key "+a.Reward))
+			out = append(out, field(w, "  ", "Model", path.Base(a.Configuration.Model)+", reward name "+a.Reward))
 		}
 		out = append(out, field(w, "  ", "Pass rule", ruleText(a)))
 		if a.Status != "supported" {
@@ -328,7 +330,7 @@ func accuracyFields(r Report, w int) []string {
 			}
 			out = append(out, field(w, "  ", name, value))
 		}
-		rate("Pass rate", a.PassRate, "passed by the pass rule, among usable rewards")
+		rate("Pass rate", a.PassRate, "passed among scored episodes")
 		if x := a.PassRate.Interval; len(x) == 2 {
 			out = append(out, field(w, "  ", "95% interval", fmt.Sprintf("%.0f%% to %.0f%%, Wilson interval for the pass rate", 100*x[0], 100*x[1])))
 		}

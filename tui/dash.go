@@ -156,7 +156,8 @@ func (m model) browse(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case k == "m" || k == "c" || k == "?":
 		m.overlay = k
 		m.body.GotoTop()
-	case m.screen == results && (k == "o" || k == "i"), m.screen == 1 && k == "s", m.screen == 2 && (k == "s" || k == "x"):
+	case m.screen == results && (k == "o" || k == "i" || k == "e"), m.screen == 1 && k == "s", m.screen == 2 && (k == "s" || k == "x" || k == "e"),
+		m.screen == 3 && k == "e":
 		toggle(k)
 	default:
 		return m.scroll(msg)

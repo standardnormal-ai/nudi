@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"fmt"
 	"maps"
-	"path"
 	"regexp"
 	"slices"
 	"strconv"
@@ -60,6 +59,18 @@ func (p *page) toggle(key, name, note string) bool {
 	}
 	return p.open[key]
 }
+
+// fold is the control on a header that opens the legend explaining it, with the key that toggles it.
+func (p *page) fold(key, name string) string {
+	arrow, verb := "▸", "expand"
+	if p.open[key] {
+		arrow, verb = "▾", "collapse"
+	}
+	return dim(arrow+" "+name) + "   " + bold(key) + " " + dim(verb)
+}
+
+// symbols is the legend of the answer cells.
+var symbols = " " + dim("✓ yes   ✗ no   - not tested   ? unresolved")
 
 func (p *page) String() string { return strings.Join(p.lines, "\n") }
 
@@ -361,15 +372,15 @@ func tested(a Attempt) []string {
 	return nil
 }
 
-// problemsTable lists the problems, each with who demonstrated it; Enter expands a problem into its evidence records,
+// problemsTable lists the problems, each with its evidence and, behind e, the legend of its cells; Enter expands a problem into its evidence records,
 // and Enter on a record opens it.
 func problemsTable(r Report, found []Finding, p *page) {
 	ps := problems(r)
-	p.add(spread(titled("PROBLEMS", len(ps)), dim("Who demonstrated it"), p.w))
 	if len(ps) == 0 {
-		p.add(" None demonstrated in this run.")
+		p.add(titled("PROBLEMS", 0), " None demonstrated in this run.")
 		return
 	}
+	p.add(spread(titled("PROBLEMS", len(ps)), p.fold("e", "Evidence"), p.w))
 	attacked := len(r.Attack.Attempts) > 0 || slices.ContainsFunc(ps, func(p Problem) bool { return p.Conditions != nil })
 	inspected := slices.ContainsFunc(ps, func(p Problem) bool { return p.EvidencedByInspector != nil })
 	// The columns of how much an Attacker was told. No info goes when the run allowed no try without information.
@@ -388,6 +399,23 @@ func problemsTable(r Report, found []Finding, p *page) {
 		heads, widths = append(heads, "Inspector"), append(widths, 11)
 	}
 	heads = append(heads, "Ref")
+	if p.open["e"] {
+		var legend, told []string
+		for _, level := range levels {
+			told = append(told, helpWords[level])
+		}
+		if len(told) > 0 {
+			legend = append(legend, strings.Join(told, ", ")+": an Attacker, by how much it was told.")
+		}
+		if inspected {
+			legend = append(legend, "Inspector: an inspector evidenced it.")
+		}
+		p.add(symbols)
+		if len(legend) > 0 {
+			p.add(wrap(strings.Join(legend, " "), p.w, " ", dim))
+		}
+		p.add("")
+	}
 	var cells []string
 	for _, h := range heads {
 		cells = append(cells, dim(h))
@@ -422,22 +450,8 @@ func problemsTable(r Report, found []Finding, p *page) {
 			untestedRows(r, pr, levels, inspected, p)
 		}
 	}
-	if p.lines[len(p.lines)-1] != "" { // an expanded last problem already ends in a blank line
-		p.add("")
-	}
-	p.add(" " + dim("✓ yes   ✗ no   - not tested   ? unresolved"))
-	var legend, told []string
-	for _, level := range levels {
-		told = append(told, helpWords[level])
-	}
-	if len(told) > 0 {
-		legend = append(legend, strings.Join(told, ", ")+": an Attacker, by how much it was told.")
-	}
-	if inspected {
-		legend = append(legend, "Inspector: an inspector evidenced it.")
-	}
-	if len(legend) > 0 {
-		p.add(wrap(strings.Join(legend, " "), p.w, " ", dim))
+	if p.lines[len(p.lines)-1] == "" { // an expanded last problem already ends in a blank line
+		p.lines = p.lines[:len(p.lines)-1]
 	}
 }
 
@@ -664,7 +678,7 @@ func rewardsSummary(r Report, w int) string {
 		for _, name := range slices.Sorted(maps.Keys(g.Rewards)) {
 			x := g.Rewards[name]
 			if len(o.Groups) > 1 || len(g.Rewards) > 1 {
-				out = append(out, " "+dim(path.Base(g.Configuration.Model)+" "+name))
+				out = append(out, " "+dim(group(g.Configuration.Model, name)))
 			}
 			out = append(out, rewardBars(x, 2, min(w, 47))...)
 			out = append(out, "", cols(47, " ", widths, dim("Episodes"), dim("Mean"), dim("Median"), dim("SD")),
@@ -698,7 +712,7 @@ func accuracySummary(r Report, w int) string {
 	w = min(w, 52)
 	for _, a := range r.Metrics.Confusion {
 		if len(r.Metrics.Confusion) > 1 {
-			out = append(out, " "+dim(path.Base(a.Configuration.Model)+" "+a.Reward))
+			out = append(out, " "+dim(group(a.Configuration.Model, a.Reward)))
 		}
 		if a.Status != "supported" {
 			out = append(out, wrap("Not available: "+strings.Join(a.Reasons, " "), w, " ", amber))

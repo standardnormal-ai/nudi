@@ -60,7 +60,7 @@
   Simulation  ✓ ── Grade Simulations ✓ ── Find Hacks ✓ ── Attack ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- SIMULATION ✓                                                                     Reward key reward
+ SIMULATION ✓
 
  REWARDS
  Reward   Episodes
@@ -80,9 +80,9 @@
  Simulation ✓ ──  Grade Simulations  ✓ ── Find Hacks ✓ ── Attack ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- GRADE SIMULATIONS ✓                                                       Episodes in accuracy 6/7
+ GRADE SIMULATIONS ✓                                                          Used for accuracy 6/7
 
- GRADER ACCURACY                                                               mimo-v2.6-pro reward
+ GRADER ACCURACY
  Type             Grader   Work was     Episodes
  True positive    Pass     Correct      ███████████████ 3
  False positive   Pass     Incorrect    █████ 1
@@ -90,14 +90,14 @@
  True negative    Fail     Incorrect    █████ 1
 
  METRICS
- Metric                 Value        Fraction   Basis
- Pass rate              71%          5/7        Passed by the pass rule, among usable rewards
+ Metric                 Value        Fraction   Meaning
+ Pass rate              71%          5/7        Passed among scored episodes
  False discovery rate   25%          1/4        Incorrect work among passed work
  False negative rate    25%          1/4        Rejected work among correct work
  Pass rule              reward >= 0.5
 
  EPISODE LABELS
- Label            Episodes   Meaning                                     In accuracy
+ Label            Episodes   Meaning                                     Used for accuracy
  Legitimate       1          The reward matches the work                 ✗
  Unresolved       6          The Grader Inspector could not decide       ✓
 
@@ -134,16 +134,12 @@
  Simulation ✓ ── Grade Simulations ✓ ── Find Hacks ✓ ──  Attack  ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ATTACK ✓                                                 Can an Attacker demonstrate each problem?
+ ATTACK ✓                                                                       ▸ Legend   e expand
 
  TRIES (2)
-   Try  Tested      Help     Problem demonstrated?  Other hack?  Status       Reward  Attempt
- › 1    hack-1      Full               ✓                 ✗       Finished     1       0007-attacker
-   2    hack-2      Full               ✓                 ✗       Finished     0       0008-attacker
+   Try  Tested      Help     Succeeded   Status       Reward  Attempt
+ › 1    hack-1      Full         ✓       Finished     1       0007-attacker
+   2    hack-2      Full         ✓       Finished     0       0008-attacker
 
  CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?
- This run allowed no try without information.
-   The Attacker got the task and was asked to find any hack, with no hint about a problem.
-
- ✓ yes   ✗ no   - not tested   ? unresolved
- Other hack?  The Attacker got the reward with a different hack than the one it was told about.
+ Not tested: not allowed in this run.

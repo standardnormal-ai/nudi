@@ -73,7 +73,7 @@ func drawTab(r Report, s, w int, open ...string) string {
 	m := newModel(r, 0, false)
 	m.w, m.screen = w, s
 	if open == nil {
-		open = []string{"o", "i", "s", "x", "?"}
+		open = []string{"o", "i", "s", "x", "e", "?"}
 		m.page()
 		for _, it := range m.items {
 			open = append(open, it.key)
@@ -149,7 +149,7 @@ func TestAgreementTable(t *testing.T) {
 // or unavailable rate reads unavailable with its reason, and an older one without its interval shows none.
 func TestNativePassRate(t *testing.T) {
 	r := fixture(t, "full")
-	if s := oneLine(plainReport(r, 120)); !strings.Contains(s, "Pass rate 83%, 10/12, passed by the pass rule") || !strings.Contains(s, "95% interval 55% to 95%, Wilson interval") {
+	if s := oneLine(plainReport(r, 120)); !strings.Contains(s, "Pass rate 83%, 10/12, passed among scored episodes") || !strings.Contains(s, "95% interval 55% to 95%, Wilson interval") {
 		t.Errorf("plain report:\n%s", s)
 	}
 	if s := oneLine(plainTab(r, 1)); !strings.Contains(s, "Pass rate 83% 10/12") || !strings.Contains(s, "95% interval 55% to 95% Wilson interval") {
@@ -354,22 +354,23 @@ func TestKeys(t *testing.T) {
 // oneLine joins wrapped text back into one line, so a test can look for a whole sentence.
 func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
 
-// The rewards show Python's summaries and its flags with their reasons as written, on the card and the Simulation screen.
+// The rewards show Python's summaries and its flags, on the card and the Simulation screen; Python's reason as written
+// is in the plain output.
 func TestRewardSummariesAndFlags(t *testing.T) {
 	r := fixture(t, "full")
-	if s := oneLine(plainReport(r, 120)); !strings.Contains(s, "0.8333") || !strings.Contains(s, "2 episodes received 0; the other 10 received 1.") {
+	if s := oneLine(plainReport(r, 120)); !strings.Contains(s, "0.8333") || !strings.Contains(s, "2 episodes received 0; the other 10 received 1.") ||
+		!strings.Contains(s, "2 of 12 usable 'reward' rewards are below the rest by the quartile rule") {
 		t.Errorf("plain report:\n%s", s)
 	}
 	s := plainTab(r, 0, "?")
 	for _, want := range []string{
 		"12/12                12          0.8333       1            0.3892       -2.055",
 		"2 episodes received 0; the other 10 received 1.",
-		"Pattern    Unusually low rewards",
+		"Reason for warning: A few rewards far below the rest",
 		"A reward is unusually low when it is below Q1 - 3 x IQR.",
 		"Q1 is 1 and Q3 is 1, so the fence is 1.",
 		"0004-simulator   Correct work rejected",
 		"No error, timeout or refusal in these episodes.",
-		"2 of 12 usable 'reward' rewards are below the rest by the quartile rule",
 		"nudi checks this only with 10 or more usable rewards.",
 	} {
 		if !strings.Contains(s, want) {
@@ -683,7 +684,7 @@ func TestBlankLimitationsAreSkipped(t *testing.T) {
 func TestUnattributedTryIsUnresolved(t *testing.T) {
 	r := fixture(t, "full")
 	s := plainTab(r, 3)
-	if got := cells(s, "2    Hint"); got != "? ? Finished 1 0014-attacker" {
+	if got := cells(s, "2    Hint"); got != "? Finished 1 0014-attacker" {
 		t.Errorf("0014-attacker row: %q\n%s", got, s)
 	}
 }
@@ -934,10 +935,10 @@ func TestExpandedProblemSaysWhyNotTested(t *testing.T) {
 	}
 }
 
-// Older reports: legacy tries ask whether the problem was demonstrated, and a problem of no recorded type gets its
+// Older reports: legacy tries name what each tested and whether it succeeded, and a problem of no recorded type gets its
 // own group.
 func TestOlderReportsGroupWhatTheyKnow(t *testing.T) {
-	if s := plainTab(fixture(t, "full-0.0.0"), 3); !strings.Contains(s, "Problem demonstrated?") {
+	if s := plainTab(fixture(t, "full-0.0.0"), 3); !strings.Contains(s, "Tested") || !strings.Contains(s, "Succeeded") {
 		t.Errorf("legacy tries:\n%s", s)
 	}
 	if s := plainTab(fixture(t, "pipeline-full"), 3); !strings.Contains(s, "TYPE NOT RECORDED (1)") {
@@ -1144,8 +1145,8 @@ func TestAssessedTryOutweighsAFailure(t *testing.T) {
 	}
 }
 
-// The Attack table's Tries counts the assessed tries; a failed one stays in the expanded list.
-func TestTriesCountsAssessedTries(t *testing.T) {
+// The Attack table has no Tries count; a failed try stays in the expanded list, which carries the row's answers.
+func TestFailedTryStaysInTheList(t *testing.T) {
 	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "other_episodes": {"attacker": ["0001-attacker"]}, "attack": {
 		"problems": [{"id": "P1", "source": "hack inspector", "cause": "c1", "level": 2, "findings": ["hack-0"],
 			"conditions": [{"condition": "full", "attempts": 0, "exploited": 0, "status": "native_timeout"}]}],
@@ -1154,7 +1155,7 @@ func TestTriesCountsAssessedTries(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := plainTab(r, 3)
-	if got := cells(s, "▾ c1"); !strings.HasSuffix(got, " 0") || !strings.Contains(s, "0001-attacker") {
+	if got := cells(s, "▾ c1"); got != "" || strings.Contains(s, "Tries") || !strings.Contains(s, "0001-attacker") {
 		t.Errorf("row %q:\n%s", got, s)
 	}
 }
@@ -1178,5 +1179,112 @@ func TestFailedExperimentIsNamedNotItsSearch(t *testing.T) {
 		if !slices.Equal(rows, [][3]string{{"Find Hacks", word(checkNames, "grader_tampering") + " (experiment-0000)", want}}) {
 			t.Errorf("open %s: %q", open, rows)
 		}
+	}
+}
+
+// Legends are folded by default: e on the header they explain opens them.
+func TestLegendsFoldedUntilE(t *testing.T) {
+	r := fixture(t, "full")
+	for s, legend := range map[int]string{
+		results: "Hint, Full: an Attacker, by how much it was told.",
+		2:       "The Hack Inspector made it happen in a copy of the task.",
+		3:       "* The Attacker got the reward with a different hack than the one it was told about.",
+	} {
+		shut, open := plainTab(r, s, "problem 0"), plainTab(r, s, "e")
+		if strings.Contains(shut, legend) || strings.Contains(shut, "✓ yes") || !strings.Contains(shut, "e expand") {
+			t.Errorf("tab %d shows its legend by default:\n%s", s, shut)
+		}
+		if !strings.Contains(open, legend) || !strings.Contains(open, "e collapse") {
+			t.Errorf("tab %d: e does not open its legend:\n%s", s, open)
+		}
+		m := newModel(r, 0, false)
+		m.screen = s
+		if m = press(m, "e"); !strings.Contains(ansi.Strip(m.View().Content), legend) {
+			t.Errorf("tab %d: pressing e does not open the legend", s)
+		}
+	}
+	if s := plainTab(r, results, "problem 0"); !strings.Contains(row(s, "PROBLEMS (4)"), "▸ Evidence") || strings.Contains(s, "Who demonstrated it") {
+		t.Errorf("Results header:\n%s", s)
+	}
+}
+
+// Disclaimers and subtitles are gone, raw labels read plainly, and the no-information question has only its answer.
+func TestScreensSayOnlyData(t *testing.T) {
+	r := fixture(t, "full")
+	screens := map[string]string{
+		"episodes": plainTab(r, 0, "episodes"), "method": plainTab(r, 0, "?"), "grade": plainTab(r, 1, "s"),
+		"hacks": plainTab(r, 2, "s", "x"), "attack": plainTab(r, 3), "plain": plainReport(r, 120),
+	}
+	for name, s := range screens {
+		for _, bad := range []string{"not recorded for this episode", "A pattern to read", "Can an Attacker demonstrate", "Reward key",
+			"Episodes in accuracy", "In accuracy", "Basis", "pass rule, among", "assessed", "allowed no try", "asked to find any hack",
+			"It describes the search", "This problem?", "Other hack?", "Tries", "Pattern name", "reward key"} {
+			if strings.Contains(s, bad) {
+				t.Errorf("%s shows %q:\n%s", name, bad, s)
+			}
+		}
+	}
+	for name, want := range map[string]string{"grade": "Used for accuracy 6/12", "hacks": "Done", "attack": "Not tested: not allowed in this run.", "plain": "Reward name"} {
+		if !strings.Contains(oneLine(screens[name]), want) {
+			t.Errorf("%s lacks %q:\n%s", name, want, screens[name])
+		}
+	}
+	if s := oneLine(screens["grade"]); !strings.Contains(s, "Fraction Meaning") || !strings.Contains(s, "Passed among scored episodes") {
+		t.Errorf("grade metrics:\n%s", screens["grade"])
+	}
+}
+
+// A flagged reward pattern puts its warning on the Simulation tab and its reason first in the method; no flag, no warning.
+func TestRewardPatternWarning(t *testing.T) {
+	r := fixture(t, "full")
+	main, method := plainTab(r, 0, "problem 0"), plainTab(r, 0, "?")
+	if !strings.Contains(main, "Warning: Possibly a bad system prompt or grader<->prompt mismatch") {
+		t.Errorf("main view:\n%s", main)
+	}
+	if !strings.Contains(oneLine(method), "│ Reason for warning: A few rewards far below the rest") || strings.Contains(method, "Pattern    ") || strings.Contains(method, "Details") {
+		t.Errorf("method:\n%s", method)
+	}
+	if s := oneLine(plainReport(r, 120)); !strings.Contains(s, "Warning Possibly a bad system prompt") || !strings.Contains(s, "Reason A few rewards far below the rest") {
+		t.Errorf("plain:\n%s", s)
+	}
+	for flag, want := range map[string]string{
+		"high_minority":     "Warning: Possibly a hack or a grader that passes wrong work",
+		"identical_rewards": "Warning: Possibly a task that is too easy or too hard, or a grader that ignores the work",
+	} {
+		r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"simulation": "complete"}, "ordinary": {"requested": 1, "attempted": 1,
+			"groups": [{"configuration": {"model": "m"}, "rewards": {"reward": {"attempted": 1, "usable": 1, "mean": 1.0,
+			"distribution": [[1.0, 1]], "flags": [{"flag": "`+flag+`", "text": "t", "episodes": []}]}}}]}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s := plainTab(r, 0); !strings.Contains(s, want) {
+			t.Errorf("%s:\n%s", flag, s)
+		}
+	}
+	if s := plainTab(fixture(t, "clean"), 0); strings.Contains(s, "Warning") {
+		t.Errorf("no flag, yet a warning:\n%s", s)
+	}
+}
+
+// An expanded Attack row leaves its cells to its tries, whose one Succeeded column marks a different hack with *.
+func TestAttackTriesSucceeded(t *testing.T) {
+	r := fixture(t, "full")
+	s := plainTab(r, 3, "tries P3 The grader trusts a timing file the agent can write.")
+	if got := cells(s, "▾ The grader trusts"); got != "a timing file the agent" {
+		t.Errorf("expanded row keeps its cells: %q", got)
+	}
+	if got := cells(s, "▸ The test runs"); got != "bash through PATH, so a - ? ✓" {
+		t.Errorf("collapsed row: %q", got)
+	}
+	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "other_episodes": {"attacker": ["0001-attacker", "0002-attacker"]}, "attack": {
+		"problems": [{"id": "P1", "source": "hack inspector", "cause": "c1", "level": 3, "findings": ["hack-0"]}],
+		"attempts": [{"number": 1, "level": "full", "problem": "P1", "candidate": "hack-0", "episode": "0001-attacker", "status": "evidenced_issue"},
+			{"number": 2, "level": "full", "problem": "P1", "candidate": "hack-0", "episode": "0002-attacker", "status": "other_exploit"}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s = plainTab(r, 3)
+	if !strings.Contains(row(s, "Try"), "Succeeded") || cells(s, "1    Full") != "✓ Finished - 0001-attacker" || cells(s, "2    Full") != "✓* Finished - 0002-attacker" {
+		t.Errorf("tries:\n%s", s)
 	}
 }

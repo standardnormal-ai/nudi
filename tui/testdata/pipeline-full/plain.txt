@@ -162,7 +162,7 @@ NOT COUNTED AS PROBLEMS
 
 SIMULATION
   Model             deepseek-v4.1-flash-1017
-  Reward key        reward
+  Reward name       reward
   Episodes          6 usable, 6 attempted, 6 requested
   Rewards           0: 1 episode
                     1: 5 episodes
@@ -173,14 +173,13 @@ SIMULATION
   Reward pattern
                     Distribution flags are not evaluated for 'reward': 6 usable rewards, fewer than
                     10.
-  Pattern name      No pattern to explain.
 
 GRADER ACCURACY
-  In accuracy       0 of 0 episodes
-  Model             deepseek-v4.1-flash-1017, reward key reward
+  Accuracy uses     0 of 0 episodes
+  Model             deepseek-v4.1-flash-1017, reward name reward
   Pass rule         reward >= 0.5
   Not available     fewer than two verified labels
-  Pass rate         83%, 5/6, passed by the pass rule, among usable rewards
+  Pass rate         83%, 5/6, passed among scored episodes
   95% interval      44% to 97%, Wilson interval for the pass rate
 
 ATTACK ATTEMPTS
