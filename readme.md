@@ -2,7 +2,7 @@
   <img src="docs/assets/nudi-startup.png" alt="nudi startup animation" width="683">
 </p>
 <p align="center">
-  <a href="pyproject.toml"><img src="https://img.shields.io/badge/version-0.3.0-555?style=flat" alt="Version"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/version-0.4.0-555?style=flat" alt="Version"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.12-3776AB?style=flat" alt="Python"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-555?style=flat" alt="License: MIT"></a>
   <a href="docs/usage.md#run-an-analysis"><img src="https://img.shields.io/badge/Integration-Harbor-171717?style=flat" alt="Integration: Harbor"></a>
