@@ -14,14 +14,14 @@
  ▸ Abandoned Problems                                                                      o expand
  ▸ What the References Mean                                                                i expand
 
- Simulation Rewards                              Grader Accuracy
- Reward   Episodes                               Not available: Grade Simulations not selected
+ Simulation Rewards                               Grader Accuracy
+ Reward   Episodes                                Not available: Grade Simulations not selected
  0        ██ 1
  0.5      ██ 1
  1        ████ 2
 
- Episodes   Mean         Median       SD
- 4/4        0.625        0.75         0.4787
+ Episodes  Mean         Median       SD
+ 4/4       0.625        0.75         0.4787
 
  Work Left (1)
  Where              What                                  Why

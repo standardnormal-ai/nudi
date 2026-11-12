@@ -218,7 +218,6 @@ ABANDONED PROBLEMS
 
   Leading zeros make a correct answer fail.
       State             Suspected only
-      Found by
       Reference         G1
 
 SIMULATION

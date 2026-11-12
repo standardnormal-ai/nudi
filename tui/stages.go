@@ -87,6 +87,9 @@ func simulationPage(r Report, found []Finding, p *page) {
 				p.add(" "+dim(group(g.Configuration.Model, name)), "")
 			}
 			widths := []int{21, 12, 13, 13, 13}
+			if p.w < 90 {
+				widths[0] = 17 // its title wraps, so Skewness keeps room for "unavailable"
+			}
 			p.add(heading("Rewards", ""))
 			p.add(rewardBars(x, 5, p.w)...)
 			p.add("", heading("Statistics", ""),
@@ -342,7 +345,7 @@ func episodesTable(r Report, found []Finding, p *page) {
 		if what == "" {
 			what = dim("-")
 		}
-		p.add(cols(p.w, "   ", widths, e, num(reward(e)), label, what, dim(problem)))
+		p.add(cols(p.w, "   ", widths, e, cell(reward(e)), label, what, dim(problem)))
 	}
 }
 
@@ -719,7 +722,8 @@ func attackPage(r Report, found []Finding, p *page) {
 	p.add(heading("Can an Attacker Succeed Without Any Information?", ""))
 	var alone []Attempt
 	for _, at := range a.Attempts {
-		if len(tested(at)) == 0 && at.Problem == "" {
+		// From schema 2 on, its problem is the one its exploit created.
+		if len(tested(at)) == 0 && (at.Problem == "" || at.Problem == deref(at.Created)) {
 			alone = append(alone, at)
 		}
 	}

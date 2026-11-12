@@ -44,8 +44,11 @@ func plainReport(r Report, w int) string {
 	if others, _ := otherFindings(r); len(others) > 0 {
 		lines := []string{field(w, "  ", "Count", stateCounts(others))}
 		for _, o := range others {
-			lines = append(lines, "", "  "+o[0], field(w, "      ", "State", strings.TrimLeft(plainText(o[1]), "✗? ")),
-				field(w, "      ", "Found by", o[2]), field(w, "      ", "Reference", o[3]))
+			lines = append(lines, "", cols(w, "  ", nil, o[0]), field(w, "      ", "State", strings.TrimLeft(plainText(o[1]), "✗? ")))
+			if o[2] != "" {
+				lines = append(lines, field(w, "      ", "Found by", o[2]))
+			}
+			lines = append(lines, field(w, "      ", "Reference", o[3]))
 		}
 		section("ABANDONED PROBLEMS", lines...)
 	}
@@ -180,8 +183,8 @@ func problemFields(r Report, found []Finding, w int) []string {
 			evidence = []string{"No evidence record on the list"}
 		}
 		kv("Evidence", strings.Join(evidence, "\n"))
-		if len(p.Members) > 0 {
-			kv("Related", strings.Join(p.Members, ", ")+": novelty_judge matched them to "+cmp.Or(p.ID, "this problem"))
+		if related := slices.DeleteFunc(slices.Clone(p.Members), func(id string) bool { return slices.Contains(p.readings(), id) }); len(related) > 0 {
+			kv("Related", strings.Join(related, ", ")+": novelty_judge matched them to "+cmp.Or(p.ID, "this problem"))
 		}
 		var tries []string
 		for _, level := range []string{"none", "minimal", "full"} {
@@ -358,16 +361,17 @@ func attemptRows(r Report, w int) []string {
 		if at.Episode != nil {
 			episode = *at.Episode
 		}
-		for _, p := range r.Attack.Problems {
-			if at.Problem == "" && p.ID != "" && slices.ContainsFunc(tested(at), func(id string) bool { return slices.Contains(p.readings(), id) }) {
-				problem = p.ID
+		var aimed *Problem // the problem its result is about
+		for i, p := range r.Attack.Problems {
+			if p.ID != "" && (p.ID == at.Problem || at.Problem == "" && slices.ContainsFunc(tested(at), func(id string) bool { return slices.Contains(p.readings(), id) })) {
+				problem, aimed = p.ID, &r.Attack.Problems[i]
 			}
 		}
 		var rewards []string
 		for _, k := range slices.Sorted(maps.Keys(at.Rewards)) {
 			rewards = append(rewards, strings.TrimPrefix(k+" ", "reward ")+num(at.Rewards[k]))
 		}
-		out = append(out, cols(w, "  ", widths, episode, problem, cmp.Or(levelWords[at.Level], "-"), tryResult(r, at, nil), cmp.Or(strings.Join(rewards, ", "), "-")))
+		out = append(out, cols(w, "  ", widths, episode, problem, cmp.Or(levelWords[at.Level], "-"), tryResult(r, at, aimed), cmp.Or(strings.Join(rewards, ", "), "-")))
 	}
 	if len(r.Attack.Attempts) == 0 {
 		return []string{"  No try recorded."}

@@ -61,6 +61,14 @@ func num(x *float64) string {
 	return strconv.FormatFloat(*x, 'g', 4, 64)
 }
 
+// cell is a number in a column too narrow for "unavailable": - when the report has none.
+func cell(x *float64) string {
+	if x == nil {
+		return "-"
+	}
+	return num(x)
+}
+
 // breakLines breaks s at spaces into lines at most w columns wide; a longer word keeps a line of its own.
 func breakLines(s string, w int) []string {
 	var out []string

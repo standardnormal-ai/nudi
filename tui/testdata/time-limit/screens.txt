@@ -16,8 +16,8 @@
 
  ▸ What the References Mean                                                                i expand
 
- Simulation Rewards                              Grader Accuracy
- Not available: no result recorded               Not available: Grade Simulations not selected
+ Simulation Rewards                               Grader Accuracy
+ Not available: no result recorded                Not available: Grade Simulations not selected
 
  Work Left (3)
  Where              What                                  Why

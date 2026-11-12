@@ -23,15 +23,15 @@
  ▸ Abandoned Problems                                                                      o expand
  ▸ What the References Mean                                                                i expand
 
- Simulation Rewards                              Grader Accuracy
- Reward   Episodes                               Type             Episodes
- 0        ████ 2                                 True positive    █████████ 3
- 1        ██████████ 5                           False positive   ███ 1
-                                                 False negative   ███ 1
- Episodes   Mean         Median       SD         True negative    ███ 1
- 7/7        0.7143       unavailable  0.488
-                                                 Incorrect among passed    25%   1/4
-                                                 Rejected among correct    25%   1/4
+ Simulation Rewards                               Grader Accuracy
+ Reward   Episodes                                Type             Episodes
+ 0        ████ 2                                  True positive    █████████ 3
+ 1        ██████████ 5                            False positive   ███ 1
+                                                  False negative   ███ 1
+ Episodes  Mean         Median       SD           True negative    ███ 1
+ 7/7       0.7143       unavailable  0.488
+                                                  Incorrect among passed    25%   1/4
+                                                  Rejected among correct    25%   1/4
 
  Work Left (7)
  Where              What                                  Why

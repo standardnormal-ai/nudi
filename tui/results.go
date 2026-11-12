@@ -104,7 +104,7 @@ func resultsPage(r Report, found []Finding, p *page) {
 	p.add("")
 	left, right := rewardsSummary(r, p.w), accuracySummary(r, p.w)
 	if p.w >= 100 {
-		p.add(lipgloss.JoinHorizontal(lipgloss.Top, lipgloss.NewStyle().Width(48).Render(left), right))
+		p.add(lipgloss.JoinHorizontal(lipgloss.Top, lipgloss.NewStyle().Width(49).Render(left), right))
 	} else {
 		p.add(left, "", right)
 	}
@@ -657,16 +657,16 @@ func rewardsSummary(r Report, w int) string {
 		return strings.Join(append(out, " "+yellowStyle.Render("Not available: "+r.missing(0))), "\n")
 	}
 	o := r.Ordinary
-	widths := []int{11, 13, 13}
+	widths := []int{10, 13, 13} // with 48 columns, each statistic keeps room for "unavailable"
 	for _, g := range o.Groups {
 		for _, name := range slices.Sorted(maps.Keys(g.Rewards)) {
 			x := g.Rewards[name]
 			if len(o.Groups) > 1 || len(g.Rewards) > 1 {
 				out = append(out, " "+dim(group(g.Configuration.Model, name)))
 			}
-			out = append(out, rewardBars(x, 2, min(w, 47))...)
-			out = append(out, "", cols(47, " ", widths, dim("Episodes"), dim("Mean"), dim("Median"), dim("SD")),
-				cols(47, " ", widths, fmt.Sprintf("%d/%d", x.Usable, o.Requested), num(x.Mean), num(x.Median), num(x.SD)))
+			out = append(out, rewardBars(x, 2, min(w, 48))...)
+			out = append(out, "", cols(48, " ", widths, dim("Episodes"), dim("Mean"), dim("Median"), dim("SD")),
+				cols(48, " ", widths, fmt.Sprintf("%d/%d", x.Usable, o.Requested), num(x.Mean), num(x.Median), num(x.SD)))
 		}
 	}
 	return strings.Join(out, "\n")
@@ -873,7 +873,7 @@ func workLeft(r Report, found []Finding) [][3]string {
 		for _, g := range o.Groups {
 			for _, name := range slices.Sorted(maps.Keys(g.Rewards)) {
 				if x := g.Rewards[name]; x.Attempted > x.Usable {
-					out = append(out, [3]string{"Simulation", fmt.Sprintf("%d episodes without a usable %s", x.Attempted-x.Usable, name), "Not counted in the rewards"})
+					out = append(out, [3]string{"Simulation", fmt.Sprintf("%d episode%s without a usable %s", x.Attempted-x.Usable, plural(x.Attempted-x.Usable), name), "Not counted in the rewards"})
 				}
 			}
 		}

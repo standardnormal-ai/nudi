@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -476,19 +477,25 @@ func load(dir string) (Report, error) {
 // shortRef is a problem id as P1 or A2, not an episode name.
 var shortRef = regexp.MustCompile(`^[A-Z]\d+$`)
 
-// shortRefs names each Attacker problem A1, A2, ... in report order where the report names it after its episode, and
-// renames every reference to it. Tries keep the episode, which links to the attempt.
+// shortRefs names each Attacker problem the report names after its episode A1, A2, ... in report order, after the A
+// ids the report already wrote, and renames every reference to it. Tries keep the episode, which links to the attempt.
 func shortRefs(r *Report) {
 	if r.Attack == nil {
 		return
 	}
-	names, n := map[string]string{}, 0
+	n := 0
+	for _, p := range append(slices.Clone(r.Attack.Problems), r.Attack.Leads...) {
+		if shortRef.MatchString(p.ID) && p.ID[0] == 'A' {
+			k, _ := strconv.Atoi(p.ID[1:])
+			n = max(n, k)
+		}
+	}
+	names := map[string]string{}
 	for i, p := range r.Attack.Problems {
-		if p.Source == "Attacker" {
-			if n++; !shortRef.MatchString(p.ID) {
-				names[p.ID] = fmt.Sprintf("A%d", n)
-				r.Attack.Problems[i].ID = names[p.ID]
-			}
+		if p.Source == "Attacker" && !shortRef.MatchString(p.ID) {
+			n++
+			names[p.ID] = fmt.Sprintf("A%d", n)
+			r.Attack.Problems[i].ID = names[p.ID]
 		}
 	}
 	rename := func(id *string) {

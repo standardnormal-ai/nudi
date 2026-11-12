@@ -1216,9 +1216,9 @@ func TestRewardPatternWarning(t *testing.T) {
 // its own help and - under Inspector, a problem without a type has ? and its reason, and a note shows only opened.
 func TestSchemaTwoTries(t *testing.T) {
 	r, err := load(writeReport(t, `{"schema_version": 2, "answer": ["x"], "analyses": {"attack": "complete"},
-		"other_episodes": {"attacker": ["0001-attacker", "0002-attacker", "0003-attacker", "0004-attacker"]}, "attack": {
+		"other_episodes": {"attacker": ["0001-attacker", "0002-attacker", "0003-attacker", "0004-attacker", "0005-attacker"]}, "attack": {
 		"problems": [
-			{"id": "P1", "finding": "hack-0", "source": "hack inspector", "cause": "c1", "type": "hack", "level": 3},
+			{"id": "P1", "finding": "hack-0", "members": ["hack-0"], "source": "hack inspector", "cause": "c1", "type": "hack", "level": 3},
 			{"id": "P2", "finding": "hack-1", "source": "hack inspector", "cause": "c2", "type": null, "level": 2,
 			 "reason": "completeness is unknown: no approved requirement list was given", "note": {"target": "P1", "kind": "same_as"}},
 			{"id": "A1", "finding": "0002-attacker", "source": "Attacker", "cause": "a1", "type": "hack", "level": 4}],
@@ -1230,12 +1230,14 @@ func TestSchemaTwoTries(t *testing.T) {
 			{"number": 1, "level": "full", "candidate": "hack-1", "sources": ["hack-1"], "episode": "0003-attacker", "status": "no_evidenced_issue",
 			 "reproduced": false},
 			{"number": 2, "level": "full", "candidate": "hack-1", "sources": ["hack-1"], "episode": "0004-attacker", "status": "no_reward",
-			 "reproduced": null, "error": "the grader wrote no reward in 0004-attacker"}]}}`))
+			 "reproduced": null, "error": "the grader wrote no reward in 0004-attacker"},
+			{"number": 1, "level": "minimal", "candidate": "hack-1", "sources": ["hack-1"], "episode": "0005-attacker", "status": "no_evidenced_issue",
+			 "reproduced": null, "rerun": "no rerun of the target's check on this episode was recorded"}]}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	res := plainTab(r, results, "none")
-	for id, want := range map[string]string{"c1": "Hack - ? ✓ ✓ P1", "c2": "? - - ✗ ✓ P2", "a1": "Hack - ✓ - - A1"} {
+	for id, want := range map[string]string{"c1": "Hack - ? ✓ ✓ P1", "c2": "? - ? ✗ ✓ P2", "a1": "Hack - ✓ - - A1"} {
 		if got := cells(res, "▸ "+id); got != want {
 			t.Errorf("%s row %q, want %q:\n%s", id, got, want, res)
 		}
@@ -1255,8 +1257,19 @@ func TestSchemaTwoTries(t *testing.T) {
 			t.Errorf("%s: %q, %q:\n%s", key, first, second, s)
 		}
 	}
-	if plain := plainReport(r, 120); !strings.Contains(plain, "no reward: the grader wrote no reward in 0004-attacker") || !strings.Contains(plain, "only a hint: demonstrated, 0002-attacker") {
+	plain := plainReport(r, 120)
+	if !strings.Contains(plain, "no reward: the grader wrote no reward in 0004-attacker") || !strings.Contains(plain, "only a hint: demonstrated, 0002-attacker") {
 		t.Errorf("plain:\n%s", plain)
+	}
+	// The attempts table says what each try's rerun showed of the problem it aimed at, as that problem's cells do; a
+	// problem's own finding is not a related one.
+	for _, want := range []string{"0003-attacker   P2        full instructions     not demonstrated", "0005-attacker   P2        only a hint           unresolved"} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("plain lacks %q:\n%s", want, plain)
+		}
+	}
+	if strings.Contains(plain, "Related") {
+		t.Errorf("a problem's own finding is related:\n%s", plain)
 	}
 }
 
@@ -1287,6 +1300,16 @@ func TestAttackerProblemsShowShortRefs(t *testing.T) {
 	}
 	if s := plainTab(short, results, "none"); !strings.HasSuffix(cells(s, "▸ a7"), " A7") {
 		t.Errorf("a short id is renamed:\n%s", s)
+	}
+	// Beside A ids the report wrote, an episode-named problem takes the next free number.
+	mixed, err := load(writeReport(t, `{"schema_version": 2, "answer": ["x"], "attack": {"leads": [{"id": "A2", "cause": "l"}], "problems": [
+		{"id": "A1", "finding": "0001-attacker", "source": "Attacker", "cause": "a1", "level": 4},
+		{"id": "0003-attacker", "finding": "0003-attacker", "source": "Attacker", "cause": "a3", "level": 4}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := []string{mixed.Attack.Problems[0].ID, mixed.Attack.Problems[1].ID}; ids[0] != "A1" || ids[1] != "A3" {
+		t.Errorf("ids %v", ids)
 	}
 }
 
@@ -1330,6 +1353,82 @@ func TestEmptyGroupsAreHidden(t *testing.T) {
 	}
 	if s := plainTab(none, 3); !strings.Contains(s, "Hacks (0)") || !strings.Contains(s, "None in this run.") {
 		t.Errorf("no problem at all:\n%s", s)
+	}
+}
+
+// A try told nothing and aimed at nothing is the no-information question's answer, also when its exploit became a problem.
+func TestDiscoveryTryThatCreatedAProblem(t *testing.T) {
+	r, err := load(writeReport(t, `{"schema_version": 2, "answer": ["x"], "analyses": {"attack": "complete"},
+		"other_episodes": {"attacker": ["0002-attacker"]}, "attack": {
+		"discovery": {"status": "evidenced_issue", "tested": true, "attempts": 1, "maximum_attempts": 1},
+		"problems": [{"id": "A1", "finding": "0002-attacker", "members": ["0002-attacker"], "source": "Attacker", "cause": "a1", "level": 5}],
+		"attempts": [{"number": 1, "level": "none", "candidate": null, "sources": [], "episode": "0002-attacker", "status": "evidenced_issue",
+			"problem": "A1", "created": "A1", "reproduced": null}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := plainTab(r, 3)
+	if _, after, _ := strings.Cut(s, "Without Any Information?"); strings.Contains(s, "Not tested") || !strings.HasPrefix(cells(after, "1  "), "✓ ✓") {
+		t.Errorf("no-information answer:\n%s", s)
+	}
+}
+
+// A missing statistic stays "unavailable" whole at 80 and 120 columns; an episode's missing reward, in a column too
+// narrow for the word, is -.
+func TestMissingNumbersNeverSplit(t *testing.T) {
+	r := fixture(t, "full")
+	g := &r.Ordinary.Groups[0]
+	x := g.Rewards["reward"]
+	x.SD, x.Skewness = nil, nil
+	g.Rewards["reward"] = x
+	g.EpisodeRewards[g.Episodes[0]]["reward"] = nil
+	for _, s := range []string{plainText(drawTab(r, results, 120)), plainText(drawTab(r, 0, 80, "p")), plainText(drawTab(r, 0, 120, "p"))} {
+		if strings.Contains(s, "unavail\n") || strings.Contains(s, "unavaila\n") || strings.Contains(s, "unavailab\n") {
+			t.Errorf("a split word:\n%s", s)
+		}
+	}
+	if s := plainText(drawTab(r, 0, 80, "p")); !strings.Contains(s, g.Episodes[0]+"    -") {
+		t.Errorf("episode without reward:\n%s", s)
+	}
+}
+
+// Counts read as English: one episode, not one episodes.
+func TestOneEpisodeWithoutReward(t *testing.T) {
+	r := fixture(t, "full")
+	g := &r.Ordinary.Groups[0]
+	x := g.Rewards["reward"]
+	x.Usable = x.Attempted - 1
+	g.Rewards["reward"] = x
+	if s := plainReport(r, 120); !strings.Contains(s, "1 episode without a usable reward") {
+		t.Errorf("plain:\n%s", s)
+	}
+}
+
+// Plain abandoned problems wrap their titles, and a lead with no source has no empty Found by row.
+func TestPlainAbandonedProblemsWrap(t *testing.T) {
+	r := fixture(t, "full")
+	r.Attack.Leads[0].Cause = strings.Repeat("a long cause ", 12)
+	s := plainReport(r, plainW)
+	for _, line := range strings.Split(s, "\n") {
+		if width(line) > plainW && !strings.Contains(line, "/") {
+			t.Errorf("%d columns: %q", width(line), line)
+		}
+	}
+	if strings.Contains(s, "Found by\n") {
+		t.Errorf("an empty Found by row:\n%s", s)
+	}
+}
+
+// At 80 columns a tab strip that needs two lines keeps Results beside a tab, never alone on a line.
+func TestTabStripWrapsWholeTabs(t *testing.T) {
+	r := fixture(t, "full")
+	r.Analyses["simulation"] = "partial"
+	m := newModel(r, 0, false)
+	m.w = 80
+	for _, line := range strings.Split(plainText(m.top()), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "│") {
+			t.Errorf("Results alone:\n%s", plainText(m.top()))
+		}
 	}
 }
 

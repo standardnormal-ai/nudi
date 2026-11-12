@@ -138,8 +138,12 @@ func tabStrip(stage func(int) (string, bool), screen, w int) string {
 		}
 	}
 	lines := []string{" " + parts[0]}
-	for _, p := range parts[1:] {
-		if last := lines[len(lines)-1]; width(last)+3+width(p) < w {
+	for i, p := range parts[1:] {
+		need := width(p)
+		if i == len(parts)-2 {
+			need += width(right) + 3 // the last tab keeps Results beside it
+		}
+		if last := lines[len(lines)-1]; width(last)+3+need < w {
 			lines[len(lines)-1] = last + dim(" ─ ") + p
 		} else {
 			lines = append(lines, " "+p)
