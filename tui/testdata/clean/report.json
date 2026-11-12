@@ -149,7 +149,8 @@
               "limits": [],
               "mechanism": "unchecked requirement",
               "reward": "reward",
-              "unresolved": []
+              "unresolved": [],
+              "use": null
             },
             "execution_scope": "native",
             "experiment": null,
@@ -167,7 +168,6 @@
         ],
         "legitimate": []
       },
-      "leads": [],
       "limits": [],
       "open": [],
       "status": "partial",

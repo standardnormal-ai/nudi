@@ -8,7 +8,7 @@
  ✓ Finished                                                                              4 problems
  The grader can be cheated, and it misjudges work.
 
- PROBLEMS (4)                                                                 ▸ Evidence   e expand
+ Problems (4)                                                                              e expand
      Problem                                     Type            Hint  Full  Inspector  Ref
  › ▸ The test runs bash through PATH, so a       Hack             ?     ✓        ✓      P1
      planted shim decides the result.
@@ -17,11 +17,10 @@
      can write.
    ▸ Leading zeros make a correct answer fail.   False negative   -     ✗        ✓      G1
 
- ▸ Not counted as problems                                                                 o expand
-   (6 unresolved, 2 not reproduced, 1 standalone evidence, 1 not attributed)
- ▸ What the references mean (P1, G1, hack-1 and others)                                    i expand
+ ▸ Abandoned Problems                                                                      o expand
+ ▸ What the References Mean                                                                i expand
 
- SIMULATION REWARDS                              GRADER ACCURACY
+ Simulation Rewards                              Grader Accuracy
  Reward   Episodes                               Type             Episodes
  0        ████ 2                                 True positive    █████████ 3
  1        ████████████████████ 10                False positive   ███ 1
@@ -31,7 +30,7 @@
                                                  Incorrect among passed    25%   1/4
                                                  Rejected among correct    25%   1/4
 
- WORK LEFT (6)
+ Work Left (6)
  Where              What                                  Why
  Attack             P3 The grader trusts a timing file    Not tested: no Attacker attempt recorded
                     the agent can write.
@@ -49,7 +48,7 @@
                                                           an eligible completion reference and a
                                                           source-grounded score ordering
 
- COST
+ Cost
  Model cost                  $0.00 of $5.00 cap    ━━━━━━━━━━━━━━━━
 === tab 0
  nudi  task                                                                Docker     Concurrency 4
@@ -58,20 +57,19 @@
   Simulation  ✓ ── Grade Simulations ✓ ── Find Hacks ✓ ── Attack ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- SIMULATION ✓
-
- REWARDS
+ Rewards
  Reward   Episodes
  0        ██████████ 2
  1        ██████████████████████████████████████████████████ 10
 
- STATISTICS
+ Statistics
  Usable / attempted   Requested   Mean         Median       Sample SD    Skewness
  12/12                12          0.8333       1            0.3892       -2.055
 
- REWARD PATTERN                                                           Enter episodes   ? method
+ Reward Pattern                                                                            ? expand
  Warning: Possibly a bad system prompt or grader<->prompt mismatch
- 2 episodes received 0; the other 10 received 1.
+
+ ▸ Episodes (12)                                                                           p expand
 === tab 1
  nudi  task                                                                Docker     Concurrency 4
  m Models                                        Model cost $0.00 of $5.00  ━━━━━━━━━━━━     c Cost
@@ -79,30 +77,28 @@
  Simulation ✓ ──  Grade Simulations  ✓ ── Find Hacks ✓ ── Attack ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- GRADE SIMULATIONS ✓                                                         Used for accuracy 6/12
-
- GRADER ACCURACY
+ Grader Accuracy                                                             Used for accuracy 6/12
  Type             Grader   Work was     Episodes
  True positive    Pass     Correct      ███████████████ 3
  False positive   Pass     Incorrect    █████ 1
  False negative   Fail     Correct      █████ 1
  True negative    Fail     Incorrect    █████ 1
 
- METRICS
- Metric                 Value        Fraction   Meaning
- Pass rate              83%          10/12      Passed among scored episodes
- 95% interval           55% to 95%              Wilson interval for the pass rate
- False discovery rate   25%          1/4        Incorrect work among passed work
- False negative rate    25%          1/4        Rejected work among correct work
+ Metrics                                                                                   e expand
+ Metric                 Value
+ Pass rate              83%
+ 95% interval           55% to 95%
+ False discovery rate   25%
+ False negative rate    25%
  Pass rule              reward >= 0.5
 
- EPISODE LABELS
- Label            Episodes   Meaning                                     Used for accuracy
- Legitimate       5          The reward matches the work                 4/5
- Mismatch         2          The reward does not match the work: G1      ✓
- Not reviewed     5          Not inspected in this run                   ✗
+ Episode Labels                                                                            e expand
+ Label            Episodes   Used for accuracy
+ Legitimate       5          4/5
+ Mismatch         2          ✓
+ Not reviewed     5          ✗
 
- ▸ Search scope (2 categories)                                                             s expand
+ ▸ Search Scope (2 categories)                                                             s expand
 === tab 2
  nudi  task                                                                Docker     Concurrency 4
  m Models                                        Model cost $0.00 of $5.00  ━━━━━━━━━━━━     c Cost
@@ -110,9 +106,7 @@
  Simulation ✓ ── Grade Simulations ✓ ──  Find Hacks  ✓ ── Attack ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- FIND HACKS ✓                                                            Hack Inspector + Attackers
-
- PROBLEMS FOUND (3)                                                             ▸ Legend   e expand
+ Problems Found (3)                                                                        e expand
    Problem                                       Reproduced?   Attacker?   Ref
  › The test runs bash through PATH, so a              ✓            ✓       P1
    planted shim decides the result.
@@ -120,14 +114,14 @@
    The grader trusts a timing file the agent          ✓            -       P3
    can write.
 
- IDEAS NOT REPRODUCED (1)
+ Ideas Not Reproduced (1)
    Idea                                          Reproduced?   What happened
    unchecked requirement                              ✗
 
- OPEN QUESTIONS (0)
+ Open Questions (0)
  None recorded.
 
- ▸ Search scope (3 categories)                                                             s expand
+ ▸ Search Scope (3 categories)                                                             s expand
  ▸ Experiments (5)                                                                         x expand
 === tab 3
  nudi  task                                                                Docker     Concurrency 4
@@ -136,19 +130,17 @@
  Simulation ✓ ── Grade Simulations ✓ ── Find Hacks ✓ ──  Attack  ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ATTACK ✓                                                                       ▸ Legend   e expand
-
- HACKS (2)
+ Hacks (2)                                                                                 e expand
      Problem                                     No info  Hint  Full
  › ▸ The test runs bash through PATH, so a          -      ?     ✓
      planted shim decides the result.
    ▸ The grader trusts a timing file the agent      -      -     -
      can write.
 
- CORRECT WORK REJECTED (2)
+ Correct Work Rejected (2)
      Problem                                     No info  Hint  Full
    ▸ Answers are compared as raw strings.           -      -     ✓
    ▸ Leading zeros make a correct answer fail.      -      -     ✗
 
- CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?
+ Can an Attacker Succeed Without Any Information?
  Not tested: not allowed in this run.

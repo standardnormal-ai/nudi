@@ -8,7 +8,7 @@
  ✓ Finished                                                                    8 evidenced findings
  The grader can be cheated, and it misjudges work.
 
- FINDINGS (8)
+ Findings (8)
    Finding                                     Type            Found by          Ref
  › unchecked requirement                       False positive  Grader Inspector  grader-6
    unchecked requirement                       False negative  Grader Inspector  grader-7
@@ -20,10 +20,10 @@
    marker
    wrote the answer with leading zeros         False negative  Attacker          0008-attacker
 
- ▸ Not counted as problems (6 unresolved, 1 not reproduced)                                o expand
- ▸ What the references mean (P1, G1, hack-1 and others)                                    i expand
+ ▸ Abandoned Problems                                                                      o expand
+ ▸ What the References Mean                                                                i expand
 
- SIMULATION REWARDS                              GRADER ACCURACY
+ Simulation Rewards                              Grader Accuracy
  Reward   Episodes                               Type             Episodes
  0        ████ 2                                 True positive    █████████ 3
  1        ██████████ 5                           False positive   ███ 1
@@ -33,7 +33,7 @@
                                                  Incorrect among passed    25%   1/4
                                                  Rejected among correct    25%   1/4
 
- WORK LEFT (7)
+ Work Left (7)
  Where              What                                  Why
  Attack             hack-1                                With only a hint: no Attacker attempt
                                                           recorded
@@ -51,7 +51,7 @@
                                                           an eligible completion reference and a
                                                           source-grounded score ordering
 
- COST
+ Cost
  Model cost                  $0.00 of $5.00 cap    ━━━━━━━━━━━━━━━━
 === tab 0
  nudi  task                                                                Docker     Concurrency 4
@@ -60,18 +60,16 @@
   Simulation  ✓ ── Grade Simulations ✓ ── Find Hacks ✓ ── Attack ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- SIMULATION ✓
-
- REWARDS
+ Rewards
  Reward   Episodes
  0        ██████████ 2
  1        █████████████████████████ 5
 
- STATISTICS
+ Statistics
  Usable / attempted   Requested   Mean         Median       Sample SD    Skewness
  7/7                  7           0.7143       unavailable  0.488        unavailable
 
- REWARD PATTERN                                                           Enter episodes   ? method
+ Reward Pattern                                                                            ? expand
  Pattern details unavailable.
 === tab 1
  nudi  task                                                                Docker     Concurrency 4
@@ -80,28 +78,26 @@
  Simulation ✓ ──  Grade Simulations  ✓ ── Find Hacks ✓ ── Attack ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- GRADE SIMULATIONS ✓                                                          Used for accuracy 6/7
-
- GRADER ACCURACY
+ Grader Accuracy                                                              Used for accuracy 6/7
  Type             Grader   Work was     Episodes
  True positive    Pass     Correct      ███████████████ 3
  False positive   Pass     Incorrect    █████ 1
  False negative   Fail     Correct      █████ 1
  True negative    Fail     Incorrect    █████ 1
 
- METRICS
- Metric                 Value        Fraction   Meaning
- Pass rate              71%          5/7        Passed among scored episodes
- False discovery rate   25%          1/4        Incorrect work among passed work
- False negative rate    25%          1/4        Rejected work among correct work
+ Metrics                                                                                   e expand
+ Metric                 Value
+ Pass rate              71%
+ False discovery rate   25%
+ False negative rate    25%
  Pass rule              reward >= 0.5
 
- EPISODE LABELS
- Label            Episodes   Meaning                                     Used for accuracy
- Legitimate       1          The reward matches the work                 ✗
- Unresolved       6          The Grader Inspector could not decide       ✓
+ Episode Labels                                                                            e expand
+ Label            Episodes   Used for accuracy
+ Legitimate       1          ✗
+ Unresolved       6          ✓
 
- ▸ Search scope (2 categories)                                                             s expand
+ ▸ Search Scope (2 categories)                                                             s expand
 === tab 2
  nudi  task                                                                Docker     Concurrency 4
  m Models                                        Model cost $0.00 of $5.00  ━━━━━━━━━━━━     c Cost
@@ -109,23 +105,21 @@
  Simulation ✓ ── Grade Simulations ✓ ──  Find Hacks  ✓ ── Attack ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- FIND HACKS ✓                                                            Hack Inspector + Attackers
-
- FINDINGS (4)
+ Findings (4)
    Finding                                     Type            Found by          Ref
  › unchecked requirement                       Hack            Hack Inspector    hack-1
    unchecked requirement                       False negative  Hack Inspector    hack-2
    unchecked requirement                       Hack            Hack Inspector    hack-3
    unchecked requirement                       Hack            Hack Inspector    hack-4
 
- IDEAS NOT REPRODUCED (1)
+ Ideas Not Reproduced (1)
    Idea                                          Reproduced?   What happened
    unchecked requirement                              ✗
 
- OPEN QUESTIONS (0)
+ Open Questions (0)
  None recorded.
 
- ▸ Search scope (3 categories)                                                             s expand
+ ▸ Search Scope (3 categories)                                                             s expand
  ▸ Experiments (5)                                                                         x expand
 === tab 3
  nudi  task                                                                Docker     Concurrency 4
@@ -134,12 +128,10 @@
  Simulation ✓ ── Grade Simulations ✓ ── Find Hacks ✓ ──  Attack  ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ATTACK ✓                                                                       ▸ Legend   e expand
-
- TRIES (2)
+ Tries (2)                                                                                 e expand
    Try  Tested      Help     Succeeded   Status       Reward  Attempt
  › 1    hack-1      Full         ✓       Finished     1       0007-attacker
    2    hack-2      Full         ✓       Finished     0       0008-attacker
 
- CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?
+ Can an Attacker Succeed Without Any Information?
  Not tested: not allowed in this run.

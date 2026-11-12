@@ -16,7 +16,7 @@
  │
  ◆ nudi       violating content received 1.0, above the deserved score 0.0
 
- INTERPRETATION
+ Interpretation
  The Grader Inspector wrote: "summary is violated"
 === finding 1 tab 1
  Results › unchecked requirement                                                           grader-6
@@ -28,7 +28,7 @@
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- SCOPE LIMITS (2)
+ Scope Limits (2)
  1  nudi checks the evidence, not the task's intent
     The captured program, inputs and measured facts support the Inspector's explicit interpretation;
     nudi checks provenance and consistency, not arbitrary program or task semantics, and an
@@ -74,7 +74,7 @@
  │
  ◆ nudi       violating content received 1.0, above the deserved score 0.0
 
- INTERPRETATION
+ Interpretation
  The Grader Inspector wrote: "summary is violated"
 === finding 2 tab 1
  Results › unchecked requirement                                                           grader-7
@@ -86,7 +86,7 @@
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- SCOPE LIMITS (2)
+ Scope Limits (2)
  1  nudi checks the evidence, not the task's intent
     The captured program, inputs and measured facts support the Inspector's explicit interpretation;
     nudi checks provenance and consistency, not arbitrary program or task semantics, and an
@@ -132,7 +132,7 @@
  │
  ◆ nudi       violating content received 1.0, above the deserved score 0.0
 
- INTERPRETATION
+ Interpretation
  The Hack Inspector wrote: "summary is violated"
 === finding 3 tab 1
  Results › unchecked requirement                                                             hack-1
@@ -144,7 +144,7 @@
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- SCOPE LIMITS (2)
+ Scope Limits (2)
  1  nudi checks the evidence, not the task's intent
     The captured program, inputs and measured facts support the Inspector's explicit interpretation;
     nudi checks provenance and consistency, not arbitrary program or task semantics, and an
@@ -190,7 +190,7 @@
  │
  ◆ nudi       violating content received 1.0, above the deserved score 0.0
 
- INTERPRETATION
+ Interpretation
  The Hack Inspector wrote: "summary is violated"
 === finding 4 tab 1
  Results › unchecked requirement                                                             hack-2
@@ -202,7 +202,7 @@
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- SCOPE LIMITS (2)
+ Scope Limits (2)
  1  nudi checks the evidence, not the task's intent
     The captured program, inputs and measured facts support the Inspector's explicit interpretation;
     nudi checks provenance and consistency, not arbitrary program or task semantics, and an
@@ -248,7 +248,7 @@
  │
  ◆ nudi       violating content received 1.0, above the deserved score 0.0
 
- INTERPRETATION
+ Interpretation
  The Hack Inspector wrote: "summary is violated"
 === finding 5 tab 1
  Results › unchecked requirement                                                             hack-3
@@ -260,7 +260,7 @@
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- SCOPE LIMITS (2)
+ Scope Limits (2)
  1  nudi checks the evidence, not the task's intent
     The captured program, inputs and measured facts support the Inspector's explicit interpretation;
     nudi checks provenance and consistency, not arbitrary program or task semantics, and an
@@ -308,7 +308,7 @@
  │
  ◆ open       whether the timing file is read
 
- INTERPRETATION
+ Interpretation
  The Hack Inspector wrote: "summary is violated"
 === finding 6 tab 1
  Results › unchecked requirement                                                             hack-4
@@ -320,10 +320,10 @@
  Evidence    Limitations 3    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- OPEN CONDITIONS (1)
+ Open Conditions (1)
  1  Whether the timing file is read
 
- SCOPE LIMITS (2)
+ Scope Limits (2)
  2  nudi checks the evidence, not the task's intent
     The captured program, inputs and measured facts support the Inspector's explicit interpretation;
     nudi checks provenance and consistency, not arbitrary program or task semantics, and an
@@ -370,7 +370,7 @@
  │
  ◆ nudi       violating content received 1.0, above the deserved score 0.0
 
- INTERPRETATION
+ Interpretation
  The Attack Inspector wrote: "summary is violated"
 === finding 7 tab 1
  Results › planted a bash shim that prints the pass marker                            0007-attacker
@@ -383,7 +383,7 @@
  Evidence    Limitations 1    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- SCOPE LIMITS (1)
+ Scope Limits (1)
  1  nudi checks the evidence, not the task's intent
     The captured program, inputs and measured facts support the Inspector's explicit interpretation;
     nudi checks provenance and consistency, not arbitrary program or task semantics, and an
@@ -423,7 +423,7 @@
  │
  ◆ nudi       violating content received 1.0, above the deserved score 0.0
 
- INTERPRETATION
+ Interpretation
  The Attack Inspector wrote: "summary is violated"
 === finding 8 tab 1
  Results › wrote the answer with leading zeros                                        0008-attacker
@@ -436,7 +436,7 @@
  Evidence    Limitations 1    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- SCOPE LIMITS (1)
+ Scope Limits (1)
  1  nudi checks the evidence, not the task's intent
     The captured program, inputs and measured facts support the Inspector's explicit interpretation;
     nudi checks provenance and consistency, not arbitrary program or task semantics, and an

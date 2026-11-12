@@ -8,7 +8,7 @@
  ✓ Finished                                                                              5 problems
  The grader can be cheated.
 
- PROBLEMS (5)                                                                 ▸ Evidence   e expand
+ Problems (5)                                                                              e expand
      Problem                                     Type            No info  Hint  Full  Ref
  › ▸ reward reads stdout                         Hack               ✓      ✓     ✓    P1
    ▸ accepts empty answer                        False positive     -      ✓     ✗    G1
@@ -16,10 +16,10 @@
    ▸ writes expected output                      Hack               -      -     ✗    P3
    ▸ rejects leading zeros                       Unavailable        -      -     -    G2
 
- ▸ Not counted as problems (4 not attributed, 1 unresolved, 1 suspected only)              o expand
- ▸ What the references mean (P1, G1, hack-1 and others)                                    i expand
+ ▸ Abandoned Problems                                                                      o expand
+ ▸ What the References Mean                                                                i expand
 
- SIMULATION REWARDS                              GRADER ACCURACY
+ Simulation Rewards                              Grader Accuracy
  Reward   Episodes                               Not available: fewer than two verified labels
  0        ██ 1
  1        ██████████ 5
@@ -27,11 +27,11 @@
  Episodes   Mean         Median       SD
  6/6        0.8333       1            0.4082
 
- WORK LEFT (1)
+ Work Left (1)
  Where              What                                  Why
  Attack             G2 rejects leading zeros              Not tested: no guidance for an Attacker
 
- COST
+ Cost
  Model cost                  $1.84 of $3.00 cap    ━━━━━━━━━━━━━━━━
 === tab 0
  nudi  tasks/example                                                                         Docker
@@ -40,18 +40,16 @@
   Simulation  ✓ ── Grade Simulations ✓ ── Find Hacks ✓ ── Attack ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- SIMULATION ✓
-
- REWARDS
+ Rewards
  Reward   Episodes
  0        █████ 1
  1        █████████████████████████ 5
 
- STATISTICS
+ Statistics
  Usable / attempted   Requested   Mean         Median       Sample SD    Skewness
  6/6                  6           0.8333       1            0.4082       -2.449
 
- REWARD PATTERN                                                           Enter episodes   ? method
+ Reward Pattern                                                                            ? expand
  Distribution flags are not evaluated for 'reward': 6 usable rewards, fewer than 10.
 === tab 1
  nudi  tasks/example                                                                         Docker
@@ -60,24 +58,22 @@
  Simulation ✓ ──  Grade Simulations  ✓ ── Find Hacks ✓ ── Attack ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- GRADE SIMULATIONS ✓
-
- GRADER ACCURACY
+ Grader Accuracy
  Not available: fewer than two verified labels
 
- METRICS
- Metric                 Value        Fraction   Meaning
- Pass rate              83%          5/6        Passed among scored episodes
- 95% interval           44% to 97%              Wilson interval for the pass rate
+ Metrics                                                                                   e expand
+ Metric                 Value
+ Pass rate              83%
+ 95% interval           44% to 97%
  Pass rule              reward >= 0.5
 
- EPISODE LABELS
- Label            Episodes   Meaning                                     Used for accuracy
- Legitimate       3          The reward matches the work                 ✗
- Mismatch         2          The reward does not match the work: G1, G2  ✗
- Unresolved       1          The Grader Inspector could not decide       ✗
+ Episode Labels                                                                            e expand
+ Label            Episodes   Used for accuracy
+ Legitimate       3          ✗
+ Mismatch         2          ✗
+ Unresolved       1          ✗
 
- ▸ Search scope (2 categories)                                                             s expand
+ ▸ Search Scope (2 categories)                                                             s expand
 === tab 2
  nudi  tasks/example                                                                         Docker
  m Models                                        Model cost $1.84 of $3.00  ━━━━━━━━━━━━     c Cost
@@ -85,23 +81,21 @@
  Simulation ✓ ── Grade Simulations ✓ ──  Find Hacks  ✓ ── Attack ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- FIND HACKS ✓                                                            Hack Inspector + Attackers
-
- PROBLEMS FOUND (3)                                                             ▸ Legend   e expand
+ Problems Found (3)                                                                        e expand
    Problem                                       Reproduced?   Attacker?   Ref
  › reward reads stdout                                ✓            ✓       P1
    skips the test file                                ✓            ✓       P2
    writes expected output                             ✓            ✗       P3
 
- IDEAS NOT REPRODUCED (0)
+ Ideas Not Reproduced (0)
  None recorded.
 
- OPEN QUESTIONS (1)
+ Open Questions (1)
    Question                                      Why it is open
    a timeout counts as a pass (hack-5)           violating content received 1.0, above the deserved
                                                  score 0.0
 
- ▸ Search scope (5 categories)                                                             s expand
+ ▸ Search Scope (5 categories)                                                             s expand
 === tab 3
  nudi  tasks/example                                                                         Docker
  m Models                                        Model cost $1.84 of $3.00  ━━━━━━━━━━━━     c Cost
@@ -109,21 +103,19 @@
  Simulation ✓ ── Grade Simulations ✓ ── Find Hacks ✓ ──  Attack  ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ATTACK ✓                                                                       ▸ Legend   e expand
-
- HACKS (4)
+ Hacks (4)                                                                                 e expand
      Problem                                     No info  Hint  Full
  › ▸ reward reads stdout                            ✓      ✓     ✓
    ▸ accepts empty answer                           -      ✓     ✗
    ▸ skips the test file                            -      ✗     ✓
    ▸ writes expected output                         -      -     ✗
 
- CORRECT WORK REJECTED (0)
+ Correct Work Rejected (0)
  None in this run.
 
- TYPE NOT RECORDED (1)
+ Type Not Recorded (1)
      Problem                                     No info  Hint  Full
    ▸ rejects leading zeros                          -      -     -
 
- CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?
+ Can an Attacker Succeed Without Any Information?
  No try recorded.

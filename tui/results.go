@@ -47,12 +47,11 @@ func (p *page) pick(n int, key string, draw func(mark string, on bool) string) {
 
 // toggle is the line of a collapsed section: its title, its count and the key that expands it.
 func (p *page) toggle(key, name, note string) bool {
-	arrow, verb := "▸", "expand"
-	if p.open[key] {
-		arrow, verb = "▾", "collapse"
-	}
-	head, right := " "+dim(arrow)+" "+bold(name), bold(key)+" "+dim(verb)
-	if width(head)+1+width(note)+width(right)+3 <= p.w {
+	arrow := map[bool]string{true: "▾", false: "▸"}[p.open[key]]
+	head, right := " "+dim(arrow)+" "+bold(name), p.fold(key)
+	if note == "" {
+		p.add(spread(head, right, p.w))
+	} else if width(head)+1+width(note)+width(right)+3 <= p.w {
 		p.add(spread(head+" "+dim(note), right, p.w))
 	} else {
 		p.add(spread(head, right, p.w), wrap(note, p.w, "   ", dim))
@@ -60,13 +59,9 @@ func (p *page) toggle(key, name, note string) bool {
 	return p.open[key]
 }
 
-// fold is the control on a header that opens the legend explaining it, with the key that toggles it.
-func (p *page) fold(key, name string) string {
-	arrow, verb := "▸", "expand"
-	if p.open[key] {
-		arrow, verb = "▾", "collapse"
-	}
-	return dim(arrow+" "+name) + "   " + bold(key) + " " + dim(verb)
+// fold is the key hint on a header that opens what explains it.
+func (p *page) fold(key string) string {
+	return keyText(key) + " " + dim(map[bool]string{true: "collapse", false: "expand"}[p.open[key]])
 }
 
 // symbols is the legend of the answer cells.
@@ -85,7 +80,7 @@ func resultsPage(r Report, found []Finding, p *page) {
 		findingsTable(found, "", p)
 	}
 	p.add("")
-	if others, opens := otherFindings(r); len(others) > 0 && p.toggle("o", "Not counted as problems", "("+stateCounts(others)+")") {
+	if others, opens := otherFindings(r); len(others) > 0 && p.toggle("o", "Abandoned Problems", "") {
 		widths := []int{36, 28, 18}
 		p.add(cols(p.w, "   ", widths, dim("Finding"), dim("State"), dim("Found by"), dim("Ref")))
 		for i, o := range others {
@@ -96,9 +91,9 @@ func resultsPage(r Report, found []Finding, p *page) {
 				p.add(cols(p.w, "   ", widths, o[0], o[1], o[2], dim(o[3])))
 			}
 		}
-		p.add(wrap("Ideas and records of the inspectors and Attackers that no problem holds. Enter opens standalone evidence.", p.w, "   ", dim))
+		p.add(wrap("Suspected problems that didn't have enough evidence", p.w, "   ", dim))
 	}
-	if p.toggle("i", "What the references mean", "(P1, G1, hack-1 and others)") {
+	if p.toggle("i", "What the References Mean", "") {
 		widths := []int{17, 62}
 		p.add(cols(p.w, "   ", widths, dim("Reference"), dim("What it names"), dim("Example")))
 		for _, x := range references {
@@ -115,7 +110,7 @@ func resultsPage(r Report, found []Finding, p *page) {
 	}
 	p.add("")
 	rows := workLeft(r, found)
-	p.add(titled("WORK LEFT", len(rows)))
+	p.add(titled("Work Left", len(rows)))
 	if len(rows) == 0 {
 		p.add(" " + dim("None recorded."))
 	} else {
@@ -125,7 +120,7 @@ func resultsPage(r Report, found []Finding, p *page) {
 			p.add(cols(p.w, " ", widths, row[0], row[1], yellowStyle.Render(row[2])))
 		}
 	}
-	p.add("", heading("COST", ""))
+	p.add("", heading("Cost", ""))
 	p.add(costRows(r, p.w, false)...)
 }
 
@@ -162,10 +157,10 @@ func endingParts(r Report) (string, []string) {
 	var head, beside string
 	var notes []string
 	failed := slices.DeleteFunc(slices.Clone(phases), func(p struct{ Name, Analysis string }) bool { return r.PhaseErrors[p.Analysis] == "" })
-	amber, verdict := yellowStyle.Bold(true), r.verdict()
+	amber, verdict := yellowStyle, r.verdict()
 	var errs []string
 	for _, p := range failed {
-		errs = append(errs, redStyle.Bold(true).Render("Error")+"  "+strings.SplitN(r.PhaseErrors[p.Analysis], "\n", 2)[0], failedNote(r, p.Name, p.Analysis))
+		errs = append(errs, redStyle.Render("Error")+"  "+strings.SplitN(r.PhaseErrors[p.Analysis], "\n", 2)[0], failedNote(r, p.Name, p.Analysis))
 	}
 	switch {
 	case r.Stop != nil: // a stop ends the run even after a phase failed; the failure stays a note
@@ -192,11 +187,11 @@ func endingParts(r Report) (string, []string) {
 			}
 		}
 	case len(failed) > 0:
-		head, notes = redStyle.Bold(true).Render(failed[0].Name+" failed"), append(errs, verdict)
+		head, notes = redStyle.Render(failed[0].Name+" failed"), append(errs, verdict)
 	case strings.HasPrefix(r.Answer[0], "Could not start"):
 		head, notes = amber.Render("Could not start"), []string{strings.TrimPrefix(r.Answer[0], "Could not start: ")}
 	case r.Status == "complete":
-		head, notes = greenStyle.Bold(true).Render("✓ Finished"), []string{verdict}
+		head, notes = greenStyle.Render("✓ Finished"), []string{verdict}
 		if clock != "" {
 			beside = "after " + clock
 		}
@@ -239,7 +234,7 @@ func tally(r Report, found []Finding) string {
 		n, noun = len(problems(r)), "problem"
 	}
 	if n > 0 {
-		return redStyle.Bold(true).Render(fmt.Sprintf("%d %s%s", n, noun, plural(n)))
+		return redStyle.Render(fmt.Sprintf("%d %s%s", n, noun, plural(n)))
 	}
 	if q := len(openQuestions(r, "grader_inspector")) + len(openQuestions(r, "hack_inspector")); q > 0 {
 		return yellowStyle.Render(fmt.Sprintf("%d open question%s", q, plural(q)))
@@ -377,10 +372,10 @@ func tested(a Attempt) []string {
 func problemsTable(r Report, found []Finding, p *page) {
 	ps := problems(r)
 	if len(ps) == 0 {
-		p.add(titled("PROBLEMS", 0), " None demonstrated in this run.")
+		p.add(titled("Problems", 0), " None demonstrated in this run.")
 		return
 	}
-	p.add(spread(titled("PROBLEMS", len(ps)), p.fold("e", "Evidence"), p.w))
+	p.add(spread(titled("Problems", len(ps)), p.fold("e"), p.w))
 	attacked := len(r.Attack.Attempts) > 0 || slices.ContainsFunc(ps, func(p Problem) bool { return p.Conditions != nil })
 	inspected := slices.ContainsFunc(ps, func(p Problem) bool { return p.EvidencedByInspector != nil })
 	// The columns of how much an Attacker was told. No info goes when the run allowed no try without information.
@@ -429,9 +424,6 @@ func problemsTable(r Report, found []Finding, p *page) {
 				arrow = dim("▾") + " "
 			}
 			name := strings.Join(strings.Fields(pr.Cause), " ")
-			if on {
-				name = bold(name)
-			}
 			cells := []string{name, redStyle.Render(problemType(r, pr))}
 			for _, level := range levels {
 				cells = append(cells, under(helpWords[level], glyph(r.tried(pr, level))))
@@ -447,7 +439,7 @@ func problemsTable(r Report, found []Finding, p *page) {
 		})
 		if p.open[key] {
 			evidenceRows(r, found, pr, p)
-			untestedRows(r, pr, levels, inspected, p)
+			levelRows(r, pr, levels, inspected, p)
 		}
 	}
 	if p.lines[len(p.lines)-1] == "" { // an expanded last problem already ends in a blank line
@@ -470,9 +462,9 @@ func evidenceRows(r Report, found []Finding, pr Problem, p *page) {
 	}
 }
 
-// untestedRows say, under an expanded problem's evidence records, why each of its cells of levels shows - for not
-// tested. Without the Inspector column, the problem's level says why it counts.
-func untestedRows(r Report, pr Problem, levels []string, inspected bool, p *page) {
+// levelRows are, under an expanded problem's evidence records, what its cells do not say: without the Inspector column,
+// the problem's level, and a demonstration while aimed at another problem. Work left says why a cell is not tested.
+func levelRows(r Report, pr Problem, levels []string, inspected bool, p *page) {
 	var rows [][2]string
 	if !inspected {
 		rows = append(rows, [2]string{"Level", level(r, pr)})
@@ -481,35 +473,11 @@ func untestedRows(r Report, pr Problem, levels []string, inspected bool, p *page
 		if target := r.aimedElsewhere(pr); target != "" {
 			rows = append(rows, [2]string{helpWords[strings.TrimPrefix(pr.why(), "elsewhere_")] + " ✓", "Demonstrated while aimed at " + target})
 		}
-		for _, level := range levels {
-			if r.tried(pr, level) == "-" {
-				rows = append(rows, [2]string{helpWords[level] + " -", "Not tested: " + r.untested(pr, level)})
-			}
-		}
-	}
-	if inspected && pr.EvidencedByInspector == nil {
-		rows = append(rows, [2]string{"Inspector -", "Not recorded"})
 	}
 	for _, row := range rows {
 		p.add(cols(p.w, "       ", []int{12}, dim(row[0]), dim(row[1])))
 	}
 	p.add("")
-}
-
-// untested says why no Attacker told as much as level demonstrated or failed p: how a try aimed at it ended, else the
-// recorded state of that condition, else that no reason is recorded.
-func (r Report) untested(p Problem, level string) string {
-	for _, at := range r.aimed(p) {
-		if at.Level == level {
-			return tryResult(r, at)
-		}
-	}
-	for _, c := range p.Conditions {
-		if c.Condition == level || level == "none" && c.Condition == "independent" {
-			return word(notTestedWords, c.Status)
-		}
-	}
-	return "Reason not recorded"
 }
 
 // demonstrates says whether Attacker finding f demonstrated problem pr, by its own exploit entry: the problem the judge
@@ -552,7 +520,7 @@ func findingsTable(found []Finding, source string, p *page) {
 	for _, f := range found {
 		n += boolInt(source == "" || f.Source == source)
 	}
-	p.add(titled("FINDINGS", n))
+	p.add(titled("Findings", n))
 	if n == 0 {
 		p.add(" None evidenced in this run.")
 		return
@@ -565,9 +533,6 @@ func findingsTable(found []Finding, source string, p *page) {
 		}
 		p.pick(i+1, "", func(mark string, on bool) string {
 			name := title(f)
-			if on {
-				name = bold(name)
-			}
 			return cols(p.w, mark, widths, name, redStyle.Render(findingType(f)), jobNames[f.Source], dim(ref(f)))
 		})
 	}
@@ -668,7 +633,7 @@ func sourceName(s string) string {
 
 // rewardsSummary is the Simulator's rewards: a bar per reward value, then the episodes and the summaries.
 func rewardsSummary(r Report, w int) string {
-	out := []string{heading("SIMULATION REWARDS", "")}
+	out := []string{heading("Simulation Rewards", "")}
 	if r.Ordinary == nil || len(r.Ordinary.Groups) == 0 {
 		return strings.Join(append(out, " "+yellowStyle.Render("Not available: "+r.missing(0))), "\n")
 	}
@@ -705,7 +670,7 @@ func rewardBars(x Rewards, unit, w int) []string {
 
 // accuracySummary is the grader's decisions against the Grader Inspector's reference, and the two rates of its mistakes.
 func accuracySummary(r Report, w int) string {
-	out := []string{heading("GRADER ACCURACY", "")}
+	out := []string{heading("Grader Accuracy", "")}
 	if r.Metrics == nil || len(r.Metrics.Confusion) == 0 {
 		return strings.Join(append(out, " "+yellowStyle.Render("Not available: "+r.missing(1))), "\n")
 	}

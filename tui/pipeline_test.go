@@ -97,10 +97,10 @@ func TestPipelineHacksScreen(t *testing.T) {
 	s := liveScreen(t, l, l.Last.at(), 100, 0)
 	snapshot(t, "pipeline-hacks", "screen.txt", s)
 	for _, want := range []string{
-		"FIND HACKS ⣾ 8:50     Hack Inspector", "Find Hacks  ⣾ ── Attack ⣾", "Simulation ── Grade Simulations ──", "AGENTS  5 running",
+		"Find Hacks  ⣾", "Find Hacks  ⣾ ── Attack ⣾", "Simulation ── Grade Simulations ──", "Agents  5 running",
 		"General search", "Focused search", "Edits grader or tests", "No information", "Skips the test file", "Full instructions, try 1",
-		"Checks try 1, hint", "FINDINGS SO FAR (4)", "Finding", "New?", "Inspector?", "Full instr.?", "Hint?",
-		"Related observations (2)", "CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?",
+		"Checks try 1, hint", "Findings So Far (4)", "Finding", "New?", "Inspector?", "Full instr.?", "Hint?",
+		"Related Observations (2)", "Can an Attacker Succeed Without Any Information?",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("lacks %q:\n%s", want, s)
@@ -139,10 +139,10 @@ func TestPipelineHacksShortScreen(t *testing.T) {
 	if s := liveKeys(t, l, l.Last.at(), 100, 24, "right", "right"); !strings.Contains(s, "Agents 4-5 of 5") || !strings.Contains(s, "Checks try 1, hint") {
 		t.Errorf("the next agents:\n%s", s)
 	}
-	if s := liveKeys(t, l, l.Last.at(), 100, 24, "down", "down", "down"); !strings.HasPrefix(row(s, "FIND"), "") || strings.Contains(s, "FIND HACKS ⣾") {
+	if s := liveKeys(t, l, l.Last.at(), 100, 24, "down", "down", "down"); strings.Contains(s, "Agents 1-3 of 5") {
 		t.Errorf("scrolled:\n%s", s)
 	}
-	if s := liveKeys(t, l, l.Last.at(), 100, 24, "f"); !strings.Contains(s, "Timeout counts as pass") || strings.Contains(s, "AGENTS") {
+	if s := liveKeys(t, l, l.Last.at(), 100, 24, "f"); !strings.Contains(s, "Timeout counts as pass") || strings.Contains(s, "Agents 1-3 of 5") {
 		t.Errorf("all findings:\n%s", s)
 	}
 }
@@ -171,8 +171,8 @@ func TestPipelineGraderScreen(t *testing.T) {
 	snapshot(t, "pipeline-grader", "screen.txt", s)
 	snapshot(t, "pipeline-grader", "screen-24.txt", liveScreen(t, l, l.Last.at(), 100, 24))
 	for _, want := range []string{
-		"Find Hacks ✓", "GRADE SIMULATIONS ⣾", "Grader Inspector", "AGENTS  1 running", "General review",
-		"novelty_judge     Same as an earlier finding: timeout counts as pass", "Related observations (5)",
+		"Find Hacks ✓", "Grade Simulations  ⣾", "Grader Inspector", "Agents  1 running", "General review",
+		"novelty_judge     Same as an earlier finding: timeout counts as pass", "Related Observations (5)",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("lacks %q:\n%s", want, s)
@@ -218,14 +218,14 @@ func TestPipelineAttackerProblem(t *testing.T) {
 		ev("03:31", "attempt_result", `, "episode": "0000-attacker", "problem": "A1", "level": "none", "status": "evidenced_issue"`)+
 		ev("04:00", "reproduced", `, "problem": "P1", "result": "not_reproduced"`)+
 		ev("04:00", "phase_end", `, "phase": "hack", "status": "complete", "elapsed": 240`))
-	if s := liveScreen(t, l, at9("04:00"), 100, 0); !strings.Contains(s, "FIND HACKS ✓ 4:00") {
+	if s := liveScreen(t, l, at9("04:00"), 100, 0); !strings.Contains(s, "Find Hacks  ✓") || !strings.Contains(s, "phase time 4:00") {
 		t.Errorf("screen:\n%s", s)
 	}
 	s := liveKeys(t, l, at9("04:00"), 100, 0, "shift+tab", "shift+tab", "shift+tab")
 	if got := cells(s, "1     Finished"); got != "✓ ✓ Prints the marker early" {
 		t.Errorf("no-information row: %q\n%s", got, s)
 	}
-	if got := cells(s, "C1"); got != "✓ ✗ - -" || !strings.Contains(s, "PROBLEMS (1)") {
+	if got := cells(s, "C1"); got != "✓ ✗ - -" || !strings.Contains(s, "Problems (1)") {
 		t.Errorf("Results:\n%s", s)
 	}
 	if !strings.Contains(s, "2 problems so far") {
@@ -366,7 +366,7 @@ func TestLiveTabsShowSelectedPhases(t *testing.T) {
 		t.Errorf("before the hacks:\n%s", s)
 	}
 	s := screen(full + ev("00:01", "phase_start", `, "phase": "hack", "slots": 6`))
-	if !strings.Contains(s, "FIND HACKS ⣾ 0:29") || !strings.Contains(s, "Simulation waiting") {
+	if !strings.Contains(s, "Find Hacks  ⣾") || !strings.Contains(s, "phase time 0:29") || !strings.Contains(s, "Simulation waiting") {
 		t.Errorf("during the hacks:\n%s", s)
 	}
 	if s := screen(start(`["hack", "attack"]`)); strings.Contains(s, "Simulation waiting") || !strings.Contains(s, "Attack waiting") {
@@ -382,8 +382,8 @@ func TestLiveFailedPhase(t *testing.T) {
 		ev("01:00", "phase_end", `, "phase": "hack", "status": "failed", "elapsed": 60, "error": "hack failed: RuntimeError: out of memory"`)+
 		ev("02:10", "run_end", `, "status": "failed", "report": "report.json"`))
 	s := screenLines(t, l, at9("02:10"))
-	for _, want := range []string{"Find Hacks  Error", "FIND HACKS Error 1:00", "Error  hack failed: RuntimeError: out of memory",
-		"The run ended at 2:10. Its report keeps the results so far.", "AGENTS  none running", "Simulation -"} {
+	for _, want := range []string{"Find Hacks  Error", "Find Hacks  Error", "Error  hack failed: RuntimeError: out of memory",
+		"The run ended at 2:10. Its report keeps the results so far.", "Agents  none running", "Simulation -"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("lacks %q:\n%s", want, s)
 		}
@@ -528,7 +528,7 @@ func TestLivePartialPhaseIsPartly(t *testing.T) {
 	l := liveFrom(t, ev("00:00", "run_start", `, "backend": "docker"`)+
 		ev("00:00", "phase_start", `, "phase": "hack"`)+
 		ev("01:00", "phase_end", `, "phase": "hack", "status": "partial", "elapsed": 60`))
-	if s := screenLines(t, l, at9("01:00")); !strings.Contains(s, "FIND HACKS partly") || strings.Contains(s, "✓") {
+	if s := screenLines(t, l, at9("01:00")); !strings.Contains(s, "Find Hacks  partly") || strings.Contains(s, "✓") {
 		t.Errorf("partial phase:\n%s", s)
 	}
 }
@@ -540,10 +540,10 @@ func TestLiveLongErrorLeavesFindingsToResults(t *testing.T) {
 		ev("00:01", "judged", `, "inspector": "hack", "finding": "hack-1", "problem": "P1", "new": true, "cause": "c1"`)+
 		ev("00:02", "judged", `, "inspector": "hack", "finding": "hack-2", "problem": "P2", "new": true, "cause": "c2"`)+
 		ev("01:00", "phase_end", `, "phase": "hack", "status": "failed", "elapsed": 60, "error": "hack failed: one\ntwo\nthree\nfour\nfive\nsix\nseven"`))
-	if s := liveScreen(t, l, at9("01:00"), 100, 24); !strings.Contains(s, "seven") || strings.Contains(s, "FINDINGS SO FAR") {
+	if s := liveScreen(t, l, at9("01:00"), 100, 24); !strings.Contains(s, "seven") || strings.Contains(s, "Findings So Far") {
 		t.Errorf("failed tab:\n%s", s)
 	}
-	if s := liveKeys(t, l, at9("01:00"), 100, 0, "tab", "tab"); !strings.Contains(s, "PROBLEMS (2)") || !strings.Contains(s, "C2") {
+	if s := liveKeys(t, l, at9("01:00"), 100, 0, "tab", "tab"); !strings.Contains(s, "Problems (2)") || !strings.Contains(s, "C2") {
 		t.Errorf("Results:\n%s", s)
 	}
 }

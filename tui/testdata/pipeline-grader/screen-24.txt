@@ -4,19 +4,19 @@
  Simulation ✓ ──  Grade Simulations  ⣾ ── Find Hacks ✓ ── Attack waiting            │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- GRADE SIMULATIONS ⣾ 3:59     Grader Inspector
-
- AGENTS  1 running
+ Agents  1 running, phase time 3:59
  ╭─ Grader Inspector ── ⣾ 3:59 ─╮
  │ General review               │
  │ All simulated episodes       │
  │                              │
  ╰──────────────────────────────╯
 
- FINDINGS SO FAR (5)
+ Findings So Far (5)
  Finding                                       New?   Inspector?  Full instr.?  Hint?
  Reward reads stdout                            ✓         ✓            ✓          ✗
  Skips the test file                            ✓         ✓            ✓          ✗
- +3 more ↓   f open
+ Writes expected output                         ✓         ✓            ✗          -
+ +2 more ↓   f open
+
 
  ? Help   Tab next tab   Up/Down scroll   l logs   q Stop following

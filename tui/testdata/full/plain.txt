@@ -125,7 +125,7 @@ EVIDENCE
       Attacker exploit  Not confirmed as hack-1 (finding 3)
       Limitations       1, shown by nudi-view testdata/full 9
 
-NOT COUNTED AS PROBLEMS
+ABANDONED PROBLEMS
   Count             6 unresolved, 2 not reproduced, 1 standalone evidence, 1 not attributed
 
   unchecked requirement

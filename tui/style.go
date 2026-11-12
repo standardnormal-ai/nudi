@@ -27,14 +27,18 @@ var (
 
 	dimStyle    = lipgloss.NewStyle().Foreground(grey)
 	boldStyle   = lipgloss.NewStyle().Foreground(white).Bold(true)
+	keyStyle    = lipgloss.NewStyle().Foreground(white)
 	redStyle    = lipgloss.NewStyle().Foreground(red)
 	greenStyle  = lipgloss.NewStyle().Foreground(green)
 	yellowStyle = lipgloss.NewStyle().Foreground(yellow)
-	logo        = lipgloss.NewStyle().Foreground(teal).Bold(true).Render("nudi")
+	logo        = lipgloss.NewStyle().Foreground(teal).Render("nudi")
 )
 
 func dim(s string) string  { return dimStyle.Render(s) }
-func bold(s string) string { return boldStyle.Render(s) }
+func bold(s string) string { return boldStyle.Render(s) } // titles only
+
+// keyText is a key in a hint, white but not bold, so that only titles are bold.
+func keyText(s string) string { return keyStyle.Render(s) }
 
 func fg(c color.Color, s string) string { return lipgloss.NewStyle().Foreground(c).Render(s) }
 

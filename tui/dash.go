@@ -45,7 +45,7 @@ type frameMsg struct{}
 func newModel(r Report, n int, withIntro bool) model {
 	m := model{r: r, found: r.findings(), screen: results, n: n, w: 100, open: map[string]bool{}, help: help.New(), body: viewport.New()}
 	m.help.ShortSeparator = "   "
-	m.help.Styles.ShortKey, m.help.Styles.ShortDesc, m.help.Styles.ShortSeparator = boldStyle, dimStyle, dimStyle
+	m.help.Styles.ShortKey, m.help.Styles.ShortDesc, m.help.Styles.ShortSeparator = keyStyle, dimStyle, dimStyle
 	m.body.KeyMap.Left.SetEnabled(false)
 	m.body.KeyMap.Right.SetEnabled(false)
 	if withIntro {
@@ -137,8 +137,6 @@ func (m model) browse(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case (k == "down" || k == "j") && *sel < len(m.items)-1:
 		*sel++
 		return m.reveal(), nil
-	case k == "enter" && m.screen == 0:
-		toggle("episodes")
 	case k == "enter" && len(m.items) > 0:
 		switch it := m.items[*sel]; {
 		case it.n > 0:
@@ -147,17 +145,15 @@ func (m model) browse(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case it.key != "":
 			toggle(it.key)
 		}
-	case k == "esc" && m.screen == 0:
-		m.open["0episodes"] = false
 	case k == "esc" && len(m.items) > 0:
 		m.open[prefix+m.items[*sel].key] = false
-	case k == "?" && m.screen == 0 && !m.open["0episodes"]:
+	case k == "?" && m.screen == 0:
 		toggle("?")
 	case k == "m" || k == "c" || k == "?":
 		m.overlay = k
 		m.body.GotoTop()
-	case m.screen == results && (k == "o" || k == "i" || k == "e"), m.screen == 1 && k == "s", m.screen == 2 && (k == "s" || k == "x" || k == "e"),
-		m.screen == 3 && k == "e":
+	case m.screen == results && (k == "o" || k == "i" || k == "e"), m.screen == 0 && k == "p", m.screen == 1 && (k == "s" || k == "e"),
+		m.screen == 2 && (k == "s" || k == "x" || k == "e"), m.screen == 3 && k == "e":
 		toggle(k)
 	default:
 		return m.scroll(msg)
@@ -272,11 +268,31 @@ func (m model) View() tea.View {
 	}
 	k := keys
 	k.finding = m.n > 0
-	if m.screen == 0 && m.n == 0 && !m.open["0episodes"] {
+	if m.screen == 0 && m.n == 0 {
 		k.help.SetHelp("?", "method")
 	}
-	v.SetContent("\n" + content + "\n\n " + m.help.View(k) + "\n")
+	if len(m.items) == 0 {
+		k.sel.SetHelp("Up/Down", "scroll")
+	}
+	k.open.SetHelp("Enter", m.enter())
+	k.open.SetEnabled(m.enter() != "")
+	v.SetContent("\n" + content + "\n\n " + truncate(m.help.View(k), m.w-1) + "\n")
 	return v
+}
+
+// enter says what Enter does on the selected row: open its finding, or expand or collapse its rows; empty for nothing.
+func (m model) enter() string {
+	s := m.sel[m.screen]
+	if m.n > 0 || m.overlay != "" || s >= len(m.items) {
+		return ""
+	}
+	switch it := m.items[s]; {
+	case it.n > 0:
+		return "open finding"
+	case it.key != "":
+		return map[bool]string{true: "collapse ", false: "expand "}[m.open[fmt.Sprint(m.screen)+it.key]] + strings.Fields(it.key)[0]
+	}
+	return ""
 }
 
 func cut(s string, w int) string {

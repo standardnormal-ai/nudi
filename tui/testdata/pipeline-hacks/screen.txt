@@ -4,9 +4,7 @@
  Simulation ── Grade Simulations ──  Find Hacks  ⣾ ── Attack ⣾                      │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- FIND HACKS ⣾ 8:50     Hack Inspector
-
- AGENTS  5 running
+ Agents  5 running, phase time 8:50
  ╭─ Hack Inspector ──── ⣾ 8:50 ─╮ ╭─ Attacker ────────── ⣾ 8:49 ─╮ ╭─ Hack Inspector ──── ⣾ 3:50 ─╮
  │ General search               │ │ No information               │ │ Focused search               │
  │ All categories               │ │ Looking for any hack         │ │ Edits grader or tests        │
@@ -18,20 +16,20 @@
  │                              │ │                              │
  ╰──────────────────────────────╯ ╰──────────────────────────────╯
 
- FINDINGS SO FAR (4)
+ Findings So Far (4)
  Finding                                       New?   Inspector?  Full instr.?  Hint?
  Reward reads stdout                            ✓         ✓            ✓          ⣾ 2:04
  Skips the test file                            ✓         ✓            ⣾ 3:20     -
  Writes expected output                         ✓         ⣾ 3:10       -          -
  Timeout counts as pass                         ✓         ✗            -          -
 
- ▸ Related observations (2)                                                                o expand
+ ▸ Related Observations (2)                                                                o expand
 
- CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?
+ Can an Attacker Succeed Without Any Information?
    Try   Status        Hack demonstrated?  New finding?  Problem
    1     ⣾ 8:49
 
- LOGS                                                                                      l expand
+ Logs                                                                                      l expand
  10:07:30  novelty_judge     Same as an earlier finding: reward reads stdout
  10:08:10  nudi              Not reproduced: timeout counts as pass
  10:08:50  Attacker          Episode returned after 2:04, reward 1: try 1 with only a hint, for

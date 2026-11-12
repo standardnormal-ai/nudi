@@ -7,8 +7,7 @@
   "answer": [
     "Stopped at your time limit. Results below are what was found so far.",
     "The grader can be cheated in a copy of the task package, not yet in a real episode.",
-    "In copies of the task package, the hack inspector reproduced cheats by grader_tampering (P1).",
-    "Problems by level: \u25cf\u25cf\u25cb\u25cb\u25cb reproduced exploit: P1.",
+    "P1: \u25cf\u25cf\u25cb\u25cb\u25cb reproduced exploit, evidenced in a package sandbox; no attempt was assessed.",
     "P: found by the hack inspector's search. G: found by the grader inspector in the simulations. A: found by an Attacker, not among the inspectors' findings."
   ],
   "attack": {
@@ -19,6 +18,7 @@
         "context": "attacker-hack-0-full-1",
         "episode": null,
         "error": null,
+        "failed": null,
         "level": "full",
         "number": 1,
         "problem": null,
@@ -128,6 +128,7 @@
         "evidenced_by_inspector": true,
         "exploited_by": [],
         "exploited_with": "unknown",
+        "family": null,
         "findings": [
           "hack-0"
         ],
@@ -278,7 +279,8 @@
               "limits": [],
               "mechanism": "unchecked requirement",
               "reward": "reward",
-              "unresolved": []
+              "unresolved": [],
+              "use": null
             },
             "execution_scope": "package",
             "experiment": "experiment-0000",
@@ -303,7 +305,6 @@
         "inconclusive": [],
         "legitimate": []
       },
-      "leads": [],
       "limits": [],
       "open": [],
       "status": "complete",

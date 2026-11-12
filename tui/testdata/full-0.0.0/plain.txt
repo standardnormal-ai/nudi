@@ -72,7 +72,7 @@ EVIDENCE
       Attacker exploit  Reproduced hack-2 (finding 4)
       Limitations       1, shown by nudi-view testdata/full-0.0.0 8
 
-NOT COUNTED AS PROBLEMS
+ABANDONED PROBLEMS
   Count             6 unresolved, 1 not reproduced
 
   unchecked requirement

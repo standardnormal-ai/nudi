@@ -93,12 +93,12 @@ func TestLiveScreen(t *testing.T) {
 	s := screenLines(t, liveFrom(t, attackLog), at9("04:00"))
 	for _, want := range []string{
 		"nudi  runs/x   following live", "Modal     Elapsed 4:00     Concurrency 8", "Model cost $0.62 of $4.00",
-		"Simulation waiting", "Find Hacks partly", "ATTACK ⣾ 2:00     Attackers + Attack Inspector",
-		"AGENTS  2 running", "Attacker", "No information", "Looking for any hack", "Try 1",
+		"Simulation waiting", "Find Hacks partly", "Attack  ⣾",
+		"Agents  2 running", "Attacker", "No information", "Looking for any hack", "Try 1",
 		"Attack Inspector", "Checks try 1, full",
-		"FINDINGS SO FAR (0)", "None yet.",
-		"CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?", "Try   Status        Hack demonstrated?  New finding?  Problem",
-		"LOGS", "l expand", "Attack Inspector  Ended, no evidence found: check of try 2 with only a hint",
+		"Findings So Far (0)", "None yet.",
+		"Can an Attacker Succeed Without Any Information?", "Try   Status        Hack demonstrated?  New finding?  Problem",
+		"Logs", "l expand", "Attack Inspector  Ended, no evidence found: check of try 2 with only a hint",
 		"Attacker          Episode returned, reward 1: try 2 with only a hint",
 		"? Help   Tab next tab   Up/Down scroll   l logs   q Stop following",
 	} {
@@ -127,13 +127,13 @@ func TestLiveScreenNotesLimitAndCost(t *testing.T) {
 		ev("00:01", "warning", `, "message": "w"`)+
 		ev("05:00", "time_limit", `, "phase": "simulation", "minutes": 5, "known_cost": 1.5, "cancelled_calls": 1`))
 	s := screenLines(t, l, at9("05:00"))
-	for _, want := range []string{"Docker     Elapsed 5:00     Concurrency 2", "Model cost $1.50", "SIMULATION ⣾ 5:00     Simulator",
-		"Limit  The run reached its time limit of 5 minutes. Its report keeps the results so far.", "AGENTS  none running"} {
+	for _, want := range []string{"Docker     Elapsed 5:00     Concurrency 2", "Model cost $1.50", "Simulation  ⣾",
+		"Limit  The run reached its time limit of 5 minutes. Its report keeps the results so far.", "Agents  none running"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("lacks %q:\n%s", want, s)
 		}
 	}
-	if strings.Contains(s, "1 warning") || strings.Contains(s, "CAN AN ATTACKER") {
+	if strings.Contains(s, "1 warning") || strings.Contains(s, "Can an Attacker") {
 		t.Errorf("an orphan count or an empty block:\n%s", s)
 	}
 	if c := liveKeys(t, l, at9("05:00"), 100, 0, "c"); !strings.Contains(c, "Calls cancelled in") {
@@ -249,7 +249,7 @@ func TestFollowScreenGivesWayToTheViewer(t *testing.T) {
 	dir := t.TempDir()
 	addLog(t, dir, attackLog)
 	m, _ := newLive(dir).Update(liveTick{})
-	if s := ansi.Strip(m.View().Content); !strings.Contains(s, "AGENTS  2 running") || !strings.Contains(s, "q Stop following") {
+	if s := ansi.Strip(m.View().Content); !strings.Contains(s, "Agents  2 running") || !strings.Contains(s, "q Stop following") {
 		t.Fatalf("live screen:\n%s", s)
 	}
 	addLog(t, dir, runEnd)
@@ -318,8 +318,8 @@ func TestReplayRecordedLog(t *testing.T) {
 	}
 	s := seen.String()
 	for _, want := range []string{
-		"AGENTS  4 running", "General search", "Focused search", "Reads leaked answer", "Episode review", "Only a hint, try",
-		"FIND HACKS ⣾", "GRADE SIMULATIONS ⣾", "ATTACK ⣾", "CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?", "Hack Inspector    Started: general search of all categories",
+		"Agents  4 running", "General search", "Focused search", "Reads leaked answer", "Episode review", "Only a hint, try",
+		"Find Hacks  ⣾", "Grade Simulations  ⣾", "Attack  ⣾", "Can an Attacker Succeed Without Any Information?", "Hack Inspector    Started: general search of all categories",
 		"Elapsed 59:21", "Model cost $1.20 of $3.00", "Docker", "Concurrency 4",
 	} {
 		if !strings.Contains(s, want) {
@@ -353,7 +353,7 @@ func TestLiveWordsOnly(t *testing.T) {
 // The live Help lists only what works while the run goes on, says what partly means and what the references are.
 func TestLiveHelp(t *testing.T) {
 	s := plainText(helpPanel(wideAt, true))
-	for _, want := range []string{"partly", "unresolved", "REFERENCES", "FINDINGS SO FAR"} {
+	for _, want := range []string{"partly", "unresolved", "References", "Findings So Far"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("live help lacks %q:\n%s", want, s)
 		}
@@ -407,8 +407,7 @@ func TestLiveNoInfoSaysHowAStartedTryStopped(t *testing.T) {
 	}
 }
 
-// The attack runs on after the hack inspection ends, so the hacks count what Attackers exploit after its end too,
-// and the Find Hacks tab names only the Hack Inspector.
+// The attack runs on after the hack inspection ends, so the hacks count what Attackers exploit after its end too.
 func TestTheHacksCountUpdatesAfterTheHackPhaseEnd(t *testing.T) {
 	log := ev("00:00", "run_start", `, "backend": "docker", "analyses": ["hack", "attack"]`) +
 		ev("00:00", "phase_start", `, "phase": "hack"`) +
@@ -418,9 +417,6 @@ func TestTheHacksCountUpdatesAfterTheHackPhaseEnd(t *testing.T) {
 	l := liveFrom(t, log)
 	if p, x := l.hackCounts(); p != 1 || x != 0 {
 		t.Fatalf("at the hack phase end: %d problems, %d exploited", p, x)
-	}
-	if s := plainText(l.phaseLine(2, at9("03:00"), "")); strings.Contains(s, "Attackers") || !strings.Contains(s, "Hack Inspector") {
-		t.Fatalf("Find Hacks line: %s", s)
 	}
 	for _, e := range readAll(t, ev("01:10", "attempt_start", `, "episode": "0000-attacker", "problem": "P1", "level": "full", "number": 1`)+
 		ev("02:00", "attempt_end", `, "episode": "0000-attacker", "problem": "P1", "level": "full", "number": 1`)+
@@ -489,10 +485,10 @@ func TestLiveWithdrawnProblemLeavesTheCount(t *testing.T) {
 // information, the related observations and the logs show on the running phase's tab and on Results.
 func TestIdlePhaseTabShowsOnlyItsPhaseAndAgents(t *testing.T) {
 	l := pipelineLive(t, "pipeline-grader")
-	shared := []string{"FINDINGS SO FAR", "CAN AN ATTACKER", "Related observations", "LOGS"}
-	for name, keys := range map[string][]string{"SIMULATION ✓": {"shift+tab"}, "FIND HACKS ✓": {"tab"}, "ATTACK waiting": {"tab", "tab"}} {
+	shared := []string{"Findings So Far", "Can an Attacker", "Related Observations", "Logs"}
+	for name, keys := range map[string][]string{"Simulation  ✓": {"shift+tab"}, "Find Hacks  ✓": {"tab"}, "Attack  waiting": {"tab", "tab"}} {
 		s := liveKeys(t, l, l.Last.at(), 100, 0, keys...)
-		if !strings.Contains(s, name) || !strings.Contains(s, "AGENTS  none running") {
+		if !strings.Contains(s, name) || !strings.Contains(s, "Agents  none running") {
 			t.Errorf("%s tab:\n%s", name, s)
 		}
 		for _, gone := range append(shared, "General review") {
@@ -502,7 +498,7 @@ func TestIdlePhaseTabShowsOnlyItsPhaseAndAgents(t *testing.T) {
 		}
 	}
 	for _, s := range []string{liveScreen(t, l, l.Last.at(), 100, 0), liveKeys(t, l, l.Last.at(), 100, 0, "tab", "tab", "tab")} {
-		if !strings.Contains(s, "CAN AN ATTACKER") || !strings.Contains(s, "Reward reads stdout") {
+		if !strings.Contains(s, "Can an Attacker") || !strings.Contains(s, "Reward reads stdout") {
 			t.Errorf("the running tab or Results lacks the findings:\n%s", s)
 		}
 	}
@@ -513,14 +509,14 @@ func TestLiveResultsKeepsTheFinishedSections(t *testing.T) {
 	l := pipelineLive(t, "pipeline-grader")
 	s := liveKeys(t, l, l.Last.at(), 100, 0, "tab", "tab", "tab")
 	at := -1
-	for _, h := range []string{"PROBLEMS (5)", "Not counted as problems", "SIMULATION REWARDS", "GRADER ACCURACY", "WORK LEFT", "COST"} {
+	for _, h := range []string{"Problems (5)", "Abandoned Problems", "Simulation Rewards", "Grader Accuracy", "Work Left", "\n Cost"} {
 		i := strings.Index(s, h)
 		if i < at {
 			t.Fatalf("%s missing or out of order:\n%s", h, s)
 		}
 		at = i
 	}
-	if n := strings.Count(s, "Available when the run ends."); n != 4 || strings.Contains(s, "FINDINGS SO FAR") {
+	if n := strings.Count(s, "Available when the run ends."); n != 4 || strings.Contains(s, "Findings So Far") {
 		t.Errorf("%d sections wait for the end:\n%s", n, s)
 	}
 }

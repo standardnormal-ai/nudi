@@ -34,9 +34,6 @@ var agentJobs = map[string]string{"grader": "Grader Inspector", "hack": "Hack In
 
 var agentColors = map[string]color.Color{"grader": blue, "hack": violet, "attack": blue, "attacker": coral}
 
-// phaseJobs say who works in each phase, in the order of phases.
-var phaseJobs = []string{"Simulator", "Grader Inspector", "Hack Inspector", "Attackers + Attack Inspector"}
-
 // shortLevels name a hint level as the Help panel does.
 var shortLevels = map[string]string{"none": "no info", "minimal": "hint", "full": "full"}
 
@@ -119,7 +116,7 @@ func (m liveModel) render(now time.Time) string {
 	}
 	var help []string
 	for _, k := range [][2]string{{"?", "Help"}, {"Tab", "next tab"}, {"Up/Down", "scroll"}, {"l", "logs"}, {"q", "Stop following"}} {
-		help = append(help, bold(k[0])+" "+dim(k[1]))
+		help = append(help, keyText(k[0])+" "+dim(k[1]))
 	}
 	// A narrow window drops keys from the middle; Help lists them all.
 	for len(help) > 2 && width(strings.Join(help, "   ")) > m.w-2 {
@@ -142,7 +139,7 @@ func (m liveModel) parts(now time.Time) (top, body string) {
 	case m.ui.overlay == "c":
 		body = costPanel(r, w)
 	case m.ui.open["f"]:
-		body = strings.Join(l.findings("FINDINGS SO FAR", now, sp, w, -1), "\n")
+		body = strings.Join(l.findings("Findings So Far", now, sp, w, -1), "\n")
 	case m.view() == results:
 		body = l.resultsBody(r, now, sp, w)
 	default:
@@ -200,7 +197,7 @@ func (l *Live) stage(i int, sp string) (string, bool) {
 	case p == nil:
 		return dim("waiting"), false
 	case p.Status == "failed":
-		return redStyle.Bold(true).Render("Error"), false
+		return redStyle.Render("Error"), false
 	case p.Status == "complete":
 		return greenStyle.Render("✓"), false
 	case p.Status == "partial": // the events do not say whether every attempt ran, so partial is never done
@@ -217,20 +214,14 @@ func (l *Live) runs(i int) bool {
 	return p != nil && p.Kind == "phase_start" || p == nil && name == "attack" && attacking
 }
 
-// phaseLine names phase i with its mark and time, then who works in it.
-func (l *Live) phaseLine(i int, now time.Time, sp string) string {
-	mark, off := l.stage(i, sp)
-	name := lipgloss.NewStyle().Bold(true).Foreground(phaseColors[i]).Render(strings.ToUpper(phases[i].Name))
-	if off {
-		return " " + name + "  " + dim("Not part of this run")
-	}
-	t := ""
+// took is how long phase i has run, or ran, or "" before it starts.
+func (l *Live) took(i int, now time.Time) string {
 	if p := l.phase(phases[i].Analysis); p != nil && p.Kind == "phase_start" {
-		t = " " + elapsed(since(p.at(), now).Seconds())
+		return elapsed(since(p.at(), now).Seconds())
 	} else if p != nil && p.Elapsed != nil {
-		t = " " + elapsed(*p.Elapsed)
+		return elapsed(*p.Elapsed)
 	}
-	return " " + name + " " + mark + t + "     " + dim(phaseJobs[i])
+	return ""
 }
 
 // stageBody is a phase tab: the phase, why it failed, the agents, the findings so far, the related observations,
@@ -239,25 +230,28 @@ func (l *Live) phaseLine(i int, now time.Time, sp string) string {
 // shows only the phase and its own agents.
 func (m liveModel) stageBody(now time.Time, sp string, room int) string {
 	l, w, i := &m.l, m.w, m.view()
-	head := []string{l.phaseLine(i, now, sp)}
+	if _, off := l.stage(i, sp); off {
+		return " " + dim("Not part of this run")
+	}
+	var head []string
 	if p := l.phase(phases[i].Analysis); p != nil && p.Error != "" {
 		note := p.Error
 		if l.End != nil {
 			note += "\nThe run ended at " + elapsed(l.ran(now).Seconds()) + ". Its report keeps the results so far."
 		}
-		head = append(head, "", cols(w, " ", []int{7}, redStyle.Bold(true).Render("Error"), note))
+		head = append(head, cols(w, " ", []int{7}, redStyle.Render("Error"), note), "")
 	}
 	if l.Limit != nil && l.Limit.Minutes != nil {
-		head = append(head, "", cols(w, " ", []int{7}, amber("Limit"),
-			"The run reached its time limit of "+strconv.FormatFloat(*l.Limit.Minutes, 'f', -1, 64)+" minutes. Its report keeps the results so far."))
+		head = append(head, cols(w, " ", []int{7}, amber("Limit"),
+			"The run reached its time limit of "+strconv.FormatFloat(*l.Limit.Minutes, 'f', -1, 64)+" minutes. Its report keeps the results so far."), "")
 	}
-	head = append(head, "")
+	took := l.took(i, now)
 	if !l.runs(i) {
 		own := *l
 		own.Agents = slices.DeleteFunc(slices.Clone(l.Agents), func(a Agent) bool { return !slices.Contains(phaseAgents[phases[i].Analysis], a.Who) })
-		agents := own.agentsBlock(now, sp, w, -1)
+		agents := own.agentsBlock(now, sp, w, -1, took)
 		if room > 0 && len(head)+len(agents) > room {
-			agents = own.agentsBlock(now, sp, w, m.ui.agents)
+			agents = own.agentsBlock(now, sp, w, m.ui.agents, took)
 		}
 		return strings.Join(append(head, agents...), "\n")
 	}
@@ -265,13 +259,13 @@ func (m liveModel) stageBody(now time.Time, sp string, room int) string {
 	join := func(agents, findings []string) string {
 		return strings.Join(slices.Concat(head, agents, []string{""}, findings, rest), "\n")
 	}
-	agents := l.agentsBlock(now, sp, w, -1)
-	findings := l.findings("FINDINGS SO FAR", now, sp, w, -1)
+	agents := l.agentsBlock(now, sp, w, -1, took)
+	findings := l.findings("Findings So Far", now, sp, w, -1)
 	if s := join(agents, findings); room == 0 || len(splitLines(s)) <= room {
 		return s
 	}
-	agents = l.agentsBlock(now, sp, w, m.ui.agents)
-	return join(agents, l.findings("FINDINGS SO FAR", now, sp, w, max(0, room-len(splitLines(strings.Join(head, "\n")))-len(agents)-1)))
+	agents = l.agentsBlock(now, sp, w, m.ui.agents, took)
+	return join(agents, l.findings("Findings So Far", now, sp, w, max(0, room-len(splitLines(strings.Join(head, "\n")))-len(agents)-1)))
 }
 
 // rest is what follows the findings on a phase tab: the related observations, the Attacker with no information
@@ -280,7 +274,7 @@ func (l *Live) rest(now time.Time, sp string, w int, open map[string]bool) []str
 	p := &page{w: w, sel: -1, open: open}
 	if rel := l.related(); len(rel) > 0 {
 		p.add("")
-		if p.toggle("o", "Related observations", fmt.Sprintf("(%d)", len(rel))) {
+		if p.toggle("o", "Related Observations", fmt.Sprintf("(%d)", len(rel))) {
 			widths := []int{20, 18, 14}
 			p.add(cols(w, "   ", widths, dim("Reference"), dim("Found by"), dim("New finding?"), dim("Same as")))
 			for _, r := range rel {
@@ -292,7 +286,7 @@ func (l *Live) rest(now time.Time, sp string, w int, open map[string]bool) []str
 		p.add("")
 		p.add(block...)
 	}
-	p.add("", spread(" "+bold("LOGS"), bold("l")+" "+dim(map[bool]string{false: "expand", true: "collapse"}[open["l"]]), w))
+	p.add("", spread(" "+bold("Logs"), keyText("l")+" "+dim(map[bool]string{false: "expand", true: "collapse"}[open["l"]]), w))
 	logs := l.Recent
 	if !open["l"] {
 		logs = logs[max(0, len(logs)-4):]
@@ -307,13 +301,16 @@ func (l *Live) rest(now time.Time, sp string, w int, open map[string]bool) []str
 func tilesPerRow(w int) int { return max(1, (w-1)/(tileW+1)) }
 
 // agentsBlock is one tile per running session and Attacker attempt, in rows as wide as the screen; with a page from
-// 0, only that page's row, with the range it shows.
-func (l *Live) agentsBlock(now time.Time, sp string, w, page int) []string {
+// 0, only that page's row, with the range it shows. took, how long the phase has run, goes in the title.
+func (l *Live) agentsBlock(now time.Time, sp string, w, page int, took string) []string {
 	n, fit := len(l.Agents), tilesPerRow(w)
-	if n == 0 {
-		return []string{heading("AGENTS", "none running")}
+	if took != "" {
+		took = ", phase time " + took
 	}
-	title, shown := heading("AGENTS", fmt.Sprintf("%d running", n)), l.Agents
+	if n == 0 {
+		return []string{heading("Agents", "none running"+took)}
+	}
+	title, shown := heading("Agents", fmt.Sprintf("%d running", n)+took), l.Agents
 	if page >= 0 && n > fit {
 		a := min(page, (n-1)/fit) * fit
 		b := min(n, a+fit)
@@ -322,7 +319,7 @@ func (l *Live) agentsBlock(now time.Time, sp string, w, page int) []string {
 		if a+1 == b {
 			which = fmt.Sprintf("Agent %d of %d", b, n)
 		}
-		title = spread(title, dim(which)+"  "+bold("←/→")+" "+dim("more"), w)
+		title = spread(title, dim(which)+"  "+keyText("←/→")+" "+dim("more"), w)
 	}
 	out := []string{title}
 	for i := 0; i < len(shown); i += fit {
@@ -444,7 +441,7 @@ func (l *Live) findings(name string, now time.Time, sp string, w, room int) []st
 		used += len(rows[k])
 		k++
 	}
-	open := bold("f") + " " + dim("open")
+	open := keyText("f") + " " + dim("open")
 	if k < 2 {
 		return []string{title + "   " + open}
 	}
@@ -591,7 +588,7 @@ func (l *Live) noInfo(now time.Time, sp string, w int) []string {
 	if len(rows) == 0 {
 		return nil
 	}
-	return append([]string{" " + bold("CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?"),
+	return append([]string{" " + bold("Can an Attacker Succeed Without Any Information?"),
 		cols(w, "   ", widths, dim("Try"), dim("Status"), dim("Hack demonstrated?"), dim("New finding?"), dim("Problem"))}, rows...)
 }
 
@@ -772,23 +769,23 @@ func (l *Live) resultsBody(r Report, now time.Time, sp string, w int) string {
 		n += boolInt(lane.Same == "" && (!lane.Withdrawn || l.exploited(lane))) // an Attacker's exploit outlasts a withdrawal
 	}
 	out := []string{
-		spread(" "+bold("Run not finished")+"  "+dim("running for "+elapsed(l.ran(now).Seconds())), dim(fmt.Sprintf("%d problem%s so far", n, plural(n))), w),
+		spread(" "+"Run not finished"+"  "+dim("running for "+elapsed(l.ran(now).Seconds())), dim(fmt.Sprintf("%d problem%s so far", n, plural(n))), w),
 		" " + dim("Findings so far. The result is final when the run ends."), "",
 	}
-	out = append(out, l.findings("PROBLEMS", now, sp, w, -1)...)
+	out = append(out, l.findings("Problems", now, sp, w, -1)...)
 	if block := l.noInfo(now, sp, w); len(block) > 0 {
 		out = append(append(out, ""), block...)
 	}
 	later := " " + dim("Available when the run ends.")
-	out = append(out, "", " "+bold("Not counted as problems"), later, "")
-	left, right := heading("SIMULATION REWARDS", "")+"\n"+later, heading("GRADER ACCURACY", "")+"\n"+later
+	out = append(out, "", " "+bold("Abandoned Problems"), later, "")
+	left, right := heading("Simulation Rewards", "")+"\n"+later, heading("Grader Accuracy", "")+"\n"+later
 	if w >= 100 {
 		out = append(out, lipgloss.JoinHorizontal(lipgloss.Top, lipgloss.NewStyle().Width(48).Render(left), right))
 	} else {
 		out = append(out, left, "", right)
 	}
-	out = append(out, "", heading("WORK LEFT", ""), later)
-	out = append(append(out, "", heading("COST", "")), costRows(r, w, false)...)
+	out = append(out, "", heading("Work Left", ""), later)
+	out = append(append(out, "", heading("Cost", "")), costRows(r, w, false)...)
 	return strings.Join(out, "\n")
 }
 

@@ -1,6 +1,6 @@
 [project]
 name = "nudi"
-version = "0.0.2"
+version = "0.3.0"
 description = "Pre-hack and simulate Harbor RL environments"
 readme = "readme.md"
 license = "MIT"

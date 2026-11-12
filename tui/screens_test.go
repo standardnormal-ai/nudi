@@ -106,7 +106,7 @@ func TestPhasesNotRun(t *testing.T) {
 	}
 	for s, want := range map[int]string{
 		1:       "Selected, but it did not start before the run stopped.",
-		2:       "FIND HACKS  not selected for this run",
+		2:       "This run used --analysis simulation",
 		results: "Not available: Grade Simulations",
 	} {
 		if got := plainTab(r, s); !strings.Contains(got, want) {
@@ -146,7 +146,7 @@ func TestWidthSweep(t *testing.T) {
 						m := tm.(model)
 						m.screen, m.overlay = s, overlay
 						if all {
-							open := []string{"o", "i", "s", "x", "e", "?", "episodes"}
+							open := []string{"o", "i", "s", "x", "e", "?", "p"}
 							m.page()
 							for _, it := range m.items {
 								open = append(open, it.key)

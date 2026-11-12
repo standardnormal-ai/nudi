@@ -17,7 +17,7 @@
  │
  ◆ nudi       violating content received 1.0, above the deserved score 0.0
 
- INTERPRETATION
+ Interpretation
  The Hack Inspector wrote: "summary is violated"
 === finding 1 tab 1
  Results › The test runs bash through PATH.                                                      P1
@@ -30,7 +30,7 @@
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- SCOPE LIMITS (2)
+ Scope Limits (2)
  1  nudi checks the evidence, not the task's intent
     The captured program, inputs and measured facts support the Inspector's explicit interpretation;
     nudi checks provenance and consistency, not arbitrary program or task semantics, and an

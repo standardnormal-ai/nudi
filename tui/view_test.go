@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -73,7 +74,7 @@ func drawTab(r Report, s, w int, open ...string) string {
 	m := newModel(r, 0, false)
 	m.w, m.screen = w, s
 	if open == nil {
-		open = []string{"o", "i", "s", "x", "e", "?"}
+		open = []string{"o", "i", "s", "x", "e", "?", "p"}
 		m.page()
 		for _, it := range m.items {
 			open = append(open, it.key)
@@ -95,11 +96,11 @@ func TestReportWithoutProblems(t *testing.T) {
 		t.Fatalf("problems: %v", r.Attack.Problems)
 	}
 	for _, s := range []string{plainTab(r, 2), plainTab(r, 3), plainTab(r, results), plainReport(r, 120), plainShow(r, r.findings(), 3, 120)} {
-		if strings.Contains(s, "\nPROBLEMS\n") || strings.Contains(s, "PROBLEMS (") || strings.Contains(s, "Who demonstrated it") {
+		if strings.Contains(s, "\nPROBLEMS\n") || strings.Contains(s, "PROBLEMS (") || strings.Contains(s, "Problems (") || strings.Contains(s, "Who demonstrated it") {
 			t.Errorf("a report without problems shows some:\n%s", s)
 		}
 	}
-	if s := plainTab(r, 3); !strings.Contains(s, "TRIES (2)") || !strings.Contains(s, "hack-1") || !strings.Contains(plainTab(r, results), "FINDINGS (") {
+	if s := plainTab(r, 3); !strings.Contains(s, "Tries (2)") || !strings.Contains(s, "hack-1") || !strings.Contains(plainTab(r, results), "Findings (") {
 		t.Errorf("attempts or findings are missing:\n%s", s)
 	}
 }
@@ -108,7 +109,7 @@ func TestReportWithoutProblems(t *testing.T) {
 func TestStoppedRunSaysNotTested(t *testing.T) {
 	r := fixture(t, "time-limit-before-levels")
 	attack := plainTab(r, 3)
-	for _, want := range []string{"ATTACK stopped", "Not started", "Not tested: stopped."} {
+	for _, want := range []string{"Not started", "Not tested: stopped."} {
 		if !strings.Contains(attack, want) {
 			t.Errorf("attack panel lacks %q:\n%s", want, attack)
 		}
@@ -329,7 +330,7 @@ func TestKeys(t *testing.T) {
 		t.Fatalf("finding %d tab %d", m.n, m.tab)
 	}
 	m = press(m, "esc", "tab", "tab", "tab")
-	if m.n != 0 || m.screen != 2 || !strings.Contains(ansi.Strip(m.View().Content), "FIND HACKS ✓") {
+	if m.n != 0 || m.screen != 2 || !strings.Contains(ansi.Strip(m.View().Content), "Find Hacks  ✓") {
 		t.Fatalf("finding %d screen %d", m.n, m.screen)
 	}
 	for _, k := range []string{"m", "c", "?"} {
@@ -340,7 +341,7 @@ func TestKeys(t *testing.T) {
 			t.Fatalf("Esc does not close panel %s", k)
 		}
 	}
-	if m = press(m, "s"); !strings.Contains(ansi.Strip(m.View().Content), "▾ Search scope") {
+	if m = press(m, "s"); !strings.Contains(ansi.Strip(m.View().Content), "▾ Search Scope") {
 		t.Fatal("s does not expand the search scope")
 	}
 	if m = press(m, "q"); !m.exited || m.View().Content != "" {
@@ -362,10 +363,9 @@ func TestRewardSummariesAndFlags(t *testing.T) {
 		!strings.Contains(s, "2 of 12 usable 'reward' rewards are below the rest by the quartile rule") {
 		t.Errorf("plain report:\n%s", s)
 	}
-	s := plainTab(r, 0, "?")
+	s := plainTab(r, 0, "?", "p")
 	for _, want := range []string{
 		"12/12                12          0.8333       1            0.3892       -2.055",
-		"2 episodes received 0; the other 10 received 1.",
 		"Reason for warning: A few rewards far below the rest",
 		"A reward is unusually low when it is below Q1 - 3 x IQR.",
 		"Q1 is 1 and Q3 is 1, so the fence is 1.",
@@ -898,7 +898,7 @@ func TestCleanRunNamesItsOpenQuestion(t *testing.T) {
 // The help defines the metrics; the Results tab only shows them.
 func TestHelpDefinesMetrics(t *testing.T) {
 	help := plainText(helpPanel(wideAt, false))
-	for _, want := range []string{"METRICS", "F1", "2 TP / (2 TP + FP + FN)", "AUROC", "Score ordering", "source-grounded"} {
+	for _, want := range []string{"Metrics", "F1", "2 TP / (2 TP + FP + FN)", "AUROC", "Score ordering", "source-grounded"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("help lacks %q:\n%s", want, help)
 		}
@@ -925,23 +925,13 @@ func TestStandaloneEvidenceOpens(t *testing.T) {
 	t.Errorf("no selectable standalone evidence:\n%s", plainText(p.String()))
 }
 
-// An expanded problem says why each level was not tested.
-func TestExpandedProblemSaysWhyNotTested(t *testing.T) {
-	s := plainTab(fixture(t, "full"), results)
-	for _, want := range []string{"Hint -      Not tested: no Attacker attempt recorded", "Not tested: no guidance for an Attacker"} {
-		if !strings.Contains(s, want) {
-			t.Errorf("results lack %q:\n%s", want, s)
-		}
-	}
-}
-
 // Older reports: legacy tries name what each tested and whether it succeeded, and a problem of no recorded type gets its
 // own group.
 func TestOlderReportsGroupWhatTheyKnow(t *testing.T) {
 	if s := plainTab(fixture(t, "full-0.0.0"), 3); !strings.Contains(s, "Tested") || !strings.Contains(s, "Succeeded") {
 		t.Errorf("legacy tries:\n%s", s)
 	}
-	if s := plainTab(fixture(t, "pipeline-full"), 3); !strings.Contains(s, "TYPE NOT RECORDED (1)") {
+	if s := plainTab(fixture(t, "pipeline-full"), 3); !strings.Contains(s, "Type Not Recorded (1)") {
 		t.Errorf("no type group:\n%s", s)
 	}
 }
@@ -1090,7 +1080,7 @@ func TestSuspectedExploitIsNotCountedAsAProblem(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := plainTab(r, results, "o")
-	for _, want := range []string{"Not counted as problems (2 suspected exploits)", "Reads solution files", "check-0", "check-1"} {
+	for _, want := range []string{"Abandoned Problems", "Reads solution files", "check-0", "check-1"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("Results misses %q:\n%s", want, s)
 		}
@@ -1124,7 +1114,7 @@ func TestSuspectedReadingIsOneRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := plainTab(r, results, "o")
-	if !strings.Contains(s, "Not counted as problems (1 suspected exploit)") || strings.Count(s, "Suspected exploit") != 1 || strings.Contains(s, "Unresolved") {
+	if !strings.Contains(s, "Abandoned Problems") || strings.Count(s, "Suspected exploit") != 1 || strings.Contains(s, "Unresolved") {
 		t.Errorf("Results:\n%s", s)
 	}
 }
@@ -1203,7 +1193,7 @@ func TestLegendsFoldedUntilE(t *testing.T) {
 			t.Errorf("tab %d: pressing e does not open the legend", s)
 		}
 	}
-	if s := plainTab(r, results, "problem 0"); !strings.Contains(row(s, "PROBLEMS (4)"), "▸ Evidence") || strings.Contains(s, "Who demonstrated it") {
+	if s := plainTab(r, results, "problem 0"); !strings.HasSuffix(row(s, "Problems (4)"), "e expand") || strings.Contains(s, "Evidence") || strings.Contains(s, "Who demonstrated it") {
 		t.Errorf("Results header:\n%s", s)
 	}
 }
@@ -1212,7 +1202,7 @@ func TestLegendsFoldedUntilE(t *testing.T) {
 func TestScreensSayOnlyData(t *testing.T) {
 	r := fixture(t, "full")
 	screens := map[string]string{
-		"episodes": plainTab(r, 0, "episodes"), "method": plainTab(r, 0, "?"), "grade": plainTab(r, 1, "s"),
+		"episodes": plainTab(r, 0, "p"), "method": plainTab(r, 0, "?"), "grade": plainTab(r, 1, "s", "e"),
 		"hacks": plainTab(r, 2, "s", "x"), "attack": plainTab(r, 3), "plain": plainReport(r, 120),
 	}
 	for name, s := range screens {
@@ -1241,7 +1231,7 @@ func TestRewardPatternWarning(t *testing.T) {
 	if !strings.Contains(main, "Warning: Possibly a bad system prompt or grader<->prompt mismatch") {
 		t.Errorf("main view:\n%s", main)
 	}
-	if !strings.Contains(oneLine(method), "│ Reason for warning: A few rewards far below the rest") || strings.Contains(method, "Pattern    ") || strings.Contains(method, "Details") {
+	if !strings.Contains(method, "╭─ Reward Patterns Explainer ─") || !strings.Contains(oneLine(method), "│ Reason for warning: A few rewards far below the rest") || strings.Contains(method, "│ Pattern") || strings.Contains(method, "Details") {
 		t.Errorf("method:\n%s", method)
 	}
 	if s := oneLine(plainReport(r, 120)); !strings.Contains(s, "Warning Possibly a bad system prompt") || !strings.Contains(s, "Reason A few rewards far below the rest") {
@@ -1287,4 +1277,157 @@ func TestAttackTriesSucceeded(t *testing.T) {
 	if !strings.Contains(row(s, "Try"), "Succeeded") || cells(s, "1    Full") != "✓ Finished - 0001-attacker" || cells(s, "2    Full") != "✓* Finished - 0002-attacker" {
 		t.Errorf("tries:\n%s", s)
 	}
+}
+
+// No repeated not-tested lines, bare key hints, plain fold titles, Simulation episodes behind p.
+func TestPlainFoldsAndKeyHints(t *testing.T) {
+	r := fixture(t, "full")
+	res := plainTab(r, results)
+	for _, bad := range []string{"Hint -      Not tested", "Full -      Not tested", "no guidance for an Attacker", "Evidence   e", "Ideas and records",
+		"Not counted as problems", "(P1, G1", "(6 unresolved"} {
+		if strings.Contains(res, bad) {
+			t.Errorf("Results shows %q:\n%s", bad, res)
+		}
+	}
+	for _, want := range []string{"▾ Abandoned Problems", "Suspected problems that didn't have enough evidence", "▾ What the References Mean"} {
+		if !strings.Contains(res, want) {
+			t.Errorf("Results lacks %q:\n%s", want, res)
+		}
+	}
+	for s, head := range map[int]string{results: "Problems (4)", 2: "Problems Found (3)", 3: "Hacks (", 1: "Metrics"} {
+		if got := oneLine(row(plainTab(r, s, "none"), head)); !strings.HasSuffix(got, " e expand") || strings.Contains(got, "Legend") {
+			t.Errorf("tab %d header %q", s, got)
+		}
+	}
+	if s := plainReport(r, 120); !strings.Contains(s, "\nABANDONED PROBLEMS\n") || strings.Contains(s, "NOT COUNTED") {
+		t.Errorf("plain:\n%s", s)
+	}
+	sim := plainTab(r, 0, "none")
+	for _, bad := range []string{"received 0", "Enter", "episodes   ?"} {
+		if strings.Contains(sim, bad) {
+			t.Errorf("Simulation shows %q:\n%s", bad, sim)
+		}
+	}
+	if !strings.Contains(sim, "? expand") || !strings.Contains(oneLine(sim), "▸ Episodes (12) p expand") || strings.Contains(sim, "0004-simulator") {
+		t.Errorf("Simulation folds:\n%s", sim)
+	}
+	if s := plainTab(r, 0, "p", "?"); !strings.Contains(s, "▾ Episodes (12)") || !strings.Contains(s, "0004-simulator    0") || !strings.Contains(s, "? collapse") ||
+		!strings.Contains(s, "Rewards") {
+		t.Errorf("Simulation open:\n%s", s)
+	}
+	grade := plainTab(r, 1, "none")
+	for _, bad := range []string{"Fraction", "Meaning", "Wilson interval", "The reward matches the work"} {
+		if strings.Contains(grade, bad) {
+			t.Errorf("Grade Simulations shows %q by default:\n%s", bad, grade)
+		}
+	}
+	if s := plainTab(r, 1, "e"); !strings.Contains(s, "Fraction   Meaning") || !strings.Contains(s, "The reward matches the work") {
+		t.Errorf("e does not show the columns:\n%s", s)
+	}
+	if s := plainTab(r, 2, "none"); !strings.Contains(s, "▸ Search Scope") || !strings.Contains(s, "▸ Experiments") {
+		t.Errorf("Find Hacks folds:\n%s", s)
+	}
+}
+
+// The key bar names what Enter does on the selected row, and shows no Enter where it does nothing.
+func TestKeyBarSaysWhatEnterDoes(t *testing.T) {
+	r := fixture(t, "full")
+	bar := func(m model) string {
+		return ansi.Strip(splitLines(strings.TrimRight(m.View().Content, "\n"))[len(splitLines(strings.TrimRight(m.View().Content, "\n")))-1])
+	}
+	for s, want := range map[int]string{results: "Enter expand problem", 2: "Enter open finding", 3: "Enter expand tries", 0: "", 1: ""} {
+		m := newModel(r, 0, false)
+		m.screen = s
+		m = m.layout()
+		got := bar(m)
+		if strings.Contains(got, "expand or open") || want == "" && strings.Contains(got, "Enter") || want != "" && !strings.Contains(got, want) {
+			t.Errorf("tab %d bar %q, want %q", s, got, want)
+		}
+	}
+	m := newModel(r, 0, false)
+	m.screen = 3
+	if got := bar(press(m.layout(), "enter")); !strings.Contains(got, "Enter collapse tries") {
+		t.Errorf("after Enter: %q", got)
+	}
+	m = newModel(r, 0, false)
+	m.screen = 0
+	if m = press(m.layout(), "p"); !strings.Contains(ansi.Strip(m.View().Content), "0004-simulator") {
+		t.Error("p does not open the episodes")
+	}
+}
+
+// Only titles are bold, in Title Case: sections, folds, boxes and the active tab. Rows, cells, values, warnings, key
+// hints and the selected row are not.
+func TestOnlyTitlesAreBold(t *testing.T) {
+	small := []string{"a", "an", "and", "as", "for", "in", "of", "on", "the", "to"}
+	for _, name := range []string{"full", "time-limit", "pipeline-full"} {
+		r := fixture(t, name)
+		for s := range results + 1 {
+			m := newModel(r, 0, false)
+			m.w, m.screen = 100, s
+			for _, k := range []string{"o", "i", "e", "?", "p"} {
+				m.open[fmt.Sprint(s)+k] = true
+			}
+			runs := boldRuns(m.View().Content)
+			if len(runs) == 0 {
+				t.Errorf("%s tab %d has no bold title", name, s)
+			}
+			for _, run := range runs {
+				caps := len(run) > 3 && strings.ToUpper(run) == run && strings.ToLower(run) != run
+				for i, w := range strings.Fields(run) {
+					if first := w[:1]; first != strings.ToUpper(first) && (i == 0 || !slices.Contains(small, w)) {
+						caps = true
+					}
+				}
+				if caps {
+					t.Errorf("%s tab %d: %q is bold but not a Title Case title", name, s, run)
+				}
+			}
+			if s == results && name == "full" && !slices.Contains(runs, "Problems") {
+				t.Errorf("Results title not bold: %q", runs)
+			}
+		}
+	}
+}
+
+// boldRuns are the stretches of s drawn bold, without their escapes.
+func boldRuns(s string) []string {
+	sgr := regexp.MustCompile(`\x1b\[([0-9;:]*)m`)
+	var runs []string
+	var run strings.Builder
+	on := false
+	for {
+		loc := sgr.FindStringSubmatchIndex(s)
+		text := s
+		if loc != nil {
+			text = s[:loc[0]]
+		}
+		if on {
+			run.WriteString(ansi.Strip(text))
+		}
+		if loc == nil {
+			break
+		}
+		params := strings.Split(s[loc[2]:loc[3]], ";")
+		for i := 0; i < len(params); i++ {
+			switch params[i] {
+			case "", "0", "22":
+				on = false
+			case "1":
+				on = true
+			case "38", "48", "58": // a colour, whose own numbers are not styles
+				if i+1 < len(params) && params[i+1] == "5" {
+					i += 2
+				} else {
+					i += 4
+				}
+			}
+		}
+		if text := strings.TrimSpace(run.String()); !on && text != "" {
+			runs = append(runs, text)
+			run.Reset()
+		}
+		s = s[loc[1]:]
+	}
+	return runs
 }

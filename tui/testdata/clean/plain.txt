@@ -16,7 +16,7 @@ RESULT
 EVIDENCE
   None evidenced in this run.
 
-NOT COUNTED AS PROBLEMS
+ABANDONED PROBLEMS
   Count             1 unresolved
 
   unchecked requirement

@@ -4,16 +4,14 @@
  Simulation ✓ ──  Grade Simulations  ⣾ ── Find Hacks ✓ ── Attack waiting            │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- GRADE SIMULATIONS ⣾ 3:59     Grader Inspector
-
- AGENTS  1 running
+ Agents  1 running, phase time 3:59
  ╭─ Grader Inspector ── ⣾ 3:59 ─╮
  │ General review               │
  │ All simulated episodes       │
  │                              │
  ╰──────────────────────────────╯
 
- FINDINGS SO FAR (5)
+ Findings So Far (5)
  Finding                                       New?   Inspector?  Full instr.?  Hint?
  Reward reads stdout                            ✓         ✓            ✓          ✗
  Skips the test file                            ✓         ✓            ✓          ✗
@@ -21,13 +19,13 @@
  Timeout counts as pass                         ✓         ✓            -          -
  Accepts empty answer                           ✓         ✓            -          -
 
- ▸ Related observations (5)                                                                o expand
+ ▸ Related Observations (5)                                                                o expand
 
- CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?
+ Can an Attacker Succeed Without Any Information?
    Try   Status        Hack demonstrated?  New finding?  Problem
    1     Finished              ✓                ✗        Reward reads stdout
 
- LOGS                                                                                      l expand
+ Logs                                                                                      l expand
  10:24:10  novelty_judge     Same as an earlier finding: reward reads stdout
  10:25:00  Grader Inspector  Evidence confirmed: incorrect work passed
  10:25:00  novelty_judge     Same as an earlier finding: timeout counts as pass

@@ -7,25 +7,21 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-
-	"charm.land/lipgloss/v2"
 )
 
 // The four phase tabs: Simulation, Grade Simulations, Find Hacks and Attack.
 
-// stageHead draws phase i's title with its mark and a note on the right, and says whether the phase has results to show.
-// A phase the run left out, did not run or that failed says so instead.
-func stageHead(r Report, i int, note string, p *page) bool {
-	a, name := phases[i].Analysis, strings.ToUpper(phases[i].Name)
-	mark, off := r.stage(i)
-	if off {
-		p.add(heading(dim(name), "not selected for this run"), "", wrap(leftOut(r), p.w, " ", plain))
+// stageHead says whether phase i has results to show. The tab is the page title and carries the mark, so a phase
+// the run left out, did not run or that failed says only why.
+func stageHead(r Report, i int, p *page) bool {
+	a := phases[i].Analysis
+	if _, off := r.stage(i); off {
+		p.add(wrap(leftOut(r), p.w, " ", plain))
 		return false
 	}
-	p.add(spread(" "+lipgloss.NewStyle().Bold(true).Foreground(phaseColors[i]).Render(name)+" "+mark, dim(note), p.w), "")
 	switch {
 	case r.PhaseErrors[a] != "":
-		p.add(wrap(redStyle.Bold(true).Render("Error")+"  "+r.PhaseErrors[a], p.w, " ", plain), wrap(failedNote(r, phases[i].Name, a), p.w, " ", plain))
+		p.add(wrap(redStyle.Render("Error")+"  "+r.PhaseErrors[a], p.w, " ", plain), wrap(failedNote(r, phases[i].Name, a), p.w, " ", plain))
 		if !kept(r, a) {
 			return false
 		}
@@ -74,18 +70,14 @@ func leftOut(r Report) string {
 }
 
 // simulationPage is the Simulator's rewards: a chart, the statistics and the reward pattern, whose method ? explains;
-// Enter lists the episodes.
+// p lists the episodes.
 func simulationPage(r Report, found []Finding, p *page) {
 	o := r.Ordinary
-	if !stageHead(r, 0, "", p) {
+	if !stageHead(r, 0, p) {
 		return
 	}
 	if o == nil || len(o.Groups) == 0 {
 		p.add(" " + dim("No simulation result recorded."))
-		return
-	}
-	if p.open["episodes"] {
-		episodesTable(r, found, p)
 		return
 	}
 	for _, g := range o.Groups {
@@ -95,20 +87,20 @@ func simulationPage(r Report, found []Finding, p *page) {
 				p.add(" "+dim(group(g.Configuration.Model, name)), "")
 			}
 			widths := []int{21, 12, 13, 13, 13}
-			p.add(heading("REWARDS", ""))
+			p.add(heading("Rewards", ""))
 			p.add(rewardBars(x, 5, p.w)...)
-			p.add("", heading("STATISTICS", ""),
+			p.add("", heading("Statistics", ""),
 				cols(p.w, " ", widths, dim("Usable / attempted"), dim("Requested"), dim("Mean"), dim("Median"), dim("Sample SD"), dim("Skewness")),
 				cols(p.w, " ", widths, fmt.Sprintf("%d/%d", x.Usable, x.Attempted), strconv.Itoa(o.Requested), num(x.Mean), num(x.Median), num(x.SD), num(x.Skewness)))
-			if left := x.Attempted - x.Usable; left > 0 {
-				p.add(wrap(fmt.Sprintf("%d episode%s without a usable reward, not counted.", left, plural(left)), p.w, " ", dim))
-			}
-			p.add("", spread(heading("REWARD PATTERN", ""), bold("Enter")+" "+dim("episodes")+"   "+bold("?")+" "+dim("method"), p.w))
+			p.add("", spread(heading("Reward Pattern", ""), p.fold("?"), p.w))
 			for _, line := range warnings(x) {
 				p.add(wrap(line, p.w, " ", amber))
 			}
+			// The flagged episodes and their rewards are in the method and the episodes; only what has no warning stays.
 			for _, line := range patterns(x, g.EpisodeRewards, name) {
-				p.add(wrap(line, p.w, " ", plain))
+				if line == unavailable || line == "No pattern flagged." {
+					p.add(wrap(line, p.w, " ", plain))
+				}
 			}
 			if x.FlagsNotEvaluated != nil {
 				p.add(wrap(*x.FlagsNotEvaluated, p.w, " ", dim))
@@ -118,18 +110,27 @@ func simulationPage(r Report, found []Finding, p *page) {
 			}
 		}
 	}
+	if n := len(o.Groups[0].EpisodeRewards); n > 0 {
+		p.add("")
+		if p.toggle("p", "Episodes", fmt.Sprintf("(%d)", n)) {
+			episodesTable(r, found, p)
+		}
+	}
 }
+
+// unavailable is the reward pattern of a report whose flags lack their details.
+const unavailable = "Pattern details unavailable."
 
 // patterns say each flagged reward pattern in one line: how many episodes received what, against the others. The
 // pattern's name is in the method panel.
 func patterns(x Rewards, rewards map[string]map[string]*float64, key string) []string {
 	if x.Flags == nil {
-		return []string{"Pattern details unavailable."}
+		return []string{unavailable}
 	}
 	var out []string
 	for _, f := range x.Flags {
 		if f == nil || f.Flag == nil || f.Text == nil {
-			out = append(out, "Pattern details unavailable.")
+			out = append(out, unavailable)
 			continue
 		}
 		if rewards == nil { // reports written before rewards per episode
@@ -218,7 +219,7 @@ func method(r Report, found []Finding, x Rewards, w int) string {
 	if rows == nil {
 		rows = []string{dim("No pattern to explain.")}
 	}
-	return box("How nudi reads a reward pattern", bold("?")+" "+dim("close"), w-1, rows...)
+	return box("Reward Patterns Explainer", keyText("?")+" "+dim("collapse"), w-1, rows...)
 }
 
 // methodRows are the method's rows, each a name and its text; none without a flagged pattern.
@@ -319,7 +320,6 @@ func episodesTable(r Report, found []Finding, p *page) {
 		}
 		return cmp.Compare(*x, *y)
 	})
-	p.add(spread(" "+fg(teal, bold("EPISODES"))+" "+dim(fmt.Sprintf("(%d)", len(episodes))), dim("lowest reward first   ")+bold("Esc")+" "+dim("back"), p.w), "")
 	widths := []int{18, 9, 15, 40}
 	p.add(cols(p.w, "   ", widths, dim("Episode"), dim("Reward"), dim("Label"), dim("Grader Inspector"), dim("Ref")))
 	for _, e := range episodes {
@@ -354,27 +354,37 @@ func boolInt(b bool) int {
 }
 
 // gradePage is the grader's accuracy against the Grader Inspector's reference: the four kinds of decision, the
-// metrics with their basis, the episode labels, and, behind s, what the Grader Inspector looked for.
+// metrics, the episode labels, and, behind s, what the Grader Inspector looked for. e shows the metrics' fractions and
+// the meanings of metrics and labels.
 func gradePage(r Report, p *page) {
-	note := ""
-	if m := r.Metrics; m != nil && m.Coverage.Ordinary > 0 {
-		note = dim("Used for accuracy ") + fmt.Sprintf("%d/%d", m.Coverage.Eligible, m.Coverage.Ordinary)
-	}
-	if !stageHead(r, 1, note, p) {
+	if !stageHead(r, 1, p) {
 		return
 	}
 	if r.Metrics == nil || len(r.Metrics.Confusion) == 0 {
 		p.add(" " + yellowStyle.Render("No grader accuracy recorded."))
 	}
 	if m := r.Metrics; m != nil {
-		for _, a := range m.Confusion {
-			agreement(a, len(m.Confusion) > 1, p)
+		used := ""
+		if m.Coverage.Ordinary > 0 {
+			used = dim("Used for accuracy ") + fmt.Sprintf("%d/%d", m.Coverage.Eligible, m.Coverage.Ordinary)
+		}
+		for i, a := range m.Confusion {
+			agreement(a, len(m.Confusion) > 1, used, p)
+			if i == 0 {
+				used = ""
+			}
 		}
 	}
 	if l := r.Labels; l != nil && len(l.Counts) > 0 {
-		p.add(heading("EPISODE LABELS", ""))
+		p.add(spread(heading("Episode Labels", ""), p.fold("e"), p.w))
 		widths := []int{17, 11, 44}
-		p.add(cols(p.w, " ", widths, dim("Label"), dim("Episodes"), dim("Meaning"), dim("Used for accuracy")))
+		labelRow := func(cells ...string) string {
+			if !p.open["e"] {
+				cells = slices.Delete(cells, 2, 3)
+			}
+			return cols(p.w, " ", widths, cells...)
+		}
+		p.add(labelRow(dim("Label"), dim("Episodes"), dim("Meaning"), dim("Used for accuracy")))
 		var excluded []string
 		if r.Metrics != nil {
 			for _, es := range r.Metrics.Coverage.Excluded {
@@ -405,7 +415,7 @@ func gradePage(r Report, p *page) {
 			if r.Metrics == nil {
 				answer = dim("-")
 			}
-			p.add(cols(p.w, " ", widths, name, strconv.Itoa(counts[name]), meaning, answer))
+			p.add(labelRow(name, strconv.Itoa(counts[name]), meaning, answer))
 		}
 		p.add("")
 	}
@@ -431,12 +441,13 @@ func graderProblems(r Report) string {
 // agreement draws one confusion group: the four kinds of decision, then the metrics. Without grader agreement it
 // says why, and the pass rate still stands with its rule.
 // With several groups, each names its Simulator model and reward.
-func agreement(a Agreement, several bool, p *page) {
+// used, how many simulated episodes the accuracy uses, goes on the right of the header.
+func agreement(a Agreement, several bool, used string, p *page) {
 	note := ""
 	if several {
-		note = dim(group(a.Configuration.Model, a.Reward))
+		note = group(a.Configuration.Model, a.Reward)
 	}
-	p.add(spread(heading("GRADER ACCURACY", ""), note, p.w))
+	p.add(spread(heading("Grader Accuracy", note), used, p.w))
 	if a.Status == "supported" {
 		widths := []int{17, 9, 13}
 		p.add(cols(p.w, " ", widths, dim("Type"), dim("Grader"), dim("Work was"), dim("Episodes")))
@@ -447,7 +458,13 @@ func agreement(a Agreement, several bool, p *page) {
 		p.add(wrap("Not available: "+strings.Join(a.Reasons, " "), p.w, " ", amber))
 	}
 	widths := []int{23, 13, 11}
-	p.add("", heading("METRICS", ""), cols(p.w, " ", widths, dim("Metric"), dim("Value"), dim("Fraction"), dim("Meaning")))
+	row := func(cells ...string) string {
+		if !p.open["e"] && len(cells) > 2 {
+			cells = cells[:2]
+		}
+		return cols(p.w, " ", widths, cells...)
+	}
+	p.add("", spread(heading("Metrics", ""), p.fold("e"), p.w), row(dim("Metric"), dim("Value"), dim("Fraction"), dim("Meaning")))
 	metric := func(name string, x Rate, basis string) {
 		value, fraction := "unavailable", ""
 		if x.Unavailable != nil {
@@ -455,17 +472,17 @@ func agreement(a Agreement, several bool, p *page) {
 		} else if x.Value != nil {
 			value, fraction = percent(x), fmt.Sprintf("%d/%d", *x.Numerator, *x.Denominator)
 		}
-		p.add(cols(p.w, " ", widths, name, value, fraction, dim(basis)))
+		p.add(row(name, value, fraction, dim(basis)))
 	}
 	metric("Pass rate", a.PassRate, "Passed among scored episodes")
 	if x := a.PassRate.Interval; len(x) == 2 {
-		p.add(cols(p.w, " ", widths, "95% interval", fmt.Sprintf("%.0f%% to %.0f%%", 100*x[0], 100*x[1]), "", dim("Wilson interval for the pass rate")))
+		p.add(row("95% interval", fmt.Sprintf("%.0f%% to %.0f%%", 100*x[0], 100*x[1]), "", dim("Wilson interval for the pass rate")))
 	}
 	if a.Status == "supported" {
 		metric("False discovery rate", a.FalseDiscoveryRate, "Incorrect work among passed work")
 		metric("False negative rate", a.FalseNegativeRate, "Rejected work among correct work")
 	}
-	p.add(cols(p.w, " ", widths, "Pass rule", ruleText(a)), "")
+	p.add(row("Pass rule", ruleText(a)), "")
 }
 
 // ruleText is the grader's native decision rule that pass and fail stand for.
@@ -514,7 +531,7 @@ func searched(in *Inspection) map[string]bool {
 // it evidenced there, the categories it did not search and why, its search attempts and its limits.
 func scope(r Report, in *Inspection, job, key string, p *page) {
 	codes := slices.Sorted(maps.Keys(in.Categories))
-	if !p.toggle(key, "Search scope", fmt.Sprintf("(%d categor%s)", len(codes), map[bool]string{true: "y", false: "ies"}[len(codes) == 1])) {
+	if !p.toggle(key, "Search Scope", fmt.Sprintf("(%d categor%s)", len(codes), map[bool]string{true: "y", false: "ies"}[len(codes) == 1])) {
 		return
 	}
 	done := searched(in)
@@ -567,11 +584,7 @@ func scope(r Report, in *Inspection, job, key string, p *page) {
 // hacksPage is the Hack Inspector's search: the problems it found and whether an Attacker demonstrated them, the
 // ideas it did not reproduce, its open questions, and behind s and x its search and its experiments.
 func hacksPage(r Report, found []Finding, p *page) {
-	note := "Hack Inspector"
-	if _, ok := r.Analyses["attack"]; ok || r.Analyses == nil && r.Attack != nil {
-		note += " + Attackers"
-	}
-	if !stageHead(r, 2, note, p) {
+	if !stageHead(r, 2, p) {
 		return
 	}
 	var ps []Problem
@@ -581,9 +594,9 @@ func hacksPage(r Report, found []Finding, p *page) {
 		})
 		widths := []int{46, 14, 12}
 		if len(ps) == 0 {
-			p.add(titled("PROBLEMS FOUND", 0), " None found in this run.")
+			p.add(titled("Problems Found", 0), " None found in this run.")
 		} else {
-			p.add(spread(titled("PROBLEMS FOUND", len(ps)), p.fold("e", "Legend"), p.w))
+			p.add(spread(titled("Problems Found", len(ps)), p.fold("e"), p.w))
 			if p.open["e"] {
 				p.add(cols(p.w, "   ", []int{15}, dim("Reproduced?"), dim("The Hack Inspector made it happen in a copy of the task.")),
 					cols(p.w, "   ", []int{15}, dim("Attacker?"), dim("An Attacker made it happen in a real episode. The Attack tab shows how.")), "")
@@ -593,9 +606,6 @@ func hacksPage(r Report, found []Finding, p *page) {
 		for _, pr := range ps {
 			p.pick(evidenceOf(found, pr), "", func(mark string, on bool) string {
 				name := strings.Join(strings.Fields(pr.Cause), " ")
-				if on {
-					name = bold(name)
-				}
 				reproduced := map[bool]string{true: "yes", false: "-"}[len(pr.Findings) > 0]
 				if e := pr.EvidencedByInspector; e != nil {
 					reproduced = map[bool]string{true: "yes", false: "no"}[*e]
@@ -621,7 +631,7 @@ func hacksPage(r Report, found []Finding, p *page) {
 			ideas = append(ideas, f)
 		}
 	}
-	p.add(titled("IDEAS NOT REPRODUCED", len(ideas)))
+	p.add(titled("Ideas Not Reproduced", len(ideas)))
 	if len(ideas) == 0 {
 		p.add(" None recorded.")
 	} else {
@@ -636,7 +646,7 @@ func hacksPage(r Report, found []Finding, p *page) {
 		}
 	}
 	questions := append(openItems(in), unresolvedFindings(in, "hack_inspector")...)
-	p.add("", titled("OPEN QUESTIONS", len(questions)))
+	p.add("", titled("Open Questions", len(questions)))
 	if len(questions) == 0 {
 		p.add(" None recorded.")
 	} else {
@@ -679,19 +689,12 @@ var helpWords = map[string]string{"none": "No info", "minimal": "Hint", "full": 
 // an Attacker told nothing succeeded.
 func attackPage(r Report, found []Finding, p *page) {
 	a := r.Attack
-	note := ""
-	if a != nil {
-		note = p.fold("e", "Legend")
-	}
-	if !stageHead(r, 3, note, p) {
+	if !stageHead(r, 3, p) {
 		return
 	}
 	if a == nil {
 		p.add(" " + dim("No Attacker result recorded."))
 		return
-	}
-	if p.open["e"] {
-		p.add(symbols, wrap("✓* The Attacker got the reward with a different hack than the one it was told about.", p.w, " ", dim), "")
 	}
 	if a.Problems == nil {
 		triesTable(r, found, a.Attempts, true, p)
@@ -707,13 +710,13 @@ func attackPage(r Report, found []Finding, p *page) {
 				hacks = append(hacks, pr)
 			}
 		}
-		attackTable(r, found, "HACKS", hacks, p)
-		attackTable(r, found, "CORRECT WORK REJECTED", rejected, p)
+		attackTable(r, found, "Hacks", hacks, true, p)
+		attackTable(r, found, "Correct Work Rejected", rejected, false, p)
 		if len(unknown) > 0 {
-			attackTable(r, found, "TYPE NOT RECORDED", unknown, p)
+			attackTable(r, found, "Type Not Recorded", unknown, false, p)
 		}
 	}
-	p.add(heading("CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?", ""))
+	p.add(heading("Can an Attacker Succeed Without Any Information?", ""))
 	var alone []Attempt
 	for _, at := range a.Attempts {
 		if len(tested(at)) == 0 && at.Problem == "" {
@@ -757,8 +760,12 @@ func attackPage(r Report, found []Finding, p *page) {
 
 // attackTable lists problems with the answer under each hint level; Enter expands a row into its tries, which then
 // carry its answers.
-func attackTable(r Report, found []Finding, name string, ps []Problem, p *page) {
-	p.add(titled(name, len(ps)))
+func attackTable(r Report, found []Finding, name string, ps []Problem, first bool, p *page) {
+	if first {
+		attackHead(titled(name, len(ps)), p)
+	} else {
+		p.add(titled(name, len(ps)))
+	}
 	if len(ps) == 0 {
 		p.add(" None in this run.", "")
 		return
@@ -774,9 +781,6 @@ func attackTable(r Report, found []Finding, name string, ps []Problem, p *page) 
 				arrow = dim("▾") + " "
 			}
 			cause := strings.Join(strings.Fields(pr.Cause), " ")
-			if on {
-				cause = bold(cause)
-			}
 			if p.open[key] {
 				return cols(p.w, mark+arrow, widths, cause, "")
 			}
@@ -790,13 +794,21 @@ func attackTable(r Report, found []Finding, name string, ps []Problem, p *page) 
 	p.add("")
 }
 
+// attackHead is the first title on the Attack tab. It carries the e hint, and the legend opens under it.
+func attackHead(title string, p *page) {
+	p.add(spread(title, p.fold("e"), p.w))
+	if p.open["e"] {
+		p.add(symbols, wrap("✓* The Attacker got the reward with a different hack than the one it was told about.", p.w, " ", dim), "")
+	}
+}
+
 // triesTable lists attempts: their hint level, whether each succeeded, with * for another hack than its own, how it ended,
 // its reward and its session; Enter opens an attempt's finding. Reports without problems also name what it tested.
 func triesTable(r Report, found []Finding, attempts []Attempt, flat bool, p *page) {
 	indent := "       "
 	if flat {
 		indent = "   "
-		p.add(titled("TRIES", len(attempts)))
+		attackHead(titled("Tries", len(attempts)), p)
 	}
 	if len(attempts) == 0 {
 		p.add(indent+dim("No try recorded."), "")

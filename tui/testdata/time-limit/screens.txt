@@ -9,22 +9,22 @@
  The grader can be cheated in a copy of the task package, not yet in a real episode.
  Results below are from before the limit.
 
- PROBLEMS (1)                                                                 ▸ Evidence   e expand
+ Problems (1)                                                                              e expand
      Problem                                Type            No info  Hint  Full  Inspector  Ref
  › ▸ The test runs bash through PATH.       Hack               -      -     -        ✓      P1
 
- ▸ What the references mean (P1, G1, hack-1 and others)                                    i expand
+ ▸ What the References Mean                                                                i expand
 
- SIMULATION REWARDS                              GRADER ACCURACY
+ Simulation Rewards                              Grader Accuracy
  Not available: no result recorded               Not available: Grade Simulations not selected
 
- WORK LEFT (3)
+ Work Left (3)
  Where              What                                  Why
  Attack             Remaining work                        Stopped
  Attack             P1 The test runs bash through PATH.   Not tested: stopped
  Attack             Search with no information            Not tested: stopped
 
- COST
+ Cost
  Model cost                  $0.00 of $5.00 cap    ━━━━━━━━━━━━━━━━
 === tab 0
  nudi  task                                                                Docker     Concurrency 4
@@ -32,8 +32,6 @@
 
   Simulation  ✓ ── Grade Simulations ── Find Hacks ✓ ── Attack stopped              │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
-
- SIMULATION ✓
 
  No simulation result recorded.
 === tab 1
@@ -43,8 +41,6 @@
  Simulation ✓ ──  Grade Simulations  ── Find Hacks ✓ ── Attack stopped              │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- GRADE SIMULATIONS  not selected for this run
-
  The run did not select this phase.
 === tab 2
  nudi  task                                                                Docker     Concurrency 4
@@ -53,19 +49,17 @@
  Simulation ✓ ── Grade Simulations ──  Find Hacks  ✓ ── Attack stopped              │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- FIND HACKS ✓                                                            Hack Inspector + Attackers
-
- PROBLEMS FOUND (1)                                                             ▸ Legend   e expand
+ Problems Found (1)                                                                        e expand
    Problem                                       Reproduced?   Attacker?   Ref
  › The test runs bash through PATH.                   ✓            -       P1
 
- IDEAS NOT REPRODUCED (0)
+ Ideas Not Reproduced (0)
  None recorded.
 
- OPEN QUESTIONS (0)
+ Open Questions (0)
  None recorded.
 
- ▸ Search scope (1 category)                                                               s expand
+ ▸ Search Scope (1 category)                                                               s expand
  ▸ Experiments (1)                                                                         x expand
 === tab 3
  nudi  task                                                                Docker     Concurrency 4
@@ -74,14 +68,12 @@
  Simulation ✓ ── Grade Simulations ── Find Hacks ✓ ──  Attack  stopped              │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ATTACK stopped                                                                 ▸ Legend   e expand
-
- HACKS (1)
+ Hacks (1)                                                                                 e expand
      Problem                                     No info  Hint  Full
  › ▸ The test runs bash through PATH.               -      -     -
 
- CORRECT WORK REJECTED (0)
+ Correct Work Rejected (0)
  None in this run.
 
- CAN AN ATTACKER SUCCEED WITHOUT ANY INFORMATION?
+ Can an Attacker Succeed Without Any Information?
  Not tested: stopped.

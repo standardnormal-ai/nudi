@@ -127,7 +127,7 @@ EVIDENCE
       Evidence from     Real episode 0007-attacker
       Reference         0007-attacker
 
-NOT COUNTED AS PROBLEMS
+ABANDONED PROBLEMS
   Count             4 not attributed, 1 unresolved, 1 suspected only
 
   a timeout counts as a pass

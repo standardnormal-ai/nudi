@@ -47,7 +47,7 @@ func plainReport(r Report, w int) string {
 			lines = append(lines, "", "  "+o[0], field(w, "      ", "State", strings.TrimLeft(plainText(o[1]), "✗? ")),
 				field(w, "      ", "Found by", o[2]), field(w, "      ", "Reference", o[3]))
 		}
-		section("NOT COUNTED AS PROBLEMS", lines...)
+		section("ABANDONED PROBLEMS", lines...)
 	}
 	section("SIMULATION", simulationFields(r, found, w)...)
 	section("GRADER ACCURACY", accuracyFields(r, w)...)

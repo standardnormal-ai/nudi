@@ -32,7 +32,7 @@ func (k keyMap) FullHelp() [][]key.Binding { return [][]key.Binding{k.ShortHelp(
 
 var keys = keyMap{
 	sel:     key.NewBinding(key.WithKeys("up", "down", "k", "j"), key.WithHelp("Up/Down", "select")),
-	open:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("Enter", "expand or open")),
+	open:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("Enter", "")),
 	tab:     key.NewBinding(key.WithKeys("tab", "shift+tab"), key.WithHelp("Tab", "next tab")),
 	help:    key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "Help")),
 	quit:    key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "Quit")),
@@ -66,8 +66,8 @@ func header(r Report, live bool, w int) string {
 	if m := c.ModalCost; m != nil {
 		cost = append(cost, dim("Sandbox estimate")+fmt.Sprintf(" $%.2f to $%.2f", m.AtRequests, m.AtLimits))
 	}
-	cost = append(cost, bold("c")+" "+dim("Cost"))
-	left, models := " "+logo+"  "+bold(r.task()), " "+bold("m")+" "+dim("Models")
+	cost = append(cost, keyText("c")+" "+dim("Cost"))
+	left, models := " "+logo+"  "+keyText(r.task()), " "+keyText("m")+" "+dim("Models")
 	if live {
 		left, models = left+"   "+dim("following live"), ""
 	}
@@ -92,7 +92,7 @@ func (r Report) stage(i int) (mark string, off bool) {
 	case !ok:
 		return "", true
 	case r.PhaseErrors[a] != "":
-		return redStyle.Bold(true).Render("Error"), false
+		return redStyle.Render("Error"), false
 	case status == "complete", status == "partial" && r.Unfinished[a] == "" && slices.Contains(r.Unresolved, a):
 		return greenStyle.Render("✓"), false
 	case status == "not run":
@@ -169,7 +169,7 @@ func modelsPanel(r Report, w int) string {
 	if len(rows) == 1 {
 		rows = []string{dim("No model recorded.")}
 	}
-	return "\n" + box("Models", bold("m")+" "+dim("close"), w-1, rows...)
+	return "\n" + box("Models", keyText("m")+" "+dim("close"), w-1, rows...)
 }
 
 // costRows are the cost section of Results, and with all the cost panel and the plain output: model cost against the
@@ -216,7 +216,7 @@ func costRows(r Report, w int, all bool) []string {
 }
 
 func costPanel(r Report, w int) string {
-	return "\n" + box("Cost", bold("c")+" "+dim("close"), w-1, costRows(r, w-4, true)...)
+	return "\n" + box("Cost", keyText("c")+" "+dim("close"), w-1, costRows(r, w-4, true)...)
 }
 
 // helpPanel explains every symbol, colour and word the screens use; live adds those of a run still going.
@@ -229,12 +229,12 @@ func helpPanel(w int, live bool) string {
 		untested, toggle = "Not tested yet.", "A collapsed or expanded section. Press the key shown beside it."
 		unfinished = "partly: the phase ended with some results unresolved or some work not finished; the report says which. stopped: it ended before its work was done."
 	}
-	out := []string{spread(" "+fg(teal, bold("HELP")), bold("?")+" "+dim("or")+" "+bold("Esc")+" "+dim("close"), w), "", heading("SYMBOLS", ""),
+	out := []string{spread(" "+fg(teal, bold("Help")), keyText("?")+" "+dim("or")+" "+keyText("Esc")+" "+dim("close"), w), "", heading("Symbols", ""),
 		row(greenStyle.Render("✓")+" "+redStyle.Render("✓"), "Yes. Green beside a phase that finished; red for a demonstrated problem."),
 		row(dim("✗"), "No. Not shown in the tests that ran."),
 		row(dim("-"), untested),
 		row(yellowStyle.Render("?"), "Unresolved. The evidence did not decide it."),
-		row(redStyle.Bold(true).Render("Error"), "The step failed to run. The reason is on the same screen."),
+		row(redStyle.Render("Error"), "The step failed to run. The reason is on the same screen."),
 		row(yellowStyle.Render("partly")+" "+yellowStyle.Render("stopped"), unfinished),
 		row(dim("▸ ▾"), toggle),
 	}
@@ -248,12 +248,12 @@ func helpPanel(w int, live bool) string {
 			row(dim("waiting"), "A phase that has not started yet."),
 			row(dim("↓"), "More rows below. f opens them all."))
 	}
-	out = append(out, "", heading("COLOURS", ""),
+	out = append(out, "", heading("Colours", ""),
 		row(redStyle.Render("red"), "A demonstrated problem, or a wrong grader decision."),
 		row(greenStyle.Render("green"), "A finished phase, or a correct grader decision."),
 		row(yellowStyle.Render("amber"), "Work that needs attention: stopped, partly finished, not tested."),
 		row(dim("grey"), "Background information."),
-		"", heading("WORDS", ""),
+		"", heading("Words", ""),
 		row("Real episode", "A normal run of the task by an agent, scored by the task's own grader."),
 		row("Task copy", "A copy of the task package that an inspector ran on its own."),
 		row("Full instructions", "The Attacker was told the problem and how to use it. Full in short."),
@@ -261,17 +261,17 @@ func helpPanel(w int, live bool) string {
 		row("No information", "The Attacker got the task and was asked to find any hack. No info in short."))
 	if !live {
 		out = append(out, row("P1, G1, hack-1", "References. On Results, i lists every kind."),
-			"", heading("METRICS", ""),
+			"", heading("Metrics", ""),
 			row("F1", "How well the grader's passes match the work the Grader Inspector found correct: 2 TP / (2 TP + FP + FN), from 0 to 1."),
 			row("AUROC", "How often the reward ranks correct work above incorrect work: 1 always, 0.5 by chance."),
 			row("Score ordering", "AUROC needs a score whose order the grader's own code sets (source-grounded). Reward values alone do not give one."))
 	}
 	if live {
-		out = append(out, "", heading("REFERENCES", ""))
+		out = append(out, "", heading("References", ""))
 		for _, x := range references {
 			out = append(out, row(x[0], x[1]+", as "+x[2]+"."))
 		}
-		out = append(out, "", heading("FINDINGS SO FAR", ""))
+		out = append(out, "", heading("Findings So Far", ""))
 	}
 	if live {
 		out = append(out, row("New?", "The novelty_judge found no earlier finding with the same cause."),
@@ -282,7 +282,7 @@ func helpPanel(w int, live bool) string {
 			row("Related observations", "Findings with the same cause as a finding above."))
 	}
 	if live {
-		out = append(out, "", heading("KEYS", ""), row("Tab, Shift+Tab", "Move between tabs."))
+		out = append(out, "", heading("Keys", ""), row("Tab, Shift+Tab", "Move between tabs."))
 		return strings.Join(append(out,
 			row("Up/Down", "Scroll."),
 			row("Left/Right", "Show more agent tiles."),
@@ -292,6 +292,6 @@ func helpPanel(w int, live bool) string {
 			row("c", "The cost of this run so far."),
 			row("q", "Stop following. The run goes on.")), "\n")
 	}
-	return strings.Join(append(out, "", heading("KEYS", ""), row("Tab, Left/Right", "Move between tabs."),
+	return strings.Join(append(out, "", heading("Keys", ""), row("Tab, Left/Right", "Move between tabs."),
 		row("m", "The models of this run."), row("c", "The cost of this run.")), "\n")
 }

@@ -172,10 +172,10 @@ func evidence(f Finding, w int) string {
 		out = append(out, s...)
 	}
 	if text := f.Interpretation.Interpretation; text != "" {
-		out = append(out, "", heading("INTERPRETATION", ""), wrap(cmp.Or(writers[f.Source], "The Inspector")+" wrote: \""+text+"\"", w, " ", plain))
+		out = append(out, "", heading("Interpretation", ""), wrap(cmp.Or(writers[f.Source], "The Inspector")+" wrote: \""+text+"\"", w, " ", plain))
 	}
 	if len(f.Interpretation.Citations) > 0 {
-		out = append(out, "", heading("CITATIONS", ""))
+		out = append(out, "", heading("Citations", ""))
 		for _, c := range f.Interpretation.Citations {
 			out = append(out, wrap(c.Excerpt, w, " ", plain), " "+dim(c.Path))
 		}
@@ -227,7 +227,7 @@ func limitations(f Finding, w int) string {
 	for _, part := range []struct {
 		name  string
 		items []string
-	}{{"OPEN CONDITIONS", filled(f.Claim.Unresolved)}, {"SCOPE LIMITS", limits(f)}} {
+	}{{"Open Conditions", filled(f.Claim.Unresolved)}, {"Scope Limits", limits(f)}} {
 		if len(part.items) == 0 {
 			continue
 		}
