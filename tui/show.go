@@ -80,15 +80,8 @@ func showHead(r Report, found []Finding, n int, from string, w int) string {
 	if f.Confirms != "" {
 		out = append(out, cols(w, " ", []int{18}, dim("Attacker exploit"), capital(f.Confirms)))
 	}
-	if r.Attack != nil && f.Source == "attack" {
-		if i := slices.IndexFunc(r.Attack.Attempts, func(at Attempt) bool { return deref(at.Episode) == f.Claim.Episode }); i >= 0 {
-			if why := rerunWords(r.Attack.Attempts[i]); why != "" {
-				out = append(out, cols(w, " ", []int{18}, dim("Rerun"), why))
-			}
-		}
-	}
 	if p != nil {
-		for _, kv := range [][2]string{{"Marks", markValues(*p)}, {"Requirement", deref(p.Requirement)}, {"Note", strings.TrimPrefix(note(*p), "Note: ")}} {
+		for _, kv := range [][2]string{{"Marks", markValues(*p)}, {"Requirement", deref(p.Requirement)}, {"Help", deref(p.Help)}} {
 			if kv[1] != "" {
 				out = append(out, cols(w, " ", []int{18}, dim(kv[0]), kv[1]))
 			}

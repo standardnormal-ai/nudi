@@ -485,7 +485,7 @@ func agreement(a Agreement, several bool, used string, p *page) {
 		metric("False discovery rate", a.FalseDiscoveryRate, "Incorrect work among passed work")
 		metric("False negative rate", a.FalseNegativeRate, "Rejected work among correct work")
 	}
-	p.add(row("Pass rule", ruleText(a)), "")
+	p.add(row("Counts as passed", ruleText(a)), "")
 }
 
 // ruleText is the grader's native decision rule that pass and fail stand for.
@@ -500,7 +500,7 @@ func ruleText(a Agreement) string {
 		}
 		return a.Reward + " " + strings.Join(values, " or ")
 	case rule.Comparison != nil && rule.Threshold != nil:
-		return a.Reward + " " + *rule.Comparison + " " + rewardText(*rule.Threshold)
+		return a.Reward + " " + cmp.Or(map[string]string{">=": "≥", "<=": "≤"}[*rule.Comparison], *rule.Comparison) + " " + rewardText(*rule.Threshold)
 	}
 	return "no native decision rule"
 }
@@ -701,19 +701,19 @@ func attackPage(r Report, found []Finding, p *page) {
 	} else {
 		groups := map[string][]Problem{}
 		for _, pr := range problems(r) {
-			name := "Hacks"
-			switch problemType(pr) {
-			case "False negative":
-				name = "Correct Work Rejected"
-			case "":
-				name = "Type Unknown"
-			}
-			groups[name] = append(groups[name], pr)
+			name := map[string]string{"Hack": "Hacks", "False positive": "Hacks", "False negative": "Correct Work Rejected",
+				"Incorrect work passed": "Incorrect Work Passed", "Correct work failed": "Correct Work Failed"}[resultType(pr)]
+			groups[cmp.Or(name, "Type Unknown")] = append(groups[cmp.Or(name, "Type Unknown")], pr)
 		}
 		// A group with no problem is left out; with no problem at all, the empty Hacks group is the tab's result.
-		names := slices.DeleteFunc([]string{"Hacks", "Correct Work Rejected", "Type Unknown"}, func(n string) bool { return len(groups[n]) == 0 })
-		if len(names) == 0 {
+		// When no problem's type is known, the one group is the problems.
+		names := slices.DeleteFunc([]string{"Hacks", "Incorrect Work Passed", "Correct Work Rejected", "Correct Work Failed", "Type Unknown"},
+			func(n string) bool { return len(groups[n]) == 0 })
+		switch {
+		case len(names) == 0:
 			names = []string{"Hacks"}
+		case len(names) == 1 && names[0] == "Type Unknown":
+			names, groups["Problems"] = []string{"Problems"}, groups["Type Unknown"]
 		}
 		for i, name := range names {
 			attackTable(r, found, name, groups[name], i == 0, p)
@@ -722,15 +722,16 @@ func attackPage(r Report, found []Finding, p *page) {
 	p.add(heading("Can an Attacker Succeed Without Any Information?", ""))
 	var alone []Attempt
 	for _, at := range a.Attempts {
-		// From schema 2 on, its problem is the one its exploit created.
-		if len(tested(at)) == 0 && (at.Problem == "" || at.Problem == deref(at.Created)) {
+		// From schema 2 on, its problem is the one whose cause its exploit was read as; from schema 3 on, a try
+		// given no information keeps the candidate it was started for.
+		if r.SchemaVersion >= 3 && at.Level == "none" || len(tested(at)) == 0 && (at.Problem == "" || r.SchemaVersion >= 2) {
 			alone = append(alone, at)
 		}
 	}
 	switch d := a.Discovery; {
 	case len(alone) > 0:
 		widths := []int{6, 21, 15}
-		p.add(cols(p.w, "   ", widths, dim("Try"), dim("Hack demonstrated?"), dim("New finding?"), dim("Same as")))
+		p.add(cols(p.w, "   ", widths, dim("Try"), dim("Hack demonstrated?"), dim("New finding?"), dim(map[bool]string{true: "Same cause as", false: "Same as"}[r.SchemaVersion >= 2])))
 		for i, at := range alone {
 			demonstrated, fresh, same := "-", "-", ""
 			if r.started(at) {
@@ -739,11 +740,24 @@ func attackPage(r Report, found []Finding, p *page) {
 				if at.Status == "other_exploit" { // the question is any hack
 					demonstrated = "yes"
 				}
+				if r.SchemaVersion >= 2 && at.Status == "no_evidenced_issue" && at.Assessment == nil {
+					demonstrated = "?" // the grader paid nothing, so nudi did not inspect it
+				}
 				if demonstrated == "" {
 					demonstrated = "-"
 				}
 			}
 			for _, pr := range a.Problems {
+				if r.SchemaVersion >= 2 { // its exploit made pr, or the attack inspector read it as pr's cause
+					switch {
+					case pr.Source == "Attacker" && pr.Finding == deref(at.Episode):
+						demonstrated, fresh, same = "yes", "yes", ""
+					case pr.ID != "" && pr.ID == at.Problem && fresh == "-":
+						demonstrated, fresh, same = "yes", "no", strings.Join(strings.Fields(pr.Cause), " ")
+					}
+					continue
+				}
+				// The judge placed its episode in pr.
 				if at.Episode != nil && slices.Contains(pr.Members, *at.Episode) {
 					demonstrated = "yes"
 					// An Attacker problem is new for the try the judge first placed in it.
@@ -765,19 +779,17 @@ func attackPage(r Report, found []Finding, p *page) {
 	}
 }
 
-// rerunWords say why an attempt's rerun did not reproduce its target, from `rerun`; empty when it did or no reason
-// is recorded.
-func rerunWords(at Attempt) string {
-	if at.Rerun == nil || at.Reproduced != nil && *at.Reproduced {
-		return ""
+// tryNote says why a started try of schema 2 on settled nothing: the grader paid nothing, so nudi did not inspect it,
+// or its result is unclear, with why. Empty otherwise.
+func tryNote(r Report, at Attempt) string {
+	switch {
+	case r.SchemaVersion < 2 || at.Episode == nil:
+	case at.Status == "no_evidenced_issue" && at.Assessment == nil && slices.ContainsFunc(slices.Collect(maps.Values(at.Rewards)), func(x *float64) bool { return x != nil && *x == 0 }):
+		return "The grader paid nothing, so nudi did not inspect it."
+	case at.Status == "unknown" && at.Error != nil:
+		return "Result unclear: " + strings.TrimSuffix(strings.SplitN(*at.Error, "\n", 2)[0], ".") + "."
 	}
-	words := map[string]string{
-		"the target's reading changed since the attempt started, so the rerun is compared with nothing": "Not compared: the target's reading changed after the try started.",
-		"the rerun measured a mark of the target otherwise than the target's own check":                 "The rerun measured the target's marks otherwise than its own check.",
-		"the rerun or the target's own check failed or measured no value of some mark":                  "The rerun or the target's own check measured no value for some mark.",
-		"no rerun of the target's check on this episode was recorded":                                   "No rerun of the target's check was recorded.",
-	}
-	return cmp.Or(words[*at.Rerun], capital(*at.Rerun))
+	return ""
 }
 
 // attackTable lists problems with the answer under each hint level; Enter expands a row into its tries, which then
@@ -792,8 +804,8 @@ func attackTable(r Report, found []Finding, name string, ps []Problem, first boo
 		p.add(" None in this run.", "")
 		return
 	}
-	widths := []int{44, 9, 6}
-	p.add(cols(p.w, "     ", widths, dim("Problem"), dim("No info"), dim("Hint"), dim("Full")))
+	widths := []int{44, 6, 6} // a try given no information is aimed at no problem, so no problem has a No info cell
+	p.add(cols(p.w, "     ", widths, dim("Problem"), dim("Hint"), dim("Full"), dim("Ref")))
 	for _, pr := range ps {
 		key := "tries " + pr.ID + " " + pr.Cause
 		aimed := r.aimed(pr)
@@ -804,10 +816,9 @@ func attackTable(r Report, found []Finding, name string, ps []Problem, first boo
 			}
 			cause := strings.Join(strings.Fields(pr.Cause), " ")
 			if p.open[key] {
-				return cols(p.w, mark+arrow, widths, cause, "")
+				return cols(p.w, mark+arrow, widths, cause, "", "", dim(pr.ID))
 			}
-			return cols(p.w, mark+arrow, widths, cause, under("No info", glyph(r.tried(pr, "none"))), under("Hint", glyph(r.tried(pr, "minimal"))),
-				under("Full", glyph(r.tried(pr, "full"))))
+			return cols(p.w, mark+arrow, widths, cause, under("Hint", glyph(r.tried(pr, "minimal"))), under("Full", glyph(r.tried(pr, "full"))), dim(pr.ID))
 		})
 		if p.open[key] {
 			triesTable(r, found, aimed, &pr, p)
@@ -826,7 +837,7 @@ func attackHead(title string, p *page) {
 
 // triesTable lists attempts: their hint level, whether each succeeded, how it ended, its reward and its session, or the
 // problem its exploit became; Enter opens an attempt's finding. Under a problem pr, from schema 2 on, an attempt
-// succeeded when it reproduced pr. Reports without problems pass no pr and also name what each tested.
+// succeeded when it was an exploit. Reports without problems pass no pr and also name what each tested.
 func triesTable(r Report, found []Finding, attempts []Attempt, pr *Problem, p *page) {
 	indent, flat := "       ", pr == nil
 	if flat {
@@ -882,8 +893,7 @@ func triesTable(r Report, found []Finding, attempts []Attempt, pr *Problem, p *p
 			row = slices.Insert(row, 1, strings.Join(tested(at), ", "))
 		}
 		p.pick(n, "", func(mark string, _ bool) string { return cols(p.w, indent[:len(indent)-3]+mark, widths, row...) })
-		// Why its rerun did not reproduce the target, unless the try succeeded for this problem, as by creating it.
-		if why := rerunWords(at); why != "" && !flat && r.succeeded(at, *pr) != "yes" {
+		if why := tryNote(r, at); why != "" && !flat {
 			p.add(cols(p.w, indent, []int{5}, "", dim(why)))
 		}
 	}

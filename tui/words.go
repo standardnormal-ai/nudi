@@ -104,7 +104,7 @@ var checkNames = map[string]string{
 	"resource_exhaustion":    "Crashes grader",
 	"online_lookup":          "Looks answer up online",
 	"persistence":            "Files survive reset",
-	"unchecked_requirements": "Skips unchecked requirements",
+	"unchecked_requirements": "Skips a requirement the grader never checks",
 	"other":                  "Other trick",
 	"accepted_invalid":       "Incorrect work passed",
 	"rejected_valid":         "Correct work failed",

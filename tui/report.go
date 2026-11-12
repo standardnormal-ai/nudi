@@ -20,7 +20,7 @@ import (
 // word, status and number in it; the viewer only lays them out. docs/viewer.md lists the fields.
 type Report struct {
 	Dir           string                 `json:"-"`
-	SchemaVersion int                    `json:"schema_version"` // 2 when each problem is one reading with its own level; 0 before the field
+	SchemaVersion int                    `json:"schema_version"` // 2 when each problem is one reading with its own level, 3 when levels come from the help given; 0 before the field
 	Status        string                 `json:"status"`
 	Answer        []string               `json:"answer"`
 	Analyses      map[string]string      `json:"analyses"`
@@ -90,6 +90,35 @@ type Ordinary struct {
 		Episodes       []string                       `json:"episodes"`
 		EpisodeRewards map[string]map[string]*float64 `json:"episode_rewards"` // null for a value that is not a finite number
 	} `json:"groups"`
+	NoReward map[string]Unrewarded `json:"no_reward"` // each episode without a finite reward
+	Failures map[string][]string   `json:"failures"`  // each episode's failures
+}
+
+// unrewarded say when each of episodes that has no reward ended, and its first failure.
+func (o Ordinary) unrewarded(episodes []string) []string {
+	var out []string
+	for _, e := range slices.Sorted(maps.Keys(o.NoReward)) {
+		if len(episodes) > 0 && !slices.Contains(episodes, e) {
+			continue
+		}
+		line := e + " ended"
+		if ph := o.NoReward[e].Phase; ph != nil {
+			line += " during " + *ph
+		} else {
+			line += " before its first model call"
+		}
+		if f := o.Failures[e]; len(f) > 0 {
+			line += ": " + strings.SplitN(f[0], "\n", 2)[0]
+		}
+		out = append(out, line+".")
+	}
+	return out
+}
+
+// Unrewarded is an episode that ended without a reward: its model calls and when it ended, agent work or grading.
+type Unrewarded struct {
+	ModelCalls int     `json:"model_calls"`
+	Phase      *string `json:"phase"`
 }
 
 type Rewards struct {
@@ -326,18 +355,19 @@ type Problem struct {
 	Text        string         `json:"text"`        // for a reading without marks, what its check measured
 	Marks       map[string]any `json:"marks"`       // each mark of its reading and the value its check measured
 	Requirement *string        `json:"requirement"` // the approved requirement its reading reads violated
-	Note        *struct {
-		Target string `json:"target"`
-		Kind   string `json:"kind"` // same_as
-	} `json:"note"` // present only when an agent read it as another problem
+	Help        *string        `json:"help"`        // the help an Attacker had and the problem it was written for
+	Unrewarded  *int           `json:"unrewarded"`  // attempts the grader paid nothing, which nudi did not inspect
+	Assessment  *int           `json:"assessment"`  // for an Attacker problem, the attack reading it comes from
 }
 
 // Condition is one condition an Attacker tried a problem under.
 type Condition struct {
 	Condition string `json:"condition"` // full, minimal, none (aimed at the problem), elsewhere_LEVEL (aimed at another) or independent
 	Exploited int    `json:"exploited"` // how many of its attempts exploited the problem
-	Attempts  int    `json:"attempts"`  // its started attempts
+	Attempts  int    `json:"attempts"`  // its started attempts; from schema 3 on, its assessed ones
 	Status    string `json:"status"`
+	// From schema 3 on, the attempts the grader paid nothing, which nudi did not inspect.
+	Unrewarded int `json:"unrewarded"`
 }
 
 // why is the problem's `exploited_with`, or in older reports its `help_needed`.
@@ -389,11 +419,8 @@ type Attempt struct {
 	Episode   *string             `json:"episode"`
 	Status    string              `json:"status"`
 
-	// Reports from schema 2 on carry these.
-	Reproduced *bool   `json:"reproduced"` // the rerun of its target's check measured the target's marks; null without a result
-	Rerun      *string `json:"rerun"`      // why reproduced is not true for an aimed attempt
-	CountsFor  *string `json:"counts_for"` // the problem it reproduced
-	Created    *string `json:"created"`    // the problem its exploit became
+	// Reports from schema 2 on carry this.
+	Assessment *int `json:"assessment"` // the attack inspector's reading of it; null when none was asked for, as for reward 0
 }
 
 // load reads DIR/report.json, never through a link that leads out of DIR. A report without an answer
@@ -503,16 +530,8 @@ func shortRefs(r *Report) {
 			*id = names[*id]
 		}
 	}
-	for _, p := range r.Attack.Problems {
-		if p.Note != nil {
-			rename(&p.Note.Target)
-		}
-	}
 	for i := range r.Attack.Attempts {
-		at := &r.Attack.Attempts[i]
-		rename(&at.Problem)
-		rename(at.CountsFor)
-		rename(at.Created)
+		rename(&r.Attack.Attempts[i].Problem)
 	}
 	for _, kind := range r.Attack.Exploits {
 		for _, e := range kind {
@@ -696,6 +715,11 @@ func evidenceOf(found []Finding, p Problem) int {
 		if i := slices.IndexFunc(found, func(f Finding) bool { return f.ID == id }); i >= 0 {
 			return i + 1
 		}
+	}
+	if i := slices.IndexFunc(found, func(f Finding) bool {
+		return f.Source == "attack" && p.Assessment != nil && f.Index != nil && *f.Index == *p.Assessment
+	}); i >= 0 {
+		return i + 1
 	}
 	return slices.IndexFunc(found, func(f Finding) bool {
 		return f.Source == "attack" && (slices.Contains(p.Members, f.Claim.Episode) || slices.Contains(p.readings(), f.Claim.Episode))

@@ -6,7 +6,7 @@
   },
   "answer": [
     "Stopped at your time limit. Results below are what was found so far.",
-    "The checks measured the problems below; no approved requirement list confirms a cheat or misjudged work.",
+    "1 problem below gave reward the checks show the work did not earn; 0 were exploited by an Attacker given their help, or found by one. The approved requirement list confirms none of them, so nudi does not say which task rule each breaks.",
     "P1: reward 1; exists = false measured by check check-0000; \u25cf\u25cf\u25cb\u25cb\u25cb reproduced exploit, evidenced in a package sandbox; no attempt was assessed.",
     "P: found by the hack inspector's search. G: found by the grader inspector in the simulations. A: found by an Attacker, not among the inspectors' findings."
   ],
@@ -16,16 +16,12 @@
         "assessment": null,
         "candidate": "hack-0",
         "context": "attacker-hack-0-full-1",
-        "counts_for": null,
-        "created": null,
         "episode": null,
         "error": null,
         "failed": null,
         "level": "full",
         "number": 1,
         "problem": null,
-        "reproduced": null,
-        "rerun": "no rerun of the target's check on this episode was recorded",
         "rewards": {},
         "sources": [
           "hack-0"
@@ -87,9 +83,7 @@
     "discovery_attempts": 1,
     "exploits": {
       "discovery": [],
-      "other": [],
-      "reproduction": [],
-      "unattributed": []
+      "reproduction": []
     },
     "findings": {
       "evidenced": [],
@@ -146,14 +140,17 @@
         "source": "hack inspector",
         "target": null,
         "type": null,
-        "unresolved": []
+        "unresolved": [],
+        "unrewarded": 0
       }
     ],
     "status": "cancelled",
     "unavailable": {},
     "unknown_cost_calls": 0
   },
+  "causes": [],
   "configuration": {
+    "approved_requirements": 2,
     "attack_from": null,
     "backend": "docker",
     "cancelled_calls": 0,
@@ -324,7 +321,7 @@
   "labels": null,
   "metrics": null,
   "notes": [
-    "Each candidate, hint level, and no-hint discovery stops at its first independently evidenced exploit, so attempt counts give no unbiased success-rate estimate. Not found means not found within the actual attempts. Only nudi's rerun of the candidate's check on the Attacker episode, measuring the candidate's marks as before, confirms the candidate under test; another or unattributed exploit does not.",
+    "Each candidate, hint level, and no-hint discovery stops at its first independently evidenced exploit, so attempt counts give no unbiased success-rate estimate. Not found means not found within the actual attempts. An attempt given a problem's full information or hint counts for that problem when its work got reward and its attack inspector's check measured the work invalid; the route it took is not compared.",
     "An evidenced finding is accepted_invalid (violating work received more than its deserved score) or rejected_valid (valid work received less than it deserved), with marks: observations of its check whose measured values show it. A finding with open conditions is still evidenced; its open conditions are listed beside it. A legitimate finding has a reward equal to its deserved score and no open condition, which does not judge the work. An inconclusive finding established no outcome, or is legitimate with an open condition. Package findings come from an Inspector sandbox running a copy of the task package, native findings from a task episode. An earlier reading of a check stays listed, marked with the later reading that superseded it. The evidenced count reads the latest reading of each check; local labels and metrics read every reading."
   ],
   "ordinary": {
@@ -393,10 +390,11 @@
       "source": "hack inspector",
       "target": null,
       "type": null,
-      "unresolved": []
+      "unresolved": [],
+      "unrewarded": 0
     }
   ],
-  "schema_version": 2,
+  "schema_version": 3,
   "status": "time_limit",
   "stop": {
     "kind": "time_limit",

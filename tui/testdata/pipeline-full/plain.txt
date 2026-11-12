@@ -170,7 +170,7 @@ SIMULATION
 GRADER ACCURACY
   Accuracy uses     0 of 0 episodes
   Model             deepseek-v4.1-flash-1017, reward name reward
-  Pass rule         reward >= 0.5
+  Counts as passed  reward ≥ 0.5
   Not available     fewer than two verified labels
   Pass rate         83%, 5/6, passed among scored episodes
   95% interval      44% to 97%, Wilson interval for the pass rate

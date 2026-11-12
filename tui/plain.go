@@ -108,14 +108,18 @@ func runFields(r Report, w int) []string {
 }
 
 func resultFields(r Report, found []Finding, w int) []string {
-	head, notes := endingParts(r)
+	head, notes := endingParts(r, true)
 	out := []string{field(w, "  ", "Ending", strings.TrimPrefix(plainText(head), "✓ "))}
 	for i, note := range notes {
 		name := ""
 		if i == 0 {
 			name = "Summary"
 		}
-		out = append(out, field(w, "  ", name, note))
+		if strings.HasPrefix(note, "  - ") {
+			out = append(out, hang(note, w, strings.Repeat(" ", 20)))
+		} else {
+			out = append(out, field(w, "  ", name, note))
+		}
 	}
 	if t := plainText(tally(r, found)); t != "" {
 		out = append(out, field(w, "  ", "Count", t))
@@ -166,12 +170,13 @@ func problemFields(r Report, found []Finding, w int) []string {
 				out = append(out, field(w, "      ", name, value))
 			}
 		}
-		kv("Type", typeNames[problemType(p)])
+		kv("Type", cmp.Or(typeNames[resultType(p)], resultType(p)))
 		if p.Reason != nil && problemType(p) == "" {
 			kv("Reason", capital(*p.Reason))
 		}
 		kv("Level", level(r, p))
-		kv("Note", strings.TrimPrefix(note(p), "Note: "))
+		kv("Help", deref(p.Help))
+		kv("Not inspected", unrewarded(p))
 		kv("Found by", sourceName(p.Source))
 		var evidence []string
 		for _, f := range found {
@@ -191,6 +196,9 @@ func problemFields(r Report, found []Finding, w int) []string {
 			for _, at := range r.aimed(p) {
 				if at.Level == level {
 					tries = append(tries, levelWords[level]+": "+tryWords(r, at, &p))
+					if why := tryNote(r, at); why != "" {
+						tries = append(tries, "  "+why)
+					}
 				}
 			}
 			if r.tried(p, level) == "-" && !slices.ContainsFunc(r.aimed(p), func(at Attempt) bool { return at.Level == level }) {
@@ -222,7 +230,7 @@ func tryWords(r Report, at Attempt, p *Problem) string {
 }
 
 // tryResult says how an Attacker's try ended, with the error of one that failed. From schema 2 on, a judged try
-// under a problem p says what its rerun showed of p.
+// under a problem p says what it showed of p.
 func tryResult(r Report, at Attempt, p *Problem) string {
 	res, _ := lookup(attemptResults, at.Status)
 	if !r.started(at) {
@@ -232,6 +240,9 @@ func tryResult(r Report, at Attempt, p *Problem) string {
 		res = map[string]Result{"yes": Evidenced, "no": NoIssue, "?": Unsettled}[r.succeeded(at, *p)]
 	}
 	out := triedWords[res]
+	if r.SchemaVersion >= 2 && at.Status == "no_evidenced_issue" && at.Assessment == nil && r.started(at) {
+		out = "not inspected" // the grader paid nothing
+	}
 	if res == NotTested && r.started(at) {
 		out = strings.ToLower(stoppedWords(at.Status)) // its episode started
 	}
@@ -316,7 +327,7 @@ func accuracyFields(r Report, w int) []string {
 		if a.Configuration.Model != "" {
 			out = append(out, field(w, "  ", "Model", path.Base(a.Configuration.Model)+", reward name "+a.Reward))
 		}
-		out = append(out, field(w, "  ", "Pass rule", ruleText(a)))
+		out = append(out, field(w, "  ", "Counts as passed", ruleText(a)))
 		if a.Status != "supported" {
 			out = append(out, field(w, "  ", "Not available", cmp.Or(strings.Join(a.Reasons, " "), "No reason recorded")))
 		} else {
@@ -363,7 +374,8 @@ func attemptRows(r Report, w int) []string {
 		}
 		var aimed *Problem // the problem its result is about
 		for i, p := range r.Attack.Problems {
-			if p.ID != "" && (p.ID == at.Problem || at.Problem == "" && slices.ContainsFunc(tested(at), func(id string) bool { return slices.Contains(p.readings(), id) })) {
+			old := p.ID == at.Problem || at.Problem == "" && slices.ContainsFunc(tested(at), func(id string) bool { return slices.Contains(p.readings(), id) })
+			if p.ID != "" && aimed == nil && (r.SchemaVersion >= 2 && r.aimedAt(at, p) || r.SchemaVersion < 2 && old) {
 				problem, aimed = p.ID, &r.Attack.Problems[i]
 			}
 		}

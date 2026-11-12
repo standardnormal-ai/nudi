@@ -9,14 +9,17 @@ RUN
 
 RESULT
   Ending            Stopped at the time limit
-  Summary           The checks measured the problems below; no approved requirement list confirms a
-                    cheat or misjudged work.
+  Summary           1 problem below gave reward the checks show the work did not earn; 0 were
+                    exploited by an Attacker given their help, or found by one. The approved
+                    requirement list confirms none of them, so nudi does not say which task rule
+                    each breaks.
                     Results below are from before the limit.
   Count             1 problem
   Work left         3 items, listed under WORK LEFT
 
 PROBLEMS
   P1  The test runs bash through PATH.
+      Type              Incorrect work passed
       Level             2 of 5: reproduced, no Attacker demonstrated it
       Found by          Hack Inspector
       Evidence          hack-0, Hack Inspector, task copy, reward 1

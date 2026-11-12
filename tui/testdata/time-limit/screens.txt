@@ -6,13 +6,14 @@
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
  Stopped at the time limit                                                                1 problem
- The checks measured the problems below; no approved requirement list confirms a cheat or misjudged
- work.
+ 1 problem below gave reward the checks show the work did not earn; 0 were exploited by an Attacker
+ given their help, or found by one. The approved requirement list confirms none of them, so nudi
+ does not say which task rule each breaks.
  Results below are from before the limit.
 
  Problems (1)                                                                              e expand
-     Problem                                Type            No info  Hint  Full  Inspector  Ref
- › ▸ The test runs bash through PATH.        ?                 -      -     -        ✓      P1
+     Problem                                Type                   Hint  Full  Inspector  Ref
+ › ▸ The test runs bash through PATH.       Incorrect work passed   -     -        ✓      P1
 
  ▸ What the References Mean                                                                i expand
 
@@ -63,9 +64,9 @@
  Simulation ✓ ── Grade Simulations ── Find Hacks ✓ ──  Attack  stopped              │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- Type Unknown (1)                                                                          e expand
-     Problem                                     No info  Hint  Full
- › ▸ The test runs bash through PATH.               -      -     -
+ Incorrect Work Passed (1)                                                                 e expand
+     Problem                                     Hint  Full  Ref
+ › ▸ The test runs bash through PATH.             -     -    P1
 
  Can an Attacker Succeed Without Any Information?
  Not tested: stopped.

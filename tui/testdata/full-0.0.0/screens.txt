@@ -90,7 +90,7 @@
  Pass rate              71%
  False discovery rate   25%
  False negative rate    25%
- Pass rule              reward >= 0.5
+ Counts as passed       reward ≥ 0.5
 
  Episode Labels                                                                            e expand
  Label            Episodes   Used for accuracy

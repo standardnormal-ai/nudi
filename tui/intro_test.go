@@ -153,7 +153,7 @@ func TestIntroAutomaticHandoff(t *testing.T) {
 		next, _ := m.Update(frameMsg{})
 		m = next.(model)
 	}
-	if m.intro != nil || !strings.Contains(m.View().Content, "The checks measured the problems") {
+	if m.intro != nil || !strings.Contains(m.View().Content, "gave reward the checks show the work did not earn") {
 		t.Fatal("the intro did not hand off to the card")
 	}
 	if _, cmd := m.Update(frameMsg{}); cmd != nil {

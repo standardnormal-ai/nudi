@@ -122,7 +122,7 @@ func TestFolderNameIsCleaned(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, out, _ := run(dir)
-	if code != 0 || strings.ContainsAny(out, "\u0007\u202e") || !strings.Contains(out, "run- A1") {
+	if code != 0 || strings.ContainsAny(out, "\u0007\u202e") || !strings.Contains(out, "run- P1") {
 		t.Fatalf("exit %d:\n%q", code, out)
 	}
 	code, _, errs := run(dir+"-none", "1")
@@ -203,12 +203,11 @@ func TestLoadReadsRunFactsAndOlderReportsLackThem(t *testing.T) {
 func TestLoadReadsTheFactsTheScreensTabulate(t *testing.T) {
 	r := fixture(t, "full")
 	ps := r.Attack.Problems
-	if r.SchemaVersion != 2 || ps[0].ID != "P1" || ps[0].Finding != "hack-1" || ps[0].Outcome != "accepted_invalid" || ps[0].Type != nil ||
-		ps[1].ID != "P2" || ps[1].Outcome != "rejected_valid" || ps[1].Reason == nil || ps[2].Note == nil || ps[2].Note.Target != "P1" ||
-		ps[6].Source != "Attacker" || ps[6].ID != "A1" || ps[6].Finding != "0014-attacker" || ps[0].Conditions[0].Attempts != 1 || ps[0].Conditions[0].Status == "" {
+	if r.SchemaVersion != 3 || ps[0].ID != "P1" || ps[0].Finding != "hack-1" || ps[0].Outcome != "accepted_invalid" || ps[0].Type != nil ||
+		ps[1].ID != "P2" || ps[1].Outcome != "rejected_valid" || ps[1].Reason == nil || ps[0].Conditions[0].Attempts != 1 || ps[0].Conditions[0].Status == "" {
 		t.Fatalf("problems: %+v", ps)
 	}
-	if at := r.Attack.Attempts; *at[0].Reproduced != true || *at[0].CountsFor != "P1" || *at[2].Created != "A1" || at[2].Rerun == nil {
+	if at := r.Attack.Attempts; at[0].Status != "evidenced_issue" || *at[0].Assessment != 0 || at[3].Status != "no_evidenced_issue" {
 		t.Fatalf("attempts: %+v", at)
 	}
 	if strings.Join(r.Ungrouped, ",") != "hack-3,grader-12,grader-13" {

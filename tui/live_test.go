@@ -282,7 +282,7 @@ func TestFollowScreenGivesWayToTheViewer(t *testing.T) {
 	}
 	m, _ = m.Update(liveTick{})
 	v, ok := m.(model)
-	if !ok || !strings.Contains(v.View().Content, "The checks measured the problems") {
+	if !ok || !strings.Contains(v.View().Content, "gave reward the checks show the work did not earn") {
 		t.Fatalf("%T does not show the viewer", m)
 	}
 }
@@ -539,5 +539,21 @@ func TestLiveResultsKeepsTheFinishedSections(t *testing.T) {
 	}
 	if n := strings.Count(s, "Available when the run ends."); n != 4 || strings.Contains(s, "Findings So Far") {
 		t.Errorf("%d sections wait for the end:\n%s", n, s)
+	}
+}
+
+// A cause event, and the same event as older logs name it, is the judge's reading, which the live view leaves out; a
+// no-hint exploit the attack inspector read as a known problem's cause says so with that problem's cause sentence,
+// which its event does not carry.
+func TestLiveCauseReadings(t *testing.T) {
+	l := liveFrom(t, ev("00:01", "judged", `, "inspector": "hack", "problem": "P1", "finding": "hack-1", "new": true, "cause": "a planted conftest"`)+
+		ev("00:02", "cause", `, "finding": "hack-2", "problem": "P2", "cause": "C1"`)+
+		ev("00:02", "hole", `, "finding": "hack-3", "problem": "P3", "hole": "H1"`)+
+		ev("00:03", "judged", `, "inspector": "attack", "problem": "P1", "finding": "0002-attacker", "new": false`))
+	if len(l.Recent) != 2 || l.Recent[1].Kind != "judged" {
+		t.Fatalf("recent: %+v", l.Recent)
+	}
+	if got := l.logWords(l.Recent[1]); got != "Read as the cause of an earlier finding: a planted conftest" {
+		t.Errorf("judged says %q", got)
 	}
 }

@@ -8,7 +8,9 @@
     "No cheat and no misjudged work was evidenced."
   ],
   "attack": null,
+  "causes": [],
   "configuration": {
+    "approved_requirements": 2,
     "attack_from": null,
     "backend": "docker",
     "cancelled_calls": 0,
@@ -277,7 +279,7 @@
   "persistence": [],
   "phase_errors": {},
   "problems": [],
-  "schema_version": 2,
+  "schema_version": 3,
   "status": "complete",
   "stop": null,
   "unfinished": {},

@@ -220,6 +220,9 @@ const recent = 40
 // apply adds one event, in the order nudi wrote them.
 func (l *Live) apply(e Event) {
 	l.Last = &e
+	if e.Kind == "cause" || e.Kind == "hole" { // the judge's reading of a finding's cause, by its older name too; not shown
+		return
+	}
 	l.Recent = append(l.Recent, e)
 	l.Recent = l.Recent[max(0, len(l.Recent)-recent):]
 	if e.Slots != nil && e.Kind == "phase_start" && e.Phase == "hack" {

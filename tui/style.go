@@ -93,6 +93,20 @@ func wrap(s string, w int, indent string, style func(string) string) string {
 
 func plain(s string) string { return s }
 
+// hang is s wrapped after indent as wrap draws it; a line that starts "  - ", a problem under a cause in Python's
+// Answer, keeps its text right of the dash on every line.
+func hang(s string, w int, indent string) string {
+	body, ok := strings.CutPrefix(s, "  - ")
+	if !ok {
+		return wrap(s, w, indent, plain)
+	}
+	lines := breakLines(body, w-width(indent)-4)
+	for i, l := range lines {
+		lines[i] = indent + map[bool]string{true: "  - ", false: "    "}[i == 0] + l
+	}
+	return strings.Join(lines, "\n")
+}
+
 func heading(s, note string) string { return " " + bold(s) + "  " + dim(note) }
 
 // titled is a section's title with its count, as in PROBLEMS (3).

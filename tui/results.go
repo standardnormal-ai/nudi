@@ -73,6 +73,15 @@ func (p *page) String() string { return strings.Join(p.lines, "\n") }
 // the rewards beside grader accuracy, the work left and the cost.
 func resultsPage(r Report, found []Finding, p *page) {
 	p.add(ending(r, found, p.w)...)
+	// The Answer's causes fold under one line, which a opens.
+	if causes := r.causeLines(); len(causes) > 0 {
+		n := len(slices.DeleteFunc(slices.Clone(causes), func(s string) bool { return !causeLine.MatchString(s) }))
+		if p.toggle("a", "Causes", "("+strconv.Itoa(n)+")") {
+			for _, line := range causes {
+				p.add(hang(line, p.w, "   "))
+			}
+		}
+	}
 	p.add("")
 	if r.Attack != nil && r.Attack.Problems != nil {
 		problemsTable(r, found, p)
@@ -140,16 +149,17 @@ var references = [][3]string{
 // ending is how the run ended, with its time or cost, the count of problems on the right, and the verdict under it
 // as Python wrote it. A failed phase names its error; a stop says that the results come from before it.
 func ending(r Report, found []Finding, w int) []string {
-	head, notes := endingParts(r)
+	head, notes := endingParts(r, false)
 	out := []string{spread(" "+head, tally(r, found), w)}
 	for _, note := range notes {
-		out = append(out, wrap(note, w, " ", plain))
+		out = append(out, hang(note, w, " "))
 	}
 	return out
 }
 
 // endingParts are the ending's headline, with its time or cost beside it, and the lines under it.
-func endingParts(r Report) (string, []string) {
+// The Answer's causes follow the verdict when causes is set.
+func endingParts(r Report, causes bool) (string, []string) {
 	clock := ""
 	if r.Elapsed != nil {
 		clock = elapsed(*r.Elapsed)
@@ -205,8 +215,27 @@ func endingParts(r Report) (string, []string) {
 	if beside != "" {
 		head += "  " + dim(beside)
 	}
+	if i := slices.Index(notes, verdict); i >= 0 && verdict != "" && causes {
+		notes = slices.Insert(notes, i+1, r.causeLines()...)
+	}
 	return head, slices.DeleteFunc(notes, func(s string) bool { return s == "" })
 }
+
+// causeLines are the Answer's causes as Python wrote them: the paragraph over them, then each cause with its problems'
+// lines under it, which start "  - ". Empty when the Answer has none.
+func (r Report) causeLines() []string {
+	i := slices.IndexFunc(r.Answer, func(s string) bool { return strings.HasPrefix(s, "Causes, ") })
+	if i < 0 {
+		return nil
+	}
+	j := i + 1
+	for j < len(r.Answer) && (strings.HasPrefix(r.Answer[j], "  - ") || causeLine.MatchString(r.Answer[j])) {
+		j++
+	}
+	return r.Answer[i:j]
+}
+
+var causeLine = regexp.MustCompile(`^C\d+: `)
 
 // verdict is Python's verdict line: the answer's second line after a headline, or its first in reports from before headlines.
 // Python's line for a run that evidenced nothing reads as the plan's words.
@@ -254,6 +283,20 @@ func problemType(p Problem) string { return typeWords[deref(p.Type)] }
 
 var typeWords = map[string]string{"hack": "Hack", "false_positive": "False positive", "false_negative": "False negative"}
 
+// resultType is what a problem's reading measured the grader do: the report's type when it records one, else its
+// outcome, an Attacker's exploit being incorrect work passed; "" when neither is recorded.
+func resultType(p Problem) string {
+	switch {
+	case problemType(p) != "":
+		return problemType(p)
+	case p.Outcome == "rejected_valid":
+		return "Correct work failed"
+	case p.Outcome == "accepted_invalid" || p.Source == "Attacker":
+		return "Incorrect work passed"
+	}
+	return ""
+}
+
 // findingType is the kind of wrong grader decision a finding shows, by its tag.
 func findingType(f Finding) string {
 	return map[string]string{"HACK": "Hack", "FP": "False positive", "FN": "False negative"}[kind(f)]
@@ -273,12 +316,12 @@ func ref(f Finding) string {
 var conditionNames = map[string][]string{"none": {"none", "independent"}, "minimal": {"minimal"}, "full": {"full"}}
 
 // tried is whether an Attacker demonstrated p when told as much as level says: yes when one exploited it, no when
-// one tried and did not, ? when its tries settled nothing, and - when none was tried. From schema 2 on an attempt
-// demonstrated p when its rerun reproduced p or its exploit became p; older reports have conditions, or without
-// them the attempts aimed at the problem.
+// one tried and did not, ? when its tries settled nothing, and - when none was tried. An inspector problem answers
+// from its conditions, Python's counts of the attempts given its help; an Attacker problem of schema 2 on, or one
+// without conditions, from its attempts.
 func (r Report) tried(p Problem, level string) string {
 	answer := "-"
-	if r.SchemaVersion >= 2 { // any reproduction, else any rerun that did not reproduce it, else no result
+	if r.SchemaVersion >= 2 && (p.Source == "Attacker" || p.Conditions == nil) { // any exploit, else any assessed none, else no result
 		seen := map[string]bool{}
 		for _, at := range r.aimed(p) {
 			if at.Level == level && r.started(at) {
@@ -295,7 +338,10 @@ func (r Report) tried(p Problem, level string) string {
 	if p.Conditions != nil {
 		for _, c := range p.Conditions {
 			switch {
-			case !slices.Contains(conditionNames[level], c.Condition) || c.Attempts == 0:
+			case !slices.Contains(conditionNames[level], c.Condition):
+			case c.Attempts == 0 && c.Unrewarded > 0: // tried, but nudi did not inspect a try the grader paid nothing
+				answer = best(answer, "?")
+			case c.Attempts == 0:
 			case c.Exploited > 0:
 				answer = "yes"
 			default:
@@ -318,16 +364,30 @@ func (r Report) tried(p Problem, level string) string {
 // answers are what an attempt that ended so says of its problem; an error or a try not started says nothing.
 var answers = map[Result]string{Evidenced: "yes", NoIssue: "no", Unsettled: "?"}
 
-// succeeded is what a started attempt says of problem p from schema 2 on: yes when its rerun reproduced p or its
-// exploit became p, no when the rerun did not reproduce its target, ? without a result.
+// succeeded is what a started attempt aimed at problem p says of it from schema 2 on: yes for an Attacker problem's
+// own attempt or an exploit, no for an assessed attempt without one, ? otherwise, as for an attempt the grader paid
+// nothing, which nudi did not inspect, or one whose result is unclear.
 func (r Report) succeeded(at Attempt, p Problem) string {
 	switch {
-	case deref(at.Created) == p.ID, at.Reproduced != nil && *at.Reproduced && deref(at.CountsFor) == p.ID:
+	case p.Source == "Attacker", at.Status == "evidenced_issue":
 		return "yes"
-	case at.Reproduced != nil && !*at.Reproduced:
+	case at.Status == "no_evidenced_issue" && at.Assessment != nil:
 		return "no"
 	}
 	return "?"
+}
+
+// exploitOf is the attempt of the exploit that attack finding f's reading is, if it is one: an attempt's further
+// readings are none.
+func (r Report) exploitOf(f Finding) (Attempt, bool) {
+	for _, kind := range r.Attack.Exploits {
+		for _, e := range kind {
+			if e != nil && e.Assessment != nil && f.Index != nil && *e.Assessment == *f.Index && e.Attempt != nil && *e.Attempt >= 0 && *e.Attempt < len(r.Attack.Attempts) {
+				return r.Attack.Attempts[*e.Attempt], true
+			}
+		}
+	}
+	return Attempt{}, false
 }
 
 // best is the strongest of the answers: yes, then unresolved, then no, then not tested.
@@ -342,21 +402,25 @@ func best(answers ...string) string {
 	return out
 }
 
-// aimed are the attempts aimed at problem p: by its id, or at one of its findings; from schema 2 on also those
-// that reproduced it or whose exploit became it.
+// aimed are the attempts aimed at problem p. From schema 2 on those given its finding's help, or for an Attacker
+// problem the attempt of its episode; in older reports those aimed at it by its id, or at one of its findings.
 func (r Report) aimed(p Problem) []Attempt {
 	if r.Attack == nil {
 		return nil
 	}
-	return slices.DeleteFunc(slices.Clone(r.Attack.Attempts), func(at Attempt) bool {
-		if deref(at.Created) == p.ID || deref(at.CountsFor) == p.ID {
-			return false
-		}
-		if p.ID != "" && at.Problem != "" {
-			return at.Problem != p.ID
-		}
-		return !slices.ContainsFunc(tested(at), func(id string) bool { return slices.Contains(p.readings(), id) })
-	})
+	return slices.DeleteFunc(slices.Clone(r.Attack.Attempts), func(at Attempt) bool { return !r.aimedAt(at, p) })
+}
+
+func (r Report) aimedAt(at Attempt, p Problem) bool {
+	switch {
+	case r.SchemaVersion >= 2 && p.Source == "Attacker":
+		return at.Episode != nil && *at.Episode == p.Finding
+	case r.SchemaVersion < 2 && p.ID != "" && at.Problem != "":
+		return at.Problem == p.ID
+	case r.SchemaVersion >= 3 && at.Level == "none": // given no information, so not the problem's help
+		return false
+	}
+	return slices.ContainsFunc(tested(at), func(id string) bool { return slices.Contains(p.readings(), id) })
 }
 
 // tested are the candidates an attempt tested; an attempt without a hint tests none.
@@ -381,17 +445,20 @@ func problemsTable(r Report, found []Finding, p *page) {
 	p.add(spread(titled("Problems", len(ps)), p.fold("e"), p.w))
 	attacked := len(r.Attack.Attempts) > 0 || slices.ContainsFunc(ps, func(p Problem) bool { return p.Conditions != nil })
 	inspected := r.SchemaVersion >= 2 || slices.ContainsFunc(ps, func(p Problem) bool { return p.EvidencedByInspector != nil })
-	// The columns of how much an Attacker was told. No info goes when the run allowed no try without information.
+	// The columns of how much an Attacker was told. A try given no information is aimed at no problem, so none of
+	// them is No info; an Attacker problem's level says when an Attacker told nothing made it.
 	var levels []string
 	if attacked {
-		levels = []string{"none", "minimal", "full"}
-		if d := r.Attack.Discovery; d != nil && d.MaximumAttempts == 0 && !slices.ContainsFunc(ps, func(p Problem) bool { return r.tried(p, "none") != "-" }) {
-			levels = levels[1:]
-		}
+		levels = []string{"minimal", "full"}
 	}
-	heads, widths := []string{"Problem", "Type"}, []int{44, 16}
+	// Without a problem of known type a column of ? would say nothing.
+	typed := slices.ContainsFunc(ps, func(p Problem) bool { return resultType(p) != "" })
+	heads, widths := []string{"Problem"}, []int{44}
+	if typed { // the Problem column gives way first, so that a nine-letter Ref still fits at 100 columns
+		heads, widths = []string{"Problem", "Type"}, []int{39, 23}
+	}
 	for _, level := range levels {
-		heads, widths = append(heads, helpWords[level]), append(widths, map[string]int{"none": 9, "minimal": 6, "full": 6}[level])
+		heads, widths = append(heads, helpWords[level]), append(widths, 6)
 	}
 	if inspected {
 		heads, widths = append(heads, "Inspector"), append(widths, 11)
@@ -427,9 +494,11 @@ func problemsTable(r Report, found []Finding, p *page) {
 				arrow = dim("▾") + " "
 			}
 			name := strings.Join(strings.Fields(pr.Cause), " ")
-			cells := []string{name, redStyle.Render(problemType(pr))}
-			if problemType(pr) == "" {
-				cells[1] = under("Type", glyph("?"))
+			cells := []string{name}
+			if typed && resultType(pr) == "" {
+				cells = append(cells, under("Type", glyph("?")))
+			} else if typed {
+				cells = append(cells, redStyle.Render(resultType(pr)))
 			}
 			for _, level := range levels {
 				cells = append(cells, under(helpWords[level], glyph(r.tried(pr, level))))
@@ -477,21 +546,25 @@ func levelRows(r Report, pr Problem, inspected bool, p *page) {
 	if !inspected {
 		p.add(cols(p.w, "       ", []int{12}, dim("Level"), dim(level(r, pr))))
 	}
+	if pr.Help != nil {
+		p.add(cols(p.w, "       ", []int{12}, dim("Help"), dim(*pr.Help)))
+	}
 	if pr.Reason != nil && problemType(pr) == "" {
 		p.add(wrap(capital(*pr.Reason), p.w, "       ", dim))
 	}
-	if n := note(pr); n != "" {
+	if n := unrewarded(pr); n != "" {
 		p.add(wrap(n, p.w, "       ", dim))
 	}
 	p.add("")
 }
 
-// note is what an agent read of a problem as another one, or "".
-func note(p Problem) string {
-	if p.Note == nil || p.Note.Kind != "same_as" {
+// unrewarded counts the attempts at a problem that the grader paid nothing, which nudi did not inspect, or "".
+func unrewarded(p Problem) string {
+	if p.Unrewarded == nil || *p.Unrewarded == 0 {
 		return ""
 	}
-	return "Note: possibly the same as " + p.Note.Target
+	n := *p.Unrewarded
+	return fmt.Sprintf("%d attempt%s got reward 0, so nudi did not inspect %s.", n, plural(n), map[bool]string{true: "it", false: "them"}[n == 1])
 }
 
 // demonstrates says whether Attacker finding f demonstrated problem pr, by its own exploit entry: the problem the judge
@@ -499,9 +572,13 @@ func note(p Problem) string {
 // findings it reproduced. A finding without an entry, or not attributed, demonstrates none. In reports without exploits,
 // it demonstrates only the first problem whose members name its session.
 func (r Report) demonstrates(f Finding, pr Problem) bool {
-	if r.SchemaVersion >= 2 { // the attempt of its episode reproduced pr, or its exploit became pr
+	if r.SchemaVersion >= 2 { // its reading is the exploit of an attempt that counts for pr
+		counts := func(at Attempt) bool { return r.aimedAt(at, pr) && r.succeeded(at, pr) == "yes" }
+		if at, ok := r.exploitOf(f); ok || r.Attack.Exploits != nil {
+			return ok && counts(at)
+		}
 		return f.Claim.Episode != "" && slices.ContainsFunc(r.Attack.Attempts, func(at Attempt) bool {
-			return deref(at.Episode) == f.Claim.Episode && r.succeeded(at, pr) == "yes"
+			return deref(at.Episode) == f.Claim.Episode && counts(at)
 		})
 	}
 	if r.Attack.Exploits == nil {
@@ -604,6 +681,9 @@ func otherFindings(r Report) (out [][4]string, opens []int) {
 	for i, f := range found {
 		if f.Source != "attack" || slices.ContainsFunc(held, func(p Problem) bool { return r.demonstrates(f, p) }) {
 			continue
+		}
+		if _, ok := r.exploitOf(f); r.SchemaVersion >= 2 && r.Attack.Exploits != nil && !ok {
+			continue // a further reading of an attempt, which the report counts nowhere
 		}
 		state := "Standalone evidence"
 		// Without exploits, a finding no problem names has no attribution at all.
@@ -839,6 +919,7 @@ var notTestedWords = map[string]string{
 	"insufficient_time":  "not enough time left",
 	"running":            "no result recorded",
 	"withdrawn":          "a later reading withdrew the finding",
+	"not_needed":         "no exploit was made with more help",
 }
 
 // workLeft is every piece of work the run did not finish, as where, what and why.
@@ -861,6 +942,9 @@ func workLeft(r Report, found []Finding) [][3]string {
 		case ok && !slices.Contains(r.Unresolved, a):
 			what := "Remaining work"
 			if o := r.Ordinary; i == 0 && o != nil {
+				if o.Attempted == o.Requested && len(o.NoReward) > 0 {
+					continue // every episode ran; the ones without a reward say what did not finish
+				}
 				what = fmt.Sprintf("%d of %d episodes", o.Attempted, o.Requested)
 			}
 			out = append(out, [3]string{p.Name, what, word(unfinishedWords, status)})
@@ -873,7 +957,8 @@ func workLeft(r Report, found []Finding) [][3]string {
 		for _, g := range o.Groups {
 			for _, name := range slices.Sorted(maps.Keys(g.Rewards)) {
 				if x := g.Rewards[name]; x.Attempted > x.Usable {
-					out = append(out, [3]string{"Simulation", fmt.Sprintf("%d episode%s without a usable %s", x.Attempted-x.Usable, plural(x.Attempted-x.Usable), name), "Not counted in the rewards"})
+					out = append(out, [3]string{"Simulation", fmt.Sprintf("%d episode%s without a usable %s", x.Attempted-x.Usable, plural(x.Attempted-x.Usable), name),
+						strings.Join(append([]string{"Not counted in the rewards."}, o.unrewarded(g.Episodes)...), " ")})
 				}
 			}
 		}

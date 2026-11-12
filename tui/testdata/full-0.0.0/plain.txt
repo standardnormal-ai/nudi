@@ -125,7 +125,7 @@ SIMULATION
 GRADER ACCURACY
   Accuracy uses     6 of 7 episodes
   Model             mimo-v2.6-pro, reward name reward
-  Pass rule         reward >= 0.5
+  Counts as passed  reward ≥ 0.5
   True positive     3: grader pass, work correct
   False positive    1: grader pass, work incorrect
   False negative    1: grader fail, work correct

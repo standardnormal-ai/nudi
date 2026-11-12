@@ -632,7 +632,17 @@ func (l *Live) logWords(e Event) string {
 		if e.New {
 			return "New finding: " + e.Cause
 		}
-		return "Same as an earlier finding: " + e.Cause
+		cause := e.Cause
+		if n := l.lane(e.Problem); cause == "" && n != nil {
+			cause = n.Cause
+		}
+		switch {
+		case cause == "":
+			return ""
+		case e.Inspector == "attack": // the attack inspector read a no-hint exploit as a known problem's cause
+			return "Read as the cause of an earlier finding: " + cause
+		}
+		return "Same as an earlier finding: " + cause
 	case "phase_start", "phase_end":
 		i := slices.IndexFunc(phases, func(p struct{ Name, Analysis string }) bool { return p.Analysis == e.Phase })
 		if i < 0 {
