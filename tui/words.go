@@ -206,15 +206,16 @@ type Result int
 const (
 	NotTested Result = iota
 	Evidenced
-	Elsewhere
 	NoIssue
 	Failed
 	Unsettled
+	NoReward // the Attacker made model calls and the grader wrote no reward: nothing to judge, and no failure
 )
 
 var attemptResults = map[string]Result{
 	"evidenced_issue":        Evidenced,
-	"other_exploit":          Elsewhere,
+	"other_exploit":          NoIssue, // an exploit of another mechanism than its target's
+	"no_reward":              NoReward,
 	"unattributed_exploit":   Unsettled, // an exploit not attributed to its problem or another
 	"no_evidenced_issue":     NoIssue,
 	"unknown":                Unsettled,
@@ -236,8 +237,8 @@ var attemptResults = map[string]Result{
 }
 
 // triedWords say what an attempt showed of its problem, as the plain output and the live logs say it.
-var triedWords = map[Result]string{Evidenced: "demonstrated", Elsewhere: "demonstrated another hack", NoIssue: "not demonstrated",
-	Unsettled: "unresolved", Failed: "error", NotTested: "not started"}
+var triedWords = map[Result]string{Evidenced: "demonstrated", NoIssue: "not demonstrated",
+	Unsettled: "unresolved", Failed: "error", NoReward: "no reward", NotTested: "not started"}
 
 // stoppedWords say how a try whose episode started ended without a result, as its phase would: "Stopped at the
 // spending cap", or else "Stopped".
@@ -251,8 +252,8 @@ func stoppedWords(status string) string {
 // resultWords say how an attempt ended, as the Status column of a try shows it.
 var resultWords = map[Result]string{
 	Evidenced: "Finished",
-	Elsewhere: "Finished",
 	NoIssue:   "Finished",
+	NoReward:  "No reward",
 	Failed:    "Error",
 	Unsettled: "Finished",
 	NotTested: "Not started",

@@ -141,6 +141,27 @@ func TestLiveScreenNotesLimitAndCost(t *testing.T) {
 	}
 }
 
+// A live run names its models from run_start: m in the header opens the Models panel; a log without them offers no m.
+func TestLiveModels(t *testing.T) {
+	l := liveFrom(t, ev("00:00", "run_start", `, "backend": "docker", "models": {"attacker": {"model": "openrouter/deepseek/a-model", "reasoning_effort": "high"}}`)+
+		ev("00:00", "phase_start", `, "phase": "simulation"`))
+	if s := liveKeys(t, l, at9("00:01"), 100, 0); !strings.Contains(s, "m Models") {
+		t.Errorf("header lacks m Models:\n%s", s)
+	}
+	if s := liveKeys(t, l, at9("00:01"), 100, 0, "m"); !strings.Contains(s, "a-model") || !strings.Contains(s, "high") {
+		t.Errorf("models panel:\n%s", s)
+	}
+	if s := liveKeys(t, l, at9("00:01"), 100, 0, "m", "m"); strings.Contains(s, "a-model") {
+		t.Errorf("m does not close the panel:\n%s", s)
+	}
+	if s := liveKeys(t, liveFrom(t, ev("00:00", "run_start", `, "backend": "docker"`)), at9("00:01"), 100, 0); strings.Contains(s, "m Models") {
+		t.Errorf("a log without models offers m:\n%s", s)
+	}
+	if s := plainText(helpPanel(100, true)); !strings.Contains(s, "The models of this run.") {
+		t.Errorf("live help lacks m:\n%s", s)
+	}
+}
+
 func TestLiveScreenShowsCleanedText(t *testing.T) {
 	s := liveModel{l: *liveFrom(t, ev("00:00", "run_start", `, "backend": "docker"`)+ev("00:00", "phase_start", `, "phase": "grader"`)+
 		ev("00:01", "session_start", `, "inspector": "grader", "session": "s", "episode": "a\u001b[2J\u0007b"`)), w: 120}.render(at9("00:02"))
@@ -261,7 +282,7 @@ func TestFollowScreenGivesWayToTheViewer(t *testing.T) {
 	}
 	m, _ = m.Update(liveTick{})
 	v, ok := m.(model)
-	if !ok || !strings.Contains(v.View().Content, "The grader can be cheated") {
+	if !ok || !strings.Contains(v.View().Content, "The checks measured the problems") {
 		t.Fatalf("%T does not show the viewer", m)
 	}
 }

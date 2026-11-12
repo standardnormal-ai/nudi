@@ -43,7 +43,7 @@ type liveUI struct {
 	screen  int
 	chosen  bool
 	open    map[string]bool // o related observations, l logs, f all findings
-	overlay string          // ? or c
+	overlay string          // ?, c or m
 	offset  int
 	agents  int
 }
@@ -83,7 +83,7 @@ func (m liveModel) press(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if room := m.room(top); room > 0 && u.offset+room < len(splitLines(body)) {
 			u.offset++
 		}
-	case k == "?" || k == "c":
+	case k == "?" || k == "c" || k == "m" && m.l.Start != nil && len(m.l.Start.Models) > 0:
 		u.overlay, u.offset = k, 0
 	}
 	return m, nil
@@ -138,6 +138,8 @@ func (m liveModel) parts(now time.Time) (top, body string) {
 		body = helpPanel(w, true)
 	case m.ui.overlay == "c":
 		body = costPanel(r, w)
+	case m.ui.overlay == "m":
+		body = modelsPanel(r, w)
 	case m.ui.open["f"]:
 		body = strings.Join(l.findings("Findings So Far", now, sp, w, -1), "\n")
 	case m.view() == results:
@@ -156,7 +158,7 @@ func (l *Live) report(now time.Time) Report {
 	if l.Start == nil {
 		return r
 	}
-	c.Backend, c.SpendingCap, c.KnownCost = l.Start.Backend, l.Start.SpendingCap, l.Last.KnownCost
+	c.Backend, c.SpendingCap, c.KnownCost, c.Models = l.Start.Backend, l.Start.SpendingCap, l.Last.KnownCost, l.Start.Models
 	c.UnknownCostCalls, c.CancelledCalls = l.Last.UnknownCostCalls, l.Last.CancelledCalls
 	if n := l.Start.Concurrency; n != nil {
 		c.Capacity.Concurrency = *n
@@ -510,7 +512,7 @@ func answer(t *Try) string {
 		return "?"
 	case res == Evidenced:
 		return "yes"
-	case res == NoIssue, res == Elsewhere:
+	case res == NoIssue:
 		return "no"
 	}
 	return ""
@@ -565,7 +567,7 @@ func (l *Live) noInfo(now time.Time, sp string, w int) []string {
 		} else {
 			res, _ := lookup(attemptResults, t.Status)
 			hack := answer(t)
-			if res == Elsewhere { // the question is any hack, so one other than its target counts
+			if t.Status == "other_exploit" { // the question is any hack, so one other than its target counts
 				hack = "yes"
 			}
 			status, shown = resultWords[res], under("Hack demonstrated?", glyph(hack))

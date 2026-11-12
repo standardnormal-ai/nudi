@@ -19,6 +19,7 @@ import (
 // word, status and number in it; the viewer only lays them out. docs/viewer.md lists the fields.
 type Report struct {
 	Dir           string                 `json:"-"`
+	SchemaVersion int                    `json:"schema_version"` // 2 when each problem is one reading with its own level; 0 before the field
 	Status        string                 `json:"status"`
 	Answer        []string               `json:"answer"`
 	Analyses      map[string]string      `json:"analyses"`
@@ -299,30 +300,35 @@ type Candidate struct {
 }
 
 type Problem struct {
-	Cause      string   `json:"cause"`
-	Findings   []string `json:"findings"`
-	Candidate  *string  `json:"candidate"`
-	Reproduced bool     `json:"reproduced"`
-	// The findings a reproduction tested; nil in reports written before the field.
-	ReproducedFindings []string `json:"reproduced_findings"`
+	Cause     string   `json:"cause"`
+	Findings  []string `json:"findings"`
+	Candidate *string  `json:"candidate"`
 
 	// Problems formed as findings arrive carry these; older reports lack them.
-	ID         string   `json:"id"`          // P1, G1 or A1
+	ID         string   `json:"id"`          // P1, G1, A1, or a finding id or Attacker episode the judge numbered no problem for
 	Source     string   `json:"source"`      // hack inspector, grader inspector or Attacker
 	Members    []string `json:"members"`     // the finding ids the judge found the same
 	HelpNeeded string   `json:"help_needed"` // in older reports, the least help an Attacker needed
-	Level      int      `json:"level"`       // the problem's place in the list, 1 to 5; 0 in older reports
+	Level      int      `json:"level"`       // the problem's place in the list, 1 to 5; 0 in older reports and for a reading without marks
 	Label      string   `json:"label"`       // that place's text
 	Scope      string   `json:"scope"`       // where its findings were evidenced, package or native; absent in older reports
 	// The least information under which an Attacker exploit was observed, or why none was; absent in older reports.
-	ExploitedWith string      `json:"exploited_with"`
-	Conditions    []Condition `json:"conditions"` // nil in older reports
-	ExploitedBy   []struct {
-		Episode string  `json:"episode"`
-		Target  *string `json:"target"`
-	} `json:"exploited_by"` // attempts aimed at another problem that exploited this one
-	Outcome              string `json:"outcome"`                // accepted_invalid or rejected_valid; empty when not recorded or mixed
-	EvidencedByInspector *bool  `json:"evidenced_by_inspector"` // nil when not recorded or without the inspections
+	ExploitedWith        string      `json:"exploited_with"`
+	Conditions           []Condition `json:"conditions"`             // nil in older reports
+	Outcome              string      `json:"outcome"`                // accepted_invalid or rejected_valid; empty when not recorded or mixed
+	EvidencedByInspector *bool       `json:"evidenced_by_inspector"` // nil when not recorded or without the inspections
+
+	// Reports from schema 2 on carry these.
+	Finding     string         `json:"finding"`     // the finding or Attacker episode the problem comes from
+	Type        *string        `json:"type"`        // hack, false_positive or false_negative, only when an approved requirement list confirms it
+	Reason      *string        `json:"reason"`      // why nudi makes no claim, or why completeness is unknown
+	Text        string         `json:"text"`        // for a reading without marks, what its check measured
+	Marks       map[string]any `json:"marks"`       // each mark of its reading and the value its check measured
+	Requirement *string        `json:"requirement"` // the approved requirement its reading reads violated
+	Note        *struct {
+		Target string `json:"target"`
+		Kind   string `json:"kind"` // same_as
+	} `json:"note"` // present only when an agent read it as another problem
 }
 
 // Condition is one condition an Attacker tried a problem under.
@@ -341,26 +347,8 @@ func (p Problem) why() string {
 	return p.HelpNeeded
 }
 
-// aimedElsewhere is the problem an Attacker was aimed at when, told as much as its rung says, it demonstrated p: set
-// for an `exploited_with` of elsewhere_minimal or elsewhere_full, by the try `exploited_by` names, else "".
-func (r Report) aimedElsewhere(p Problem) string {
-	level, ok := strings.CutPrefix(p.why(), "elsewhere_")
-	if !ok || r.Attack == nil {
-		return ""
-	}
-	for _, by := range p.ExploitedBy {
-		if slices.ContainsFunc(r.Attack.Attempts, func(at Attempt) bool { return at.Episode != nil && *at.Episode == by.Episode && at.Level == level }) {
-			return cmp.Or(deref(by.Target), "another problem")
-		}
-	}
-	return "another problem"
-}
-
-// byRung orders problems highest on the exploit chart first and, on one rung, an exploit aimed at the problem before
-// one found while aimed at another, as the report lists them.
-func byRung(a, b Problem) int {
-	return cmp.Or(b.ladder()-a.ladder(), boolInt(strings.HasPrefix(a.why(), "elsewhere_"))-boolInt(strings.HasPrefix(b.why(), "elsewhere_")))
-}
+// byRung orders problems highest on the exploit chart first.
+func byRung(a, b Problem) int { return b.ladder() - a.ladder() }
 
 // lead says whether a problem is a lead, one no evidence confirmed: level 1 in reports written before leads.
 func (p Problem) lead() bool {
@@ -375,15 +363,18 @@ func (p Problem) ladder() int {
 	if l, ok := helpLevels[p.why()]; ok {
 		return l
 	}
-	if p.why() == "no_guidance" || len(p.Findings) > 0 {
+	if p.why() == "no_guidance" || len(p.Findings) > 0 && p.Text == "" {
 		return 2
 	}
 	return 1
 }
 
-// validWork says whether a problem's findings are correct work the grader fails, so it is no exploit.
-func (r Report) validWork(p Problem) bool {
-	return r.Attack != nil && slices.ContainsFunc(r.Attack.Candidates, func(c Candidate) bool { return c.ValidWork && slices.Contains(p.Findings, c.ID) })
+// readings are the inspector findings a problem holds: from schema 2 on, only the reading it comes from.
+func (p Problem) readings() []string {
+	if p.Finding != "" {
+		return []string{p.Finding}
+	}
+	return p.Findings
 }
 
 type Attempt struct {
@@ -396,6 +387,12 @@ type Attempt struct {
 	Sources   []string            `json:"sources"`
 	Episode   *string             `json:"episode"`
 	Status    string              `json:"status"`
+
+	// Reports from schema 2 on carry these.
+	Reproduced *bool   `json:"reproduced"` // the rerun of its target's check measured the target's marks; null without a result
+	Rerun      *string `json:"rerun"`      // why reproduced is not true for an aimed attempt
+	CountsFor  *string `json:"counts_for"` // the problem it reproduced
+	Created    *string `json:"created"`    // the problem its exploit became
 }
 
 // load reads DIR/report.json, never through a link that leads out of DIR. A report without an answer
@@ -458,8 +455,65 @@ func load(dir string) (Report, error) {
 	for i, line := range r.Answer {
 		r.Answer[i] = strings.TrimSuffix(line, " That does not show that the grader is safe.")
 	}
+	// A problem the judge gave no cause is named by its reading's mechanism, or a reading without marks by what its
+	// check measured.
+	if r.Attack != nil {
+		found := r.findings()
+		for i, p := range r.Attack.Problems {
+			if strings.TrimSpace(p.Cause) == "" {
+				if j := slices.IndexFunc(found, func(f Finding) bool { return f.ID == p.Finding || f.Source == "attack" && f.Claim.Episode == p.Finding }); j >= 0 {
+					p.Cause = found[j].Claim.Mechanism
+				}
+				r.Attack.Problems[i].Cause = cmp.Or(p.Cause, p.Text)
+			}
+		}
+	}
+	shortRefs(&r)
 	r.Dir = shown(dir)
 	return r, nil
+}
+
+// shortRef is a problem id as P1 or A2, not an episode name.
+var shortRef = regexp.MustCompile(`^[A-Z]\d+$`)
+
+// shortRefs names each Attacker problem A1, A2, ... in report order where the report names it after its episode, and
+// renames every reference to it. Tries keep the episode, which links to the attempt.
+func shortRefs(r *Report) {
+	if r.Attack == nil {
+		return
+	}
+	names, n := map[string]string{}, 0
+	for i, p := range r.Attack.Problems {
+		if p.Source == "Attacker" {
+			if n++; !shortRef.MatchString(p.ID) {
+				names[p.ID] = fmt.Sprintf("A%d", n)
+				r.Attack.Problems[i].ID = names[p.ID]
+			}
+		}
+	}
+	rename := func(id *string) {
+		if id != nil && names[*id] != "" {
+			*id = names[*id]
+		}
+	}
+	for _, p := range r.Attack.Problems {
+		if p.Note != nil {
+			rename(&p.Note.Target)
+		}
+	}
+	for i := range r.Attack.Attempts {
+		at := &r.Attack.Attempts[i]
+		rename(&at.Problem)
+		rename(at.CountsFor)
+		rename(at.Created)
+	}
+	for _, kind := range r.Attack.Exploits {
+		for _, e := range kind {
+			if e != nil {
+				rename(e.Problem)
+			}
+		}
+	}
 }
 
 // shown is the run folder's name for display only, cleaned as report text is; files are read through the name as given.
@@ -614,7 +668,7 @@ func (r Report) problemOf(id string) int {
 		return -1
 	}
 	for i, p := range r.Attack.Problems {
-		if slices.Contains(p.Findings, id) {
+		if slices.Contains(p.readings(), id) {
 			return i
 		}
 	}
@@ -631,12 +685,14 @@ func deref(s *string) string {
 // evidenceOf is the number of the finding that shows problem p, or 0: its candidate, else its first finding on the
 // list, else for a problem an Attacker found the attack finding of one of its episodes.
 func evidenceOf(found []Finding, p Problem) int {
-	for _, id := range append(slices.DeleteFunc([]string{deref(p.Candidate)}, func(s string) bool { return s == "" }), p.Findings...) {
+	for _, id := range append(slices.DeleteFunc([]string{deref(p.Candidate)}, func(s string) bool { return s == "" }), p.readings()...) {
 		if i := slices.IndexFunc(found, func(f Finding) bool { return f.ID == id }); i >= 0 {
 			return i + 1
 		}
 	}
-	return slices.IndexFunc(found, func(f Finding) bool { return f.Source == "attack" && slices.Contains(p.Members, f.Claim.Episode) }) + 1
+	return slices.IndexFunc(found, func(f Finding) bool {
+		return f.Source == "attack" && (slices.Contains(p.Members, f.Claim.Episode) || slices.Contains(p.readings(), f.Claim.Episode))
+	}) + 1
 }
 
 // topProblem is the problem highest on the list whose evidence is on the list of findings, and that evidence's number;
@@ -655,8 +711,8 @@ func (r Report) topProblem(found []Finding) (*Problem, int) {
 	return nil, 1
 }
 
-// helpNeeded says whether the report's problems carry `exploited_with`, or `help_needed` in older reports, as problems
-// formed during the run do.
+// helpNeeded says whether the report's problems were formed during the run: every problem of schema 2, or one carrying
+// `exploited_with`, or `help_needed` in older reports.
 func (r Report) helpNeeded() bool {
-	return r.Attack != nil && slices.ContainsFunc(r.Attack.Problems, func(p Problem) bool { return p.why() != "" })
+	return r.Attack != nil && (r.SchemaVersion >= 2 || slices.ContainsFunc(r.Attack.Problems, func(p Problem) bool { return p.why() != "" }))
 }

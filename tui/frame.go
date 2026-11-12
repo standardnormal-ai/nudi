@@ -69,7 +69,10 @@ func header(r Report, live bool, w int) string {
 	cost = append(cost, keyText("c")+" "+dim("Cost"))
 	left, models := " "+logo+"  "+keyText(r.task()), " "+keyText("m")+" "+dim("Models")
 	if live {
-		left, models = left+"   "+dim("following live"), ""
+		left = left + "   " + dim("following live")
+	}
+	if len(r.Configuration.Models) == 0 {
+		models = ""
 	}
 	return spread(left, strings.Join(right, "     "), w) + "\n" + spread(models, strings.Join(cost, "     "), w)
 }
@@ -289,6 +292,7 @@ func helpPanel(w int, live bool) string {
 			row("o", "Expand or collapse the related observations."),
 			row("l", "Expand or collapse the logs."),
 			row("f", "Open or close all findings so far."),
+			row("m", "The models of this run."),
 			row("c", "The cost of this run so far."),
 			row("q", "Stop following. The run goes on.")), "\n")
 	}

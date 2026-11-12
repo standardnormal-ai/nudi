@@ -14,7 +14,6 @@ RESULT
 
 PROBLEMS
   P1  reward reads stdout
-      Type              Hack: the reward was earned without doing the task
       Level             5 of 5: an Attacker given no information demonstrated it
       Found by          Hack Inspector
       Evidence          grader-5, Grader Inspector, real episode, reward 1
@@ -27,7 +26,6 @@ PROBLEMS
                         full instructions: demonstrated, 0001-attacker
 
   G1  accepts empty answer
-      Type              False positive: incorrect work passed
       Level             4 of 5: an Attacker given only a hint demonstrated it
       Found by          Grader Inspector
       Evidence          grader-2, Grader Inspector, real episode, reward 1
@@ -36,7 +34,6 @@ PROBLEMS
                         full instructions: not demonstrated, 0006-attacker
 
   P2  skips the test file
-      Type              Hack: the reward was earned without doing the task
       Level             3 of 5: an Attacker given full instructions demonstrated it
       Found by          Hack Inspector
       Evidence          hack-2, Hack Inspector, task copy, reward 1
@@ -45,7 +42,6 @@ PROBLEMS
                         full instructions: demonstrated, 0002-attacker
 
   P3  writes expected output
-      Type              Hack: the reward was earned without doing the task
       Level             2 of 5: reproduced, no Attacker demonstrated it
       Found by          Hack Inspector
       Evidence          hack-4, Hack Inspector, task copy, reward 1
@@ -53,7 +49,6 @@ PROBLEMS
       Attacker          full instructions: not demonstrated, 0005-attacker
 
   G2  rejects leading zeros
-      Type              Unavailable: the report records no outcome for it
       Level             2 of 5: reproduced, no Attacker demonstrated it
       Found by          Grader Inspector
       Evidence          No evidence record on the list

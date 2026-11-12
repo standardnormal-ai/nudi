@@ -68,9 +68,6 @@
  Findings (0)
  None evidenced in this run.
 
- Ideas Not Reproduced (0)
- None recorded.
-
  Open Questions (1)
    Question                                      Why it is open
    unchecked requirement (hack-0)                Reason not recorded

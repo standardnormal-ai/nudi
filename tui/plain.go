@@ -133,11 +133,13 @@ func level(r Report, p Problem) string {
 		run, _, _ = strings.Cut(run, " at ")
 		again = " in run " + run + "; not found again here"
 	}
-	if problemType(r, p) == "False negative" {
+	if problemType(p) == "False negative" || p.Outcome == "rejected_valid" {
+		if r.SchemaVersion >= 2 {
+			return p.Label
+		}
 		return cmp.Or(capital(strings.TrimPrefix(validWorkWords[p.ladder()], ", ")), "Not reproduced by an Attacker") + again
 	}
-	elsewhere := strings.TrimSuffix(", while aimed at "+r.aimedElsewhere(p), ", while aimed at ")
-	return fmt.Sprintf("%d of 5: %s", p.ladder(), strings.TrimLeft(cmp.Or(ladderWords[p.ladder()], p.Label), "●○ ")) + elsewhere + again
+	return fmt.Sprintf("%d of 5: %s", p.ladder(), strings.TrimLeft(cmp.Or(ladderWords[p.ladder()], p.Label), "●○ ")) + again
 }
 
 // problemFields are the problems, highest level first, each with its type, level, evidence records and Attacker tries.
@@ -147,22 +149,30 @@ func problemFields(r Report, found []Finding, w int) []string {
 		return []string{"  None demonstrated in this run."}
 	}
 	var out []string
+	idw := 4 // a problem no judge numbered keeps its finding id or Attacker episode
+	for _, p := range ps {
+		idw = max(idw, width(p.ID)+2)
+	}
 	for i, p := range ps {
 		if i > 0 {
 			out = append(out, "")
 		}
-		out = append(out, cols(w, "  ", []int{4}, p.ID, strings.Join(strings.Fields(p.Cause), " ")))
+		out = append(out, cols(w, "  ", []int{idw}, p.ID, strings.Join(strings.Fields(p.Cause), " ")))
 		kv := func(name, value string) {
 			if value != "" {
 				out = append(out, field(w, "      ", name, value))
 			}
 		}
-		kv("Type", typeNames[problemType(r, p)])
+		kv("Type", typeNames[problemType(p)])
+		if p.Reason != nil && problemType(p) == "" {
+			kv("Reason", capital(*p.Reason))
+		}
 		kv("Level", level(r, p))
+		kv("Note", strings.TrimPrefix(note(p), "Note: "))
 		kv("Found by", sourceName(p.Source))
 		var evidence []string
 		for _, f := range found {
-			if f.Source != "attack" && slices.Contains(p.Findings, f.ID) || f.Source == "attack" && r.demonstrates(f, p) {
+			if f.Source != "attack" && slices.Contains(p.readings(), f.ID) || f.Source == "attack" && r.demonstrates(f, p) {
 				evidence = append(evidence, ref(f)+", "+jobNames[f.Source]+", "+word(scopeWords, f.ExecutionScope)+", reward "+num(f.reward()))
 			}
 		}
@@ -177,14 +187,7 @@ func problemFields(r Report, found []Finding, w int) []string {
 		for _, level := range []string{"none", "minimal", "full"} {
 			for _, at := range r.aimed(p) {
 				if at.Level == level {
-					tries = append(tries, levelWords[level]+": "+tryWords(r, at))
-				}
-			}
-			// Tries aimed at another problem that exploited this one, as the judge named it.
-			for _, by := range p.ExploitedBy {
-				if i := slices.IndexFunc(r.Attack.Attempts, func(at Attempt) bool { return at.Episode != nil && *at.Episode == by.Episode }); i >= 0 && r.Attack.Attempts[i].Level == level {
-					at := r.Attack.Attempts[i]
-					tries = append(tries, levelWords[level]+": demonstrated while aimed at "+cmp.Or(deref(by.Target), "another problem")+strings.TrimPrefix(tryWords(r, at), tryResult(r, at)))
+					tries = append(tries, levelWords[level]+": "+tryWords(r, at, &p))
 				}
 			}
 			if r.tried(p, level) == "-" && !slices.ContainsFunc(r.aimed(p), func(at Attempt) bool { return at.Level == level }) {
@@ -203,9 +206,9 @@ func problemFields(r Report, found []Finding, w int) []string {
 	return out
 }
 
-// tryWords say how an Attacker's try ended, with its session and reward.
-func tryWords(r Report, at Attempt) string {
-	out := tryResult(r, at)
+// tryWords say how an Attacker's try ended for problem p, with its session and reward.
+func tryWords(r Report, at Attempt, p *Problem) string {
+	out := tryResult(r, at, p)
 	if at.Episode != nil {
 		out += ", " + *at.Episode
 	}
@@ -215,17 +218,21 @@ func tryWords(r Report, at Attempt) string {
 	return out
 }
 
-// tryResult says how an Attacker's try ended, with the error of one that failed.
-func tryResult(r Report, at Attempt) string {
+// tryResult says how an Attacker's try ended, with the error of one that failed. From schema 2 on, a judged try
+// under a problem p says what its rerun showed of p.
+func tryResult(r Report, at Attempt, p *Problem) string {
 	res, _ := lookup(attemptResults, at.Status)
 	if !r.started(at) {
 		res = NotTested
+	}
+	if r.SchemaVersion >= 2 && p != nil && (res == Evidenced || res == NoIssue || res == Unsettled) {
+		res = map[string]Result{"yes": Evidenced, "no": NoIssue, "?": Unsettled}[r.succeeded(at, *p)]
 	}
 	out := triedWords[res]
 	if res == NotTested && r.started(at) {
 		out = strings.ToLower(stoppedWords(at.Status)) // its episode started
 	}
-	if at.Error != nil && res == Failed {
+	if at.Error != nil && (res == Failed || res == NoReward) {
 		out += ": " + strings.SplitN(*at.Error, "\n", 2)[0]
 	}
 	return out
@@ -352,7 +359,7 @@ func attemptRows(r Report, w int) []string {
 			episode = *at.Episode
 		}
 		for _, p := range r.Attack.Problems {
-			if at.Problem == "" && p.ID != "" && slices.ContainsFunc(tested(at), func(id string) bool { return slices.Contains(p.Findings, id) }) {
+			if at.Problem == "" && p.ID != "" && slices.ContainsFunc(tested(at), func(id string) bool { return slices.Contains(p.readings(), id) }) {
 				problem = p.ID
 			}
 		}
@@ -360,7 +367,7 @@ func attemptRows(r Report, w int) []string {
 		for _, k := range slices.Sorted(maps.Keys(at.Rewards)) {
 			rewards = append(rewards, strings.TrimPrefix(k+" ", "reward ")+num(at.Rewards[k]))
 		}
-		out = append(out, cols(w, "  ", widths, episode, problem, cmp.Or(levelWords[at.Level], "-"), tryResult(r, at), cmp.Or(strings.Join(rewards, ", "), "-")))
+		out = append(out, cols(w, "  ", widths, episode, problem, cmp.Or(levelWords[at.Level], "-"), tryResult(r, at, nil), cmp.Or(strings.Join(rewards, ", "), "-")))
 	}
 	if len(r.Attack.Attempts) == 0 {
 		return []string{"  No try recorded."}

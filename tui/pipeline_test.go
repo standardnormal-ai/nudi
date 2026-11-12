@@ -283,7 +283,7 @@ func TestPipelineUnattributedIsNotSettled(t *testing.T) {
 	if got := cells(liveScreen(t, liveFrom(t, log), at9("04:00"), 100, 0), "C1"); got != "✓ ✓ ? -" {
 		t.Errorf("P1 row: %q", got)
 	}
-	if res, _ := lookup(attemptResults, "other_exploit"); res != Elsewhere {
+	if res, _ := lookup(attemptResults, "other_exploit"); res != NoIssue {
 		t.Errorf("other_exploit reads %v", res)
 	}
 }
@@ -470,9 +470,8 @@ func TestProblemsByHelpNeeded(t *testing.T) {
 	}
 }
 
-// A problem of correct work the grader fails is named with the simulation chart's FN words, never an exploit step;
-// an older problem without findings or levels is a lead.
-func TestPlainNamesCorrectWorkFailedAndCountsOlderPendingProblemsAsLeads(t *testing.T) {
+// An older problem without findings or levels is a lead.
+func TestPlainCountsOlderPendingProblemsAsLeads(t *testing.T) {
 	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"attack": "complete"}, "attack": {
 		"candidates": [{"id": "grader-0", "valid_work": true}],
 		"problems": [{"id": "G1", "cause": "rejects zeros", "source": "grader inspector", "findings": ["grader-0"], "help_needed": "full_info"},
@@ -481,10 +480,6 @@ func TestPlainNamesCorrectWorkFailedAndCountsOlderPendingProblemsAsLeads(t *test
 		t.Fatal(err)
 	}
 	s := plainReport(r, 120)
-	if !strings.Contains(s, "False negative: correct work was rejected") || !strings.Contains(s, "Level             Reproduced by an Attacker with full instructions") ||
-		strings.Contains(s, "exploit executable") {
-		t.Errorf("correct work failed:\n%s", s)
-	}
 	if !strings.Contains(s, "Count             1 problem\n") || strings.Contains(s, "  P1  pending") {
 		t.Errorf("older pending problem:\n%s", s)
 	}

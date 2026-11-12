@@ -5,6 +5,7 @@
  Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
  Problem           P1                      Attacker result    Not tested
  Mechanism         unchecked requirement
+ Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -26,6 +27,7 @@
  Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
  Problem           P1                      Attacker result    Not tested
  Mechanism         unchecked requirement
+ Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -48,6 +50,7 @@
  Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
  Problem           P1                      Attacker result    Not tested
  Mechanism         unchecked requirement
+ Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────

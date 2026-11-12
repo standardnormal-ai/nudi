@@ -116,9 +116,6 @@
    Idea                                          Reproduced?   What happened
    unchecked requirement                              ✗
 
- Open Questions (0)
- None recorded.
-
  ▸ Search Scope (3 categories)                                                             s expand
  ▸ Experiments (5)                                                                         x expand
 === tab 3
@@ -129,7 +126,7 @@
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
  Tries (2)                                                                                 e expand
-   Try  Tested      Help     Succeeded   Status       Reward  Attempt
+   Try  Tested      Help     Succeeded   Status       Reward  Ref
  › 1    hack-1      Full         ✓       Finished     1       0007-attacker
    2    hack-2      Full         ✓       Finished     0       0008-attacker
 

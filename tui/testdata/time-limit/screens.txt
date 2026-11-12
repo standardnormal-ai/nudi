@@ -6,12 +6,13 @@
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
  Stopped at the time limit                                                                1 problem
- The grader can be cheated in a copy of the task package, not yet in a real episode.
+ The checks measured the problems below; no approved requirement list confirms a cheat or misjudged
+ work.
  Results below are from before the limit.
 
  Problems (1)                                                                              e expand
      Problem                                Type            No info  Hint  Full  Inspector  Ref
- › ▸ The test runs bash through PATH.       Hack               -      -     -        ✓      P1
+ › ▸ The test runs bash through PATH.        ?                 -      -     -        ✓      P1
 
  ▸ What the References Mean                                                                i expand
 
@@ -53,12 +54,6 @@
    Problem                                       Reproduced?   Attacker?   Ref
  › The test runs bash through PATH.                   ✓            -       P1
 
- Ideas Not Reproduced (0)
- None recorded.
-
- Open Questions (0)
- None recorded.
-
  ▸ Search Scope (1 category)                                                               s expand
  ▸ Experiments (1)                                                                         x expand
 === tab 3
@@ -68,12 +63,9 @@
  Simulation ✓ ── Grade Simulations ── Find Hacks ✓ ──  Attack  stopped              │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- Hacks (1)                                                                                 e expand
+ Type Unknown (1)                                                                          e expand
      Problem                                     No info  Hint  Full
  › ▸ The test runs bash through PATH.               -      -     -
-
- Correct Work Rejected (0)
- None in this run.
 
  Can an Attacker Succeed Without Any Information?
  Not tested: stopped.

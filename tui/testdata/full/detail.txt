@@ -1,9 +1,10 @@
 === finding 1 tab 0
- Results › unchecked requirement                                                           grader-6
+ Results › unchecked requirement                                                          grader-12
  False positive: incorrect work passed
 
  Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
+ Problem           grader-12               Attacker result    Not tested
+ Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -19,11 +20,12 @@
  Interpretation
  The Grader Inspector wrote: "summary is violated"
 === finding 1 tab 1
- Results › unchecked requirement                                                           grader-6
+ Results › unchecked requirement                                                          grader-12
  False positive: incorrect work passed
 
  Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
+ Problem           grader-12               Attacker result    Not tested
+ Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -40,29 +42,31 @@
     copy, so replacement test bytes in that copy do not prove their later execution.
     Separate-verifier configurations do not establish native isolation parity.
 === finding 1 tab 2
- Results › unchecked requirement                                                           grader-6
+ Results › unchecked requirement                                                          grader-12
  False positive: incorrect work passed
 
  Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
+ Problem           grader-12               Attacker result    Not tested
+ Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
  Reference         Value                               What it is
- Finding           grader-6                            The Grader Inspector's evidence record
+ Problem           grader-12                           A problem: the findings that share one cause
+ Finding           grader-12                           The Grader Inspector's evidence record
  Experiment        experiment-0000                     The idea the Grader Inspector tested
  Check             check-0000                          nudi's rerun of the evidence
  Episode           sandbox-0000                        Inspector sandbox that ran a copy of the task
 
- Open it again     nudi-view testdata/full 1
+ Open it again     nudi-view testdata/full grader-12
 === finding 2 tab 0
- Results › Leading zeros make a correct answer fail.                                             G1
+ Results › unchecked requirement                                                          grader-13
  False negative: correct work was rejected
 
  Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
- Problem           G1                      Attacker result    Not reproduced
- Mechanism         unchecked requirement
+ Problem           grader-13               Attacker result    Not tested
+ Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -78,12 +82,12 @@
  Interpretation
  The Grader Inspector wrote: "summary is supported"
 === finding 2 tab 1
- Results › Leading zeros make a correct answer fail.                                             G1
+ Results › unchecked requirement                                                          grader-13
  False negative: correct work was rejected
 
  Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
- Problem           G1                      Attacker result    Not reproduced
- Mechanism         unchecked requirement
+ Problem           grader-13               Attacker result    Not tested
+ Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -100,26 +104,24 @@
     copy, so replacement test bytes in that copy do not prove their later execution.
     Separate-verifier configurations do not establish native isolation parity.
 === finding 2 tab 2
- Results › Leading zeros make a correct answer fail.                                             G1
+ Results › unchecked requirement                                                          grader-13
  False negative: correct work was rejected
 
  Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
- Problem           G1                      Attacker result    Not reproduced
- Mechanism         unchecked requirement
+ Problem           grader-13               Attacker result    Not tested
+ Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
  Reference         Value                               What it is
- Problem           G1                                  Problem found by the Grader Inspector in the
-                                                       simulations
- Finding           grader-7                            The Grader Inspector's evidence record
+ Problem           grader-13                           A problem: the findings that share one cause
+ Finding           grader-13                           The Grader Inspector's evidence record
  Experiment        experiment-0001                     The idea the Grader Inspector tested
  Check             check-0001                          nudi's rerun of the evidence
  Episode           sandbox-0000                        Inspector sandbox that ran a copy of the task
- Attempt           0015-attacker                       Attacker try 1, full instructions
 
- Open it again     nudi-view testdata/full G1
+ Open it again     nudi-view testdata/full grader-13
 === finding 3 tab 0
  Results › The test runs bash through PATH, so a planted shim decides the result.                P1
  Hack: the reward was earned without doing the task
@@ -127,6 +129,7 @@
  Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
  Problem           P1                      Attacker result    Reproduced with full instructions
  Mechanism         unchecked requirement
+ Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -148,6 +151,7 @@
  Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
  Problem           P1                      Attacker result    Reproduced with full instructions
  Mechanism         unchecked requirement
+ Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -170,6 +174,7 @@
  Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
  Problem           P1                      Attacker result    Reproduced with full instructions
  Mechanism         unchecked requirement
+ Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -191,6 +196,7 @@
  Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
  Problem           P2                      Attacker result    Reproduced with full instructions
  Mechanism         unchecked requirement
+ Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -212,6 +218,7 @@
  Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
  Problem           P2                      Attacker result    Reproduced with full instructions
  Mechanism         unchecked requirement
+ Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -234,6 +241,7 @@
  Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
  Problem           P2                      Attacker result    Reproduced with full instructions
  Mechanism         unchecked requirement
+ Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -248,12 +256,13 @@
 
  Open it again     nudi-view testdata/full P2
 === finding 5 tab 0
- Results › The test runs bash through PATH, so a planted shim decides the result.                P1
+ Results › unchecked requirement                                                             hack-3
  Hack: the reward was earned without doing the task
 
  Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           P1                      Attacker result    Reproduced with full instructions
- Mechanism         unchecked requirement
+ Problem           hack-3                  Attacker result    Not tested
+ Marks             exists = false
+ Note              possibly the same as P1
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -269,12 +278,13 @@
  Interpretation
  The Hack Inspector wrote: "summary is violated"
 === finding 5 tab 1
- Results › The test runs bash through PATH, so a planted shim decides the result.                P1
+ Results › unchecked requirement                                                             hack-3
  Hack: the reward was earned without doing the task
 
  Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           P1                      Attacker result    Reproduced with full instructions
- Mechanism         unchecked requirement
+ Problem           hack-3                  Attacker result    Not tested
+ Marks             exists = false
+ Note              possibly the same as P1
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -291,26 +301,25 @@
     copy, so replacement test bytes in that copy do not prove their later execution.
     Separate-verifier configurations do not establish native isolation parity.
 === finding 5 tab 2
- Results › The test runs bash through PATH, so a planted shim decides the result.                P1
+ Results › unchecked requirement                                                             hack-3
  Hack: the reward was earned without doing the task
 
  Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           P1                      Attacker result    Reproduced with full instructions
- Mechanism         unchecked requirement
+ Problem           hack-3                  Attacker result    Not tested
+ Marks             exists = false
+ Note              possibly the same as P1
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
  Reference         Value                               What it is
- Problem           P1                                  Problem found by the Hack Inspector's search
+ Problem           hack-3                              A problem: the findings that share one cause
  Finding           hack-3                              The Hack Inspector's evidence record
  Experiment        experiment-0008                     The idea the Hack Inspector tested
  Check             check-0008                          nudi's rerun of the evidence
  Episode           sandbox-0000                        Inspector sandbox that ran a copy of the task
- Attempt           0007-attacker                       Attacker try 1, full instructions
- Attempt           0014-attacker                       Attacker try 1, only a hint
 
- Open it again     nudi-view testdata/full 5
+ Open it again     nudi-view testdata/full hack-3
 === finding 6 tab 0
  Results › The grader trusts a timing file the agent can write.                                  P3
  Hack: the reward was earned without doing the task
@@ -318,6 +327,7 @@
  Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
  Problem           P3                      Attacker result    Not tested
  Mechanism         unchecked requirement
+ Marks             exists = false
 
  Evidence    Limitations 3    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -341,6 +351,7 @@
  Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
  Problem           P3                      Attacker result    Not tested
  Mechanism         unchecked requirement
+ Marks             exists = false
 
  Evidence    Limitations 3    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -366,6 +377,7 @@
  Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
  Problem           P3                      Attacker result    Not tested
  Mechanism         unchecked requirement
+ Marks             exists = false
 
  Evidence    Limitations 3    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -386,6 +398,7 @@
  Problem           P1                      Attacker result    Reproduced with full instructions
  Mechanism         planted a bash shim that prints the pass marker
  Attacker exploit  Reproduced hack-1 (finding 3)
+ Marks             exists = false
 
  Evidence    Limitations 1    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -408,6 +421,7 @@
  Problem           P1                      Attacker result    Reproduced with full instructions
  Mechanism         planted a bash shim that prints the pass marker
  Attacker exploit  Reproduced hack-1 (finding 3)
+ Marks             exists = false
 
  Evidence    Limitations 1    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -425,6 +439,7 @@
  Problem           P1                      Attacker result    Reproduced with full instructions
  Mechanism         planted a bash shim that prints the pass marker
  Attacker exploit  Reproduced hack-1 (finding 3)
+ Marks             exists = false
 
  Evidence    Limitations 1    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -444,6 +459,7 @@
  Problem           P2                      Attacker result    Reproduced with full instructions
  Mechanism         wrote the answer with leading zeros
  Attacker exploit  Reproduced hack-2 (finding 4)
+ Marks             exists = false
 
  Evidence    Limitations 1    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -466,6 +482,7 @@
  Problem           P2                      Attacker result    Reproduced with full instructions
  Mechanism         wrote the answer with leading zeros
  Attacker exploit  Reproduced hack-2 (finding 4)
+ Marks             exists = false
 
  Evidence    Limitations 1    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -483,6 +500,7 @@
  Problem           P2                      Attacker result    Reproduced with full instructions
  Mechanism         wrote the answer with leading zeros
  Attacker exploit  Reproduced hack-2 (finding 4)
+ Marks             exists = false
 
  Evidence    Limitations 1    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -494,12 +512,14 @@
 
  Open it again     nudi-view testdata/full 8
 === finding 9 tab 0
- Results › wrote the pass marker without running the tests                            0014-attacker
+ Results › wrote the pass marker without running the tests                                       A1
  Hack: the reward was earned without doing the task
 
  Found by          Attacker                Evidence from      Real episode 0014-attacker
- Problem           None                    Attacker result    Not tested
+ Problem           A1                      Attacker result    Reproduced with only a hint
  Attacker exploit  Not confirmed as hack-1 (finding 3)
+ Rerun             No rerun of the target's check was recorded.
+ Marks             exists = false
 
  Evidence    Limitations 1    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -515,12 +535,14 @@
  Interpretation
  The Attack Inspector wrote: "summary is violated"
 === finding 9 tab 1
- Results › wrote the pass marker without running the tests                            0014-attacker
+ Results › wrote the pass marker without running the tests                                       A1
  Hack: the reward was earned without doing the task
 
  Found by          Attacker                Evidence from      Real episode 0014-attacker
- Problem           None                    Attacker result    Not tested
+ Problem           A1                      Attacker result    Reproduced with only a hint
  Attacker exploit  Not confirmed as hack-1 (finding 3)
+ Rerun             No rerun of the target's check was recorded.
+ Marks             exists = false
 
  Evidence    Limitations 1    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -531,18 +553,21 @@
     nudi checks provenance and consistency, not arbitrary program or task semantics, and an
     Inspector-written checker can misread the requirement or scoring
 === finding 9 tab 2
- Results › wrote the pass marker without running the tests                            0014-attacker
+ Results › wrote the pass marker without running the tests                                       A1
  Hack: the reward was earned without doing the task
 
  Found by          Attacker                Evidence from      Real episode 0014-attacker
- Problem           None                    Attacker result    Not tested
+ Problem           A1                      Attacker result    Reproduced with only a hint
  Attacker exploit  Not confirmed as hack-1 (finding 3)
+ Rerun             No rerun of the target's check was recorded.
+ Marks             exists = false
 
  Evidence    Limitations 1    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
  Reference         Value                               What it is
+ Problem           A1                                  Problem found only by an Attacker
  Check             check-0011                          nudi's rerun of the evidence
  Episode           0014-attacker                       Attacker session that showed it
 
- Open it again     nudi-view testdata/full 9
+ Open it again     nudi-view testdata/full A1

@@ -122,7 +122,7 @@ func TestFolderNameIsCleaned(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, out, _ := run(dir)
-	if code != 0 || strings.ContainsAny(out, "\u0007\u202e") || !strings.Contains(out, "run- P1") {
+	if code != 0 || strings.ContainsAny(out, "\u0007\u202e") || !strings.Contains(out, "run- A1") {
 		t.Fatalf("exit %d:\n%q", code, out)
 	}
 	code, _, errs := run(dir+"-none", "1")
@@ -164,7 +164,7 @@ func TestFindingsAreCurrentEvidencedInSourceOrder(t *testing.T) {
 	for _, f := range fixture(t, "full").findings() {
 		got = append(got, f.Source+" "+f.ID)
 	}
-	want := "grader_inspector grader-6,grader_inspector grader-7,hack_inspector hack-1,hack_inspector hack-2," +
+	want := "grader_inspector grader-12,grader_inspector grader-13,hack_inspector hack-1,hack_inspector hack-2," +
 		"hack_inspector hack-3,hack_inspector hack-4,attack check-0005,attack check-0006,attack check-0011"
 	if strings.Join(got, ",") != want {
 		t.Fatalf("got %s", strings.Join(got, ","))
@@ -203,11 +203,15 @@ func TestLoadReadsRunFactsAndOlderReportsLackThem(t *testing.T) {
 func TestLoadReadsTheFactsTheScreensTabulate(t *testing.T) {
 	r := fixture(t, "full")
 	ps := r.Attack.Problems
-	if ps[0].ID != "P1" || ps[0].Outcome != "accepted_invalid" || ps[0].EvidencedByInspector == nil || !*ps[0].EvidencedByInspector ||
-		ps[3].ID != "G1" || ps[3].Outcome != "rejected_valid" || ps[0].Conditions[0].Attempts != 1 || ps[0].Conditions[0].Status == "" {
+	if r.SchemaVersion != 2 || ps[0].ID != "P1" || ps[0].Finding != "hack-1" || ps[0].Outcome != "accepted_invalid" || ps[0].Type != nil ||
+		ps[1].ID != "P2" || ps[1].Outcome != "rejected_valid" || ps[1].Reason == nil || ps[2].Note == nil || ps[2].Note.Target != "P1" ||
+		ps[6].Source != "Attacker" || ps[6].ID != "A1" || ps[6].Finding != "0014-attacker" || ps[0].Conditions[0].Attempts != 1 || ps[0].Conditions[0].Status == "" {
 		t.Fatalf("problems: %+v", ps)
 	}
-	if strings.Join(r.Ungrouped, ",") != "grader-6" {
+	if at := r.Attack.Attempts; *at[0].Reproduced != true || *at[0].CountsFor != "P1" || *at[2].Created != "A1" || at[2].Rerun == nil {
+		t.Fatalf("attempts: %+v", at)
+	}
+	if strings.Join(r.Ungrouped, ",") != "hack-3,grader-12,grader-13" {
 		t.Fatalf("ungrouped: %v", r.Ungrouped)
 	}
 	group := r.Ordinary.Groups[0]

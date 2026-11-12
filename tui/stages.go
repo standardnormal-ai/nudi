@@ -294,7 +294,7 @@ func episodeProblem(r Report, found []Finding, e string) string {
 		return ""
 	}
 	for _, p := range r.Attack.Problems {
-		if slices.Contains(p.Members, e) || slices.ContainsFunc(found, func(f Finding) bool { return f.Claim.Episode == e && slices.Contains(p.Findings, f.ID) }) {
+		if slices.Contains(p.Members, e) || slices.ContainsFunc(found, func(f Finding) bool { return f.Claim.Episode == e && slices.Contains(p.readings(), f.ID) }) {
 			return p.ID
 		}
 	}
@@ -606,7 +606,7 @@ func hacksPage(r Report, found []Finding, p *page) {
 		for _, pr := range ps {
 			p.pick(evidenceOf(found, pr), "", func(mark string, on bool) string {
 				name := strings.Join(strings.Fields(pr.Cause), " ")
-				reproduced := map[bool]string{true: "yes", false: "-"}[len(pr.Findings) > 0]
+				reproduced := map[bool]string{true: "yes", false: "-"}[len(pr.readings()) > 0]
 				if e := pr.EvidencedByInspector; e != nil {
 					reproduced = map[bool]string{true: "yes", false: "no"}[*e]
 				}
@@ -631,10 +631,9 @@ func hacksPage(r Report, found []Finding, p *page) {
 			ideas = append(ideas, f)
 		}
 	}
-	p.add(titled("Ideas Not Reproduced", len(ideas)))
-	if len(ideas) == 0 {
-		p.add(" None recorded.")
-	} else {
+	// Ideas and questions show only when there are some: neither being empty is a result.
+	if len(ideas) > 0 {
+		p.add(titled("Ideas Not Reproduced", len(ideas)))
 		widths := []int{46, 14}
 		p.add(cols(p.w, "   ", widths, dim("Idea"), dim("Reproduced?"), dim("What happened")))
 		for _, f := range ideas {
@@ -644,18 +643,16 @@ func hacksPage(r Report, found []Finding, p *page) {
 			}
 			p.add(cols(p.w, "   ", widths, title(f), under("Reproduced?", glyph("no")), what))
 		}
+		p.add("")
 	}
-	questions := append(openItems(in), unresolvedFindings(in, "hack_inspector")...)
-	p.add("", titled("Open Questions", len(questions)))
-	if len(questions) == 0 {
-		p.add(" None recorded.")
-	} else {
+	if questions := append(openItems(in), unresolvedFindings(in, "hack_inspector")...); len(questions) > 0 {
+		p.add(titled("Open Questions", len(questions)))
 		p.add(cols(p.w, "   ", []int{46}, dim("Question"), dim("Why it is open")))
 		for _, q := range questions {
 			p.add(cols(p.w, "   ", []int{46}, q[0], q[1]))
 		}
+		p.add("")
 	}
-	p.add("")
 	scope(r, in, "Hack Inspector", "s", p)
 	if len(in.Experiments) > 0 && p.toggle("x", "Experiments", fmt.Sprintf("(%d)", len(in.Experiments))) {
 		widths := []int{18, 26, 16}
@@ -697,23 +694,26 @@ func attackPage(r Report, found []Finding, p *page) {
 		return
 	}
 	if a.Problems == nil {
-		triesTable(r, found, a.Attempts, true, p)
+		triesTable(r, found, a.Attempts, nil, p)
 	} else {
-		var hacks, rejected, unknown []Problem
+		groups := map[string][]Problem{}
 		for _, pr := range problems(r) {
-			switch problemType(r, pr) {
+			name := "Hacks"
+			switch problemType(pr) {
 			case "False negative":
-				rejected = append(rejected, pr)
-			case "Unavailable":
-				unknown = append(unknown, pr)
-			default:
-				hacks = append(hacks, pr)
+				name = "Correct Work Rejected"
+			case "":
+				name = "Type Unknown"
 			}
+			groups[name] = append(groups[name], pr)
 		}
-		attackTable(r, found, "Hacks", hacks, true, p)
-		attackTable(r, found, "Correct Work Rejected", rejected, false, p)
-		if len(unknown) > 0 {
-			attackTable(r, found, "Type Not Recorded", unknown, false, p)
+		// A group with no problem is left out; with no problem at all, the empty Hacks group is the tab's result.
+		names := slices.DeleteFunc([]string{"Hacks", "Correct Work Rejected", "Type Unknown"}, func(n string) bool { return len(groups[n]) == 0 })
+		if len(names) == 0 {
+			names = []string{"Hacks"}
+		}
+		for i, name := range names {
+			attackTable(r, found, name, groups[name], i == 0, p)
 		}
 	}
 	p.add(heading("Can an Attacker Succeed Without Any Information?", ""))
@@ -731,7 +731,10 @@ func attackPage(r Report, found []Finding, p *page) {
 			demonstrated, fresh, same := "-", "-", ""
 			if r.started(at) {
 				res, _ := lookup(attemptResults, at.Status)
-				demonstrated = map[Result]string{Evidenced: "yes", NoIssue: "no", Elsewhere: "yes", Unsettled: "?"}[res]
+				demonstrated = map[Result]string{Evidenced: "yes", NoIssue: "no", Unsettled: "?"}[res]
+				if at.Status == "other_exploit" { // the question is any hack
+					demonstrated = "yes"
+				}
 				if demonstrated == "" {
 					demonstrated = "-"
 				}
@@ -756,6 +759,21 @@ func attackPage(r Report, found []Finding, p *page) {
 	default:
 		p.add(" Not tested: " + word(notTestedWords, d.Status) + ".")
 	}
+}
+
+// rerunWords say why an attempt's rerun did not reproduce its target, from `rerun`; empty when it did or no reason
+// is recorded.
+func rerunWords(at Attempt) string {
+	if at.Rerun == nil || at.Reproduced != nil && *at.Reproduced {
+		return ""
+	}
+	words := map[string]string{
+		"the target's reading changed since the attempt started, so the rerun is compared with nothing": "Not compared: the target's reading changed after the try started.",
+		"the rerun measured a mark of the target otherwise than the target's own check":                 "The rerun measured the target's marks otherwise than its own check.",
+		"the rerun or the target's own check failed or measured no value of some mark":                  "The rerun or the target's own check measured no value for some mark.",
+		"no rerun of the target's check on this episode was recorded":                                   "No rerun of the target's check was recorded.",
+	}
+	return cmp.Or(words[*at.Rerun], capital(*at.Rerun))
 }
 
 // attackTable lists problems with the answer under each hint level; Enter expands a row into its tries, which then
@@ -788,7 +806,7 @@ func attackTable(r Report, found []Finding, name string, ps []Problem, first boo
 				under("Full", glyph(r.tried(pr, "full"))))
 		})
 		if p.open[key] {
-			triesTable(r, found, aimed, false, p)
+			triesTable(r, found, aimed, &pr, p)
 		}
 	}
 	p.add("")
@@ -798,14 +816,15 @@ func attackTable(r Report, found []Finding, name string, ps []Problem, first boo
 func attackHead(title string, p *page) {
 	p.add(spread(title, p.fold("e"), p.w))
 	if p.open["e"] {
-		p.add(symbols, wrap("✓* The Attacker got the reward with a different hack than the one it was told about.", p.w, " ", dim), "")
+		p.add(symbols, "")
 	}
 }
 
-// triesTable lists attempts: their hint level, whether each succeeded, with * for another hack than its own, how it ended,
-// its reward and its session; Enter opens an attempt's finding. Reports without problems also name what it tested.
-func triesTable(r Report, found []Finding, attempts []Attempt, flat bool, p *page) {
-	indent := "       "
+// triesTable lists attempts: their hint level, whether each succeeded, how it ended, its reward and its session, or the
+// problem its exploit became; Enter opens an attempt's finding. Under a problem pr, from schema 2 on, an attempt
+// succeeded when it reproduced pr. Reports without problems pass no pr and also name what each tested.
+func triesTable(r Report, found []Finding, attempts []Attempt, pr *Problem, p *page) {
+	indent, flat := "       ", pr == nil
 	if flat {
 		indent = "   "
 		attackHead(titled("Tries", len(attempts)), p)
@@ -815,7 +834,7 @@ func triesTable(r Report, found []Finding, attempts []Attempt, flat bool, p *pag
 		return
 	}
 	widths := []int{5, 9, 12, 13, 8}
-	heads := []string{"Try", "Help", "Succeeded", "Status", "Reward", "Attempt"}
+	heads := []string{"Try", "Help", "Succeeded", "Status", "Reward", "Ref"}
 	if flat {
 		widths = []int{5, 12, 9, 12, 13, 8}
 		heads = slices.Insert(heads, 1, "Tested")
@@ -833,8 +852,8 @@ func triesTable(r Report, found []Finding, attempts []Attempt, flat bool, p *pag
 				status = stoppedWords(at.Status) // its episode started
 			}
 			succeeded = glyph(answers[res])
-			if res == Elsewhere {
-				succeeded = glyph("yes") + dim("*")
+			if r.SchemaVersion >= 2 && pr != nil {
+				succeeded = glyph(r.succeeded(at, *pr))
 			}
 		} else {
 			status = resultWords[NotTested]
@@ -859,6 +878,10 @@ func triesTable(r Report, found []Finding, attempts []Attempt, flat bool, p *pag
 			row = slices.Insert(row, 1, strings.Join(tested(at), ", "))
 		}
 		p.pick(n, "", func(mark string, _ bool) string { return cols(p.w, indent[:len(indent)-3]+mark, widths, row...) })
+		// Why its rerun did not reproduce the target, unless the try succeeded for this problem, as by creating it.
+		if why := rerunWords(at); why != "" && !flat && r.succeeded(at, *pr) != "yes" {
+			p.add(cols(p.w, indent, []int{5}, "", dim(why)))
+		}
 	}
 	p.add("")
 }

@@ -27,10 +27,11 @@ type Event struct {
 	UnknownCostCalls int      `json:"unknown_cost_calls"`
 	CancelledCalls   int      `json:"cancelled_calls"`
 
-	Backend            string   `json:"backend"`
-	SpendingCap        *float64 `json:"spending_cap"`
-	Concurrency        *int     `json:"concurrency"`
-	ConcurrencySetting *int     `json:"concurrency_setting"`
+	Backend            string           `json:"backend"`
+	Models             map[string]Model `json:"models"` // in run_start: each role's model, as configuration.models
+	SpendingCap        *float64         `json:"spending_cap"`
+	Concurrency        *int             `json:"concurrency"`
+	ConcurrencySetting *int             `json:"concurrency_setting"`
 
 	Phase     string     `json:"phase"`
 	Status    string     `json:"status"`

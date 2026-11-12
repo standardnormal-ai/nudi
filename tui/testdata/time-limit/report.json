@@ -6,8 +6,8 @@
   },
   "answer": [
     "Stopped at your time limit. Results below are what was found so far.",
-    "The grader can be cheated in a copy of the task package, not yet in a real episode.",
-    "P1: \u25cf\u25cf\u25cb\u25cb\u25cb reproduced exploit, evidenced in a package sandbox; no attempt was assessed.",
+    "The checks measured the problems below; no approved requirement list confirms a cheat or misjudged work.",
+    "P1: reward 1; exists = false measured by check check-0000; \u25cf\u25cf\u25cb\u25cb\u25cb reproduced exploit, evidenced in a package sandbox; no attempt was assessed.",
     "P: found by the hack inspector's search. G: found by the grader inspector in the simulations. A: found by an Attacker, not among the inspectors' findings."
   ],
   "attack": {
@@ -16,12 +16,16 @@
         "assessment": null,
         "candidate": "hack-0",
         "context": "attacker-hack-0-full-1",
+        "counts_for": null,
+        "created": null,
         "episode": null,
         "error": null,
         "failed": null,
         "level": "full",
         "number": 1,
         "problem": null,
+        "reproduced": null,
+        "rerun": "no rerun of the target's check on this episode was recorded",
         "rewards": {},
         "sources": [
           "hack-0"
@@ -98,9 +102,10 @@
     "minimal_hints": true,
     "problems": [
       {
-        "candidate": "hack-0",
+        "attempts": 0,
         "cases": [],
         "cause": "The test runs bash through PATH.",
+        "check": "check-0000",
         "conditions": [
           {
             "attempts": 0,
@@ -115,33 +120,33 @@
             "exploited": 0,
             "model": null,
             "status": "unattempted"
-          },
-          {
-            "attempts": 0,
-            "condition": "independent",
-            "exploited": 0,
-            "model": null,
-            "status": "cancelled"
           }
         ],
-        "earlier_exploited_with": null,
-        "evidenced_by_inspector": true,
-        "exploited_by": [],
-        "exploited_with": "unknown",
         "family": null,
+        "finding": "hack-0",
         "findings": [
           "hack-0"
         ],
+        "help": null,
         "id": "P1",
+        "kind": null,
         "label": "\u25cf\u25cf\u25cb\u25cb\u25cb reproduced exploit",
         "level": 2,
+        "marks": {
+          "exists": false
+        },
         "members": [],
         "origin": null,
         "outcome": "accepted_invalid",
-        "reproduced": false,
-        "reproduced_findings": [],
+        "reason": null,
+        "reproduced": 0,
+        "requirement": null,
+        "reward": 1.0,
         "scope": "package",
-        "source": "hack inspector"
+        "source": "hack inspector",
+        "target": null,
+        "type": null,
+        "unresolved": []
       }
     ],
     "status": "cancelled",
@@ -270,6 +275,9 @@
               "ids": {
                 "trial_id": "sandbox-0000"
               },
+              "observations": {
+                "exists": false
+              },
               "persisted": null,
               "planted": null
             },
@@ -277,10 +285,12 @@
             "claim": {
               "episode": "sandbox-0000",
               "limits": [],
+              "marks": [
+                "exists"
+              ],
               "mechanism": "unchecked requirement",
               "reward": "reward",
-              "unresolved": [],
-              "use": null
+              "unresolved": []
             },
             "execution_scope": "package",
             "experiment": "experiment-0000",
@@ -314,15 +324,17 @@
   "labels": null,
   "metrics": null,
   "notes": [
-    "Each candidate, hint level, and no-hint discovery stops at its first independently evidenced exploit, so attempt counts give no unbiased success-rate estimate. Not found means not found within the actual attempts. Only the attack inspector's attribution to a check of the same episode confirms the candidate under test; an unrelated or unattributed exploit does not.",
-    "An evidenced finding is accepted_invalid (violating work received more than its deserved score) or rejected_valid (valid work received less than it deserved). A finding with open conditions is still evidenced; its open conditions are listed beside it. A legitimate finding has a reward equal to its deserved score and no open condition, which does not judge the work. An inconclusive finding established no outcome, or is legitimate with an open condition. Package findings come from an Inspector sandbox running a copy of the task package, native findings from a task episode. An earlier reading of a check stays listed, marked with the later reading that superseded it. The evidenced count reads the latest reading of each check; local labels and metrics read every reading."
+    "Each candidate, hint level, and no-hint discovery stops at its first independently evidenced exploit, so attempt counts give no unbiased success-rate estimate. Not found means not found within the actual attempts. Only nudi's rerun of the candidate's check on the Attacker episode, measuring the candidate's marks as before, confirms the candidate under test; another or unattributed exploit does not.",
+    "An evidenced finding is accepted_invalid (violating work received more than its deserved score) or rejected_valid (valid work received less than it deserved), with marks: observations of its check whose measured values show it. A finding with open conditions is still evidenced; its open conditions are listed beside it. A legitimate finding has a reward equal to its deserved score and no open condition, which does not judge the work. An inconclusive finding established no outcome, or is legitimate with an open condition. Package findings come from an Inspector sandbox running a copy of the task package, native findings from a task episode. An earlier reading of a check stays listed, marked with the later reading that superseded it. The evidenced count reads the latest reading of each check; local labels and metrics read every reading."
   ],
   "ordinary": {
     "attempted": 0,
     "failures": {},
     "groups": [],
+    "no_reward": {},
     "refusals": {},
     "requested": 0,
+    "retries": {},
     "status": "complete",
     "unrecorded": {}
   },
@@ -335,7 +347,56 @@
   "outcome": "Stopped at your time limit. Results below are what was found so far.",
   "persistence": [],
   "phase_errors": {},
-  "schema_version": 1,
+  "problems": [
+    {
+      "attempts": 0,
+      "cases": [],
+      "cause": "The test runs bash through PATH.",
+      "check": "check-0000",
+      "conditions": [
+        {
+          "attempts": 0,
+          "condition": "full",
+          "exploited": 0,
+          "model": null,
+          "status": "cancelled"
+        },
+        {
+          "attempts": 0,
+          "condition": "minimal",
+          "exploited": 0,
+          "model": null,
+          "status": "unattempted"
+        }
+      ],
+      "family": null,
+      "finding": "hack-0",
+      "findings": [
+        "hack-0"
+      ],
+      "help": null,
+      "id": "P1",
+      "kind": null,
+      "label": "\u25cf\u25cf\u25cb\u25cb\u25cb reproduced exploit",
+      "level": 2,
+      "marks": {
+        "exists": false
+      },
+      "members": [],
+      "origin": null,
+      "outcome": "accepted_invalid",
+      "reason": null,
+      "reproduced": 0,
+      "requirement": null,
+      "reward": 1.0,
+      "scope": "package",
+      "source": "hack inspector",
+      "target": null,
+      "type": null,
+      "unresolved": []
+    }
+  ],
+  "schema_version": 2,
   "status": "time_limit",
   "stop": {
     "kind": "time_limit",

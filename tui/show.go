@@ -2,8 +2,10 @@ package main
 
 import (
 	"cmp"
+	"encoding/json"
 	"fmt"
 	"image/color"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -78,6 +80,20 @@ func showHead(r Report, found []Finding, n int, from string, w int) string {
 	if f.Confirms != "" {
 		out = append(out, cols(w, " ", []int{18}, dim("Attacker exploit"), capital(f.Confirms)))
 	}
+	if r.Attack != nil && f.Source == "attack" {
+		if i := slices.IndexFunc(r.Attack.Attempts, func(at Attempt) bool { return deref(at.Episode) == f.Claim.Episode }); i >= 0 {
+			if why := rerunWords(r.Attack.Attempts[i]); why != "" {
+				out = append(out, cols(w, " ", []int{18}, dim("Rerun"), why))
+			}
+		}
+	}
+	if p != nil {
+		for _, kv := range [][2]string{{"Marks", markValues(*p)}, {"Requirement", deref(p.Requirement)}, {"Note", strings.TrimPrefix(note(*p), "Note: ")}} {
+			if kv[1] != "" {
+				out = append(out, cols(w, " ", []int{18}, dim(kv[0]), kv[1]))
+			}
+		}
+	}
 	return strings.Join(out, "\n")
 }
 
@@ -90,12 +106,21 @@ func detailName(r Report, f Finding) string {
 	return title(f)
 }
 
+// markValues are each mark of a problem's reading with the value its check measured, as "exists = false".
+func markValues(p Problem) string {
+	var out []string
+	for _, k := range slices.Sorted(maps.Keys(p.Marks)) {
+		v, _ := json.Marshal(p.Marks[k])
+		out = append(out, k+" = "+string(v))
+	}
+	return strings.Join(out, ", ")
+}
+
 // typeNames give each kind of wrong grader decision its full name.
 var typeNames = map[string]string{
 	"False positive": "False positive: incorrect work passed",
 	"False negative": "False negative: correct work was rejected",
 	"Hack":           "Hack: the reward was earned without doing the task",
-	"Unavailable":    "Unavailable: the report records no outcome for it",
 }
 
 // findingProblem is the problem that holds finding f, or that an Attacker's finding demonstrated; nil for none.
@@ -104,7 +129,7 @@ func findingProblem(r Report, f Finding) *Problem {
 		return nil
 	}
 	for i, p := range r.Attack.Problems {
-		if f.Source != "attack" && slices.Contains(p.Findings, f.ID) || f.Source == "attack" && r.demonstrates(f, p) {
+		if f.Source != "attack" && slices.Contains(p.readings(), f.ID) || f.Source == "attack" && r.demonstrates(f, p) {
 			return &r.Attack.Problems[i]
 		}
 	}
@@ -118,7 +143,7 @@ func attackerResult(r Report, p *Problem) string {
 	}
 	for _, level := range []string{"none", "minimal", "full"} {
 		if r.tried(*p, level) == "yes" {
-			return strings.TrimSuffix("Reproduced with "+levelWords[level]+" while aimed at "+r.aimedElsewhere(*p), " while aimed at ")
+			return "Reproduced with " + levelWords[level]
 		}
 	}
 	switch best(r.tried(*p, "none"), r.tried(*p, "minimal"), r.tried(*p, "full")) {
