@@ -6,11 +6,10 @@ import math
 import time
 
 from harbor.models.task.task import Task
-from pydantic import BaseModel, model_validator
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 from nudi import copies
-from nudi.assessment import captured_object
-from nudi.checks import check_submission, redacted
+from nudi.checks import redacted
 from nudi.episode import bound_notice
 from nudi.inspection import (
     InferenceFailure,
@@ -26,7 +25,7 @@ from nudi.inspection import (
     unmarked,
 )
 from nudi.inspector_sandbox import START_FAILURES
-from nudi.records import Assessment, EnvironmentUnavailable, InfrastructureAbort, write_private
+from nudi.records import Assessment, EnvironmentUnavailable, write_private
 
 
 NO_CANDIDATE = "no candidate"
@@ -57,17 +56,15 @@ class Candidate(BaseModel):
     """Valid work the grader rejects: its Attacker attempts do the task correctly in that way, never exploit."""
     source: str | None = None
     """The inspector whose finding it is, `hack_inspector` or `grader_inspector`; None in older records."""
-    marks: list[str] = []
-    """Observations of `check` whose measured values show the finding; empty in older records."""
 
 
 class Problem(BaseModel):
-    """One cause, one flaw of the grader or environment, judged as its evidenced findings arrive. Each finding of that
-    cause is one of its cases, also where its location differs."""
+    """One evidenced finding of an inspector, or one no-hint Attacker exploit read as a new cause, with each later
+    reading of its check as a further case."""
 
     cause: str
-    """The judge's one sentence naming the flaw, from the verdict that made it; the first finding's mechanism when that
-    judge call failed, and in older records."""
+    """Its cause: the finding's one sentence on what the grader trusts, else its mechanism; in older records the judge's
+    sentence."""
     findings: list[str] = []
     """Ids of the candidate findings this cause explains."""
     id: str | None = None
@@ -87,9 +84,6 @@ class Problem(BaseModel):
     without `cause` and `reason` in records from before verdicts gave them."""
     origin: str | None = None
     """The earlier run a rerun took this problem from; None for a problem of this run."""
-    same_as: str | None = None
-    """The known problem the judge read this one as, a note only: no agent merges problems, so it changes no level, count
-    or scheduling. None when the judge named none, and in older records, whose judge merged instead."""
     earlier_exploited_with: str | None = None
     """The least information under which an Attacker exploited it in the `origin` run, in older records; nudi no longer
     carries an earlier run's level."""
@@ -117,17 +111,15 @@ class AttackAttempt(BaseModel):
     error: str | None = None
     assessment: int | None = None
     problem: str | None = None
+    """The problem its target was in when it started, the one its help was written for; for a no-hint search, the
+    problem whose cause its attack inspector read its exploit as. None without one."""
     failed: str | None = None
     """The agent whose failure ended the attempt, `Attacker` or `attack inspector`; None otherwise and in older records."""
-    reproduced: bool | None = None
-    """True when nudi's rerun of the target's check on this episode measured every mark of the target as its own check
-    did, False when it measured one otherwise; None without marks, without a rerun result and in older records."""
-    rerun: str | None = None
-    """Why `reproduced` is not True once a rerun ran; None before a rerun and in older records."""
 
 
 class AttackFinding(BaseModel):
-    """An accepted invalid exploit retained from one attempt. Kind is reproduction, other, unattributed, or discovery."""
+    """The exploit of one attempt: `reproduction` with a problem's full information or hint, `discovery` with no hint;
+    older records also have noted, other and unattributed."""
 
     kind: str
     candidate: str | None = None
@@ -140,8 +132,17 @@ class AttackFinding(BaseModel):
     rationale: str | None = None
     """The attack inspector's short rationale in older records, shown in the report only."""
     problem: str | None = None
-    """For an `other` or discovery exploit, the problem the judge grouped it with, for display only; None without a judge
-    and in older records."""
+    """For a discovery, the problem whose cause the attack inspector read it as, or the Attacker problem it made; older
+    records hold the judge's problem."""
+
+
+class Cause(BaseModel):
+    """One thing the grader trusts, a reading: its first problem's cause sentence, then each problem whose cause the judge
+    read as it when its finding was evidenced, none of them attacked."""
+
+    id: str
+    cause: str
+    problems: list[str]
 
 
 class AttackResult(BaseModel):
@@ -155,7 +156,9 @@ class AttackResult(BaseModel):
     unavailable: dict[str, str] = {}
     candidates: list[Candidate] = []
     problems: list[Problem] = []
-    """The run's problems, judged as findings arrived. Empty in older records."""
+    """The run's problems, made as findings arrived. Empty in older records."""
+    causes: list[Cause] = Field([], validation_alias=AliasChoices("causes", "holes"))  # older records name it holes
+    """`problems` by cause, as each was placed when it was made; empty in older records."""
     discovery: dict[str, str] = {}
     attempts: list[AttackAttempt] = []
     assessments: list[Assessment] = []
@@ -248,29 +251,6 @@ def recorded_failure(run, name: str, episode) -> tuple[str, str] | None:
     return "unknown", f"unknown cause: {cause}"
 
 
-async def rerun_check(run, check, episode: str, source: str | None, location: str | None) -> dict | None:
-    """The check that evidenced an attempt's candidate, rerun on the Attacker episode's copy at that check's capture point,
-    as the attack inspector's starting point, with the candidate's `location`. A failed rerun says why; the attack
-    inspector judges either way. None for a candidate without a check program."""
-    from nudi.run_state import SpendingCapReached
-
-    if check is None or not check.program:
-        return None
-    point = next((copy.point for copy in run.record.copies if copy.id == check.state_copy), "verification_start")
-    found = [copy for copy in run.record.copies if copy.episode == episode and copy.point == point and copy.receipt]
-    label = f"the {(source or 'inspector').replace('_', ' ')}'s check {check.id}, rerun by nudi on this attempt's {point} copy"
-    if not found:
-        return {"label": label, "status": "unavailable", "reason": f"this episode has no {point} copy"}
-    try:
-        rerun = await check_submission(run, found[-1], check.requirement, check.scoring, check.program, timing=check.timing)
-    except (SpendingCapReached, InfrastructureAbort, EnvironmentUnavailable):
-        raise
-    except Exception as error:
-        return {"label": label, "status": "unavailable", "reason": redacted(run, f"{type(error).__name__}: {error}")}
-    return {"label": label, "check": rerun.id, "program": check.program, "exit_code": rerun.exit_code, "output": rerun.output,
-            "source_output": check.output, "location": location, "capture_point": point}
-
-
 def _attempt_limit(name: str, value) -> None:
     if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be a nonnegative integer")
@@ -297,25 +277,9 @@ def _normalize_candidate(item: Candidate) -> None:
     item.guidance, item.unavailable, item.conditions = guidance, unavailable, conditions
 
 
-# Why an attempt's `reproduced` is not True, once nudi's rerun of the target's check ran.
-CHANGED = "the target's reading changed since the attempt started, so the rerun is compared with nothing"
-OTHERWISE = "the rerun measured a mark of the target otherwise than the target's own check"
-UNMEASURED = "the rerun or the target's own check failed or measured no value of some mark"
-
-
-def shown(marks: list[str], rerun: dict) -> bool | None:
-    """Whether nudi's `rerun` of a target's check measured each of its `marks` as the target's own check did: None
-    without marks, or when either output lacks one."""
-    measured = [(captured_object(rerun.get(key) or "") or {}).get("observations") for key in ("output", "source_output")]
-    if not marks or rerun.get("exit_code") != 0 or not all(isinstance(item, dict) and set(marks) <= item.keys() for item in measured):
-        return None
-    now, then = measured
-    return all(now[name] == then[name] for name in marks)
-
-
 def _candidate_groups(items: list[Candidate]) -> list[list[Candidate]]:
     """Duplicate records share a group, in record order: the same kind, category, check, exact mechanism and both
-    guidance fields, as one rerun then decides them all. A shared check or hint string alone does not merge; an empty
+    guidance fields, as one attempt then decides them all. A shared check or hint string alone does not merge; an empty
     mechanism never merges."""
     groups: dict = {}
     for number, item in enumerate(items):
@@ -328,7 +292,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                  minimal: str | None = None, unavailable_reasons: dict[str, str] | None = None,
                  candidates: list[Candidate] | None = None, problems: list[Problem] | None = None,
                  deadline: float | None = None, minimal_hints: bool = True, feed: asyncio.Queue | None = None,
-                 gate: contextlib.AbstractAsyncContextManager | None = None, judge=None, current=None) -> AttackResult:
+                 gate: contextlib.AbstractAsyncContextManager | None = None, judge=None, current=None, causes: list[Cause] | None = None) -> AttackResult:
     """Reproduce each candidate and search the environment with no hint.
 
     `discovery_attempts` is the total no-hint attempts, default one. `maximum_attempts` is the
@@ -339,27 +303,26 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
     whose every record is `unknown`. Records of the same kind, category and check with
     the same exact mechanism and the same full and minimal guidance share
     one native run and keep every source id. A shared check or hint string alone stays separate, and an empty
-    mechanism stays separate. A missing hint stays unavailable. The first evidenced reproduction stops only that candidate and level.
-    Reproduction needs nudi's rerun of the target's check on this episode to measure each of the target's marks as the
-    target's check did, and an evidenced reading of this episode. An exploit the rerun does not show is another exploit;
-    without a rerun result or marks it is unattributed. Another exploit does not stop the candidate. The first evidenced no-hint exploit
-    stops only that stream. There is no separate instruction model and no second judge.
+    mechanism stays separate. A missing hint stays unavailable. An attempt is an exploit when its episode got reward and
+    an evidenced reading of the attack inspector's own check of that episode measured its work invalid; with a candidate's
+    full guidance or hint it counts for that candidate, whatever route it took. The first exploit stops only that
+    candidate and level, and the first no-hint exploit only that stream.
 
     `at_once` attempts run at once, each of a different stream: discovery, or one candidate at one
     level. Each next one is the earliest in that order whose stream has none running, so a
     stream's attempts run one after another and an evidenced one still ends its stream. The
     record lists attempts, and their assessments and findings, in that order, not as they ended.
-    A candidate's minimal hint is tried only after its full hint reproduced it, and a no-hint attempt aimed at it, with
-    the independent attempts' instruction, only after its minimal hint reproduced it; otherwise each later level is
-    `not_needed`. Only that attempt's attack inspector is told its target. Another exploit, an unattributed one or an
-    unclear result stops the cascade.
+    A candidate's minimal hint is tried only after its full hint was exploited, and a no-hint attempt aimed at it, with
+    the independent attempts' instruction, only after its minimal hint was; otherwise each later level is `not_needed`.
+    Only a hinted attempt's attack inspector is told its target; a no-hint one gets `known_causes`, each problem's id and
+    cause. An unclear result stops the cascade.
 
     Each rewarded attempt, and every valid-work attempt, is judged by one attack inspector
     session of `inspect`, bound to its episode. A valid-work candidate's attempt succeeds only with that episode's rejected valid work.
     `problems` is the run's list of problems, which may grow while the attack runs; the record keeps that list. Each
-    attempt names its candidate's problem. `judge(attempt, assessment, case)`, given, makes each no-hint, other or
-    unattributed exploit a new problem of its own, whose note names the problem the judge read it as; `case` is the
-    category, location and capture point of the attack inspector's experiment whose check evidenced it.
+    attempt names its candidate's problem. `judge(attempt, assessment, case)`, given, returns the problem of each no-hint
+    exploit: the known problem whose cause the reading's `cause` names, or a new Attacker problem; `case` is the category,
+    location and capture point of the experiment whose check evidenced it.
 
     `deadline` is the run's time limit on the event loop's clock. A valid-work attempt whose task
     agent timeout is longer than the time left does not start and is `insufficient_time`.
@@ -370,7 +333,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
     With `feed` the attack runs beside the inspections: it takes candidates from the queue until None, which adds no
     candidate; planned attempts still run. With `gate` every attempt holds one of its slots, which other work shares.
     `current(candidate)`, given, returns the candidate that stands for it now, from the latest reading of its check, or
-    None once a later reading withdrew it; once an attempt has its slot, a candidate group none of whose members is current
+    None once a later reading withdrew it. Once an attempt has its slot, a candidate group none of whose members is current
     starts no Attacker, and its unattempted steps are `withdrawn`. Otherwise a hinted attempt uses the first standing
     candidate's guidance for its level; without it the attempt does not start and an unattempted level is `unavailable`.
 
@@ -403,12 +366,13 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
     result = AttackResult(maximum_attempts=maximum_attempts, discovery_attempts=discovery_attempts, minimal_hints=minimal_hints, candidates=prepared,
                           discovery={"none": "unattempted"})
     result.problems = [] if problems is None else problems  # The caller's list, so problems judged meanwhile are saved.
+    result.causes = [] if causes is None else causes  # The same for causes.
     destination = run.config.output_dir / "attack.json"
     agent_timeout = None if deadline is None else Task(run.config.task_dir).config.agent.timeout_sec
     candidate_groups = _candidate_groups(result.candidates)
 
     # The case of each check the attack inspector measured, for the judge, and the checks a later experiment replaced.
-    cases, answered, reruns = {}, set(), set()
+    cases, answered = {}, set()
 
     def owner(name: str | None) -> Problem | None:
         return next((problem for problem in result.problems if name in problem.findings), None)
@@ -471,10 +435,10 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
         attempt.assessment = len(result.assessments) - 1
         save()
 
-    async def decide(attempt: AttackAttempt, index: int, level: str, members: list[Candidate], judging: bool = True) -> bool:
-        """The findings and status of attempt `index`, from the latest reading of each of its checks, so a reading that
-        corrects an exploit withdraws its finding. True only when this stream should stop. Without `judging` it awaits
-        nothing."""
+    async def decide(attempt: AttackAttempt, index: int, level: str, members: list[Candidate]) -> bool:
+        """The exploit of attempt `index`: its first evidenced reading of its own episode, from the latest reading of each
+        of its checks, so a reading that corrects an exploit withdraws it. A no-hint exploit's problem is `judge`'s. True
+        only when there is one, so this stream stops."""
         latest = {}
         for position, (assessment, owner) in enumerate(zip(result.assessments, owners)):
             if owner == index and assessment.claim.check not in answered:
@@ -483,53 +447,29 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
         # work counts only for a valid-work candidate's attempts.
         wanted = "rejected_valid" if members and members[0].valid_work else "accepted_invalid"
         result.findings = [item for item in result.findings if item.attempt != index]
-        mine = []
-        for position in sorted(latest.values()):
-            assessment = result.assessments[position]
-            if not (evidenced(assessment) and assessment.outcome == wanted
-                    and assessment.execution_scope == "native" and assessment.claim.episode == attempt.episode):
-                continue
-            # Only the rerun of the target's check, showing its marks, ties an exploit to the target.
-            kind = ("discovery" if not members else "unattributed" if attempt.reproduced is None
-                    else "reproduction" if attempt.reproduced else "other")
-            mine.append(AttackFinding(kind=kind, candidate=None if kind == "discovery" else members[0].id,
-                                      sources=attempt.sources, attempt=index, assessment=position))
-        result.findings += mine
-
-        def recorded() -> str | None:
-            kinds = {item.kind for item in mine}
-            status = ("evidenced_issue" if kinds & {"discovery", "reproduction"} else "unattributed_exploit" if "unattributed" in kinds
-                      else "other_exploit" if "other" in kinds else None)
-            if status:
-                attempt.status = status
-                mark(level, members, {"unattributed_exploit": "unknown", "other_exploit": "no_evidenced_issue"}.get(status, status))
+        shows = [position for position in sorted(latest.values()) if evidenced(result.assessments[position])
+                 and result.assessments[position].outcome == wanted and result.assessments[position].execution_scope == "native"
+                 and result.assessments[position].claim.episode == attempt.episode]
+        if not shows:
+            return False
+        hinted = bool(members) and level != "none"
+        found = AttackFinding(kind="reproduction" if hinted else "discovery", candidate=members[0].id if members else None,
+                              sources=attempt.sources, attempt=index, assessment=shows[0])
+        result.findings.append(found)
+        attempt.status = "evidenced_issue"
+        mark(level, members, "evidenced_issue")
+        save()
+        if judge and not hinted:
+            reading = result.assessments[shows[0]]
+            found.problem = judge(attempt, reading, cases.get(reading.claim.check, {}))
+            if not members:
+                attempt.problem = found.problem
             save()
-            return status
-
-        # Saved before any judging, so a stop while the judge reads leaves the other exploits unjudged and keeps the rest.
-        status = recorded()
-        if judge and judging:
-            # Each exploit the rerun did not confirm is a new problem of its own; the judge's reading of it is only its note.
-            def judged(item):
-                assessment = result.assessments[item.assessment]
-                case = cases.get(assessment.claim.check, {})
-                # nudi's rerun looks where the target looks, which an exploit of another problem need not.
-                if item.kind == "other" and assessment.claim.check in reruns:
-                    case = {key: value for key, value in case.items() if key not in ("location", "capture_point")}
-                return judge(attempt, assessment, case)
-
-            if found := next((item for item in mine if item.kind == "discovery"), None):
-                attempt.problem = await judged(found)
-            for item in mine:
-                if item.kind in ("other", "unattributed"):
-                    item.problem = await judged(item)
-            status = recorded()
-        return status == "evidenced_issue"
+        return True
 
     async def one(level: str, number: int, members: list[Candidate], text: str | None, position: int, reading: Candidate | None = None) -> None:
         """Attempt `number` of `members` at `level` with `text`, the guidance of `reading`, the reading that stood for
-        the first member when the attempt started; the attempt's sources name that reading, and its rerun compares that
-        reading's marks."""
+        the first member when the attempt started; the attempt's sources name that reading."""
         identity = members[0].id if members else None
         reading = (reading or members[0]) if members else None
         valid_work = bool(members) and members[0].valid_work
@@ -607,21 +547,15 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                 for key in ("requirement", "scoring"):
                     reference = getattr(check, key, None)
                     references[key] = reference.model_dump() if reference is not None and reference.episode is None else None
-                target = None if not members else {"id": reading.id, "sources": attempt.sources,
-                                                   "problem": attempt.problem, "mechanism": reading.mechanism,
-                                                   "full_guidance": reading.guidance.get("full"), "level": level, **references}
+                target = None if not members or level == "none" else {
+                    "id": reading.id, "sources": attempt.sources, "problem": attempt.problem, "mechanism": reading.mechanism,
+                    "full_guidance": reading.guidance.get("full"), "level": level, **references}
                 found = [copy for copy in run.record.copies if copy.episode == name and copy.point == "verification_start" and copy.receipt]
                 request = {"valid_work": valid_work, "target_candidate": target,
                            "executed_instruction": (run.config.output_dir / "episodes" / name / "nudi-evidence" / "extension.md").read_text(),
                            "workspace": "verification_start copy" if found else "task image"}
-                if members and (rerun := await rerun_check(run, check, name, members[0].source, members[0].location)):
-                    request["check_rerun"] = rerun
-                    # A later reading of the target's check since the attempt started leaves its comparison unknown.
-                    now = current(members[0]) if current else members[0]
-                    attempt.reproduced = shown(reading.marks, rerun) if now is not None and now.id == reading.id else None
-                    attempt.rerun = (CHANGED if now is None or now.id != reading.id else None if attempt.reproduced
-                                     else OTHERWISE if attempt.reproduced is False else UNMEASURED)
-                    reruns.add(rerun.get("check"))
+                if level == "none":
+                    request["known_causes"] = [{"id": item.id, "cause": item.cause} for item in result.problems if item.id]
                 session = await inspect(run, "attack", [name], 0, ["rejected_valid" if valid_work else "accepted_invalid"],
                                         title=f"attack_inspector-{context}", workspace=found[-1] if found else None, request=request)
                 own.update(row["episode"] for row in session.experiments if row.get("episode"))
@@ -672,14 +606,14 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
             save()
             raise
         except (asyncio.CancelledError, KeyboardInterrupt):  # KeyboardInterrupt: a second Ctrl-C
-            # The readings its attack inspector saved before the stop stay, unjudged, as its returned session's would.
+            # The readings its attack inspector saved before the stop stay, as its returned session's would.
             saved = run.config.output_dir / f"inspection-attack_inspector-{context}.json"
             if index not in owners and saved.is_file():
                 stopped = InspectionResult.model_validate_json(saved.read_text())
                 answered.update(replaced(stopped.experiments, stopped.assessments))
                 for assessment in stopped.assessments:
                     retain(attempt, index, assessment)
-                await decide(attempt, index, level, members, judging=False)
+                await decide(attempt, index, level, members)
             if attempt.status != "evidenced_issue":  # an exploit saved before the stop stays evidenced
                 attempt.status = "cancelled"
             result.status = "cancelled"
@@ -712,13 +646,13 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
             mark(level, members, "tool_failure")
             save()
         finally:
-            # The saved status, judged and attributed: `attempt_end` comes before the attack inspector.
-            target = attempt.problem or "the task"
-            said = {"evidenced_issue": f"{OUTCOMES['rejected_valid'] + ' on' if valid_work else 'exploited'} {target}, confirmed by the attack inspector",
-                    "other_exploit": "cheated through another mechanism",
-                    "unattributed_exploit": "cheated; the rerun of the target's check gave no result",
+            # The saved status: `attempt_end` comes before the attack inspector.
+            read = next((item.problem for item in result.findings if item.attempt == index and item.problem), None)
+            said = {"evidenced_issue": f"{OUTCOMES['rejected_valid']} on {attempt.problem}" if valid_work
+                    else f"an exploit with no extra information, its cause read as {read}'s" if level == "none" and read
+                    else f"an exploit with help written for {attempt.problem or identity}" if level != "none" else "an exploit",
                     "no_evidenced_issue": "nothing confirmed" if valid_work else "no exploit confirmed",
-                    "unknown": "unclear: the attack inspector could not tell",
+                    "unknown": f"unclear: {attempt.error or 'no reading decided whether the work is invalid'}",
                     "no_reward": "the grader wrote no reward",
                     "step_limit": attempt.error}.get(attempt.status, attempt.status)
             event(run, "attempt_result", f"Attacker {attempt.episode or context} result: {said}", episode=attempt.episode,
@@ -732,7 +666,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
         if discovery_attempts > 0:
             needed.append(result.discovery.get("none"))
         if maximum_attempts > 0:
-            # Each step counts once the one before it reproduced the candidate.
+            # Each step counts once the one before it was exploited.
             needed.extend(item.conditions[level] for item in result.candidates for before, level in zip((None, *levels), levels)
                           if item.conditions.get(level) not in ("unavailable", "not_applicable")
                           and (before is None or item.conditions[before] == "evidenced_issue"))

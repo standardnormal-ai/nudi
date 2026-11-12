@@ -13,7 +13,7 @@ from harbor.environments.base import ExecResult
 from harbor.utils.optional_import import MissingExtraError
 
 from nudi.inspector_sandbox import _now
-from nudi.records import ModalSandbox, RunRecord
+from nudi.records import OUT_OF_MEMORY, ModalSandbox, RunRecord
 from nudi.report import MODAL_LIFETIME
 from nudi.run_state import current, logger
 
@@ -71,9 +71,10 @@ async def stop_app(run) -> None:
 
 
 class ModalFailure(RuntimeError):
-    """A Modal SDK or transport failure, named only by its operation and exception type. The
-    original text can quote the Modal credential, as grpclib's metadata check does, so it is
-    dropped before Harbor or nudi logs or records the error."""
+    """A Modal SDK or transport failure, named only by its operation and exception type, or for
+    a sandbox that exited 137 by `OUT_OF_MEMORY`. The original text can quote the Modal
+    credential, as grpclib's metadata check does, so it is dropped before Harbor or nudi logs or
+    records the error."""
 
 
 async def _guarded(operation: str, call):
@@ -83,6 +84,8 @@ async def _guarded(operation: str, call):
         raise
     except TimeoutError:
         raise TimeoutError(f"Modal {operation} timed out") from None
+    except modal.SandboxLikelyOutOfMemoryError:
+        raise ModalFailure(f"Modal {operation} failed: {OUT_OF_MEMORY}") from None
     except Exception as error:
         raise ModalFailure(f"Modal {operation} failed: {type(error).__name__}") from None
 

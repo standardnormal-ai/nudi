@@ -1226,3 +1226,34 @@ def test_a_flag_states_its_quartiles_fence_minimum_and_what_its_episodes_recorde
     ordinary_rewards(same, (1.0, 10))
     (identical,) = reward_summary(same.report())["flags"]
     assert (identical["quartiles"], identical["fence"]) == (None, None)
+
+
+def test_one_reading_for_several_approved_requirements_supports_none_of_them(tmp_path):
+    """A reading of one check's requirement that names the observations of two approved requirements does not say which
+    it read supported, so neither is: the work the grader failed is not confirmed correct, and the metrics count no FN."""
+    run = RunDir(tmp_path)
+    both = ["sorted", "summary"]
+    name = run.episode(rewards={"reward": 0.0})
+    reading = checked(name, "c1", "sorted", "supported", outcome="rejected_valid", basis=basis("supported", both, ["c1"], decision=RULE))
+    reading.claim.derivation.observations = reading.claim.marks = both
+    reading.check.output = json.dumps({"observations": {"sorted": True, "summary": False}})
+    run.label(name, "rejected_valid", reading)
+    built = run.report()
+    assert [(item["type"], item["label"], item["reason"]) for item in built["problems"]] == [
+        (None, "Work the grader failed", inspection_module.NOT_ALL)]
+    assert built["metrics"]["episodes"][name]["completion"] == "unknown"
+    assert [group["fn"] for group in built["metrics"]["confusion"]] in ([], [0])
+
+
+def test_findings_and_metrics_read_an_episodes_completion_from_the_same_readings(tmp_path):
+    """Two checks each read one approved requirement supported. The metrics count the episode as correct work failed, so
+    its rejected-valid finding says so too."""
+    run = RunDir(tmp_path)
+    name = run.episode(rewards={"reward": 0.0})
+    run.label(name, "rejected_valid", checked(name, "c1", "sorted", "supported", outcome="rejected_valid"),
+              checked(name, "c2", "summary", "supported", basis=basis("supported", ["sorted", "summary"], ["c1", "c2"], decision=RULE)))
+    built = run.report()
+    assert [group["fn"] for group in built["metrics"]["confusion"]] == [1]
+    assert [(item["type"], item["label"], item["reason"]) for item in built["problems"]] == [
+        ("false_negative", "Correct work failed", None)]
+    assert built["answer"][1] == "The grader misjudges work."

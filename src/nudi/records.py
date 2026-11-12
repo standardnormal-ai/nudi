@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 NativeBehavior = Literal["shared_grading", "host_harness", "atif"]
 ExecutionPath = Literal["verifiers", "harbor"]
@@ -462,6 +462,10 @@ class PersistenceProbe(BaseModel):
     episodes: list[str] = []
 
 
+# How nudi names a Modal sandbox that exited 137, which Harbor reads as out of memory.
+OUT_OF_MEMORY = "sandbox killed, out of memory (exit 137)"
+
+
 class ModalSandbox(BaseModel):
     """One Modal sandbox of the run, recorded when it was stopped, for the cost estimate."""
 
@@ -620,7 +624,7 @@ class Claim(BaseModel):
     """Further retained text, only when the check's requirement and scoring citations do not suffice.
     Only the grader inspector writes it; nudi drops it from hack and attack inspector claims."""
     full_guidance: str | None = None
-    """Concrete steps that reproduce the suspected loophole, or that do the valid work the grader rejects, when an inspector supplies them."""
+    """Concrete steps that reproduce the suspected flaw, or that do the valid work the grader rejects, when an inspector supplies them."""
     hint_location: str | None = None
     """Only a file, interface, or component to examine. It excludes the solution and the reproduction recipe."""
     family: str | None = None
@@ -637,8 +641,10 @@ class Claim(BaseModel):
     basis: MetricBasis | None = None
     """For an ordinary episode: the reference that grader metrics use; see `MetricBasis`."""
     marks: list[str] = []
-    """For a hack or grader inspector reading: the observations of its check whose measured values show the finding. An
-    Attacker episode counts for the finding only when nudi's rerun of this check there measures each the same."""
+    """The observations of its check whose measured values show the work invalid, or valid work rejected."""
+    cause: str | None = Field(None, validation_alias=AliasChoices("cause", "hole"))  # older records name it hole
+    """A hack or grader inspector finding's one sentence on what the grader trusts; for an attack inspector reading of a
+    no-hint exploit, the id of a known cause it used, or such a sentence for a new one. None in older records."""
     attribution: dict | None = None
     """In older records, the attack inspector's link of an Attacker exploit to its target candidate; it decides nothing."""
 

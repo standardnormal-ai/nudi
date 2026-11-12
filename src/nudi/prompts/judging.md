@@ -84,11 +84,8 @@ legitimate result from counting as clean. Scope notes go in `limits`, such
 as whether a requirement that no test reads was meant to be graded.
 
 A reading is a finding only with `marks`: observations of this check whose
-measured values show it. nudi prints their values beside the finding and reports
-a reading without them as measured facts. A mark is an observation the check
-prints of what the grader wrongly trusted or wrongly rejected, with the same value in any episode
-that uses the same thing; not a size, not a count, and not only that the work is
-wrong.
+measured values show the work invalid, or valid work rejected. nudi prints their
+values beside the finding and reports a reading without them as measured facts.
 
 `approved_requirements` in the task context, when present, lists the task's
 requirements a person approved, each with the `observation` that measures it.

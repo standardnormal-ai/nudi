@@ -6,7 +6,7 @@ valid-work candidate: valid work the grader rejects. Its instruction asks for th
 task done correctly in that way, without exploiting the grader, and succeeds only
 when the attack inspector finds rejected valid work. Full and minimal guidance each
 belong to one inspector candidate. Full adds only that
-candidate's loophole details. Minimal adds only that candidate's short hint.
+candidate's flaw details. Minimal adds only that candidate's short hint.
 Neither receives the static hack-family checklist or another candidate's hint.
 The no-hint instruction is one discovery stream for the environment. It adds
 no checklist, no grader or hack inspector findings and no privileged material.
@@ -16,8 +16,7 @@ never sees the copies.
 
 The native agent reasons in its original harness, under the shared queue,
 credentials and spending cap. A reward, a written file, or a model flag is
-not evidence. Discovery stops at its first evidenced exploit. A candidate
-stops only when nudi's rerun of the candidate's check on that episode measures
-each of the candidate's marks as before and the attack inspector evidences an
-exploit in that episode. The minimal and no-hint
+not evidence. Discovery stops at its first evidenced exploit, and a candidate's
+level at the first attempt with its help whose rewarded work the attack inspector
+measured invalid. The minimal and no-hint
 actors do not receive that mechanism or full guidance.

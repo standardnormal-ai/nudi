@@ -564,6 +564,19 @@ def test_a_sandbox_command_whose_output_is_not_utf8_returns_it_with_replacement_
     assert (result["output"], result["exit_code"], result["error"]) == ("half \ufffd\n", 0, None)
 
 
+def test_a_sandbox_killed_for_memory_keeps_its_exit_code():
+    """Harbor reads exit 137 as out of memory; its text holds only the requested memory, so nudi names the cause and
+    the exit code, not only the exception type."""
+    from harbor.environments import modal
+
+    async def killed():
+        raise modal.SandboxLikelyOutOfMemoryError(requested_memory_mb=128)
+
+    with pytest.raises(modal_env.ModalFailure) as raised:
+        asyncio.run(modal_env._guarded("exec", killed()))
+    assert str(raised.value) == "Modal exec failed: sandbox killed, out of memory (exit 137)"
+
+
 @pytest.mark.parametrize("failure", ["create", "exec", "stop"])
 @needs_modal
 def test_a_modal_error_quoting_the_credential_reaches_no_file_log_or_error_of_a_sandbox(tmp_path, monkeypatch, caplog, failure):

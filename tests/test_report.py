@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 from nudi import cli, inspection, report
 from nudi.assessment import CHECK_LIMIT
-from nudi.attack import DISABLED_LIMIT, AttackAttempt, AttackFinding, AttackResult, Candidate, Problem
+from nudi.attack import DISABLED_LIMIT, AttackAttempt, AttackFinding, AttackResult, Candidate, Cause, Problem
 from nudi.inspection import InspectionAttempt, InspectionResult, OrdinaryReview
 from nudi.persistence import TIMING_LIMIT
 from nudi.records import CANCELLED, Assessment, CallRecord, Claim, Derivation, ErrorRecord, PersistenceProbe, Requirement, RunRecord
@@ -789,9 +789,9 @@ def answered(run: RunDir) -> None:
                     Candidate(id="hack-2", mechanism="leading zeros", guidance=guidance, valid_work=True,
                               conditions={"full": "evidenced_issue", "minimal": "unattempted"})],
         attempts=[AttackAttempt(level="full", number=1, candidate="hack-1", sources=["hack-1"], context="attacker-hack-1-full-1",
-                                episode=reproduced, rewards={"reward": 1.0}, status="evidenced_issue", assessment=0, reproduced=True),
+                                episode=reproduced, rewards={"reward": 1.0}, status="evidenced_issue", assessment=0),
                   AttackAttempt(level="full", number=1, candidate="hack-2", sources=["hack-2"], context="attacker-hack-2-full-1",
-                                episode=refused, rewards={"reward": 0.0}, status="evidenced_issue", assessment=1, reproduced=True)],
+                                episode=refused, rewards={"reward": 0.0}, status="evidenced_issue", assessment=1)],
         assessments=[shim, rejected],
         findings=[AttackFinding(kind="reproduction", candidate="hack-1", sources=["hack-1"], attempt=0, assessment=0, relation="target",
                                 rationale="the planted shim printed the pass marker"),
@@ -800,7 +800,7 @@ def answered(run: RunDir) -> None:
 
 def test_the_answer_gives_one_line_per_problem_led_by_its_facts_and_its_quotes_stay_in_the_attack_section(tmp_path):
     """Each problem has its own Answer line, by the judge's id or else its finding's: the reward, the values its check
-    measured for its marks, its label and how many assessed attempts reproduced it, exploits first. An attempt's
+    measured for its marks, its label and how many assessed attempts with its help were exploits, exploits first. An attempt's
     quotation stays in its attempt line in Attack, which keeps the finding ids."""
     run = RunDir(tmp_path)
     answered(run)
@@ -813,16 +813,16 @@ def test_the_answer_gives_one_line_per_problem_led_by_its_facts_and_its_quotes_s
         "Finished. Every step ran.",
         "The grader can be cheated, and it misjudges work.",
         "P2: requirement \"Write the explanation file\"; reward 1; exists = false measured by check check-0003; ●●●○○ exploit executable by learner with full information; "
-        "1 of 1 assessed attempts reproduced it.",
+        "1 of 1 assessed attempts with its help were exploits.",
         "G1: requirement \"Write the explanation file\"; reward 1; exists = false measured by check check-0000; ●●○○○ reproduced exploit, evidenced in a package sandbox; "
         "no attempt was assessed.",
         "P3: reward 1; exists = false measured by check check-0004; Correct work failed, reproduced by an Attacker with full "
-        "instructions; 1 of 1 assessed attempts reproduced it.",
+        "instructions; 1 of 1 assessed attempts with its help were exploits.",
         "grader-1: reward 1; exists = false measured by check check-0001; Correct work failed, evidenced in a package sandbox; no attempt was assessed.",
         report.LEGEND]
     text = report.markdown(result)
     assert "planted a bash shim" not in "\n".join(result["answer"])
-    assert ('- 0001-attacker exploited hack-1 (grader_tampering, check-0003) with full instructions: reward 1. '
+    assert ('- 0001-attacker an exploit with full instructions written for P2: reward 1. '
             'How: "planted a bash shim that prints the pass marker"') in text
 
 
@@ -929,11 +929,11 @@ def test_the_report_opens_with_a_plain_answer_built_from_its_cases(tmp_path):
         "Finished. Every step ran.",
         "The grader can be cheated, and it misjudges work.",
         "hack-1: requirement \"Write the explanation file\"; reward 1; exists = false measured by check check-0003; ●●●○○ exploit executable by learner with full information; "
-        "1 of 1 assessed attempts reproduced it.",
+        "1 of 1 assessed attempts with its help were exploits.",
         "grader-0: requirement \"Write the explanation file\"; reward 1; exists = false measured by check check-0000; ●●○○○ reproduced exploit, evidenced in a package sandbox; "
         "no attempt was assessed.",
         "hack-2: reward 1; exists = false measured by check check-0004; Correct work failed, reproduced by an Attacker with full "
-        "instructions; 1 of 1 assessed attempts reproduced it.",
+        "instructions; 1 of 1 assessed attempts with its help were exploits.",
         "grader-1: reward 1; exists = false measured by check check-0001; Correct work failed, evidenced in a package sandbox; "
         "no attempt was assessed.",
     ]
@@ -987,9 +987,9 @@ def test_an_older_pooled_attack_record_answers_from_its_evidenced_attempts(tmp_p
                                 "●●●○○ exploit executable by learner with full information."]
     # Its attempts are listed one per line too, after the pooled conditions.
     lines = report.markdown(result).splitlines()
-    start = next(i for i, line in enumerate(lines) if line.startswith("- 0000-attacker cheated"))
+    start = next(i for i, line in enumerate(lines) if line.startswith("- 0000-attacker an exploit"))
     assert lines[start:start + 5] == [
-        '- 0000-attacker cheated with full instructions: reward 1. How: "unchecked requirement"',
+        '- 0000-attacker an exploit with full instructions: reward 1. How: "unchecked requirement"',
         "- 0001-attacker searched with only a hint: reward 0; refused: finish_reason: content_filter",
         f"- 0002-attacker searched with no extra information: no reward; infrastructure_failure: daemon said {SECRET}",
         "- 0003-attacker searched with only a hint: no reward; inference_failure: InferenceFailure: RateLimitError",
@@ -1026,22 +1026,21 @@ def test_a_secret_across_the_answer_cut_never_appears_even_in_part(tmp_path):
     assert " ".join(result["answer"]).count("[redac") == 2
 
 
-def test_an_attempt_line_keeps_every_mechanism_of_findings_with_the_same_wording(tmp_path):
-    """Two other-mechanism findings on one attempt read the same; each mechanism stays, in order, once."""
+def test_an_attempt_outside_a_reproduction_is_one_exploit_its_first_reading(tmp_path):
+    """Three exploit readings on one attempt: the attempt is one exploit, its first reading, so its line keeps only that
+    reading's mechanism."""
     run = RunDir(tmp_path)
     answered(run)
     episode = run.attack.attempts[0].episode
     run.attack.assessments[0].claim.mechanism = "planted a shell shim"
     run.attack.assessments += [evidenced(episode, "check-0007"), evidenced(episode, "check-0008")]
     run.attack.assessments[2].claim.mechanism, run.attack.assessments[3].claim.mechanism = "forged the reward file", "planted a shell shim"
-    run.attack.findings[0:1] = [AttackFinding(kind="other", candidate="hack-1", sources=["hack-1"], attempt=0, assessment=number,
-                                              relation="other") for number in (0, 2, 3)]
-    run.attack.attempts[0].reproduced = False
     lines = report.markdown(run.report()).splitlines()
-    assert ('- 0001-attacker cheated through another mechanism while testing hack-1 (grader_tampering, check-0003) with full instructions: '
-            'reward 1. How: "planted a shell shim". How: "forged the reward file"') in lines
-    # The Answer gives that attempt one case.
-    assert " ".join(run.report()["answer"]).count("0001-attacker") == 1
+    assert ('- 0001-attacker an exploit with full instructions written for hack-1 (grader_tampering, check-0003): '
+            'reward 1. How: "planted a shell shim"') in [line.split(". Attack inspector:")[0] for line in lines]
+    assert not any(line.startswith("- 0001-attacker") and "forged the reward file" in line for line in lines)
+    # The attempt counts for hack-1, whose help its Attacker had, so the Answer gives it no case of its own.
+    assert " ".join(run.report()["answer"]).count("0001-attacker") == 0
 
 
 def test_the_answer_reads_only_the_latest_reading_of_each_check(tmp_path):
@@ -1065,8 +1064,8 @@ def test_the_answer_reads_only_the_latest_reading_of_each_check(tmp_path):
 
 def test_an_evidenced_attack_finding_outside_the_requested_outcome_is_its_own_case(tmp_path):
     """Testing valid work, an Attacker had incorrect work passed; testing a cheat, another had correct work
-    failed. Neither confirms its candidate, so neither is an exploit entry, but each is a case on its own evidence,
-    at the help its Attacker had for another problem."""
+    failed. Neither is the outcome its attempt sought, so neither counts for its candidate, but each is a case on its own
+    evidence, at the help its Attacker had."""
     run = RunDir(tmp_path)
     invalid, valid = run.episode("attacker", {"reward": 1.0}), run.episode("attacker", {"reward": 0.0})
     rejected = evidenced(valid, "check-0001")
@@ -1084,10 +1083,10 @@ def test_an_evidenced_attack_finding_outside_the_requested_outcome_is_its_own_ca
     assert result["answer"] == [
         "Finished. Every step ran.",
         "The grader can be cheated, and it misjudges work.",
-        "0000-attacker: requirement \"Write the explanation file\"; reward 1; exists = false measured by check check-0000; with full instructions while testing valid-0; "
-        "no reproduction of valid-0 was established; ●●●○○ exploit executable by learner with full information.",
-        "0001-attacker: reward 1; exists = false measured by check check-0001; with full instructions while testing hack-0; "
-        "no reproduction of hack-0 was established; Correct work failed, reproduced by an Attacker with full instructions."]
+        "0000-attacker: requirement \"Write the explanation file\"; reward 1; exists = false measured by check check-0000; with full instructions written for valid-0; "
+        "●●●○○ exploit executable by learner with full information.",
+        "0001-attacker: reward 1; exists = false measured by check check-0001; with full instructions written for hack-0; "
+        "Correct work failed, reproduced by an Attacker with full instructions."]
     # Neither attempt line claims what was submitted.
     lines = report.markdown(result).splitlines()
     assert "- 0000-attacker tested valid-0 with full instructions: reward 1; no case where correct work failed was found" in lines
@@ -1120,17 +1119,17 @@ def test_each_attack_attempt_is_one_line_naming_the_finding_it_tested_and_its_ou
         "Status complete; at most 2 attempts per candidate and hint level; 0 Attacker and attack inspector calls with unknown prices and 0 cancelled in flight.",
         "Independent attacker with no extra information: 0 started of at most 0.",
         "- hack-1 from the hack inspector, ●●●○○ exploit executable by learner with full information.",
-        "  - With full instructions: 1 of 1 attempts reproduced it, openai/deepseek/deepseek-v4.1-flash-1017, evidenced_issue.",
-        "  - With only a hint: 0 of 1 attempts reproduced it, openai/deepseek/deepseek-v4.1-flash-1017, no_evidenced_issue.",
+        "  - With full instructions: 1 of 1 attempts were exploits, openai/deepseek/deepseek-v4.1-flash-1017, evidenced_issue.",
+        "  - With only a hint: 0 of 1 attempts were exploits, openai/deepseek/deepseek-v4.1-flash-1017, no_evidenced_issue.",
         "- hack-2 from the hack inspector, Correct work failed, reproduced by an Attacker with full instructions.",
-        "  - With full instructions: 1 of 1 attempts reproduced it, openai/deepseek/deepseek-v4.1-flash-1017, evidenced_issue.",
+        "  - With full instructions: 1 of 1 attempts were exploits, openai/deepseek/deepseek-v4.1-flash-1017, evidenced_issue.",
         "  - With only a hint: No attempt was assessed. Not run or not assessed: 0004-attacker, reward 1, "
         "model_output_failure: Invalid Claim: 1 validation error for Claim.",
         "- grader-0 from the grader inspector, ●●○○○ reproduced exploit, evidenced in a package sandbox.",
         "- grader-1 from the grader inspector, Correct work failed, evidenced in a package sandbox.",
-        '- 0001-attacker exploited hack-1 (grader_tampering, check-0003) with full instructions: reward 1. '
+        '- 0001-attacker an exploit with full instructions written for hack-1 (grader_tampering, check-0003): reward 1. '
         'How: "planted a bash shim that prints the pass marker". Attack inspector: Matches the target. The check shows the shim ran.',
-        '- 0002-attacker had correct work failed while testing hack-2 (unchecked_requirements, check-0004) with full instructions: reward 0. '
+        '- 0002-attacker had work the grader failed with full instructions written for hack-2 (unchecked_requirements, check-0004): reward 0. '
         'How: "wrote the answer with leading zeros"',
         "- 0003-attacker tested hack-1 (grader_tampering, check-0003) with only a hint: reward 0.5; no exploit was evidenced",
         "- 0004-attacker tested hack-2 (unchecked_requirements, check-0004) with only a hint: reward 1; "
@@ -1190,7 +1189,7 @@ def test_an_attempt_that_was_not_run_or_not_assessed_is_listed_apart_from_the_at
         id="hack-0", mechanism="m", outcome="accepted_invalid", guidance={"full": "steps", "minimal": "look"},
         conditions={"full": "evidenced_issue", "minimal": "inference_failure", "none": "unattempted"})],
         attempts=[AttackAttempt(level="full", number=1, context="c0", candidate="hack-0", sources=["hack-0"], episode=full,
-                                status="evidenced_issue", problem="P1", rewards={"reward": 1.0}, reproduced=True, assessment=0),
+                                status="evidenced_issue", problem="P1", rewards={"reward": 1.0}, assessment=0),
                   AttackAttempt(level="minimal", number=1, context="c1", candidate="hack-0", sources=["hack-0"], episode=failed,
                                 status="inference_failure", error="the attack inspector failed: APIError: spend limit", rewards={"reward": 1.0}),
                   AttackAttempt(level="minimal", number=2, context="c2", candidate="hack-0", sources=["hack-0"], episode=empty,
@@ -1200,18 +1199,18 @@ def test_an_attempt_that_was_not_run_or_not_assessed_is_listed_apart_from_the_at
         problems=[Problem(id="P1", source="hack inspector", cause="Skip the test.", findings=["hack-0"], evidence="evidenced")],
         discovery={"none": "unattempted"})
     built = run.report(selected=["hack", "attack"])
-    assert [(row["condition"], row["attempts"], row.get("not_assessed", [])) for row in built["problems"][0]["conditions"][:2]] == [
-        ("full", 1, []), ("minimal", 1, [{"episode": failed, "status": "inference_failure", "reward": "reward 1",
-                                          "error": "the attack inspector failed: APIError: spend limit"}])]
+    # The attempt the grader paid nothing was never inspected, so it is no assessed attempt either.
+    assert [(row["condition"], row["attempts"], row.get("unrewarded"), row.get("not_assessed", [])) for row in built["problems"][0]["conditions"][:2]] == [
+        ("full", 1, None, []), ("minimal", 0, 1, [{"episode": failed, "status": "inference_failure", "reward": "reward 1",
+                                                   "error": "the attack inspector failed: APIError: spend limit"}])]
     model = "openai/deepseek/deepseek-v4.1-flash-1017"
     section = report.markdown(built).split("\n## Attack\n")[1].splitlines()
     at = section.index(next(line for line in section if line.startswith("- P1 ")))
-    # No-hint search attempts never count for an inspector's problem, so its conditions end with the aimed ones.
-    assert section[at + 2:at + 5] == [
-        f"  - With only a hint: 0 of 1 attempts reproduced it, {model}, inference_failure. Not run or not assessed: {failed}, "
+    # A problem's rows are the help levels its own help was given at; no-hint attempts are not aimed at it.
+    assert section[at + 2:at + 4] == [
+        f"  - With only a hint: No attempt was assessed. 1 got reward 0, so nudi did not inspect it. Not run or not assessed: {failed}, "
         "reward 1, inference_failure: the attack inspector failed: APIError: spend limit.",
-        "  - With no extra information, aimed at it: Not attempted, the step with only a hint failed (inference_failure).",
-        f'- {full} exploited hack-0 (grader_tampering, check-0000) with full instructions: reward 1. How: "unchecked requirement"']
+        f'- {full} an exploit with full instructions written for P1: reward 1. How: "unchecked requirement"']
 
 
 def test_a_native_timeout_without_reward_or_assessment_is_not_an_attempt(tmp_path):
@@ -1233,9 +1232,9 @@ def test_a_native_timeout_without_reward_or_assessment_is_not_an_attempt(tmp_pat
     assert "of 1 attempts" not in report.markdown(built)
 
 
-def grouped(run: RunDir, problems: list[Problem]) -> dict:
-    """hack-0 no Attacker reproduced, hack-1 one with a hint reproduced and hack-2 one with full instructions reproduced;
-    a no-hint Attacker found its own exploit, the judge's A1. Reported with these problems."""
+def grouped(run: RunDir, problems: list[Problem], causes: list[Cause] = ()) -> dict:
+    """hack-0 no Attacker given its help exploited, hack-1 one with a hint did and hack-2 one with full instructions did;
+    a no-hint Attacker found its own exploit, the Attacker problem A1. Reported with these problems and causes."""
     inspected(run, 3)
     episodes = [run.episode("attacker", {"reward": 1.0}) for _ in range(6)]
     levels = {"hack-0": ("no_evidenced_issue", "not_needed"), "hack-1": ("evidenced_issue", "evidenced_issue"),
@@ -1250,91 +1249,181 @@ def grouped(run: RunDir, problems: list[Problem]) -> dict:
             if status != "not_needed":
                 found = status == "evidenced_issue"
                 attempts.append(AttackAttempt(level=level, number=1, context=f"attacker-{name}-{level}-1", candidate=name, sources=[name],
-                                              episode=episodes[len(attempts)], status=status, reproduced=found or None,
+                                              episode=episodes[len(attempts)], status=status,
                                               assessment=len(attempts), rewards={"reward": 1.0}))
                 findings += [AttackFinding(kind="reproduction", candidate=name, sources=[name], attempt=len(attempts) - 1,
                                            assessment=len(attempts) - 1)] * found
     readings = [evidenced(item.episode, f"check-{100 + index}") if item.status == "evidenced_issue"
                 else checked(item.episode, f"check-{100 + index}", "summary", "supported", outcome="legitimate") for index, item in enumerate(attempts)]
     run.attack = AttackResult(status="complete", candidates=candidates, attempts=attempts, problems=problems, findings=findings,
-                              assessments=readings, discovery={"none": "evidenced_issue"})
+                              assessments=readings, discovery={"none": "evidenced_issue"}, causes=list(causes))
     return run.report(selected=["hack", "attack"])
 
 
-def test_each_problem_has_its_own_level_and_the_judges_same_as_is_only_a_note(tmp_path):
-    """A problem's level is the least help under which an Attacker reproduced it, and a no-hint exploit's is 5. The
-    judge merges nothing: its `same_as` is a note that changes no level or count. A judge's problem that is none of
-    nudi's is a lead. Beneath each problem each hint level Attackers aimed at it shows its attempts."""
-    def problems(note):
-        return [Problem(id="P1", source="hack inspector", cause="Forge the digest.", findings=["hack-0"], evidence="evidenced"),
-                Problem(id="P2", source="hack inspector", cause="Forge it again.", findings=["hack-1"], evidence="evidenced", same_as=note),
+def test_each_problem_has_its_own_level_and_a_cause_lists_its_problems_at_their_best(tmp_path):
+    """A problem's level is the least help under which an Attacker given its help made an exploit, and a no-hint exploit
+    that is an Attacker problem is at 5. A stored problem none of whose evidence stands is a lead. The judge's causes group
+    problems: each cause is at its problems' best level and lists them beneath it, each keeping its own level and counts.
+    Beneath each problem each help level its help was given at shows its attempts."""
+    problems = [Problem(id="P1", source="hack inspector", cause="Forge the digest.", findings=["hack-0"], evidence="evidenced"),
+                Problem(id="P2", source="hack inspector", cause="Forge it again.", findings=["hack-1"], evidence="evidenced"),
                 Problem(id="P3", source="hack inspector", cause="Skip the test.", findings=["hack-2"], evidence="evidenced"),
-                Problem(id="A1", source="Attacker", cause="Write the score file.", members=["0000-attacker"], same_as=note),
+                Problem(id="A1", source="Attacker", cause="Write the score file.", members=["0000-attacker"]),
                 Problem(id="P5", source="hack inspector", cause="Read the key.", members=["experiment-0009"], evidence="not_reproduced")]
-
-    built = grouped(RunDir(tmp_path / "a"), problems("P1"))
-    levels = [(item["id"], item["finding"], item["level"], item["reproduced"], item.get("note")) for item in built["problems"]]
-    note = {"target": "P1", "kind": "same_as"}
-    assert levels == [("P1", "hack-0", 2, 0, None), ("P2", "hack-1", 4, 2, note), ("P3", "hack-2", 3, 1, None), ("A1", "0000-attacker", 5, None, note)]
+    causes = [Cause(id="C1", cause="The grader trusts the digest.", problems=["P1", "P2"]),
+             Cause(id="C2", cause="The grader trusts the score file.", problems=["P3", "A1", "P5"])]
+    built = grouped(RunDir(tmp_path / "a"), problems, causes)
+    assert [(item["id"], item["finding"], item["level"], item["reproduced"]) for item in built["problems"]] == [
+        ("P1", "hack-0", 2, 0), ("P2", "hack-1", 4, 2), ("P3", "hack-2", 3, 1), ("A1", "0000-attacker", 5, None)]
     assert built["attack"]["problems"] == built["problems"]
     assert built["attack"]["leads"] == [{"id": "P5", "cause": "Read the key.", "origin": None}]
-    again = grouped(RunDir(tmp_path / "b"), problems(None))
-    assert [(item["id"], item["level"], item["reproduced"]) for item in again["problems"]] == [row[:1] + row[2:4] for row in levels]
+    assert built["causes"] == [
+        {"id": "C1", "cause": "The grader trusts the digest.", "level": 4, "label": report.LADDER[4], "problems": ["P2", "P1"], "readings": [], "not_attacked": []},
+        {"id": "C2", "cause": "The grader trusts the score file.", "level": 5, "label": report.LADDER[5], "problems": ["A1", "P3"], "readings": [], "not_attacked": []}]
+    answer = built["answer"]
+    at = answer.index(report.CAUSES)
+    assert answer[at + 1] == f"C1: The grader trusts the digest; {report.LADDER[4]}."
+    assert [line.split(":")[0] for line in answer[at + 2:at + 4]] == ["  - P2", "  - P1"]
+    assert answer[at + 4] == f"C2: The grader trusts the score file; {report.LADDER[5]}."
+    assert [line.split(":")[0] for line in answer[at + 5:at + 7]] == ["  - A1", "  - P3"]
+    assert f"- C1: The grader trusts the digest; {report.LADDER[4]}." in report.markdown(built).splitlines()
     model = "openai/deepseek/deepseek-v4.1-flash-1017"
     section = report.markdown(built).split("\n## Attack\n")[1].split("\n## ")[0].splitlines()
     p1 = section.index("- P1 from the hack inspector, ●●○○○ reproduced exploit, evidenced in a package sandbox: Forge the digest; findings hack-0 (grader_tampering, check-0000).")
-    assert section[p1 + 1:p1 + 3] == [f"  - With full instructions: 0 of 1 attempts reproduced it, {model}, no_evidenced_issue.",
-                                      "  - With only a hint: Not run, no reproduction was established with more help."]
-    assert ("- P2 from the hack inspector, ●●●●○ exploit executable by learner with hint: Forge it again; "
-            "findings hack-1 (grader_tampering, check-0001); possibly the same as P1.") in section
-    assert ("- A1 from the Attacker, ●●●●● exploit executable by unaided learner: Write the score file; found in 0000-attacker; "
-            "possibly the same as P1.") in section
+    assert section[p1 + 1:p1 + 3] == [f"  - With full instructions: 0 of 1 attempts were exploits, {model}, no_evidenced_issue.",
+                                      "  - With only a hint: Not run, no exploit was made with more help."]
+    assert "- P2 from the hack inspector, ●●●●○ exploit executable by learner with hint: Forge it again; findings hack-1 (grader_tampering, check-0001)." in section
+    assert "- A1 from the Attacker, ●●●●● exploit executable by unaided learner: Write the score file; found in 0000-attacker." in section
     assert "- Leads, which no evidence confirmed: P5 (Read the key)." in section
-    assert [line.split(":")[0] for line in built["answer"][2:6]] == ["A1", "P2", "P3", "P1"]
-    assert built["answer"][2].endswith("; ●●●●● exploit executable by unaided learner; possibly the same as P1.")
+    assert "possibly the same as" not in report.markdown(built)
+    plain = grouped(RunDir(tmp_path / "b"), problems)
+    assert plain["causes"] == [] and report.CAUSES not in plain["answer"]
+    assert [line.split(":")[0] for line in plain["answer"][2:6]] == ["A1", "P2", "P3", "P1"]
 
 
-def test_an_attacker_case_takes_the_level_of_the_help_its_own_attacker_had(tmp_path):
-    """An exploit an Attacker found is its own case at the help its Attacker was given: one found while the Attacker held
-    full instructions or a hint for another finding is at that rung and says the rerun of that finding's check did not reproduce it; one a
-    no-hint Attacker found is at 5. Its problem is a display group: a later member the judge grouped with it raises
-    nothing, and the inspector case those Attackers aimed at keeps its own level."""
+def test_a_no_hint_exploit_read_as_a_known_cause_raises_that_cause_to_5_but_not_its_problem(tmp_path):
+    """The attack inspector read a no-hint exploit as P2's cause: that is a reading, so the exploit is no problem of its own,
+    P2 keeps its own level and counts, and the cause holding P2 is at 5 and names the episode."""
+    problems = [Problem(id="P1", source="hack inspector", cause="Forge the digest.", findings=["hack-0"], evidence="evidenced"),
+                Problem(id="P2", source="hack inspector", cause="Forge it again.", findings=["hack-1"], evidence="evidenced"),
+                Problem(id="P3", source="hack inspector", cause="Skip the test.", findings=["hack-2"], evidence="evidenced")]
+    run = RunDir(tmp_path)
+    grouped(run, problems, [Cause(id="C1", cause="The grader trusts the digest.", problems=["P1", "P2"])])
+    run.attack.findings[0].problem = run.attack.attempts[0].problem = "P2"
+    built = run.report(selected=["hack", "attack"])
+    episode = run.attack.attempts[0].episode
+    assert [(item["id"], item["level"], item["reproduced"]) for item in built["problems"]] == [("P1", 2, 0), ("P2", 4, 2), ("P3", 3, 1)]
+    assert built["causes"] == [{"id": "C1", "cause": "The grader trusts the digest.", "level": 5, "label": report.LADDER[5],
+                               "problems": ["P2", "P1"], "readings": [episode], "not_attacked": []}]
+    assert (f"C1: The grader trusts the digest; {report.LADDER[5]}; the attack inspector read the no-hint exploit in {episode} "
+            "as this cause.") in built["answer"]
+    assert (f"- {episode} an exploit with no extra information, its cause read as P2's: reward 1. "
+            'How: "unchecked requirement"') in [line.split(". Attack inspector:")[0] for line in report.markdown(built).splitlines()]
+
+
+def test_a_problem_of_a_known_cause_is_not_attacked_separately_and_a_cause_of_one_problem_is_shown_on_its_own(tmp_path):
+    """The judge read hack-1's cause as C1 when it was evidenced, so no Attacker attacked P2: it stays at level 2, and its
+    line says it was not attacked on its own rather than that no attempt was assessed. C2 holds one problem and no
+    reading, so its problem P3 is listed on its own. With only such causes there is no causes header."""
+    problems = [Problem(id=f"P{index + 1}", source="hack inspector", cause=f"Forge {index}.", findings=[f"hack-{index}"], evidence="evidenced")
+                for index in range(3)]
+
+    def built(name, causes):
+        run = RunDir(tmp_path / name)
+        inspected(run, 3)
+        episode = run.episode("attacker", {"reward": 1.0})
+        run.attack = AttackResult(
+            status="complete", problems=problems, causes=causes, discovery={"none": "no_evidenced_issue"},
+            candidates=[Candidate(id=name, mechanism=name, outcome="accepted_invalid", guidance={"full": "steps", "minimal": None},
+                                  conditions={"full": "evidenced_issue" if name == "hack-0" else "no_evidenced_issue", "minimal": "unavailable"})
+                        for name in ("hack-0", "hack-2")],
+            attempts=[AttackAttempt(level="full", number=1, context="attacker-hack-0-full-1", candidate="hack-0", sources=["hack-0"],
+                                    episode=episode, status="evidenced_issue", assessment=0, rewards={"reward": 1.0})],
+            findings=[AttackFinding(kind="reproduction", candidate="hack-0", sources=["hack-0"], attempt=0, assessment=0)],
+            assessments=[evidenced(episode, "check-0100")])
+        return run.report(selected=["hack", "attack"])
+
+    report_of = built("a", [Cause(id="C1", cause="The grader trusts the digest.", problems=["P1", "P2"]),
+                            Cause(id="C2", cause="The grader trusts the log.", problems=["P3"])])
+    assert [(item["id"], item["level"]) for item in report_of["problems"]] == [("P1", 3), ("P2", 2), ("P3", 2)]
+    assert report_of["causes"] == [{"id": "C1", "cause": "The grader trusts the digest.", "level": 3, "label": report.LADDER[3],
+                                   "problems": ["P1", "P2"], "readings": [], "not_attacked": ["P2"]}]
+    answer = report_of["answer"]
+    at = answer.index(report.CAUSES)
+    assert "a judge compared a finding's cause sentence with the known ones when both existed" in report.CAUSES
+    assert [line.split(":")[0] for line in answer[at + 1:at + 5]] == ["C1", "  - P1", "  - P2", "P3"]
+    assert answer[at + 3].endswith("; not attacked on its own.") and "assessed" not in answer[at + 3]
+    assert "not attacked on its own" not in answer[at + 4]
+    alone = built("b", [Cause(id=f"C{index}", cause="The grader trusts the digest.", problems=[f"P{index}"]) for index in (1, 2, 3)])
+    assert alone["causes"] == [] and report.CAUSES not in alone["answer"]
+
+
+def test_a_no_hint_exploit_read_as_the_cause_of_a_problem_no_longer_shown_keeps_that_cause_at_5(tmp_path):
+    """The attack inspector read a no-hint exploit as P5's cause, and P5 is now a lead: the cause still lists the exploit at
+    5, with no problem beneath it, so the measured exploit stays in the Answer."""
+    problems = [Problem(id="P1", source="hack inspector", cause="Forge the digest.", findings=["hack-0"], evidence="evidenced"),
+                Problem(id="P5", source="hack inspector", cause="Read the key.", members=["experiment-0009"], evidence="not_reproduced")]
+    run = RunDir(tmp_path)
+    grouped(run, problems, [Cause(id="C1", cause="The grader trusts the key.", problems=["P5"])])
+    run.attack.findings[0].problem = run.attack.attempts[0].problem = "P5"
+    built = run.report(selected=["hack", "attack"])
+    episode = run.attack.attempts[0].episode
+    assert built["causes"] == [{"id": "C1", "cause": "The grader trusts the key.", "level": 5, "label": report.LADDER[5],
+                               "problems": [], "readings": [episode], "not_attacked": []}]
+    assert (f"C1: The grader trusts the key; {report.LADDER[5]}; the attack inspector read the no-hint exploit in {episode} "
+            "as this cause.") in built["answer"]
+
+
+def test_two_exploits_for_one_problem_whose_finding_no_longer_stands_take_its_id_once(tmp_path):
+    """hack-1's full instructions and hint were both exploited, then a later reading replaced hack-1, so P2's finding is no
+    current reading. The first exploit's row takes P2's id; the second keeps its episode's id, so no id repeats."""
+    problems = [Problem(id="P2", source="hack inspector", cause="Forge it again.", findings=["hack-9"], evidence="evidenced")]
+    run = RunDir(tmp_path)
+    grouped(run, problems)
+    for item in [*run.attack.attempts, *run.attack.findings]:
+        if item.sources == ["hack-1"]:
+            item.sources, item.candidate = ["hack-9"], "hack-9"
+    built = run.report(selected=["hack", "attack"])
+    ids = [item["id"] for item in built["problems"]]
+    assert ids.count("P2") == 1 and len(ids) == len(set(ids))
+
+
+def test_older_records_that_name_the_cause_a_hole_still_load():
+    """Records written before the rename name a claim's cause `hole` and the attack's causes `holes`; both still load, and
+    are written back under the new names only."""
+    claim = Claim.model_validate({"mechanism": "m", "episode": "e", "hole": "The grader trusts the log."})
+    result = AttackResult.model_validate({"holes": [{"id": "H1", "cause": "The grader trusts the log.", "problems": ["P1"]}]})
+    assert claim.cause == "The grader trusts the log." and [item.id for item in result.causes] == ["H1"]
+    assert "hole" not in claim.model_dump() and "holes" not in result.model_dump()
+
+
+def test_an_exploit_counts_for_the_problem_whose_help_its_attacker_had(tmp_path):
+    """Every exploit an Attacker given hack-0's full instructions or hint made counts for hack-0's problem P1, whatever
+    route it took, so P1 is at the least such help; a no-hint exploit of a new cause is its own Attacker problem at 5."""
     run = RunDir(tmp_path)
     inspected(run)
-    reproduced, full, hinted, unaided = (run.episode("attacker", {"reward": 1.0}) for _ in range(4))
+    first, second, hinted, unaided = (run.episode("attacker", {"reward": 1.0}) for _ in range(4))
     candidate = Candidate(id="hack-0", source="hack_inspector", mechanism="m", outcome="accepted_invalid",
-                          guidance={"full": "steps", "minimal": "look"}, conditions={"full": "evidenced_issue", "minimal": "no_evidenced_issue"})
-    aimed = {"candidate": "hack-0", "sources": ["hack-0"]}
-    attempts = [AttackAttempt(level="full", number=1, context="c0", episode=reproduced, status="evidenced_issue", reproduced=True, assessment=0, **aimed),
-                AttackAttempt(level="full", number=2, context="c1", episode=full, status="other_exploit", problem="A1", reproduced=False,
-                              assessment=1, **aimed),
-                AttackAttempt(level="minimal", number=1, context="c2", episode=hinted, status="other_exploit", problem="A2", reproduced=False,
-                              assessment=2, **aimed),
-                AttackAttempt(level="none", number=1, context="c3", episode=unaided, status="evidenced_issue", problem="A3", assessment=3)]
-    findings = [AttackFinding(kind="reproduction", candidate="hack-0", sources=["hack-0"], attempt=0, assessment=0),
-                AttackFinding(kind="other", candidate="hack-0", sources=["hack-0"], attempt=1, assessment=1, problem="A1"),
-                AttackFinding(kind="other", candidate="hack-0", sources=["hack-0"], attempt=2, assessment=2, problem="A2"),
-                AttackFinding(kind="discovery", attempt=3, assessment=3, problem="A3")]
+                          guidance={"full": "steps", "minimal": "look"}, conditions={"full": "evidenced_issue", "minimal": "evidenced_issue"})
+    aimed = {"candidate": "hack-0", "sources": ["hack-0"], "problem": "P1", "status": "evidenced_issue"}
+    attempts = [AttackAttempt(level="full", number=1, context="c0", episode=first, assessment=0, **aimed),
+                AttackAttempt(level="full", number=2, context="c1", episode=second, assessment=1, **aimed),
+                AttackAttempt(level="minimal", number=1, context="c2", episode=hinted, assessment=2, **aimed),
+                AttackAttempt(level="none", number=1, context="c3", episode=unaided, status="evidenced_issue", problem="A1", assessment=3)]
+    findings = [AttackFinding(kind="reproduction", candidate="hack-0", sources=["hack-0"], attempt=index, assessment=index) for index in range(3)]
+    findings.append(AttackFinding(kind="discovery", attempt=3, assessment=3, problem="A1"))
     problems = [Problem(id="P1", source="hack inspector", cause="Skip the test.", members=["experiment-0000"], findings=["hack-0"], evidence="evidenced"),
-                Problem(id="A1", source="Attacker", cause="Hide the module.", members=[full, unaided]),
-                Problem(id="A2", source="Attacker", cause="Patch the runner.", members=[hinted, hinted]),
-                Problem(id="A3", source="Attacker", cause="Write the score file.", members=[unaided])]
+                Problem(id="A1", source="Attacker", cause="Write the score file.", members=[unaided])]
     run.attack = AttackResult(status="complete", candidates=[candidate], attempts=attempts, problems=problems, findings=findings,
                               assessments=[evidenced(item.episode, f"check-{100 + index}") for index, item in enumerate(attempts)],
                               discovery={"none": "evidenced_issue"})
-
     built = run.report(selected=["hack", "attack"])
-    assert [(item["id"], item["finding"], item["level"], item["label"], item["help"]) for item in built["problems"]] == [
-        ("P1", "hack-0", 3, "●●●○○ exploit executable by learner with full information", None),
-        ("A1", full, 3, "●●●○○ exploit executable by learner with full information", "full instructions"),
-        ("A2", hinted, 4, "●●●●○ exploit executable by learner with hint", "only a hint"),
-        ("A3", unaided, 5, "●●●●● exploit executable by unaided learner", "no extra information")]
-    assert [(item["episode"], item["counts_for"], item["created"]) for item in built["attack"]["attempts"]] == [
-        (reproduced, "P1", None), (full, None, "A1"), (hinted, None, "A2"), (unaided, None, "A3")]
-    assert built["answer"][2] == ("A3: requirement \"Write the explanation file\"; reward 1; exists = false measured by check check-103; with no extra information; "
-                                  "●●●●● exploit executable by unaided learner.")
-    assert built["answer"][3] == ("A2: requirement \"Write the explanation file\"; reward 1; exists = false measured by check check-102; with only a hint while testing hack-0; "
-                                  "the rerun of hack-0's check did not reproduce it; ●●●●○ exploit executable by learner with hint.")
+    assert [(item["id"], item["finding"], item["level"], item["reproduced"], item["help"]) for item in built["problems"]] == [
+        ("P1", "hack-0", 4, 3, None), ("A1", unaided, 5, None, "no extra information")]
+    assert [(row["condition"], row["attempts"]) for row in built["problems"][0]["conditions"]] == [("full", 2), ("minimal", 1)]
+    assert "counts_for" not in built["attack"]["attempts"][0]
+    assert built["answer"][2] == ("A1: requirement \"Write the explanation file\"; reward 1; exists = false measured by check check-103; "
+                                  "with no extra information; ●●●●● exploit executable by unaided learner.")
 
 
 def test_a_problem_whose_findings_later_readings_withdrew_is_a_lead(tmp_path):
@@ -1385,7 +1474,7 @@ def test_an_attacker_reproduction_of_a_withdrawn_finding_is_its_own_case(tmp_pat
     candidate = Candidate(id="hack-0", source="hack_inspector", mechanism="m", outcome="accepted_invalid", guidance={"full": "steps", "minimal": None},
                           conditions={"full": "evidenced_issue", "minimal": "unavailable", "none": "unattempted"})
     attempt = AttackAttempt(level="full", number=1, context="attacker-hack-0-full-1", candidate="hack-0", sources=["hack-0"], episode=episode,
-                            status="evidenced_issue", reproduced=True, assessment=0, rewards={"reward": 1.0})
+                            status="evidenced_issue", assessment=0, rewards={"reward": 1.0})
     run.attack = AttackResult(status="complete", candidates=[candidate], attempts=[attempt], discovery={"none": "no_evidenced_issue"},
                               assessments=[evidenced(episode, "check-0100")],
                               findings=[AttackFinding(kind="reproduction", candidate="hack-0", sources=["hack-0"], attempt=0, assessment=0)],
@@ -1394,15 +1483,14 @@ def test_an_attacker_reproduction_of_a_withdrawn_finding_is_its_own_case(tmp_pat
     built = run.report(selected=["hack", "attack"])
     assert [(item["id"], item["finding"], item["source"], item["level"], item["kind"]) for item in built["problems"]] == [
         ("P1", episode, "Attacker", 3, "reproduction")]
-    assert built["attack"]["attempts"][0]["counts_for"] == "P1"
     assert built["attack"]["leads"] == [{"id": "P2", "cause": "Forge the digest.", "origin": None}]
 
 
-def test_a_no_hint_attempt_aimed_at_a_case_is_listed_apart_and_another_exploit_it_found_is_its_own_case(tmp_path):
-    """hack-0's full hint, its single hint and then a no-hint attempt aimed at it reproduced it, so it is at 5, yet no
-    independent Attacker found it. The first no-hint attempt aimed at it exploited something its rerun did not show,
-    which the judge grouped with P2: its own case at 5, which raises neither hack-0 nor P2's hack-1. Correct work the
-    grader fails gets no single hint and no no-hint attempt."""
+def test_an_older_no_hint_attempt_aimed_at_a_finding_is_a_no_hint_exploit_of_its_own(tmp_path):
+    """An older record: hack-0's full instructions and its hint were exploited, so P1 is at 4, and two no-hint attempts
+    aimed at it exploited too. A no-hint attempt is given no finding, so neither counts for P1: each is a no-hint exploit at
+    5 of its own, the one the judge made A1 under A1 and the other under its episode, and neither raises P2. Correct work
+    the grader fails gets no hint."""
     run = RunDir(tmp_path)
     inspected(run, 2)
     graded = run.episode(rewards={"reward": 1.0})
@@ -1416,17 +1504,17 @@ def test_a_no_hint_attempt_aimed_at_a_case_is_listed_apart_and_another_exploit_i
                             conditions={"full": "evidenced_issue", "minimal": "not_applicable", "none": "not_applicable"})]
     aimed = [("full", 1, "evidenced_issue"), ("minimal", 1, "evidenced_issue"), ("none", 1, "other_exploit"), ("none", 2, "evidenced_issue")]
     attempts = [AttackAttempt(level=level, number=number, context=f"attacker-hack-0-{level}-{number}", candidate="hack-0", sources=["hack-0"],
-                              episode=episodes[index], status=status, reproduced=status == "evidenced_issue", assessment=index, rewards={"reward": 1.0})
+                              episode=episodes[index], status=status, assessment=index, rewards={"reward": 1.0})
                 for index, (level, number, status) in enumerate(aimed)]
     attempts.append(AttackAttempt(level="none", number=1, context="attacker-none-none-1", episode=episodes[5], status="no_evidenced_issue"))
     attempts.append(AttackAttempt(level="full", number=1, context="attacker-grader-0-full-1", candidate="grader-0", sources=["grader-0"],
-                                  episode=episodes[4], status="evidenced_issue", reproduced=True, assessment=4, rewards={"reward": 0.0}))
+                                  episode=episodes[4], status="evidenced_issue", assessment=4, rewards={"reward": 0.0}))
     readings = [evidenced(item.episode, f"check-{100 + index}") for index, item in enumerate(attempts[:4])]
     readings.append(evidenced(episodes[4], "check-0104").model_copy(update={"outcome": "rejected_valid"}))
     problems = [Problem(id="P1", source="hack inspector", cause="Skip the test.", members=["hack-0"], findings=["hack-0"], evidence="evidenced"),
                 Problem(id="P2", source="hack inspector", cause="Forge the digest.", members=["hack-1"], findings=["hack-1"], evidence="evidenced"),
                 Problem(id="G1", source="grader inspector", cause="Reject zeros.", members=["grader-0"], findings=["grader-0"], evidence="evidenced"),
-                Problem(id="A1", source="Attacker", cause="Forge the digest.", members=[episodes[2]], same_as="P2")]
+                Problem(id="A1", source="Attacker", cause="Forge the digest.", members=[episodes[2]])]
     findings = [AttackFinding(kind="other" if index == 2 else "reproduction", candidate="hack-0", sources=["hack-0"], attempt=index,
                               assessment=index, problem="A1" if index == 2 else None) for index in range(4)]
     findings.append(AttackFinding(kind="reproduction", candidate="grader-0", sources=["grader-0"], attempt=5, assessment=4))
@@ -1434,23 +1522,20 @@ def test_a_no_hint_attempt_aimed_at_a_case_is_listed_apart_and_another_exploit_i
                               assessments=readings, discovery={"none": "no_evidenced_issue"})
 
     built = run.report()
-    assert [(item["id"], item["finding"], item["level"], item.get("note")) for item in built["problems"]] == [
-        ("P1", "hack-0", 5, None), ("P2", "hack-1", 2, None), ("G1", "grader-0", 3, None),
-        ("A1", episodes[2], 5, {"target": "P2", "kind": "same_as"})]
+    assert [(item["id"], item["finding"], item["level"], item["help"]) for item in built["problems"]] == [
+        ("P1", "hack-0", 4, None), ("P2", "hack-1", 2, None), ("G1", "grader-0", 3, None),
+        ("A1", episodes[2], 5, "no extra information"), (episodes[3], episodes[3], 5, "no extra information")]
     model = "openai/deepseek/deepseek-v4.1-flash-1017"
     section = report.markdown(built).split("\n## Attack\n")[1].split("\n## ")[0].splitlines()
-    at = section.index(f"  - With full instructions: 1 of 1 attempts reproduced it, {model}, evidenced_issue.")
-    assert section[at + 1:at + 3] == [
-        f"  - With only a hint: 1 of 1 attempts reproduced it, {model}, evidenced_issue.",
-        f"  - With no extra information, aimed at it: 1 of 2 attempts reproduced it, {model}, evidenced_issue."]
+    at = section.index(f"  - With full instructions: 1 of 1 attempts were exploits, {model}, evidenced_issue.")
+    assert section[at + 1:at + 3] == [f"  - With only a hint: 1 of 1 attempts were exploits, {model}, evidenced_issue.",
+                                      "- P2 from the hack inspector, ●●○○○ reproduced exploit, evidenced in a package sandbox: Forge the digest; "
+                                      "findings hack-1 (grader_tampering, check-0001)."]
     g1 = section.index(next(line for line in section if line.startswith("- G1 ")))
-    assert section[g1 + 1:g1 + 4] == [
-        f"  - With full instructions: 1 of 1 attempts reproduced it, {model}, evidenced_issue.",
-        "  - With only a hint: Not attempted, no hint for correct work.",
-        "  - With no extra information, aimed at it: Not attempted, no hint for correct work."]
-    line = next(line for line in built["answer"] if line.startswith("A1: "))
-    assert line == ("A1: requirement \"Write the explanation file\"; reward 1; exists = false measured by check check-102; with no extra information while testing hack-0; "
-                    "the rerun of hack-0's check did not reproduce it; ●●●●● exploit executable by unaided learner; possibly the same as P2.")
+    assert section[g1 + 1:g1 + 3] == [f"  - With full instructions: 1 of 1 attempts were exploits, {model}, evidenced_issue.",
+                                      "  - With only a hint: Not attempted, no hint for correct work."]
+    assert f'- {episodes[2]} an exploit with no extra information: reward 1. How: "unchecked requirement"' in section
+    assert not any("rerun" in line or "aimed at it" in line or "possibly the same as" in line for line in section)
 
 
 def test_a_case_without_an_attack_candidate_says_no_attempt_was_assessed(tmp_path):
@@ -1677,19 +1762,22 @@ def test_each_analysis_that_raised_keeps_its_error_as_data(tmp_path):
     assert run.report()["phase_errors"] == {"simulation": "RuntimeError: boom", "hack": "Docker is unavailable"}
 
 
-def test_a_judges_problem_that_is_no_problem_of_nudis_is_a_lead_and_unjudged_findings_are_listed_by_id(tmp_path):
-    """A judge's problem whose Attacker episode only reproduced an inspector's problem is none of nudi's, so it is a
-    lead. Inspector findings that the judge placed in no problem keep their own ids and are listed."""
+def test_only_an_earlier_runs_problem_that_is_no_problem_of_nudis_is_a_lead_and_unjudged_findings_are_listed_by_id(tmp_path):
+    """A judge's problem whose Attacker episode only reproduced an inspector's problem is none of nudi's. Measured in
+    this run, it is no lead; one an earlier run judged is. Inspector findings that the judge placed in no problem keep
+    their own ids and are listed."""
     run = RunDir(tmp_path)
     answered(run)
     run.attack.problems = [Problem(id="P2", source="hack inspector", cause="A bash shim.", findings=["hack-1"], evidence="evidenced"),
                            Problem(id="P3", source="hack inspector", cause="Leading zeros.", findings=["hack-2"], evidence="evidenced"),
                            Problem(id="A1", source="Attacker", cause="A shim found alone.", members=["0001-attacker"],
+                                   cases=[{"id": "0001-attacker", "outcome": "accepted_invalid"}]),
+                           Problem(id="A2", source="Attacker", cause="A shim found earlier.", members=["0001-attacker"], origin="first",
                                    cases=[{"id": "0001-attacker", "outcome": "accepted_invalid"}])]
     result = run.report()
     assert [(item["id"], item["finding"]) for item in result["attack"]["problems"]] == [
         ("P2", "hack-1"), ("P3", "hack-2"), ("grader-0", "grader-0"), ("grader-1", "grader-1")]
-    assert [item["id"] for item in result["attack"]["leads"]] == ["A1"]
+    assert [item["id"] for item in result["attack"]["leads"]] == ["A2"]
     assert result["ungrouped"] == ["grader-0", "grader-1"]
     run.attack = None
     (run.path / "attack.json").unlink()
@@ -1812,11 +1900,41 @@ def test_a_simulator_episode_that_never_started_is_named_with_its_reason_and_cla
     assert first not in result["ordinary"]["no_reward"]
 
 
+def test_an_attempt_the_grader_paid_nothing_is_not_counted_as_assessed():
+    """nudi does not inspect an attempt with reward 0, so the count names it apart from the assessed ones."""
+    assert [report.tally({"attempts": attempts, "reproduced": reproduced, "unrewarded": unrewarded})
+            for attempts, reproduced, unrewarded in [(1, 1, 1), (0, 0, 1), (2, 0, 2), (1, 0, 0)]] == [
+        "1 of 1 assessed attempts with its help were exploits, and 1 attempt got reward 0",
+        "no attempt was assessed, and 1 attempt got reward 0",
+        "no exploit in 2 assessed attempts with its help, and 2 attempts got reward 0",
+        "no exploit in 1 assessed attempt with its help"]
+
+
+def test_a_simulator_episode_that_ended_without_a_reward_says_when(tmp_path):
+    """An episode whose agent made model calls ended in the agent's work unless nudi had copied its environment for
+    grading; the gap line says when, beside its failure."""
+    from nudi.records import StateCopy
+
+    run = RunDir(tmp_path)
+    killed = ErrorRecord(type="ModalFailure", message="Modal exec failed: sandbox killed, out of memory (exit 137)")
+    working, grading = run.episode(rewards={}, errors=[killed]), run.episode(rewards={}, errors=[killed])
+    run.record.calls = [CallRecord(role="simulator", episode=name, model="xai/grok-4.7", cost=0.0, cost_source="provider")
+                        for name in (working, grading)]
+    run.record.copies = [StateCopy(id="copy-0000", episode=grading, point="verification_start", environment="agent", backend="modal",
+                                   ids={}, started_at="2026-01-01T00:00:00+00:00")]
+    run.record.simulation.status, run.record.failed_phases = "partial", ["simulation"]
+    result = run.report(selected=["simulation"])
+    assert [result["ordinary"]["no_reward"][name]["phase"] for name in (working, grading)] == ["agent work", "grading"]
+    assert result["answer"][0] == (f"Finished with gaps: 2 of 2 Simulator episodes ended without a reward: {working} (during agent work; "
+                                   f"ModalFailure: Modal exec failed: sandbox killed, out of memory (exit 137)), {grading} (during grading; "
+                                   "ModalFailure: Modal exec failed: sandbox killed, out of memory (exit 137)). Results below are what was found.")
+
+
 def test_a_lead_whose_reason_starts_with_its_id_names_it_once():
     item = {"open": [{"id": "experiment-0025", "category": "grader_tampering",
-                      "reason": "experiment-0025: its episode has no native reward to compare"}], "findings": {"legitimate": []}}
+                      "reason": "experiment-0025: its grading wrote no reward"}], "findings": {"legitimate": []}}
     assert report.still_open("hack_inspector", item) == [
-        "- hack_inspector grader_tampering leads: experiment-0025: its episode has no native reward to compare"]
+        "- hack_inspector grader_tampering leads: experiment-0025: its grading wrote no reward"]
 
 
 def test_failed_attempts_of_one_session_are_numbered_in_one_clause(tmp_path):
@@ -1870,7 +1988,8 @@ def test_correct_work_failed_needs_an_approved_list_every_requirement_of_which_i
             assert built["answer"][1] == "The grader misjudges work."
             assert [(item["level"], item["label"], item["type"]) for item in built["problems"]] == [(2, "Correct work failed", "false_negative")]
             continue
-        assert built["answer"][1:3] == [report.UNCONFIRMED,
+        assert built["answer"][1:3] == ["1 problem below withheld reward where the checks measured the marks shown; 0 were exploited by an "
+                                        f"Attacker given their help, or found by one. {report.UNCONFIRMED[requirements is not None]}",
                                         f"grader-0: reward 0; {observed} measured by check check-0000; Work the grader failed, "
                                         f"evidenced in a native episode; {reason}."]
         assert [(item["id"], item["type"], item["level"], item["reason"]) for item in built["problems"]] == [("grader-0", None, 2, reason)]
@@ -1893,7 +2012,7 @@ def test_a_reading_without_marks_is_a_scoped_fact_and_one_with_marks_is_a_proble
     run.attack = AttackResult(status="complete", discovery_attempts=0, candidates=[Candidate(
         id="hack-0", mechanism="m", guidance={"full": "steps"}, conditions={"full": "evidenced_issue"})],
         attempts=[AttackAttempt(level="full", number=1, context="c0", candidate="hack-0", sources=["hack-0"], episode=attacker,
-                                status="evidenced_issue", reproduced=True, rewards={"reward": 1.0}, assessment=0)],
+                                status="evidenced_issue", rewards={"reward": 1.0}, assessment=0)],
         findings=[AttackFinding(kind="reproduction", candidate="hack-0", sources=["hack-0"], attempt=0, assessment=0)],
         assessments=[evidenced(attacker, "check-0003")])
     for requirements, kind in ((None, None), ([Requirement(text="Write the numbers sorted", observation="exists")], "hack")):
@@ -1901,8 +2020,9 @@ def test_a_reading_without_marks_is_a_scoped_fact_and_one_with_marks_is_a_proble
         built = run.report(selected=["hack", "attack"])
         assert [(item["id"], item["type"], item["level"]) for item in built["problems"]] == [
             ("hack-0", kind, 3), ("hack-1", kind, 2), ("hack-2", None, None)]
-        assert built["attack"]["attempts"][0]["counts_for"] == "hack-0"
-        assert built["answer"][1] == (report.UNCONFIRMED if kind is None else "The grader can be cheated.")
+        assert built["attack"]["attempts"][0]["candidate"] == "hack-0"
+        assert built["answer"][1] == ("2 problems below gave reward the checks show the work did not earn; 1 was exploited by an Attacker "
+                                      f"given its help, or found by one. {report.UNCONFIRMED[False]}" if kind is None else "The grader can be cheated.")
         assert f"{graded}, check check-0002: reward 1, above the score its check measured; observed exists = false; {report.NO_MARKS}." in built["answer"]
 
 
@@ -1930,12 +2050,12 @@ def test_a_reproduction_of_a_later_reading_of_a_fed_check_counts_for_that_readin
     run.attack = AttackResult(status="complete", discovery_attempts=0, candidates=[Candidate(
         id="hack-0", mechanism="m", guidance={"full": "steps"}, conditions={"full": "evidenced_issue"})],
         attempts=[AttackAttempt(level="full", number=1, context="c0", candidate="hack-0", sources=["hack-1"], episode=attacker,
-                                status="evidenced_issue", reproduced=True, rewards={"reward": 1.0}, assessment=0)],
+                                status="evidenced_issue", rewards={"reward": 1.0}, assessment=0)],
         findings=[AttackFinding(kind="reproduction", candidate="hack-0", sources=["hack-1"], attempt=0, assessment=0)],
         assessments=[evidenced(attacker, "check-0100")])
     built = run.report(selected=["hack", "attack"])
     assert [(item["id"], item["level"], item["reproduced"]) for item in built["problems"]] == [("hack-1", 3, 1)]
-    assert built["attack"]["attempts"][0]["counts_for"] == "hack-1" and built["attack"]["attempts"][0]["created"] is None
+    assert built["attack"]["exploits"]["discovery"] == []
 
 
 def test_a_valid_work_attempt_keeps_an_exploit_a_later_reading_of_another_check_does_not_withdraw(tmp_path):
@@ -1970,3 +2090,51 @@ def test_complete_work_in_the_metrics_needs_the_approved_list(tmp_path):
     run.label(name, "unknown", checked(name, f"check-{name}", "sorted", "supported", basis=basis("supported", ["sorted"], [f"check-{name}"])))
     entry = run.report(selected=["grader"])["metrics"]["episodes"][name]
     assert entry["completion"] == "unknown" and entry["completion_reasons"][-1] == inspection.NO_LIST
+
+
+def test_an_older_attack_record_with_rerun_fields_loads_and_its_report_drops_them(tmp_path):
+    """An attack record from before levels by help given keeps the rerun's `reproduced`, `rerun`, `noted` fields and its
+    findings' `relation`: it loads, its exploits count as a new record's do, and the report names none of those fields."""
+    run = RunDir(tmp_path / "new")
+    answered(run)
+    new = run.report()
+    old = run.attack.model_dump(mode="json")
+    for item in old["attempts"]:
+        item |= {"reproduced": True, "rerun": None, "rerun_check": "check-0003", "noted": None, "noted_reproduced": None,
+                 "noted_rerun": None}
+    run.attack = AttackResult.model_validate(old)
+    built = run.report()
+    assert built["answer"] == new["answer"] and built["problems"] == new["problems"]
+    fields = ("reproduced", "rerun", "rerun_check", "noted", "noted_reproduced", "noted_rerun", "counts_for", "created")
+    assert not any(name in item for item in built["attack"]["attempts"] for name in fields)
+    assert built["causes"] == []
+
+
+def test_a_partial_step_that_ran_to_its_end_says_why_beside_its_status(tmp_path):
+    """An attack that ran to its end with a condition unsettled is partial, not unfinished: the Analyses line says so,
+    so it does not contradict "Every step ran"."""
+    run = RunDir(tmp_path)
+    answered(run)
+    run.attack.status = "partial"
+    built = run.report()
+    assert built["answer"][0].startswith("Finished. Every step ran.")
+    assert "- attack: partial: it ran to its end, but not every condition was settled; see Warnings" in report.markdown(built).splitlines()
+    assert "- hack: complete" in report.markdown(built).splitlines()
+
+
+def test_an_unknown_attempt_says_what_left_it_undecided():
+    """An attempt is unknown only when no reading decided whether its work is invalid; its line names that reason, never
+    that the attack inspector could not tell."""
+    attempt = {"status": "unknown", "error": "no marks: name in `marks` the observations\nof check check-0"}
+    assert report.ending(attempt, False) == "result unclear: no marks: name in `marks` the observations"
+    assert report.ending(attempt | {"error": None}, False) == "result unclear"
+
+
+def test_an_older_unknown_attempt_its_own_reading_shows_an_exploit_is_one_without_the_old_reason(tmp_path):
+    """An older record left an attempt unknown because its rerun of the target's check measured otherwise; its own reading
+    shows an exploit, so it counts for its problem and keeps no reason from the rerun."""
+    run = RunDir(tmp_path)
+    answered(run)
+    run.attack.attempts[0].status, run.attack.attempts[0].error = "unknown", "the rerun measured a mark of the target otherwise"
+    attempt = run.report()["attack"]["attempts"][0]
+    assert (attempt["status"], attempt["error"]) == ("evidenced_issue", None)

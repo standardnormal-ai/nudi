@@ -756,6 +756,29 @@ def test_a_hack_category_stays_open_after_its_first_issue_and_lists_every_findin
                and "valid work" in request["instruction"] for request in sent[1:])
 
 
+def test_each_hack_inspector_request_lists_the_causes_known_when_it_is_sent_and_asks_for_a_different_one(tmp_path, monkeypatch, credentials, plan_order, unit_sandboxes):
+    """Each hack inspector request lists the cause sentences known when it is sent, so a later one has the causes judged
+    meanwhile, and asks for a different cause."""
+    from nudi.attack import Cause
+
+    requests = inspector_responses(monkeypatch, [{"probes": []}, {"probes": []}])
+    scripted = inspector.litellm.acompletion
+    causes = [Cause(id="C1", cause="The grader trusts the answer file.", problems=["P1"])]
+
+    async def completion(**request):
+        reply = await scripted(**request)
+        causes.append(Cause(id=f"C{len(causes) + 1}", cause="The grader trusts the exit code.", problems=["P2"]))
+        return reply
+
+    monkeypatch.setattr(inspector.litellm, "acompletion", completion)
+    run = new_run(tmp_path, monkeypatch, credentials, concurrency=2)  # One session at a time keeps the script's order.
+    asyncio.run(inspection_module.inspect(run, "hack", [], 1, ["grader_tampering"], causes=causes))
+    sent = [json.loads(request["messages"][-1]["content"]) for request in requests]
+    assert [request["known_causes"] for request in sent] == [
+        ["The grader trusts the answer file."], ["The grader trusts the answer file.", "The grader trusts the exit code."]]
+    assert all(request["instruction"].endswith(" look for a different cause.") for request in sent)
+
+
 def test_a_focused_hack_inspector_reply_lists_the_findings_measured_since_its_request(
         tmp_path, monkeypatch, credentials, unit_sandboxes):
     """`found` reached a focused hack inspector only in its request, so findings measured meanwhile were found again.
@@ -806,8 +829,8 @@ def test_the_replies_repeat_the_definitions_the_inspector_prompts_give():
     """A duplicate's reply defines a case as every inspector's prompt does, so no reply contradicts its prompt."""
     prompts = {job: " ".join(inspection_module.inspector_prompt(job).split()) for job in ("hack", "grader", "attack")}
     assert all(inspection_module.CASE in prompt for prompt in prompts.values())
-    # nudi, not the attack inspector, decides whether an exploit is its target's problem.
-    assert "nudi decides from `check_rerun`, not from your reading" in prompts["attack"] and "route" not in prompts["attack"]
+    # nudi reruns no check: the attack inspector's own check decides an exploit.
+    assert "check_rerun" not in prompts["attack"] and "route" not in prompts["attack"]
 
 
 @pytest.mark.parametrize("first, statuses", [
@@ -1093,7 +1116,7 @@ def test_a_workspace_that_ran_out_of_memory_is_labelled_out_of_memory(tmp_path, 
     nudi directly or through the session's model request."""
     from nudi import report
     from nudi.modal_env import ModalFailure
-    out_of_memory = ModalFailure("Modal exec failed: SandboxLikelyOutOfMemoryError")
+    out_of_memory = ModalFailure("Modal exec failed: sandbox killed, out of memory (exit 137)")
 
     async def broken(*args, **kwargs):
         if path == "experiment":
@@ -1116,11 +1139,11 @@ def test_a_workspace_that_ran_out_of_memory_is_labelled_out_of_memory(tmp_path, 
         assert [entry["id"] for entry in result.open] == ["experiment-0000"] and "in `replaces`" in result.open[0]["next"]
     else:
         assert result.attempts[0].status == "out_of_memory"
-    assert result.attempts[0].error.endswith("Modal exec failed: SandboxLikelyOutOfMemoryError")
+    assert result.attempts[0].error.endswith("Modal exec failed: sandbox killed, out of memory (exit 137)")
     assert result.categories == {"package_oracles": "unknown"}
     warnings = []
     report.inspection("hack", result, warnings)
-    assert any(" out_of_memory: " in warning and warning.endswith("SandboxLikelyOutOfMemoryError") for warning in warnings)
+    assert any(" out_of_memory: " in warning and warning.endswith("out of memory (exit 137)") for warning in warnings)
 
 
 def test_no_later_attempt_runs_in_a_workspace_that_ran_out_of_memory(tmp_path, monkeypatch, credentials, unit_sandboxes):
@@ -1131,7 +1154,7 @@ def test_no_later_attempt_runs_in_a_workspace_that_ran_out_of_memory(tmp_path, m
     async def behave(name, tools, schema):
         asked.append(name)
         if name == "hack-package_oracles":
-            raise inspection_module.InferenceFailure("ModalFailure: Modal exec failed: SandboxLikelyOutOfMemoryError")
+            raise inspection_module.InferenceFailure("ModalFailure: Modal exec failed: sandbox killed, out of memory (exit 137)")
         return schema()
 
     episode_tools(monkeypatch, behave)
@@ -2293,9 +2316,11 @@ def test_only_an_explicit_replacement_resolves_an_open_reading(tmp_path, monkeyp
     assert result.experiments[1].get("replaces") == ("experiment-0000" if replaced else None)
 
 
-def test_a_missing_native_reward_is_an_unavailable_measurement_not_a_failed_check(tmp_path, monkeypatch, credentials, unit_sandboxes):
-    """A check that exits 0 on an episode without a native reward did not fail: the reward is unavailable, which no
-    re-check adds, so the case is not run again and the limit says why."""
+@pytest.mark.parametrize("runs", [1, 2])
+def test_a_missing_native_reward_is_an_unavailable_measurement_not_a_failed_check(tmp_path, monkeypatch, credentials, unit_sandboxes, runs):
+    """A check that exits 0 on an experiment whose grading wrote no reward did not fail: the reward is unavailable, which
+    no re-check adds, so the case is not run again and the limit says why. It is that experiment's limit: unless the
+    inspector repeats the case, its session is not unobservable, so its other measurements and findings stand."""
     mock_experiments(monkeypatch, agreeing())
     scripted = inspection_module.measure_experiment
 
@@ -2307,7 +2332,7 @@ def test_a_missing_native_reward_is_an_unavailable_measurement_not_a_failed_chec
 
     async def behave(name, tools, schema):
         if name == "hack-broad":
-            for _ in range(2):
+            for _ in range(runs):
                 replies.append(await tools["run_experiment"].ainvoke({"probe": setup_probe()}))
         return schema()
 
@@ -2315,11 +2340,12 @@ def test_a_missing_native_reward_is_an_unavailable_measurement_not_a_failed_chec
     run = new_run(tmp_path, monkeypatch, credentials)
     result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
     assert result.experiments[0]["status"] == "incomplete" and len(result.experiments) == 1
-    assert replies[1]["status"] == "unobservable" and result.attempts[0].status == "unobservable"
+    assert [item["status"] == "unobservable" for item in replies] == [False, True][:runs]
+    assert (result.attempts[0].status == "unobservable") == (runs == 2)
     assert not any(inspection_module.CHECK_FAILED in limit for limit in result.limits)
-    assert "experiment-0000: its episode has no native reward to compare." in result.limits
+    assert "experiment-0000: its grading wrote no reward." in result.limits and "native" not in " ".join(result.limits)
     assert all("its check failed" not in entry["reason"] for entry in result.open)
-    assert any("experiment-0000: its episode has no native reward" in entry["reason"] for entry in result.open)
+    assert any("experiment-0000: its grading wrote no reward" in entry["reason"] for entry in result.open)
 
 
 def consistent_focused(tmp_path, monkeypatch, credentials, *more, focused_attempts=1):
@@ -4103,6 +4129,17 @@ def schema_objects(node):
 
 
 @pytest.mark.parametrize("mode", ["grader", "hack", "attack"])
+def test_every_inspector_reads_what_a_mark_is(mode):
+    """A mark is an observation of the reading's own check whose measured value shows the finding; the hack, grader and
+    attack inspectors each read that rule and the marks field says it. No rule limits a mark to text of other episodes."""
+    prompt = " ".join(inspection_module.inspector_prompt(mode).split())
+    assert ("A reading is a finding only with `marks`: observations of this check whose measured values show the work "
+            "invalid, or valid work rejected.") in prompt and "copied from this one episode" not in prompt
+    assert inspection_module.claim_model(mode).model_fields["marks"].description == (
+        "Observations of this check whose measured values show this finding.")
+
+
+@pytest.mark.parametrize("mode", ["grader", "hack", "attack"])
 def test_every_object_in_the_experiment_tool_arguments_refuses_unknown_keys(tmp_path, monkeypatch, credentials, mode, unit_sandboxes):
     """An unknown key is an argument error at every depth of the probe and the claim, never a reference dropped unseen."""
     run = new_run(tmp_path, monkeypatch, credentials)
@@ -4143,158 +4180,6 @@ def test_a_citation_nested_in_a_grader_derivation_is_refused_before_assessment(t
     result = asyncio.run(inspection_module.inspect(run, "grader", pool, 0, ["accepted_invalid"]))
     assert replies[0]["investigation_result"]["outcome"] == "accepted_invalid"
     assert [assessment.outcome for assessment in result.assessments] == ["accepted_invalid"]
-
-
-def test_the_attack_inspector_interprets_nudis_rerun_of_the_target_check_without_a_new_experiment(
-        tmp_path, monkeypatch, credentials, unit_sandboxes):
-    """The check nudi reran on the Attacker's copy is a receipt like the attack inspector's own: interpret_experiment
-    also reads it by its check id and runs nothing. Another check of that episode stays outside the tool."""
-    from nudi.records import Check, Content
-
-    run = new_run(tmp_path, monkeypatch, credentials)
-    pool = ordinary_pool(run, 1)
-    output = json.dumps({"observations": {"answered": 1}, "results": {"deserved": 1}})
-    requirement = Observation(episode=None, path="instruction.md", excerpt="Write the number 42")
-    run.record.checks += [Check(id=f"check-000{number}", ids={}, content=Content(episode=pool[0], path="copy.json", sha256="0" * 64),
-                                requirement=requirement, command=["python3"], exit_code=0, output=output) for number in range(2)]
-    replies = []
-
-    async def behave(name, tools, schema):
-        for check in ("check-0000", "check-0001"):
-            replies.append(await tools["interpret_experiment"].ainvoke({"experiment": check, **SUPPORTED}))
-        return schema()
-
-    episode_tools(monkeypatch, behave)
-    result = asyncio.run(inspection_module.inspect(run, "attack", pool, 0, ["accepted_invalid"], title="attack-judge",
-                                                   request={"target_candidate": None, "check_rerun": {"check": "check-0000"}}))
-    assert replies[0]["investigation_result"]["claim"]["check"] == "check-0000"
-    assert replies[1]["status"] == "invalid_experiment"
-    assert [item.claim.check for item in result.assessments] == ["check-0000"]
-    assert len(run.record.checks) == 2
-    assert ("When it holds a `draft`, that is your open draft reading: complete it first with interpret_experiment, naming no "
-            "experiment. Then measure with run_experiment only what it leaves open: an entry in `open`, or, for valid work, a "
-            "requirement the score depends on that no reading measured.") in " ".join(inspection_module.inspector_prompt("attack").split())
-
-
-def test_an_unknown_reading_of_nudis_rerun_keeps_the_attack_judgement_open(tmp_path, monkeypatch, credentials, unit_sandboxes):
-    """The rerun check's reading is a reading of the session like its own experiments': an unknown one stays in `open`
-    under its draft's experiment id, so its category and the session stay unsettled."""
-    from nudi.records import Check, Content
-
-    run = new_run(tmp_path, monkeypatch, credentials)
-    pool = ordinary_pool(run, 1)
-    output = json.dumps({"observations": {"answered": 1}, "results": {"deserved": 1}})
-    requirement = Observation(episode=None, path="instruction.md", excerpt="Write the number 42")
-    run.record.checks.append(Check(id="check-0000", ids={}, content=Content(episode=pool[0], path="copy.json", sha256="0" * 64),
-                                   requirement=requirement, command=["python3"], exit_code=0, output=output))
-    monkeypatch.setattr(inspection_module, "assess", lambda claim, directory: Assessment(
-        claim=claim, execution_scope="native", outcome="unknown", reasons=["nothing settles it"]))
-
-    async def behave(name, tools, schema):
-        await tools["interpret_experiment"].ainvoke({"experiment": "check-0000", **SUPPORTED})
-        return schema()
-
-    episode_tools(monkeypatch, behave)
-    result = asyncio.run(inspection_module.inspect(run, "attack", pool, 0, ["accepted_invalid"], title="attack-judge",
-                                                   request={"target_candidate": None, "check_rerun": {"check": "check-0000"}}))
-    assert [(entry["id"], entry["category"], entry["reason"]) for entry in result.open] == [
-        ("experiment-0000", "accepted_invalid", "nothing settles it")]
-    assert result.categories == {"accepted_invalid": "unknown"} and result.status == "partial"
-    events = [json.loads(line) for line in (run.config.output_dir / "events.jsonl").read_text().splitlines()]
-    assert [item["result"] for item in events if item["kind"] == "session_end"] == ["open"]
-
-
-def rerun_session(tmp_path, monkeypatch, credentials, behave, exit_code=0, output=None):
-    """An attack inspector session whose request carries nudi's rerun `check-0000` of the target's check on its episode,
-    which was rewarded 1.0 while the rerun measured a deserved score of 0. Returns the run, its result and each request."""
-    from nudi.records import Check, Content
-
-    run = new_run(tmp_path, monkeypatch, credentials)
-    pool = ordinary_pool(run, 1)
-    output = output or json.dumps({"observations": {"answered": 0}, "results": {"deserved": 0}})
-    requirement = Observation(episode=None, path="instruction.md", excerpt="Write the number 42")
-    run.record.checks.append(Check(id="check-0000", ids={}, content=Content(episode=pool[0], path="copy.json", sha256="0" * 64),
-                                   requirement=requirement, command=["python3"], exit_code=exit_code, output=output))
-    asked = []
-    episode_tools(monkeypatch, lambda name, tools, schema: behave(run, pool, tools, schema))
-    scripted = inspector.Investigation.ask
-
-    async def ask(session, context, schema, *, tools):
-        asked.append(json.loads(context))
-        return await scripted(session, context, schema, tools=tools)
-
-    monkeypatch.setattr(inspector.Investigation, "ask", ask)
-    rerun = {"label": "the hack inspector's check check-0000, rerun by nudi", "check": "check-0000", "exit_code": exit_code,
-             "output": output, "location": "/app/answer.txt", "capture_point": "verification_start"}
-    result = asyncio.run(inspection_module.inspect(run, "attack", pool, 0, ["accepted_invalid"], title="attack-judge",
-                                                   request={"target_candidate": None, "check_rerun": rerun}))
-    return run, result, asked
-
-
-def test_a_successful_rerun_is_the_attack_inspectors_open_draft_and_run_experiment_waits_for_it(
-        tmp_path, monkeypatch, credentials, unit_sandboxes):
-    """nudi's successful rerun of the target's check is the session's open draft reading from the start, with the native
-    reward, check, references, location, capture point, observations and deserved score. The first run_experiment
-    returns that draft and starts no sandbox; interpret_experiment with no id completes it."""
-    replies = []
-
-    async def behave(run, pool, tools, schema):
-        before = (len(run.record.sandboxes), len(run.record.checks))
-        replies.append(await tools["run_experiment"].ainvoke({"probe": {k: v for k, v in review_probe(pool[0]).items() if k != "category"}}))
-        replies.append((len(run.record.sandboxes), len(run.record.checks)) == before)
-        replies.append(await tools["interpret_experiment"].ainvoke(SUPPORTED))
-        return schema()
-
-    run, result, asked = rerun_session(tmp_path, monkeypatch, credentials, behave)
-    waited, untouched, interpreted = replies
-    draft = waited["draft"]
-    assert waited["instruction"] == inspection_module.OPEN_DRAFT and untouched
-    assert (draft["experiment"], draft["episode"], draft["check"], draft["reward"], draft["native_reward"]) == (
-        "experiment-0000", "0000-simulator", "check-0000", "reward", 1.0)
-    assert draft["requirement"] == {"episode": None, "path": "instruction.md", "excerpt": "Write the number 42"}
-    assert (draft["location"], draft["capture_point"], draft["observations"], draft["deserved"]) == (
-        "/app/answer.txt", "verification_start", ["answered"], 0)
-    assert interpreted["investigation_result"]["claim"]["check"] == "check-0000"
-    assert [(item["id"], item["status"], item["check"]) for item in result.experiments] == [("experiment-0000", "assessed", "check-0000")]
-    # The first request shows the draft and the open entry it makes, and asks for it first.
-    assert asked[0]["check_rerun"]["draft"] == draft
-    assert [entry["id"] for entry in asked[0]["open"]] == ["experiment-0000"]
-    assert "interpret_experiment first" in asked[0]["instruction"] and "Measure it with run_experiment" not in asked[0]["instruction"]
-
-
-def test_a_session_ending_before_it_interprets_the_rerun_leaves_the_draft_unfinished(
-        tmp_path, monkeypatch, credentials, unit_sandboxes):
-    """The draft is saved before the first turn, and a session that ends without interpreting it leaves it unfinished:
-    nudi does not settle the reward's disagreement with the deserved score from the numbers alone."""
-    saved = []
-
-    async def behave(run, pool, tools, schema):
-        saved.append(json.loads((run.config.output_dir / "inspection-attack-judge.json").read_text())["experiments"])
-        return schema()
-
-    run, result, _ = rerun_session(tmp_path, monkeypatch, credentials, behave)
-    assert [(item["id"], item["status"], item["check"]) for item in saved[0]] == [("experiment-0000", "measured", "check-0000")]
-    assert [(item["id"], item["status"]) for item in result.experiments] == [("experiment-0000", "unfinished")]
-    (assessment,) = result.assessments
-    assert (assessment.outcome, assessment.reasons, assessment.claim.check) == ("unknown", [inspection_module.UNFINISHED], "check-0000")
-    recorded = json.loads((run.config.output_dir / "inspection-attack-judge.json").read_text())
-    assert [item["status"] for item in recorded["experiments"]] == ["unfinished"]
-
-
-@pytest.mark.parametrize("exit_code, output", [(1, "Traceback"), (0, "no json")], ids=["failed check", "broken contract"])
-def test_a_failed_rerun_leaves_run_experiment_working_at_once(tmp_path, monkeypatch, credentials, exit_code, output, unit_sandboxes):
-    """A rerun whose check failed or broke the output contract is no draft: run_experiment measures at once."""
-    mock_experiments(monkeypatch, reviewed("unknown"))
-    replies = []
-
-    async def behave(run, pool, tools, schema):
-        replies.append(await tools["run_experiment"].ainvoke({"probe": {k: v for k, v in review_probe(pool[0]).items() if k != "category"}}))
-        return schema()
-
-    _, result, asked = rerun_session(tmp_path, monkeypatch, credentials, behave, exit_code, output)
-    assert "instruction" not in replies[0] and replies[0]["status"] == "measured"
-    assert [item["case"] for item in result.experiments] == ["answer in 0000-simulator"]
-    assert "draft" not in asked[0]["check_rerun"] and "interpret_experiment first" not in asked[0]["instruction"]
 
 
 @pytest.mark.parametrize("target", ["both", "scoring", None], ids=["target candidate", "target scoring only", "discovery"])
@@ -6128,7 +6013,7 @@ def test_run_experiment_returns_a_draft_reading_with_everything_nudi_knows(tmp_p
         "experiment": "experiment-0000", "episode": reply["episode"], "check": check.id, "category": "package_oracles",
         "reward": "reward", "native_reward": 1.0, "requirement": check.requirement.model_dump(), "scoring": check.scoring.model_dump(),
         "location": "/app/explanation.txt", "capture_point": "verification_start", "observations": ["answered"], "deserved": 1,
-        "supply": ["mechanism", "interpretation", "derivation", "unresolved", "limits", "marks", "full_guidance", "hint_location", "family"]}
+        "supply": ["mechanism", "interpretation", "derivation", "unresolved", "limits", "marks", "cause", "full_guidance", "hint_location", "family"]}
     assert reply["id"] == "experiment-0000" and reply["check"]["id"] == check.id
 
 
@@ -7967,3 +7852,16 @@ def test_a_closed_category_does_not_wait_for_a_slot(tmp_path, monkeypatch, crede
 
     result = asyncio.run(main())
     assert [item.phase for item in result.attempts] == ["broad"] and result.categories["rejected_valid"] == "evidenced_issue"
+
+
+def test_each_claim_states_its_cause_and_a_no_hint_attack_claim_names_a_known_one_by_id():
+    """A hack or grader inspector claim states the cause its finding uses in one sentence; an attack inspector claim names
+    the `known_causes` entry its exploit used, or says a new sentence. The prompts say the same."""
+    for job in ("hack", "grader"):
+        schema = inspection_module.claim_model(job).model_json_schema()
+        assert schema["properties"]["cause"]["description"] == inspection_module.CAUSE_FIELD[0]
+        assert "`cause`: one sentence on what the grader" in " ".join(inspection_module.inspector_prompt(job).split())
+    attack = inspection_module.claim_model("attack").model_json_schema()
+    assert "known_causes" in attack["properties"]["cause"]["description"]
+    prompt = " ".join(inspection_module.inspector_prompt("attack").split())
+    assert "set the claim's `cause` to the id of the one it used" in prompt and "check_rerun" not in prompt
