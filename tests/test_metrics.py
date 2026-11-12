@@ -61,7 +61,9 @@ class RunDir:
             models=dict(DEFAULT_MODELS), credential_sources={role: "environment" for role in DEFAULT_MODELS},
             spending_cap=5.0, capacity=Capacity(docker_cpus=8, docker_memory_mb=16384, episode_cpus=1,
                                                 episode_memory_mb=2048, concurrency=4),
-            cost_map={"source": "local"}, simulation=Simulation(requested=0, status="complete"))
+            cost_map={"source": "local"}, simulation=Simulation(requested=0, status="complete"),
+            # An approved requirement list with nothing to measure, so correct work rests on the readings alone.
+            requirements=[])
         self.grader: InspectionResult | None = None
         self.hack: InspectionResult | None = None
         self.attack: AttackResult | None = None

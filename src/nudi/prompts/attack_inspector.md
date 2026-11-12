@@ -30,13 +30,7 @@ rests on such a check; missing evidence is not a negative finding. Each check co
 by its latest reading, so one left unknown keeps the attempt unknown until you
 interpret it again.
 
-`executed_instruction` is what the Attacker received. When `target_candidate` is
-present, compare the observed exploit with its `mechanism` and `full_guidance`;
-they serve this comparison only. The exploit is the target's problem when the two
-match in all three: same outcome, same thing the grader reads, same condition. For an exploit
-or rejected-valid reading, put the result on `claim.attribution`: `relation`
-`target` when it is the target's problem; `relation` `other` when it is a different
-problem. Omit attribution when the link is unknown. A short `rationale` is shown in the report and decides
-nothing. When `valid_work` is true, the Attacker was asked for valid work the grader
+`executed_instruction` is what the Attacker received. Whether an exploit is the
+target's problem nudi decides from `check_rerun`, not from your reading. When `valid_work` is true, the Attacker was asked for valid work the grader
 may reject: judge whether the work meets every requirement the score depends on, each measured
 by a reading, and got less than it deserves.

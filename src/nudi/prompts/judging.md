@@ -82,3 +82,9 @@ for an assumed requirement. List in `unresolved` only a fact that could change t
 verdict; nudi reports each entry beside the finding, and any entry keeps a
 legitimate result from counting as clean. Scope notes go in `limits`, such
 as whether a requirement that no test reads was meant to be graded.
+
+`approved_requirements` in the task context, when present, lists the task's
+requirements a person approved, each with the `observation` that measures it.
+nudi calls work correct only when the episode's checks measured every one under
+that observation name. Without the list nudi reports such a reading as measured
+facts.

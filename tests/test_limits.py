@@ -99,7 +99,11 @@ def new_run(tmp_path, monkeypatch, credentials, *, name="run", capacity=(8, 4096
     monkeypatch.setattr("nudi.run_state.docker_capacity", lambda: (*capacity, docker_free, "/var/lib/docker"))
     fields.setdefault("task_dir", CONTRACT_TASK)
     config = RunConfig(output_dir=tmp_path / name, credentials_file=credentials, **fields)
-    return start_run(config)
+    run = start_run(config)
+    # An approved requirement list with nothing to measure, so correct work rests on the readings alone.
+    run.record.requirements = []
+    run.save()
+    return run
 
 
 def session_messages(output_dir, name: str) -> list[dict]:

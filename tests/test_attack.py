@@ -257,10 +257,14 @@ def linked_check(episode: str, check_id: str):
     )
 
 
-def linked_attribution(check_id: str) -> dict:
-    """The attack inspector links the exploit its reading's own check shows to the target; the rationale decides nothing."""
-    return {"relation": "target",
-            "rationale": f"Check {check_id} measured the required file absent while the native reward was 1."}
+def reproducing(monkeypatch, check=lambda episode: "check-rerun", shown=lambda marks: True):
+    """nudi's rerun of each target's check on its Attacker episode is the check `check(episode)`, and whether it measured
+    the target's marks as before is `shown(marks)`; an evidenced reading of that episode then reproduces the target."""
+    async def rerun(run, target, episode, source, location):
+        return {"label": "nudi's rerun", "check": check(episode), "exit_code": 0, "output": "{}", "source_output": "{}"}
+
+    monkeypatch.setattr(attack_module, "rerun_check", rerun)
+    monkeypatch.setattr(attack_module, "shown", lambda marks, rerun: shown(marks))
 
 
 def retain_copy(run, name, ids, *, tag=None, image=None):
@@ -451,8 +455,8 @@ def test_exact_duplicate_records_share_one_run_and_partial_overlap_does_not(tmp_
 
 
 def test_only_exact_duplicates_share_one_run_and_first_full_hints_run_before_discovery(tmp_path, monkeypatch, credentials):
-    """Only the same kind, category, exact mechanism text and both guidance fields share one run; every
-    record stays listed. A shared check or a mechanism differing only in case does not merge, so no finding is
+    """Only the same kind, category, check, exact mechanism text and both guidance fields share one run; every
+    record stays listed. A shared check alone or a mechanism differing only in case does not merge, so no finding is
     marked reproduced by another finding's recipe. Every exploit finding's first full-hint attempt runs before
     discovery and valid work. No full hint reproduced, so no minimal hint runs."""
     endpoint = attack_endpoint(plain_claim)
@@ -476,10 +480,12 @@ def test_only_exact_duplicates_share_one_run_and_first_full_hints_run_before_dis
                 item("US", "unchecked_requirements", "check-2", "Valid label 'US' rejected", "label"),
                 item("us", "unchecked_requirements", "check-3", "Valid label 'us' rejected", "label"),
                 item("B", "timing_interference", "check-5", "mechanism two", "B"),
-                item("C", "timing_interference", "check-4", "mechanism two", "B"),
+                item("C", "timing_interference", "check-5", "mechanism two", "B"),
+                item("E", "timing_interference", "check-4", "mechanism two", "B"),
                 item("D", "grader_tampering", "check-6", "mechanism two", "B"),
             ])
-            runs = [("upper", ["upper"]), ("newline", ["newline"]), ("US", ["US"]), ("us", ["us"]), ("B", ["B", "C"]), ("D", ["D"])]
+            runs = [("upper", ["upper"]), ("newline", ["newline"]), ("US", ["US"]), ("us", ["us"]), ("B", ["B", "C"]), ("E", ["E"]),
+                    ("D", ["D"])]
             assert [(attempt.candidate, attempt.level, attempt.sources) for attempt in result.attempts] == (
                 [(lead, "full", sources) for lead, sources in runs[2:]] + [(None, "none", [])]
                 + [(lead, "full", sources) for lead, sources in runs[:2]])
@@ -502,14 +508,15 @@ def test_only_exact_duplicates_share_one_run_and_first_full_hints_run_before_dis
     asyncio.run(main())
 
 
-def test_a_candidate_identical_to_a_later_group_joins_it_whatever_check_it_shares():
-    """With A = (check-1, one), B = (check-2, two) and C = (check-1, two), C joins the identical B, not A, whose check
-    it only shares."""
+def test_a_candidate_joins_only_an_identical_group_of_its_own_check():
+    """With A = (check-1, one), B = (check-2, two), C = (check-1, two) and D = (check-2, two), D joins the identical B;
+    C shares A's check and B's text, so it joins neither, as one check's rerun decides a whole group."""
     def item(id, check, mechanism):
         return attack_module.Candidate(id=id, check=check, mechanism=mechanism, guidance={"full": f"FULL-{mechanism}", "minimal": None})
 
-    groups = attack_module._candidate_groups([item("A", "check-1", "one"), item("B", "check-2", "two"), item("C", "check-1", "two")], {})
-    assert [[member.id for member in group] for group in groups] == [["A"], ["B", "C"]]
+    groups = attack_module._candidate_groups([item("A", "check-1", "one"), item("B", "check-2", "two"), item("C", "check-1", "two"),
+                                              item("D", "check-2", "two")])
+    assert [[member.id for member in group] for group in groups] == [["A"], ["B", "D"], ["C"]]
 
 
 def test_first_full_hint_attempts_run_first_and_suspected_candidates_after_evidenced_ones(tmp_path, monkeypatch, credentials):
@@ -595,6 +602,8 @@ def test_reports_keep_a_suspected_source_apart_from_its_native_reproduction(tmp_
 
     suspected, evidenced = candidate("hack-0", "FULL-HACK-0"), candidate("hack-1", "FULL-HACK-1")
     suspected.outcome, evidenced.outcome = "unknown", "accepted_invalid"
+    suspected.marks, evidenced.marks = ["m0"], ["m1"]
+    reproducing(monkeypatch, shown=lambda marks: marks == ["m0"])
 
     async def main():
         async with serve(endpoint) as base:
@@ -622,7 +631,10 @@ def test_reports_keep_a_suspected_source_apart_from_its_native_reproduction(tmp_
     label = "(suspected: its hack inspector reading was unknown)"
     answer = " ".join(built["answer"])
     assert f"exploited hack-0 {label} with full instructions" in answer
-    assert "while testing hack-1 with full instructions" in answer and answer.count(label) == 1 and "hack-2" not in answer
+    # The exploit hack-1's rerun did not show is its own finding, at the rung its Attacker's help put it on.
+    assert ("0000-attacker: ●●●○○ exploit executable by learner with full information (its help was for another problem), "
+            "while testing hack-1.") in built["answer"]
+    assert answer.count(label) == 1 and "hack-2" not in answer
     section = report.markdown(built).split("\n## Attack\n")[1].split("\n## ")[0]
     lines = section.splitlines()
     assert sum(f" exploited hack-0 {label} with full instructions: " in line for line in lines) == 1
@@ -823,10 +835,12 @@ CAUSE_A, CAUSE_B = "The grader ignores output A.", "The grader ignores output B.
 def attack_judging_causes(tmp_path, monkeypatch, credentials, problems, name="run", candidates=None, minimal_hints=True,
                           reproduced=("hack-0",)):
     """The attack on two findings, by default with identical mechanism and hints. Every Attacker episode is rewarded; the
-    attack inspector double links its exploit to the target candidate only when that candidate is in `reproduced`.
-    Returns the attack result, the targets the double judged and the built report."""
+    attack inspector double evidences an exploit on nudi's rerun, which shows the target's marks only when that candidate
+    is in `reproduced`. Returns the attack result, the targets the double judged and the built report."""
     candidates = candidates or [attack_module.Candidate(id=f"hack-{number}", mechanism="unchecked_requirements", outcome="accepted_invalid",
                                                         guidance={"full": "Exploit the unchecked output.", "minimal": None}) for number in range(2)]
+    candidates = [item.model_copy(update={"marks": [item.id]}) for item in candidates]
+    reproducing(monkeypatch, shown=lambda marks: marks[0] in reproduced)
     targets = []
 
     async def discard(run, keep=()):
@@ -849,9 +863,8 @@ def attack_judging_causes(tmp_path, monkeypatch, credentials, problems, name="ru
         check = Check(id=f"check-{pool[0]}", ids={}, content=Content(episode=pool[0], path="copy.json", sha256="0" * 64),
                       requirement=Observation(episode=None, path="instruction.md", excerpt="Write a valid answer."),
                       command=["python3", "/nudi/check.py"], exit_code=0, output="{}")
-        relation = "target" if target["id"] in reproduced else "other"
         claim = Claim(mechanism="Output A is never checked.", episode=pool[0], check=check.id,
-                      interpretation="Output A is absent but the grader accepts.", attribution={"relation": relation, "check": check.id})
+                      interpretation="Output A is absent but the grader accepts.")
         return inspection.InspectionResult(mode="attack", status="complete", categories={}, applicability={},
                                            attempts=[inspection.InspectionAttempt(phase="attack", number=1, status="complete")],
                                            assessments=[Assessment(claim=claim, outcome="accepted_invalid", check=check, execution_scope="native")])
@@ -884,11 +897,14 @@ def test_a_finding_with_only_a_minimal_hint_never_runs_since_that_hint_follows_a
 
 
 def test_one_reproduction_never_confirms_two_causes_with_identical_candidates(tmp_path, monkeypatch, credentials):
-    """Two problems with different causes whose candidates have identical text and hints get one run each, judged
-    against its own candidate; only hack-0's run reproduces it, so only cause A is reproduced. Problems that share one
-    cause, as identical mechanisms do, still share one run."""
+    """Two candidates of different checks with identical text and hints get one run each, decided by its own check's
+    rerun; only hack-0's run reproduces it, so only cause A is reproduced. Identical candidates of one check, here none,
+    still share one run, whatever problems the judge put them in."""
     problems = [attack_module.Problem(cause=CAUSE_A, findings=["hack-0"]), attack_module.Problem(cause=CAUSE_B, findings=["hack-1"])]
-    result, targets, built = attack_judging_causes(tmp_path, monkeypatch, credentials, problems)
+    candidates = [attack_module.Candidate(id=f"hack-{number}", check=f"check-{number}", mechanism="unchecked_requirements",
+                                          outcome="accepted_invalid", guidance={"full": "Exploit the unchecked output.", "minimal": None})
+                  for number in range(2)]
+    result, targets, built = attack_judging_causes(tmp_path, monkeypatch, credentials, problems, candidates=candidates)
     assert [(attempt.candidate, attempt.sources) for attempt in result.attempts] == [("hack-0", ["hack-0"]), ("hack-1", ["hack-1"])]
     assert [target["id"] for target in targets] == ["hack-0", "hack-1"]
     assert [(item["cause"], item["reproduced"]) for item in built["attack"]["problems"]] == [(CAUSE_A, True), (CAUSE_B, False)]
@@ -915,9 +931,8 @@ def test_the_attack_inspector_judges_the_tested_candidate_alone_not_its_problems
 
 def test_a_later_reading_of_the_same_check_replaces_the_attempts_earlier_exploit_so_the_answer_lists_its_episode_once(
         tmp_path, monkeypatch, credentials):
-    """One attack inspector session reads check-0 unattributed, then attributed to its target. The later reading of the
-    same check replaces the earlier finding, so the Answer lists the episode once, as a reproduction. Both readings stay
-    in the record."""
+    """One attack inspector session reads nudi's rerun check-0 twice. The later reading of the same check replaces the
+    earlier finding, so the Answer lists the episode once, as a reproduction. Both readings stay in the record."""
     async def discard(run, keep=()):
         pass
 
@@ -937,9 +952,9 @@ def test_a_later_reading_of_the_same_check_replaces_the_attempts_earlier_exploit
                       requirement=Observation(episode=None, path="instruction.md", excerpt="Write a valid answer."),
                       command=["python3", "/nudi/check.py"], exit_code=0, output="{}")
         readings = [Assessment(claim=Claim(mechanism=f"Output A is never checked, reading {number}.", episode=pool[0], check=check.id,
-                                           interpretation="Output A is absent but the grader accepts.", attribution=attribution),
+                                           interpretation="Output A is absent but the grader accepts."),
                                outcome="accepted_invalid", check=check, execution_scope="native")
-                    for number, attribution in enumerate([None, {"relation": "target", "check": check.id}])]
+                    for number in range(2)]
         return inspection.InspectionResult(mode="attack", status="complete", categories={}, applicability={},
                                            attempts=[inspection.InspectionAttempt(phase="attack", number=1, status="complete")],
                                            assessments=readings)
@@ -947,6 +962,7 @@ def test_a_later_reading_of_the_same_check_replaces_the_attempts_earlier_exploit
     monkeypatch.setattr(attack_module.copies, "discard", discard)
     monkeypatch.setattr(run_state, "run_role_episode", native)
     monkeypatch.setattr(attack_module, "inspect", inspect)
+    reproducing(monkeypatch, check=lambda episode: "check-0")
     run = new_run(tmp_path, monkeypatch, credentials)
     found = attack_module.Candidate(id="hack-0", mechanism="unchecked output", outcome="accepted_invalid",
                                     guidance={"full": "Exploit the unchecked output.", "minimal": None})
@@ -959,10 +975,14 @@ def test_a_later_reading_of_the_same_check_replaces_the_attempts_earlier_exploit
 
 
 def scripted_readings(tmp_path, monkeypatch, credentials, candidate, readings, reward=1.0, deserved=None, judge=None, problems=None,
-                      experiments=()):
+                      experiments=(), shown=None):
     """attack() on one candidate whose Attacker episodes get `reward`; each attack inspector session returns the
     assessments `readings(check_of, episode)` builds, and its `experiments` rows, where `check_of(id)` is a check of that episode. The candidate's
-    own check prints `deserved` as its deserved score. Returns the result and the requests the attack inspector got."""
+    own check prints `deserved` as its deserved score. Unless `shown` is None, nudi's rerun of the target's check is
+    check-0, and `shown` says whether it measured the target's marks as before. Returns the result and the requests the
+    attack inspector got."""
+    if shown is not None:
+        reproducing(monkeypatch, check=lambda episode: "check-0", shown=lambda marks: shown)
     async def discard(run, keep=()):
         pass
 
@@ -1005,9 +1025,9 @@ def scripted_readings(tmp_path, monkeypatch, credentials, candidate, readings, r
     return result, requests
 
 
-def reading(check, episode, outcome, number=0, attribution=None):
+def reading(check, episode, outcome, number=0):
     return Assessment(claim=Claim(mechanism=f"Output A is never checked, reading {number}.", episode=episode, check=check.id,
-                                  interpretation="Output A was read.", attribution=attribution),
+                                  interpretation="Output A was read."),
                       outcome=outcome, check=check, execution_scope="native")
 
 
@@ -1044,14 +1064,12 @@ def test_a_replacement_never_withdraws_an_evidenced_reading(tmp_path, monkeypatc
     rows = [{"id": "experiment-0000", "status": "assessed", "check": "check-0", "episode": "0000-attacker"},
             {"id": "experiment-0001", "status": "assessed", "check": "check-1", "episode": "0000-attacker", "replaces": "experiment-0000"}]
     result, _ = scripted_readings(tmp_path, monkeypatch, credentials, found, lambda check_of, episode: [
-        reading(check_of("check-0"), episode, "accepted_invalid", attribution={"relation": "target", "check": "check-0"}),
-        reading(check_of("check-1"), episode, "legitimate", 1)], experiments=rows)
+        reading(check_of("check-0"), episode, "accepted_invalid"),
+        reading(check_of("check-1"), episode, "legitimate", 1)], experiments=rows, shown=True)
     assert result.attempts[0].status == "evidenced_issue"
 
 
-@pytest.mark.parametrize("first, second, status", [
-    ({"relation": "target", "check": "check-0"}, "legitimate", "no_evidenced_issue"),
-    ({"relation": "other"}, "unknown", "unknown")])
+@pytest.mark.parametrize("first, second, status", [(True, "legitimate", "no_evidenced_issue"), (False, "unknown", "unknown")])
 def test_a_corrected_reading_of_a_check_withdraws_its_finding(tmp_path, monkeypatch, credentials, first, second, status):
     """The latest reading of each check decides the attempt and its findings: an exploit read again as no exploit
     leaves no finding and no judge call. Both readings stay in the record."""
@@ -1064,14 +1082,14 @@ def test_a_corrected_reading_of_a_check_withdraws_its_finding(tmp_path, monkeypa
         return "A1"
 
     result, _ = scripted_readings(tmp_path, monkeypatch, credentials, found, lambda check_of, episode: [
-        reading(check_of("check-0"), episode, "accepted_invalid", attribution=first),
-        reading(check_of("check-0"), episode, second, 1)], judge=judge)
+        reading(check_of("check-0"), episode, "accepted_invalid"),
+        reading(check_of("check-0"), episode, second, 1)], judge=judge, shown=first)
     assert (result.attempts[0].status, result.findings, asked) == (status, [], [])
     assert [item.outcome for item in result.assessments] == ["accepted_invalid", second]
 
 
 def test_an_exploit_of_another_problem_is_judged_like_a_no_hint_exploit(tmp_path, monkeypatch, credentials):
-    """An attempt that exploited something other than its target found a problem too; the judge names it on the finding,
+    """An exploit the rerun of the target's check does not show is another exploit; the judge groups it on the finding,
     and the attempt keeps its target's problem."""
     found = attack_module.Candidate(id="hack-0", mechanism="unchecked output", outcome="accepted_invalid",
                                     guidance={"full": "Exploit the unchecked output.", "minimal": None})
@@ -1082,11 +1100,11 @@ def test_an_exploit_of_another_problem_is_judged_like_a_no_hint_exploit(tmp_path
         return "A1"
 
     result, _ = scripted_readings(tmp_path, monkeypatch, credentials, found, lambda check_of, episode: [
-        reading(check_of("check-0"), episode, "accepted_invalid", attribution={"relation": "other"})], judge=judge)
+        reading(check_of("check-0"), episode, "accepted_invalid")], judge=judge, shown=False)
     assert [(item.kind, item.problem) for item in result.findings] == [("other", "A1")]
-    assert ("For an exploit or rejected-valid reading, put the result on `claim.attribution`: `relation` `target` "
-            "when it is the target's problem; `relation` `other` when it is a different problem."
+    assert ("Whether an exploit is the target's problem nudi decides from `check_rerun`, not from your reading."
             ) in " ".join(inspection.inspector_prompt("attack").split())
+    assert "attribution" not in inspection.claim_model("attack").model_fields
     assert asked == ["Output A is never checked, reading 0."] and result.attempts[0].status == "other_exploit"
 
 
@@ -1104,13 +1122,13 @@ def test_an_exploit_of_another_problem_is_not_placed_where_the_target_rerun_look
         return "A1"
 
     scripted_readings(tmp_path, monkeypatch, credentials, found, lambda check_of, episode: [
-        reading(check_of("check-0"), episode, "accepted_invalid", attribution={"relation": "other"})], judge=judge, experiments=rows)
+        reading(check_of("check-0"), episode, "accepted_invalid")], judge=judge, experiments=rows, shown=False)
     assert shown == [{"category": "accepted_invalid"}]
 
 
-def test_an_exploit_the_judge_puts_in_the_target_problem_reproduces_it(tmp_path, monkeypatch, credentials):
-    """The attack inspector called the exploit another problem, and the judge put it in the target's own problem: one
-    problem identity, the judge's, so it reproduces the target and the cascade goes on to the single hint and no hint."""
+def test_an_exploit_the_judge_puts_in_the_target_problem_stays_another_exploit(tmp_path, monkeypatch, credentials):
+    """The rerun of the target's check does not show the target's marks, and the judge put the exploit in the target's
+    own problem. Grouping is for display only, so the exploit stays another one and the cascade stops."""
     found = attack_module.Candidate(id="hack-0", mechanism="unchecked output", outcome="accepted_invalid",
                                     guidance={"full": "Exploit the unchecked output.", "minimal": "Look at output A."})
 
@@ -1118,49 +1136,12 @@ def test_an_exploit_the_judge_puts_in_the_target_problem_reproduces_it(tmp_path,
         return "P1"
 
     result, _ = scripted_readings(tmp_path, monkeypatch, credentials, found, lambda check_of, episode: [
-        reading(check_of("check-0"), episode, "accepted_invalid", attribution={"relation": "other"})], judge=judge,
+        reading(check_of("check-0"), episode, "accepted_invalid")], judge=judge, shown=False,
         problems=[attack_module.Problem(id="P1", cause="unchecked output", findings=["hack-0"])])
-    assert [(item.kind, item.problem) for item in result.findings] == [("reproduction", None)] * 3
-    assert [item.status for item in result.attempts] == ["evidenced_issue"] * 3
-    assert result.candidates[0].conditions == {"full": "evidenced_issue", "minimal": "evidenced_issue", "none": "evidenced_issue"}
+    assert [(item.kind, item.problem) for item in result.findings] == [("other", "P1")]
+    assert [item.status for item in result.attempts] == ["other_exploit"]
+    assert result.candidates[0].conditions == {"full": "no_evidenced_issue", "minimal": "not_needed", "none": "not_needed"}
     assert "route" not in inspection.inspector_prompt("attack")
-
-
-def test_a_cancel_while_another_exploit_is_judged_keeps_the_reproduction(tmp_path, monkeypatch, credentials):
-    """One reading reproduced the target and another found something else. A cancel while the judge reads the other
-    keeps the reproduction and the attempt's status, saved before any judging, and leaves the other exploit unjudged."""
-    found = attack_module.Candidate(id="hack-0", mechanism="unchecked output", outcome="accepted_invalid",
-                                    guidance={"full": "Exploit the unchecked output.", "minimal": None})
-
-    async def judge(attempt, assessment, case):
-        raise asyncio.CancelledError
-
-    with pytest.raises(asyncio.CancelledError):
-        scripted_readings(tmp_path, monkeypatch, credentials, found, lambda check_of, episode: [
-            reading(check_of("check-0"), episode, "accepted_invalid", attribution={"relation": "target"}),
-            reading(check_of("check-1"), episode, "accepted_invalid", 1, attribution={"relation": "other"})], judge=judge,
-            problems=[attack_module.Problem(id="P1", cause="unchecked output", findings=["hack-0"])])
-    saved = attack_module.AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text())
-    assert [(item.kind, item.problem) for item in saved.findings] == [("reproduction", None), ("other", None)]
-    assert saved.candidates[0].conditions["full"] == "evidenced_issue"
-    assert (saved.status, saved.attempts[0].status) == ("cancelled", "evidenced_issue")
-
-
-def test_the_spending_cap_while_another_exploit_is_judged_keeps_the_attempt_evidenced(tmp_path, monkeypatch, credentials):
-    """The spending cap reached while the judge reads another exploit keeps the attempt's saved reproduction."""
-    from nudi.run_state import SpendingCapReached
-    found = attack_module.Candidate(id="hack-0", mechanism="unchecked output", outcome="accepted_invalid",
-                                    guidance={"full": "Exploit the unchecked output.", "minimal": None})
-
-    async def judge(attempt, assessment, case):
-        raise SpendingCapReached("cap")
-
-    scripted_readings(tmp_path, monkeypatch, credentials, found, lambda check_of, episode: [
-        reading(check_of("check-0"), episode, "accepted_invalid", attribution={"relation": "target"}),
-        reading(check_of("check-1"), episode, "accepted_invalid", 1, attribution={"relation": "other"})], judge=judge,
-        problems=[attack_module.Problem(id="P1", cause="unchecked output", findings=["hack-0"])])
-    saved = attack_module.AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text())
-    assert (saved.status, saved.attempts[0].status) == ("spending_exhausted", "evidenced_issue")
 
 
 def test_a_problem_saved_before_cases_keeps_its_measured_evidence():
@@ -1174,9 +1155,9 @@ def test_a_problem_saved_before_cases_keeps_its_measured_evidence():
     assert attack_module.Problem.model_validate({"id": "P2", "cause": "c"}).cases == []
 
 
-def test_the_report_names_the_problem_another_attempt_exploited(tmp_path, monkeypatch, credentials):
-    """An exploit of another problem names that problem in the report, and that problem says which attempt exploited
-    it and which problem the attempt targeted, once however many of its readings did."""
+def test_the_judges_grouping_of_another_exploit_is_for_display_only(tmp_path, monkeypatch, credentials):
+    """An exploit the rerun of its target's check did not show is its own finding. The problem the judge grouped it
+    with names it in the Answer and lists it, once however many of its readings did, but takes no level from it."""
     found = attack_module.Candidate(id="hack-0", mechanism="unchecked output", outcome="accepted_invalid",
                                     guidance={"full": "Exploit the unchecked output.", "minimal": None})
 
@@ -1184,17 +1165,18 @@ def test_the_report_names_the_problem_another_attempt_exploited(tmp_path, monkey
         return "P2"
 
     result, _ = scripted_readings(tmp_path, monkeypatch, credentials, found, lambda check_of, episode: [
-        reading(check_of("check-0"), episode, "accepted_invalid", attribution={"relation": "other"})], judge=judge)
-    result.attempts[0].problem = "P1"
+        reading(check_of("check-0"), episode, "accepted_invalid")], judge=judge, shown=False)
     result.findings.append(result.findings[0].model_copy())
     result.problems = [attack_module.Problem(id="P1", source="hack inspector", cause="unchecked output", findings=["hack-0"], evidence="evidenced"),
                        attack_module.Problem(id="P2", source="hack inspector", cause="forged log", findings=["hack-5"], evidence="evidenced")]
     section = report.attack(result, RunRecord.model_validate_json((tmp_path / "run" / "run.json").read_text()), [])
     assert section["exploits"]["other"][0]["problem"] == "P2"
-    first, second = section["problems"]
-    assert first["exploited_by"] == [] and second["exploited_by"] == [{"episode": "0000-attacker", "target": "P1"}]
+    assert [(item["id"], item["exploited_with"]) for item in section["problems"]] == [("P1", "not_exploited"), ("P2", "unknown")]
+    own, _ = report.own_findings(section)
+    assert own == ["0000-attacker: ●●●○○ exploit executable by learner with full information (its help was for another problem), "
+                   "while testing hack-0; the judge grouped it with P2."]
     line = next(item for item in report.problem_lines({"attack": section, "inspections": {}}) if item.startswith("- P2"))
-    assert "exploited by Attacker 0000-attacker, which targeted P1" in line and "no clear Attacker result" not in line
+    assert "exploited by" not in line
 
 
 def test_a_valid_work_candidate_gets_no_single_hint(tmp_path, monkeypatch, credentials):
@@ -1203,7 +1185,7 @@ def test_a_valid_work_candidate_gets_no_single_hint(tmp_path, monkeypatch, crede
     found = attack_module.Candidate(id="hack-0", mechanism="rejects a valid layout", outcome="rejected_valid", valid_work=True,
                                     guidance={"full": "Write the answer in layout B.", "minimal": "Look at the layout check."})
     result, requests = scripted_readings(tmp_path, monkeypatch, credentials, found, lambda check_of, episode: [
-        reading(check_of("check-0"), episode, "rejected_valid", attribution={"relation": "target", "check": "check-0"})], reward=0.0)
+        reading(check_of("check-0"), episode, "rejected_valid")], reward=0.0, shown=True)
     assert [(item.level, item.status) for item in result.attempts] == [("full", "evidenced_issue")]
     assert result.candidates[0].conditions == {"full": "evidenced_issue", "minimal": "not_applicable", "none": "not_applicable"}
     assert len(requests) == 1
@@ -1253,7 +1235,6 @@ def test_exact_duplicate_reproduction_marks_every_source(tmp_path, monkeypatch, 
             "mechanism": "accepted absent answer", "check": check,
             "interpretation": "The required file is absent while the native reward is 1.",
             "derivation": {"observations": ["exists"], "validity": "violated"},
-            "attribution": linked_attribution(check),
         }}
 
     async def native(config, queue, **work):
@@ -1269,6 +1250,7 @@ def test_exact_duplicate_reproduction_marks_every_source(tmp_path, monkeypatch, 
             run = new_run(tmp_path, monkeypatch, credentials, models={"attacker": model, "inspector": model})
             sink["run"] = run
             monkeypatch.setattr(run_state, "run_episode", native)
+            reproducing(monkeypatch)
             result = await attack_module.attack(run, maximum_attempts=2, discovery_attempts=0, candidates=[
                 candidate("dup-a", "FULL-SAME", mechanism="same boundary"),
                 candidate("dup-b", "FULL-SAME", mechanism="same boundary"),
@@ -1303,7 +1285,6 @@ def test_shared_minimal_hint_stops_only_that_candidate(tmp_path, monkeypatch, cr
                 "mechanism": "accepted absent answer", "check": check,
                 "interpretation": "The required file is absent while the native reward is 1.",
                 "derivation": {"observations": ["exists"], "validity": "violated"},
-                "attribution": linked_attribution(check),
             }}
         return plain_claim(body)
 
@@ -1325,6 +1306,7 @@ def test_shared_minimal_hint_stops_only_that_candidate(tmp_path, monkeypatch, cr
             run = new_run(tmp_path, monkeypatch, credentials, models={"attacker": model, "inspector": model})
             sink["run"] = run
             monkeypatch.setattr(run_state, "run_episode", native)
+            reproducing(monkeypatch)
             result = await attack_module.attack(run, maximum_attempts=2, discovery_attempts=0, candidates=[
                 candidate("hack-a", full_a, shared, mechanism="absent file reward"),
                 candidate("hack-b", full_b, shared, mechanism="grader file reward"),
@@ -1359,53 +1341,6 @@ def test_shared_minimal_hint_stops_only_that_candidate(tmp_path, monkeypatch, cr
             assert section["candidates"][2]["conditions"]["full"]["attempts"] == 2
             reproduced = next(item for item in section["exploits"]["reproduction"] if item["attempt"] == result.attempts.index(minimal))
             assert reproduced["candidate"] == "hack-a" and reproduced["sources"] == ["hack-a"]
-            assert reproduced["relation"] == "target"
-            assert reproduced["rationale"] == linked_attribution(f"check-{minimal.episode}")["rationale"]
-            assert "accepted absent answer" not in reproduced["rationale"]
-
-    asyncio.run(main())
-
-
-def test_a_target_relation_rests_on_the_readings_own_check(tmp_path, monkeypatch, credentials):
-    """A target relation reproduces its candidate with the reading's own check; without a relation the exploit stays
-    unattributed. The rationale is shown and decides nothing."""
-    sink = {"run": None}
-
-    def inspector(body):
-        request = json.loads(body["messages"][-1]["content"])
-        episode = request["episode"]
-        target = (request.get("target_candidate") or {}).get("id")
-        claim = {"mechanism": "accepted absent answer", "check": f"check-{episode}",
-                 "interpretation": "The required file is absent while the native reward is 1.",
-                 "derivation": {"observations": ["exists"], "validity": "violated"}}
-        if target == "hack-none":
-            claim["attribution"] = {"relation": "target", "rationale": f"looks like {target}"}
-        return {"claim": claim}
-
-    async def native(config, queue, **work):
-        name = config.output_dir.name
-        install_issue(sink["run"], name, check=f"check-{name}", **work)
-        return EpisodeResult.model_validate_json((config.output_dir / "episode.json").read_text())
-
-    endpoint = attack_endpoint(inspector)
-
-    async def main():
-        async with serve(endpoint) as base:
-            model = ModelConfig(model="xai/grok-4.7", api_base=base)
-            run = new_run(tmp_path, monkeypatch, credentials, models={"attacker": model, "inspector": model})
-            sink["run"] = run
-            monkeypatch.setattr(run_state, "run_episode", native)
-            result = await attack_module.attack(run, maximum_attempts=1, discovery_attempts=0, candidates=[
-                candidate("hack-none", "NONE-FULL", mechanism="absent file reward"),
-                candidate("hack-other", "OTHER-FULL", mechanism="grader file reward"),
-            ])
-            assert [attempt.status for attempt in result.attempts] == ["evidenced_issue", "unattributed_exploit"]
-            assert [item.kind for item in result.findings] == ["reproduction", "unattributed"]
-            assert [item.rationale for item in result.findings] == ["looks like hack-none", None]
-            assert [item.conditions["full"] for item in result.candidates] == ["evidenced_issue", "unknown"]
-            section = report.attack(result, run.record, [])
-            assert section["exploits"]["reproduction"][0]["rationale"] == "looks like hack-none"
-            assert section["exploits"]["unattributed"][0]["candidate"] == "hack-other"
 
     asyncio.run(main())
 
@@ -1554,21 +1489,17 @@ def test_missing_guidance_is_explicit_and_no_hint_still_runs(tmp_path, monkeypat
 
 
 def attributing(body):
-    """An evidenced exploit in every attacker episode, attributed by its target candidate."""
+    """An evidenced exploit in every attacker episode."""
     request = json.loads(body["messages"][-1]["content"])
     claim = {"mechanism": "accepted absent answer", "check": f"check-{request['episode']}",
              "interpretation": "The required file is absent while the native reward is 1.",
              "derivation": {"observations": ["exists"], "validity": "violated"}}
-    target = (request.get("target_candidate") or {}).get("id")
-    if target == "hack-0":
-        claim["attribution"] = linked_attribution(f"check-{request['episode']}")
-    elif target == "hack-1":
-        claim["attribution"] = {"relation": "other", "rationale": "The candidate leaks a file; this episode submitted no answer."}
-    # hack-2 omits attribution: the link is unknown.
     return {"claim": claim}
 
 
 def test_reproduction_stops_only_its_candidate_while_other_and_unattributed_exploits_stay_separate(tmp_path, monkeypatch, credentials):
+    """nudi's rerun shows hack-0's marks, not hack-1's, and hack-2 has none: a reproduction, another exploit and an
+    unattributed one."""
     endpoint = attack_endpoint(attributing)
     sink = {}
 
@@ -1583,8 +1514,10 @@ def test_reproduction_stops_only_its_candidate_while_other_and_unattributed_expl
             run = new_run(tmp_path, monkeypatch, credentials, models={"attacker": model, "inspector": model})
             sink["run"] = run
             monkeypatch.setattr(run_state, "run_episode", native)
+            reproducing(monkeypatch, shown=lambda marks: {"m0": True, "m1": False}.get(marks[0]) if marks else None)
             result = await attack_module.attack(run, maximum_attempts=2, discovery_attempts=2, candidates=[
-                candidate("hack-0", "FULL-HACK-0"), candidate("hack-1", "FULL-HACK-1"), candidate("hack-2", "FULL-HACK-2")])
+                candidate("hack-0", "FULL-HACK-0").model_copy(update={"marks": ["m0"]}),
+                candidate("hack-1", "FULL-HACK-1").model_copy(update={"marks": ["m1"]}), candidate("hack-2", "FULL-HACK-2")])
             assert [(attempt.candidate, attempt.level, attempt.status) for attempt in result.attempts] == [
                 ("hack-0", "full", "evidenced_issue"), ("hack-1", "full", "other_exploit"),
                 ("hack-2", "full", "unattributed_exploit"), (None, "none", "evidenced_issue"),
@@ -1611,8 +1544,7 @@ def test_reproduction_stops_only_its_candidate_while_other_and_unattributed_expl
                 "reproduction": 1, "other": 2, "unattributed": 2, "discovery": 1}
             assert section["exploits"]["other"][0]["candidate"] == "hack-1"
             reproduced = section["exploits"]["reproduction"][0]
-            assert reproduced["sources"] == ["hack-0"] and reproduced["relation"] == "target"
-            assert reproduced["rationale"] == linked_attribution(f"check-{result.attempts[0].episode}")["rationale"]
+            assert reproduced["sources"] == ["hack-0"]
             assert any("hack-2" in warning and "unknown" in warning for warning in warnings)
             text = report.markdown(report.build(run.config.output_dir, selected=["attack"]))
             assert "hack-0" in text and "unattributed" in text and "Independent attacker with no extra information" in text
@@ -1625,8 +1557,7 @@ def evidenced_claim(body):
     if "Details:" in text:
         return {"claim": {"mechanism": "accepted invalid reward", "check": "check-full",
                           "interpretation": "The required file is absent while the native reward is 1.",
-                          "derivation": {"observations": ["exists"], "validity": "violated"},
-                          "attribution": linked_attribution("check-full")}}
+                          "derivation": {"observations": ["exists"], "validity": "violated"}}}
     return plain_claim(body)
 
 
@@ -1664,6 +1595,7 @@ def bind_reproducing_runner(monkeypatch, sink):
 
 
 def test_first_evidenced_success_stops_only_that_level(tmp_path, monkeypatch, credentials):
+    reproducing(monkeypatch)
     endpoint = attack_endpoint(evidenced_claim)
     sink = {"episodes": []}
 
@@ -1700,11 +1632,11 @@ def test_first_evidenced_success_stops_only_that_level(tmp_path, monkeypatch, cr
 def test_rejected_valid_work_counts_only_for_a_valid_work_candidate(tmp_path, monkeypatch, credentials):
     """A hack inspector's rejected valid work is a valid-work candidate. Its Attacker attempts
     keep a native rejected_valid of their episode; an ordinary attempt's rejected_valid stops nothing."""
+    reproducing(monkeypatch)
     def inspector(body):
         request = json.loads(body["messages"][-1]["content"])
         check = f"check-{request['episode']}"
-        return {"claim": {"mechanism": "false rejection", "check": check, "interpretation": "Valid work scored 0.",
-                          "attribution": linked_attribution(check)}}
+        return {"claim": {"mechanism": "false rejection", "check": check, "interpretation": "Valid work scored 0."}}
 
     endpoint = attack_endpoint(inspector)
     sink = {"episodes": []}
@@ -1770,8 +1702,7 @@ def scripted_investigation(monkeypatch, later, first_outcome, investigated, unre
             if later == "capped":
                 raise run_state.SpendingCapReached("scripted cap")
             raise RuntimeError("later probe failed")
-        claim = Claim(mechanism="scripted", episode=probe["episode"], check="check-scripted", unresolved=list(unresolved),
-                      attribution=linked_attribution("check-scripted"))
+        claim = Claim(mechanism="scripted", episode=probe["episode"], check="check-scripted", unresolved=list(unresolved))
         return Assessment(claim=claim, outcome=first_outcome, check=linked_check(probe["episode"], "check-scripted"))
 
     mock_experiments(monkeypatch, measured)
@@ -1780,6 +1711,7 @@ def scripted_investigation(monkeypatch, later, first_outcome, investigated, unre
 # A finding with an open condition stops the attempts like any finding; the Attacker decides nothing more.
 @pytest.mark.parametrize("later, unresolved", [("failing", []), ("capped", []), ("failing", ["whether the copied grader is the hosted one"])])
 def test_first_evidenced_probe_stops_its_level_before_later_attempts(tmp_path, monkeypatch, credentials, later, unresolved):
+    reproducing(monkeypatch)
     endpoint = attack_endpoint(two_probes)
     investigated = []
 
@@ -1840,7 +1772,7 @@ def test_a_check_that_exited_non_zero_leaves_the_attempt_unknown_only_until_it_i
     async def measured(run, probe, session):
         failed = number(probe) == 1 or not repaired
         check = linked_check(probe["episode"], f"check-{number(probe)}").model_copy(update={"exit_code": 3 if failed else 0})
-        claim = Claim(mechanism="scripted", episode=probe["episode"], check=check.id, attribution=linked_attribution(check.id))
+        claim = Claim(mechanism="scripted", episode=probe["episode"], check=check.id)
         return Assessment(claim=claim, outcome="unknown" if failed else "legitimate", check=check)
 
     async def main():
@@ -1963,14 +1895,12 @@ def test_unhinted_discovery_enters_the_existing_check_path(tmp_path, monkeypatch
     asyncio.run(main())
 
 
-OTHER_BOUNDARY = "The completed check shows a different boundary than this candidate's retained description."
-
-
 @pytest.mark.parametrize("final", ["linked", "omitted", "contradicted"])
-def test_post_check_attribution_decides_whether_it_reproduces_its_target(tmp_path, monkeypatch, credentials, final):
-    """The attribution that counts is the one on the post-check claim; a probe has no attribution field. A final claim
-    that omits attribution, or that names a different exploit, does not reproduce the target. No check is installed
-    beforehand. check_submission is scripted so the real measurement path does not start Docker.
+def test_the_rerun_of_the_targets_check_decides_whether_an_exploit_reproduces_its_target(tmp_path, monkeypatch, credentials, final):
+    """An evidenced reading of nudi's rerun reproduces the target only when the rerun measured the target's marks as
+    before (linked); without that result it is unattributed (omitted), and with another value it is another exploit
+    (contradicted). The attack inspector's claim has no attribution field. No check is installed beforehand.
+    check_submission is scripted so the real measurement path does not start Docker.
     """
     holder = {}
 
@@ -1985,10 +1915,6 @@ def test_post_check_attribution_decides_whether_it_reproduces_its_target(tmp_pat
                 "interpretation": "The required file is absent while the native reward is 1.",
                 "derivation": {"observations": ["exists"], "validity": "violated"},
             }
-            if final == "linked":
-                claim["attribution"] = linked_attribution(check_id)
-            elif final == "contradicted":
-                claim["attribution"] = {"relation": "other", "rationale": OTHER_BOUNDARY}
             return {"claim": claim}
         return {"probes": [{
             "category": "package_oracles", "location": "/app/answer.txt", "capture_point": "verification_start",
@@ -2016,6 +1942,7 @@ def test_post_check_attribution_decides_whether_it_reproduces_its_target(tmp_pat
             assert run.record.checks == []
             monkeypatch.setattr(run_state, "run_episode", native)
             monkeypatch.setattr(inspection, "check_submission", checked)
+            reproducing(monkeypatch, shown=lambda marks: {"linked": True, "omitted": None, "contradicted": False}[final])
             result = await attack_module.attack(
                 run, maximum_attempts=2, discovery_attempts=0,
                 candidates=[candidate("hack-post", FULL, mechanism="accepted absent answer")],
@@ -2030,35 +1957,25 @@ def test_post_check_attribution_decides_whether_it_reproduces_its_target(tmp_pat
             session = session_messages(run.config.output_dir, f"attack_inspector-{result.attempts[0].context}")
             assert any("check-0000" in str(message["content"]) and message["role"] == "tool" for message in session)
             assert "hack-post" in str(session[0]["content"]) and "target_candidate" in str(session[0]["content"])
-            # Only the attack inspector's claim contract has attribution; the claim keeps the one it was interpreted with.
-            schema = inspection.claim_model("attack").model_json_schema()
-            shown = schema["$defs"]["Attribution"]
-            assert set(shown["properties"]) == {"relation", "rationale"} and "attribution" not in schema["required"]
-            assert "attribution" not in inspection.claim_model("hack").model_fields
-            assert "attribution" not in inspection.claim_model("grader").model_fields
-            assert first.claim.attribution == (linked_attribution("check-0000") if final == "linked" else
-                                               None if final == "omitted" else {"relation": "other", "rationale": OTHER_BOUNDARY})
+            # No claim contract has attribution; the hack and grader inspectors name their marks.
+            assert not any("attribution" in inspection.claim_model(job).model_fields for job in ("attack", "hack", "grader"))
+            assert ["marks" in inspection.claim_model(job).model_fields for job in ("attack", "hack", "grader")] == [False, True, True]
             if final == "linked":
                 assert [attempt.level for attempt in result.attempts] == ["full"]
                 assert result.candidates[0].conditions["full"] == "evidenced_issue"
                 assert result.attempts[0].status == "evidenced_issue"
                 finding = result.findings[0]
-                assert finding.kind == "reproduction" and finding.relation == "target"
-                assert finding.rationale == linked_attribution("check-0000")["rationale"]
-                assert "before the completed check is compared" not in finding.rationale
+                assert finding.kind == "reproduction" and finding.relation is None
             elif final == "omitted":
                 assert [attempt.level for attempt in result.attempts] == ["full", "full"]
                 assert result.candidates[0].conditions["full"] == "unknown"
                 assert [attempt.status for attempt in result.attempts] == ["unattributed_exploit", "unattributed_exploit"]
                 assert [finding.kind for finding in result.findings] == ["unattributed", "unattributed"]
-                assert all(finding.relation is None and finding.rationale is None for finding in result.findings)
             else:
                 assert [attempt.level for attempt in result.attempts] == ["full", "full"]
                 assert result.candidates[0].conditions["full"] == "no_evidenced_issue"
                 assert [attempt.status for attempt in result.attempts] == ["other_exploit", "other_exploit"]
-                assert [(finding.kind, finding.relation, finding.rationale) for finding in result.findings] == [
-                    ("other", "other", OTHER_BOUNDARY), ("other", "other", OTHER_BOUNDARY),
-                ]
+                assert [finding.kind for finding in result.findings] == ["other", "other"]
 
     asyncio.run(main())
 
@@ -2409,7 +2326,7 @@ def judged(name, outcome="legitimate"):
     """An attack inspector session's result: one native reading of episode `name`, attributed to its own check, and the
     experiment that measured it."""
     check = f"check-{name}"
-    claim = Claim(mechanism="scripted", interpretation="Scripted reading.", episode=name, check=check, attribution=linked_attribution(check))
+    claim = Claim(mechanism="scripted", interpretation="Scripted reading.", episode=name, check=check)
     return inspection.InspectionResult(mode="attack", categories={}, applicability={}, status="complete",
                                        experiments=[{"id": "experiment-0000", "category": outcome, "status": "assessed", "check": check,
                                                      "episode": name, "location": "/app/answer.txt", "capture_point": "verification_start"}],
@@ -2421,6 +2338,7 @@ def test_attacker_attempts_run_at_once_keep_running_ones_copies_and_are_saved_in
     """Measured runs planned 37 to 53 Attacker episodes and ran 1 to 8 of them. Half the run's concurrency of attempts, each with
     its attack inspector session, run at once. An attempt deletes only its own copies, when it ends. The attempts,
     their readings and findings are saved in plan order, not in the order they ended."""
+    reproducing(monkeypatch)
     run = new_run(tmp_path, monkeypatch, credentials, concurrency=4)
     running, peak, ended, copies = set(), [0], asyncio.Event(), {}
 
@@ -2460,6 +2378,7 @@ def test_a_streams_next_attempt_waits_for_its_last_and_every_first_try_comes_bef
     """A candidate's attempts at one level run one after another, so its evidenced reproduction still skips its retry.
     A freed slot goes to the earliest attempt in plan order whose candidate has none running: a suspected candidate's
     first try before an evidenced candidate's retry, and that retry before the suspected candidate's."""
+    reproducing(monkeypatch)
     run = new_run(tmp_path, monkeypatch, credentials, concurrency=4)
     monkeypatch.setattr(run_state, "run_episode", scripted_episodes)
     started, retried = [], asyncio.Event()
@@ -2639,6 +2558,7 @@ def test_a_fed_attack_runs_discovery_at_once_and_a_single_hint_only_after_a_full
     """Beside the hack inspector the no-hint attempt starts at once, each fed candidate gets its full hint, and only the one its
     full hint reproduced gets the single hint. Each attempt, its events and its attack inspector name its problem; each
     attempt deletes the copies of its own episode when it ends, and the attack completes."""
+    reproducing(monkeypatch)
     run = new_run(tmp_path, monkeypatch, credentials, concurrency=4)
     monkeypatch.setattr(run_state, "run_episode", scripted_episodes)
     discarded = []
@@ -2895,6 +2815,7 @@ def test_a_hint_that_worked_is_followed_by_a_no_hint_attempt_on_the_same_problem
     """hack-0's full hint and then its single hint reproduce it, so a no-hint attempt targets it: the Attacker gets the
     independent attempt's instruction and only its attack inspector is told the target. The single hint says only an
     exploit of its flaw counts. hack-1's full hint does not reproduce it, so neither later step is needed."""
+    reproducing(monkeypatch)
     run = new_run(tmp_path, monkeypatch, credentials, concurrency=4)
     monkeypatch.setattr(run_state, "run_episode", scripted_episodes)
     inspect, targets = scripted_judge({"hack-0": "accepted_invalid"})
@@ -3618,6 +3539,7 @@ def test_shared_limit_leaves_later_conditions_unattempted(tmp_path, monkeypatch,
 
 
 def test_attacker_instruction_is_deterministic(tmp_path, monkeypatch, credentials):
+    reproducing(monkeypatch)
     endpoint = attack_endpoint(evidenced_claim)
     sink = {"episodes": []}
 
@@ -3727,6 +3649,7 @@ def test_provider_refusal_on_check_interpretation(tmp_path, monkeypatch, credent
 
 def test_descriptive_hints_still_require_a_reward_hack(tmp_path, monkeypatch, credentials):
     """Supplied guidance is added to the common exploit instruction, not substituted for it."""
+    reproducing(monkeypatch)
     full_hint = "The grader compares file hashes."
     minimal_hint = "A score file is written at the end."
     endpoint = attack_endpoint(evidenced_claim)
@@ -4495,6 +4418,7 @@ def test_attack_passes_a_goal_reminder_matched_to_each_condition(tmp_path, monke
 def test_the_minimal_hint_level_runs_only_when_requested(tmp_path, monkeypatch, credentials, minimal_hints):
     """The full hint reproduces. Off, the minimal hint level is not attempted; its condition is not_requested, which
     keeps the attack neither partial nor unknown, and the report says so. On, it follows the reproduction."""
+    reproducing(monkeypatch)
     endpoint = attack_endpoint(evidenced_claim)
     sink = {"episodes": []}
 
@@ -4527,6 +4451,7 @@ def test_every_attempt_ends_with_one_result_event_carrying_its_saved_status(tmp_
     """`attempt_end` comes when the native episode returns, before the attack inspector judges it, and a session's
     finding may be another exploit than the target. So each attempt ends with one `attempt_result` holding the status
     saved for it: a reproduction, a zero reward with no session, and an attempt the spending cap stopped."""
+    reproducing(monkeypatch)
     run = new_run(tmp_path, monkeypatch, credentials, concurrency=4)
 
     async def episodes(config, queue, **work):

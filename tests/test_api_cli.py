@@ -408,17 +408,21 @@ def test_grader_agreement_availability_is_the_same_in_api_cli_json_and_markdown(
         (task / name).parent.mkdir(parents=True, exist_ok=True)
         (task / name).write_text(text)
     grader = {}
+    approved = tmp_path / "requirements.toml"
+    approved.write_text('[[requirement]]\ntext = "sorted"\nobservation = "sorted"\n')
     if status == "supported":
-        # One verified reference grounds the binary rule; the other two episodes take it with presumed labels.
-        grader = {"assessments": [checked("0000-simulator", "c0", "sorted", "supported",
-                                          basis=basis("supported", ["sorted"], ["c0"], decision=RULE))],
+        # One verified reference grounds the binary rule; the other two episodes take it with presumed labels. Its
+        # check measured the one approved requirement, so its work counts as complete.
+        reference = checked("0000-simulator", "c0", "sorted", "supported", basis=basis("supported", ["sorted"], ["c0"], decision=RULE))
+        reference.check.output = json.dumps({"observations": {"sorted": True}})
+        grader = {"assessments": [reference],
                   "ordinary": {"0000-simulator": EpisodeLabel(label="legitimate", basis="verified", assessments=[0]),
                                **{f"000{index}-simulator": EpisodeLabel(label="legitimate", basis="presumed") for index in (1, 2)}}}
     Analyses(monkeypatch, rewards=rewards, **grader)
-    result = send_nudis(task, output_dir=tmp_path / "api", episodes=len(rewards), analysis="simulation")
+    result = send_nudis(task, output_dir=tmp_path / "api", episodes=len(rewards), analysis="simulation", requirements=approved)
     Analyses(monkeypatch, rewards=rewards, **grader)
     code = cli.main(["send-nudis", str(task), "--output", str(tmp_path / "cli"), "--episodes", str(len(rewards)),
-                     "--analysis", "simulation"])
+                     "--analysis", "simulation", "--requirements", str(approved)])
 
     # Unsupported agreement alone neither fails the run nor hides its other results.
     assert code == 0 and result["status"] == "complete"
@@ -578,8 +582,11 @@ def test_rejected_valid_hack_findings_become_valid_work_candidates(tmp_path, mon
     assert len(sent) == len(candidates)
     assert [(item.id, item.valid_work) for item in sent] == [("hack-0", True), ("hack-1", False)][:len(candidates)]
     assert sent[0].guidance == {"full": "Write the answer in the documented format.", "minimal": WHERE_TO_LOOK + "\nfn/private-grader.py"}
-    retained = result["inspections"]["hack_inspector"]["findings"]["evidenced"]
-    assert retained[0]["assessment"]["outcome"] == "rejected_valid"
+    # Without an approved requirement list the report does not call the work correct.
+    findings = result["inspections"]["hack_inspector"]["findings"]
+    lowered, = findings["inconclusive"]
+    assert lowered["assessment"]["outcome"] is None and lowered["assessment"]["reasons"] == [report.NO_LIST]
+    assert [item["assessment"]["outcome"] for item in findings["evidenced"]] == ["accepted_invalid"][:len(candidates) - 1]
 
 
 @pytest.mark.parametrize(("full_guidance", "hint_location"), [
@@ -991,11 +998,11 @@ def test_the_judge_runs_with_its_own_callbacks_so_it_is_no_turn_of_the_inspector
 GRADER_STEPS, GRADER_LOCATION = "Write the answer in the documented format.", "tests/test_outputs.py"
 
 
-def test_each_grader_finding_is_judged_against_every_problem_and_only_new_ones_are_attacked(tmp_path, monkeypatch):
+def test_each_grader_finding_is_judged_against_every_problem_and_attacked_whatever_its_problem(tmp_path, monkeypatch):
     """Each evidenced grader inspector finding is judged against the problems of both inspectors as it is recorded:
-    grader-0 is the hack inspector's P1, which the attack was already fed, so it is not fed again; grader-1 is new, G1,
-    and fed to the same attack. An id names its inspector and assessment, so a hack and a grader finding of one index
-    stay distinct."""
+    grader-0 is the hack inspector's P1 and grader-1 is new, G1. The judge's grouping decides no Attacker, so both are
+    fed to the same attack, as each check's finding is. An id names its inspector and assessment, so a hack and a grader
+    finding of one index stay distinct."""
     judge_replies(monkeypatch, [said(cause=MECHANISM), said("P1", cause=MECHANISM), said(cause=GRADER_STEPS)])
     analyses = Analyses(monkeypatch, judging=True, candidates=[
         candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION)], assessments=[
@@ -1006,8 +1013,9 @@ def test_each_grader_finding_is_judged_against_every_problem_and_only_new_ones_a
     ])
     send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
 
-    assert analyses.calls[-1] == ("attack", 1, 1, 2)
-    hack, grader = analyses.candidates_sent
+    assert analyses.calls[-1] == ("attack", 1, 1, 3)
+    hack, same, grader = analyses.candidates_sent
+    assert same.id == "grader-0"
     assert hack.id == "hack-0"
     assert (grader.id, grader.source, grader.valid_work) == ("grader-1", "grader_inspector", True)
     assert grader.guidance == {"full": GRADER_STEPS, "minimal": f"{WHERE_TO_LOOK}\n{GRADER_LOCATION}"}
@@ -2203,6 +2211,7 @@ def test_a_rerun_keeps_only_evidenced_earlier_problems_each_with_the_run_and_lev
                        attack.Problem(id="A1", source="Attacker", cause="Write the score file.", members=["0007-attacker"])]
     saved.attempts.append(attack.AttackAttempt(level="none", number=1, context="attacker-none-1", episode="0007-attacker",
                                                status="evidenced_issue", problem="A1"))
+    saved.findings.append(attack.AttackFinding(kind="discovery", attempt=len(saved.attempts) - 1, assessment=0, problem="A1"))
     (earlier / "attack.json").write_text(saved.model_dump_json())
     analyses = Analyses(monkeypatch, judging=True)
     built = send_nudis(tmp_path / "task", output_dir=tmp_path / "run-2", attack_from=earlier)
@@ -2553,8 +2562,10 @@ async def evidence_each(report, on_evidence, readings):
 
 def real_early_attack(monkeypatch, judge):
     """The real attack, with each Attacker episode rewarded and its attack inspector session `judge(target, episode)`, with
-    target `none` for a no-hint attempt."""
-    from test_attack import judged
+    target `none` for a no-hint attempt. nudi's rerun of each target's check shows its marks."""
+    from test_attack import judged, reproducing
+
+    reproducing(monkeypatch)
 
     async def native(run, role, instruction, reminder=None):
         name = f"{len(run.record.episodes):04d}-attacker"

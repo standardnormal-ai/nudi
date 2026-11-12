@@ -30,15 +30,15 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter
 
 from nudi import copies, report
 from nudi.attack import FULL_UNAVAILABLE, MINIMAL_UNAVAILABLE, AttackResult, Candidate, Problem, attack
 from nudi.checks import finish_cleanup, redacted
 from nudi.inspection import InspectionResult, at_once, evidenced, finding_view, inspect_grader, inspect_hacks
 from nudi.episode import UnsupportedTask, check_backend, check_output, select_path, tree_digest
-from nudi.records import (DEFAULT_MODELS, Assessment, DiskFull, EnvironmentUnavailable, RunConfig, RunRecord, SandboxResult, private_dir,
-                          write_private)
+from nudi.records import (DEFAULT_MODELS, Assessment, DiskFull, EnvironmentUnavailable, Requirement, RunConfig, RunRecord, SandboxResult,
+                          private_dir, write_private)
 from nudi.run_state import (ORIGINAL_BEHAVIOR, BackendUnavailable, CapacityError, Slots, declared_requirements, elapsed, environment, event, events_lock,
                             simulate, start_run)
 
@@ -118,6 +118,9 @@ class AnalysisConfig(RunConfig):
     """Attempt each candidate whose full hint reproduced its exploit with the minimal hint too. On by default."""
     attack_from: Path | None = None
     """An earlier run of the same task, only read: this run copies its inspection records and runs only the attack."""
+    requirements: Path | None = None
+    """A TOML file of the task's requirements a person approved, each a `[[requirement]]` table with its `text` and the
+    `observation` of a check that measures it. Without it the report calls no work correct and no route a violation of the task."""
 
 
 def configure(task_dir, config, options: dict) -> AnalysisConfig:
@@ -127,10 +130,18 @@ def configure(task_dir, config, options: dict) -> AnalysisConfig:
     if config is not None:
         config = Path(config)
         values = tomllib.loads(config.read_text())
-        for key in ("output_dir", "credentials_file", "attack_from"):
+        for key in ("output_dir", "credentials_file", "attack_from", "requirements"):
             if isinstance(values.get(key), str):
                 values[key] = config.parent / values[key]
     return AnalysisConfig.model_validate({**values, **options, "task_dir": task_dir})
+
+
+def approved(path: Path) -> list[Requirement]:
+    """The approved requirement list in the TOML file at `path`: at least one requirement, each with its own observation."""
+    items = TypeAdapter(list[Requirement]).validate_python(tomllib.loads(path.read_text()).get("requirement"))
+    if not items or len({item.observation for item in items}) != len(items):
+        raise ValueError(f"{path} must list at least one requirement, each with its own observation")
+    return items
 
 
 WHERE_TO_LOOK = (
@@ -187,6 +198,7 @@ def guidance(hack: InspectionResult | None = None, grader: InspectionResult | No
                 id=f"{prefix}-{index}", mechanism=item.claim.mechanism, check=item.claim.check, category=row.get("category"), location=row.get("location"),
                 outcome=item.outcome, guidance={"full": full, "minimal": None if location is None else WHERE_TO_LOOK + "\n" + location},
                 unavailable=unavailable, valid_work=item.outcome == "rejected_valid", source=f"{prefix}_inspector",
+                marks=item.claim.marks,
             ))
     # A stable sort keeps record order within the evidenced and the suspected candidates.
     candidates.sort(key=lambda item: item.outcome == "unknown")
@@ -427,6 +439,7 @@ async def send_nudis_async(task_dir, config=None, **options) -> dict:
     if settings.output_dir.exists() and any(settings.output_dir.iterdir()):
         raise ValueError(f"output directory {settings.output_dir} is not empty; choose a new or empty directory")
     selected, roles, earlier, results = SELECTED[settings.analysis], ROLES[settings.analysis], None, {}
+    requirements = approved(settings.requirements) if settings.requirements else None
     if settings.attack_from:
         # Resolved once, before every check and the copy: `.` and a link such as `runs/latest` name the folder they point to.
         settings.attack_from = settings.attack_from.resolve()
@@ -436,6 +449,7 @@ async def send_nudis_async(task_dir, config=None, **options) -> dict:
                          if name in results or name in earlier.failed_phases or name == "attack")
         roles = ROLES["hacking"]
     run = start_run(settings, roles, ("attack",) if earlier else selected)  # The analyses that will run.
+    run.record.requirements = requirements
     # The log's last event says how the run ended, also when it was cancelled or stopped, or a rerun's copy failed.
     try:
         if earlier:
@@ -517,7 +531,7 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
     judge = judging(run, problems)
     # One set of slots for the run: each Simulator episode, inspector session and Attacker attempt holds one.
     gate = Slots(at_once(run))
-    # The attack's one feed of candidates, a problem's first evidenced finding with full guidance, until None.
+    # The attack's one feed of candidates, each check's first evidenced finding with full guidance, until None.
     feed, queued = asyncio.Queue(), set()
 
     async def exploit(attempt, assessment, case) -> str:
@@ -550,10 +564,10 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
         return next((other for other in guidance(**{inspector: live[inspector]})["candidates"]
                      if (other.check or other.id) == (item.check or item.id)), None)
 
-    def attack_on(item, problem) -> None:
-        """Feed a problem's first finding with full guidance to the attack."""
-        if problem.id not in queued and item.guidance["full"]:
-            queued.add(problem.id)
+    def attack_on(item) -> None:
+        """Feed each check's first finding with full guidance to the attack; how the judge grouped it decides nothing."""
+        if (item.check or item.id) not in queued and item.guidance["full"]:
+            queued.add(item.check or item.id)
             feed.put_nowait(item)
 
     def found(inspector: str):
@@ -566,7 +580,8 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
             # A control's reading is no candidate, so it makes no problem.
             item = next((item for item in guidance(**{inspector: report})["candidates"] if item.id == f"{inspector}-{index}"), None)
             if item:
-                attack_on(item, await evidence(inspector, report, item))
+                await evidence(inspector, report, item)
+                attack_on(item)
                 if "attack" in results:  # The attack has returned, as at the spending cap: its record keeps the problem, not attacked.
                     write_private(run.config.output_dir / "attack.json",
                                   results["attack"].model_copy(update={"problems": problems}).model_dump_json(indent=2))
@@ -575,14 +590,14 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
 
     async def earlier_targets():
         """A rerun's targets in the feed. Each grader finding, and each hack finding no problem holds, as in a rerun of a
-        run from before problems were judged, is judged against every problem. Each evidenced problem is attacked with its
-        first finding with full guidance. A rerun starts from the earlier run's judged problems that were evidenced or that
+        run from before problems were judged, is judged against every problem. Each evidenced problem's findings with full
+        guidance are attacked, once per check. A rerun starts from the earlier run's judged problems that were evidenced or that
         an Attacker found, each with that run and the least information an Attacker exploited it with there; their
         judgements and evidence its log repeats. It copies no attack record."""
         before = settings.attack_from / "attack.json"
         if before.is_file():
             older = AttackResult.model_validate_json(before.read_text())
-            problems.extend(item.model_copy(update={"origin": str(settings.attack_from), "earlier_exploited_with": report.exploited_with(item, older, set())})
+            problems.extend(item.model_copy(update={"origin": str(settings.attack_from), "earlier_exploited_with": report.exploited_with(item, report.counted(older), set())})
                             for item in older.problems if item.id and (item.evidence == "evidenced" or any(name.endswith("-attacker") for name in item.members)))
             for problem in problems:  # Replayed for this log alone, with no judge call.
                 for index, name in enumerate(problem.members):
@@ -602,7 +617,7 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
             if problem.evidence == "evidenced":
                 for name in problem.findings:
                     if name in by_id:
-                        attack_on(by_id[name], problem)
+                        attack_on(by_id[name])
 
     async def closing():
         """None in the feed once the inspections that feed it have ended."""
@@ -867,6 +882,8 @@ async def send_environments_async(task_dirs, config=None, **options) -> dict:
         raise ValueError(f"output directory {batch} is not empty; choose a new or empty directory")
     if settings.attack_from and len(tasks) > 1:
         raise ValueError("--attack-from reruns the attack of one task; give one task")
+    if settings.requirements and len(tasks) > 1:
+        raise ValueError("--requirements lists the requirements of one task; give one task")
     for task in tasks:
         check_output(batch, task)
         if settings.credentials_file and settings.credentials_file.resolve().is_relative_to(task.resolve()):

@@ -477,6 +477,14 @@ class ModalSandbox(BaseModel):
     """Modal reported the sandbox ended after stop, or after one more terminate."""
 
 
+class Requirement(BaseModel):
+    """One requirement of an approved requirement list: its text and the name of the check observation that measures it."""
+
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1)
+    observation: str = Field(min_length=1)
+
+
 class RunRecord(BaseModel):
     task_dir: str
     path: ExecutionPath
@@ -523,6 +531,8 @@ class RunRecord(BaseModel):
     modal: list[ModalSandbox] = []
     attack_from: str | None = None
     """The earlier run's resolved directory, whose inspection records this run copied to run only the attack again."""
+    requirements: list[Requirement] | None = None
+    """The approved requirement list the run was given; None without one and in older records."""
     started_at: str | None = None
     """When the run started, in UTC ISO 8601; None in older records."""
     ended_at: str | None = None
@@ -597,6 +607,8 @@ class Use(BaseModel):
     rule: Literal["forbids", "allows", "none"] = Field(description=(
         "The task's own rule on this route: `forbids` or `allows` when the probe's `requirement` states it, "
         "`none` when the task states no rule on it."))
+    requirement: str | None = Field(None, description=(
+        "With `approved_requirements`, the `observation` of the approved requirement this route violates."))
 
 
 class Claim(BaseModel):
@@ -638,9 +650,11 @@ class Claim(BaseModel):
     """Required for an ordinary episode's legitimate label; see `Coverage`."""
     basis: MetricBasis | None = None
     """For an ordinary episode: the reference that grader metrics use; see `MetricBasis`."""
+    marks: list[str] = []
+    """For a hack or grader inspector reading: the observations of its check whose measured values show the finding. An
+    Attacker episode counts for the finding only when nudi's rerun of this check there measures each the same."""
     attribution: dict | None = None
-    """The attack inspector's link of an Attacker exploit to its target candidate: `relation`
-    `target` or `other`, and a `rationale`; a target relation rests on the reading's own check. Other jobs never write it."""
+    """In older records, the attack inspector's link of an Attacker exploit to its target candidate; it decides nothing."""
 
 
 Discrepancy = Literal["over", "under", "none", "unknown"]

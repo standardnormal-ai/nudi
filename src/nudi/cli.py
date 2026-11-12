@@ -65,6 +65,9 @@ def main(argv=None) -> int:
     send.add_argument("--attack-from", type=Path,
                       help="an earlier run directory of the same task: copy its inspection records and run only the attack; "
                            "the earlier directory is only read")
+    send.add_argument("--requirements", type=Path,
+                      help="TOML file of the task's approved requirements, each with the check observation that measures it; "
+                           "without it the report calls no work correct and no route a violation of the task")
     send.add_argument("--spending-cap", type=float, help="US dollar cap on known inference cost; no default")
     send.add_argument("--time-limit", type=float,
                       help="whole-run limit in minutes; at it the run stops, cleans up and reports; no default")

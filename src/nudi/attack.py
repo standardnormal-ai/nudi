@@ -1,4 +1,4 @@
-"""Attacker attempts: inspector candidates, grouped by problem, and what each attempt established."""
+"""Attacker attempts: inspector candidates, and what each attempt established."""
 
 import asyncio
 import contextlib
@@ -9,6 +9,7 @@ from harbor.models.task.task import Task
 from pydantic import BaseModel, model_validator
 
 from nudi import copies
+from nudi.assessment import captured_object
 from nudi.checks import check_submission, redacted
 from nudi.episode import bound_notice
 from nudi.inspection import (
@@ -55,6 +56,8 @@ class Candidate(BaseModel):
     """Valid work the grader rejects: its Attacker attempts do the task correctly in that way, never exploit."""
     source: str | None = None
     """The inspector whose finding it is, `hack_inspector` or `grader_inspector`; None in older records."""
+    marks: list[str] = []
+    """Observations of `check` whose measured values show the finding; empty in older records."""
 
 
 class Problem(BaseModel):
@@ -111,6 +114,9 @@ class AttackAttempt(BaseModel):
     problem: str | None = None
     failed: str | None = None
     """The agent whose failure ended the attempt, `Attacker` or `attack inspector`; None otherwise and in older records."""
+    reproduced: bool | None = None
+    """True when nudi's rerun of the target's check on this episode measured every mark of the target as its own check
+    did, False when it measured one otherwise; None without marks, without a rerun result and in older records."""
 
 
 class AttackFinding(BaseModel):
@@ -123,11 +129,12 @@ class AttackFinding(BaseModel):
     attempt: int
     assessment: int
     relation: str | None = None
-    """The attack inspector's attribution relation, when it returned one."""
+    """The attack inspector's attribution relation in older records."""
     rationale: str | None = None
-    """The attack inspector's short rationale, shown in the report only."""
+    """The attack inspector's short rationale in older records, shown in the report only."""
     problem: str | None = None
-    """For an `other` exploit, the problem the judge named; None without a judge and in older records."""
+    """For an `other` or discovery exploit, the problem the judge grouped it with, for display only; None without a judge
+    and in older records."""
 
 
 class AttackResult(BaseModel):
@@ -234,12 +241,14 @@ def recorded_failure(run, name: str, episode) -> tuple[str, str] | None:
     return "unknown", f"unknown cause: {cause}"
 
 
-async def rerun_check(run, check, episode: str, source: str | None, location: str | None) -> dict:
+async def rerun_check(run, check, episode: str, source: str | None, location: str | None) -> dict | None:
     """The check that evidenced an attempt's candidate, rerun on the Attacker episode's copy at that check's capture point,
     as the attack inspector's starting point, with the candidate's `location`. A failed rerun says why; the attack
-    inspector judges either way."""
+    inspector judges either way. None for a candidate without a check program."""
     from nudi.run_state import SpendingCapReached
 
+    if check is None or not check.program:
+        return None
     point = next((copy.point for copy in run.record.copies if copy.id == check.state_copy), "verification_start")
     found = [copy for copy in run.record.copies if copy.episode == episode and copy.point == point and copy.receipt]
     label = f"the {(source or 'inspector').replace('_', ' ')}'s check {check.id}, rerun by nudi on this attempt's {point} copy"
@@ -281,26 +290,23 @@ def _normalize_candidate(item: Candidate) -> None:
     item.guidance, item.unavailable, item.conditions = guidance, unavailable, conditions
 
 
-def _attribution_kind(raw, assessment: Assessment) -> str:
-    """reproduction, other, or unknown. `target` is reproduction only when the reading's own check is of this same
-    episode. The rationale is shown in the report and decides nothing."""
-    if not isinstance(raw, dict):
-        return "unknown"
-    if raw.get("relation") == "other":
-        return "other"
-    check = assessment.check
-    if raw.get("relation") == "target" and check is not None and check.content.episode == assessment.claim.episode:
-        return "reproduction"
-    return "unknown"
+def shown(marks: list[str], rerun: dict) -> bool | None:
+    """Whether nudi's `rerun` of a target's check measured each of its `marks` as the target's own check did: None
+    without marks, or when either output lacks one."""
+    measured = [(captured_object(rerun.get(key) or "") or {}).get("observations") for key in ("output", "source_output")]
+    if not marks or rerun.get("exit_code") != 0 or not all(isinstance(item, dict) and set(marks) <= item.keys() for item in measured):
+        return None
+    now, then = measured
+    return all(now[name] == then[name] for name in marks)
 
 
-def _candidate_groups(items: list[Candidate], causes: dict[str, str]) -> list[list[Candidate]]:
-    """Duplicate records share a group, in record order: the same kind, category, exact mechanism, both guidance
-    fields and problem cause in `causes`. A shared check or hint string alone does not merge; an empty mechanism never merges."""
+def _candidate_groups(items: list[Candidate]) -> list[list[Candidate]]:
+    """Duplicate records share a group, in record order: the same kind, category, check, exact mechanism and both
+    guidance fields, as one rerun then decides them all. A shared check or hint string alone does not merge; an empty
+    mechanism never merges."""
     groups: dict = {}
     for number, item in enumerate(items):
-        key = (item.valid_work, item.category, item.mechanism, item.guidance.get("full"), item.guidance.get("minimal"),
-               causes.get(item.id))
+        key = (item.valid_work, item.category, item.check, item.mechanism, item.guidance.get("full"), item.guidance.get("minimal"))
         groups.setdefault(key if item.mechanism.strip() else number, []).append(item)
     return list(groups.values())
 
@@ -317,12 +323,13 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
     full-hint attempt runs first, then discovery, then the rest of the full hint level, valid
     work included, then the minimal hint, so a bounded run tests more distinct findings. Within
     each of these every evidenced candidate runs, retries included, before the suspected ones,
-    whose every record is `unknown`. Records of the same kind and category with
-    the same exact mechanism, the same full and minimal guidance and the same problem cause share
+    whose every record is `unknown`. Records of the same kind, category and check with
+    the same exact mechanism and the same full and minimal guidance share
     one native run and keep every source id. A shared check or hint string alone stays separate, and an empty
     mechanism stays separate. A missing hint stays unavailable. The first evidenced reproduction stops only that candidate and level.
-    Reproduction needs the attack inspector's `target` relation citing this episode's assessed
-    check. Another exploit does not stop the candidate. The first evidenced no-hint exploit
+    Reproduction needs nudi's rerun of the target's check on this episode to measure each of the target's marks as the
+    target's check did, and an evidenced reading of this episode. An exploit the rerun does not show is another exploit;
+    without a rerun result or marks it is unattributed. Another exploit does not stop the candidate. The first evidenced no-hint exploit
     stops only that stream. There is no separate instruction model and no second judge.
 
     `at_once` attempts run at once, each of a different stream: discovery, or one candidate at one
@@ -335,12 +342,11 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
     unclear result stops the cascade.
 
     Each rewarded attempt, and every valid-work attempt, is judged by one attack inspector
-    session of `inspect`, bound to its episode; each interpreted claim's attribution is its
-    own. A valid-work candidate's attempt succeeds only with that episode's rejected valid work.
-    `problems` is the run's list of problems, which may grow while the attack runs; the record keeps that list. The attack
-    inspector judges each episode against its candidate's problem cause, so a reproduction confirms that cause only. Each
-    attempt names its candidate's problem. `judge(attempt, assessment, case)`, given, names the problem of a no-hint exploit;
-    `case` is the category, location and capture point of the attack inspector's experiment whose check evidenced it.
+    session of `inspect`, bound to its episode. A valid-work candidate's attempt succeeds only with that episode's rejected valid work.
+    `problems` is the run's list of problems, which may grow while the attack runs; the record keeps that list. Each
+    attempt names its candidate's problem. `judge(attempt, assessment, case)`, given, groups a no-hint or other exploit
+    with a problem, for display only; `case` is the category, location and capture point of the attack inspector's
+    experiment whose check evidenced it.
 
     `deadline` is the run's time limit on the event loop's clock. A valid-work attempt whose task
     agent timeout is longer than the time left does not start and is `insufficient_time`.
@@ -386,10 +392,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
     result.problems = [] if problems is None else problems  # The caller's list, so problems judged meanwhile are saved.
     destination = run.config.output_dir / "attack.json"
     agent_timeout = None if deadline is None else Task(run.config.task_dir).config.agent.timeout_sec
-    # Findings of different causes never share a run. Without grouping each finding's cause is its
-    # mechanism, so exact duplicates still do.
-    causes = {finding: problem.cause for problem in result.problems for finding in problem.findings}
-    candidate_groups = _candidate_groups(result.candidates, causes)
+    candidate_groups = _candidate_groups(result.candidates)
 
     # The case of each check the attack inspector measured, for the judge, and the checks a later experiment replaced.
     cases, answered, reruns = {}, set(), set()
@@ -473,15 +476,11 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
             if not (evidenced(assessment) and assessment.outcome == wanted
                     and assessment.execution_scope == "native" and assessment.claim.episode == attempt.episode):
                 continue
-            raw_attr = assessment.claim.attribution
-            link = _attribution_kind(raw_attr, assessment)
-            kind = "discovery" if not members else link if link in ("reproduction", "other") else "unattributed"
-            relation = raw_attr.get("relation") if isinstance(raw_attr, dict) and raw_attr.get("relation") in ("target", "other") else None
-            rationale = raw_attr.get("rationale") if isinstance(raw_attr, dict) and isinstance(raw_attr.get("rationale"), str) else None
-            mine.append(AttackFinding(
-                kind=kind, candidate=None if kind == "discovery" else members[0].id, sources=[item.id for item in members],
-                attempt=index, assessment=position, relation=None if kind == "discovery" else relation,
-                rationale=None if kind == "discovery" else rationale))
+            # Only the rerun of the target's check, showing its marks, ties an exploit to the target.
+            kind = ("discovery" if not members else "unattributed" if attempt.reproduced is None
+                    else "reproduction" if attempt.reproduced else "other")
+            mine.append(AttackFinding(kind=kind, candidate=None if kind == "discovery" else members[0].id,
+                                      sources=[item.id for item in members], attempt=index, assessment=position))
         result.findings += mine
 
         def recorded() -> str | None:
@@ -497,9 +496,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
         # Saved before any judging, so a stop while the judge reads leaves the other exploits unjudged and keeps the rest.
         status = recorded()
         if judge and judging:
-            # A no-hint exploit is a problem of its own; an exploit of another problem is judged as one is, and the
-            # attempt keeps its target's problem. The judge's problem is the one identity: an exploit it puts in the
-            # target's problem reproduces the target.
+            # The judge groups a no-hint or other exploit for display; its grouping never makes a reproduction.
             def judged(item):
                 assessment = result.assessments[item.assessment]
                 case = cases.get(assessment.claim.check, {})
@@ -513,8 +510,6 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
             for item in mine:
                 if item.kind == "other":
                     item.problem = await judged(item)
-                    if attempt.problem and item.problem == attempt.problem:
-                        item.kind, item.problem = "reproduction", None
             status = recorded()
         return status == "evidenced_issue"
 
@@ -602,15 +597,16 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                 request = {"valid_work": valid_work, "target_candidate": target,
                            "executed_instruction": (run.config.output_dir / "episodes" / name / "nudi-evidence" / "extension.md").read_text(),
                            "workspace": "verification_start copy" if found else "task image"}
-                if check is not None and check.program:
-                    request["check_rerun"] = await rerun_check(run, check, name, members[0].source, members[0].location)
+                if members and (rerun := await rerun_check(run, check, name, members[0].source, members[0].location)):
+                    request["check_rerun"] = rerun
+                    attempt.reproduced = shown(members[0].marks, rerun)
+                    reruns.add(rerun.get("check"))
                 session = await inspect(run, "attack", [name], 0, ["rejected_valid" if valid_work else "accepted_invalid"],
                                         title=f"attack_inspector-{context}", workspace=found[-1] if found else None, request=request)
                 own.update(row["episode"] for row in session.experiments if row.get("episode"))
                 cases.update({row["check"]: {key: row.get(key) for key in ("category", "location", "capture_point")}
                               for row in session.experiments if row.get("check")})
                 answered.update(replaced(session.experiments, session.assessments))
-                reruns.update(row["check"] for row in session.experiments if row.get("case") == "check_rerun" and row.get("check"))
                 # Every interpretation is retained, also one made before the spending cap stopped the session.
                 for assessment in session.assessments:
                     retain(attempt, index, assessment)

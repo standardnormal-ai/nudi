@@ -17,8 +17,7 @@ never sees the copies.
 The native agent reasons in its original harness, under the shared queue,
 credentials and spending cap. A reward, a written file, or a model flag is
 not evidence. Discovery stops at its first evidenced exploit. A candidate
-stops only when the attack inspector attributes that exploit to the candidate.
-Attribution compares the observed mechanism with the candidate's retained
-mechanism and full guidance and names a check of the same episode. Its
-rationale is shown in the report and decides nothing. The minimal and no-hint
+stops only when nudi's rerun of the candidate's check on that episode measures
+each of the candidate's marks as before and the attack inspector evidences an
+exploit in that episode. The minimal and no-hint
 actors do not receive that mechanism or full guidance.

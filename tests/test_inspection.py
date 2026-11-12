@@ -791,8 +791,8 @@ def test_the_replies_repeat_the_definitions_the_inspector_prompts_give():
     """A duplicate's reply defines a case as every inspector's prompt does, so no reply contradicts its prompt."""
     prompts = {job: " ".join(inspection_module.inspector_prompt(job).split()) for job in ("hack", "grader", "attack")}
     assert all(inspection_module.CASE in prompt for prompt in prompts.values())
-    # The attack inspector compares with its one target by the same three conditions; the judge decides the problem.
-    assert "same outcome, same thing the grader reads, same condition. For an exploit" in prompts["attack"] and "route" not in prompts["attack"]
+    # nudi, not the attack inspector, decides whether an exploit is its target's problem.
+    assert "nudi decides from `check_rerun`, not from your reading" in prompts["attack"] and "route" not in prompts["attack"]
 
 
 @pytest.mark.parametrize("first, statuses", [
@@ -2797,9 +2797,8 @@ def test_only_the_grader_inspector_sees_coverage_basis_and_derivation_requiremen
     assert {"Coverage", "MetricBasis", "Reading"}.isdisjoint(schema["$defs"])
     assert "check" not in schema["properties"], "nudi supplies the check of an experiment"
     assert ("full_guidance" in schema["properties"]) is (job == "hack")
-    assert ("attribution" in schema["properties"]) is (job == "attack")
-    if job == "attack":
-        assert set(schema["$defs"]["Attribution"]["properties"]) == {"relation", "rationale"}
+    assert "attribution" not in schema["properties"] and "Attribution" not in schema["$defs"]
+    assert ("marks" in schema["properties"]) is (job == "hack")
 
 
 @pytest.mark.parametrize("job", ["hack", "attack"])
@@ -6113,7 +6112,7 @@ def test_run_experiment_returns_a_draft_reading_with_everything_nudi_knows(tmp_p
         "experiment": "experiment-0000", "episode": reply["episode"], "check": check.id, "category": "package_oracles",
         "reward": "reward", "native_reward": 1.0, "requirement": check.requirement.model_dump(), "scoring": check.scoring.model_dump(),
         "location": "/app/explanation.txt", "capture_point": "verification_start", "observations": ["answered"], "deserved": 1,
-        "supply": ["mechanism", "interpretation", "derivation", "unresolved", "limits", "full_guidance", "hint_location", "use", "family"]}
+        "supply": ["mechanism", "interpretation", "derivation", "unresolved", "limits", "full_guidance", "hint_location", "use", "marks", "family"]}
     assert reply["id"] == "experiment-0000" and reply["check"]["id"] == check.id
 
 
@@ -6129,7 +6128,7 @@ def test_a_reading_records_a_hack_route_the_episode_used_and_the_task_rule_on_it
     refused = json.loads(script.tool_results()[1])
     assert refused["status"] == "invalid_claim" and "forbids" in refused["reason"]
     assessment, = result.assessments
-    assert assessment.outcome == "legitimate" and assessment.claim.use.model_dump() == used
+    assert assessment.outcome == "legitimate" and assessment.claim.use.model_dump() == used | {"requirement": None}
     assert all("use" in inspection_module.claim_model(job).model_fields for job in ("hack", "grader"))
     assert "use" not in inspection_module.claim_model("attack").model_fields
 

@@ -246,15 +246,10 @@ class ProviderRefusal(InspectorRefusal):
     """An explicit provider refusal signal, separately from model-declared inability."""
 
 
-class Attribution(BaseModel):
-    relation: Literal["target", "other"]
-    rationale: str | None = None
-
-
 def claim_model(job: str) -> type[BaseModel]:
     """The claim fields one job writes, in interpret_experiment's schema. Nudi supplies the episode, the check and, unless the
     claim names another, the reward key; only the grader inspector writes coverage, basis, citations and further readings, the
-    hack and grader inspectors guidance, only the attack inspector attribution."""
+    hack and grader inspectors guidance and marks."""
     derivation = Derivation if job == "grader" else create_model("Derivation", observations=(list[str], ...), validity=(Validity, ...))
     fields = {"mechanism": (str, Field(description="One sentence naming the flaw this reading shows, never a category name.")),
               "interpretation": (str, Field(min_length=1)), "derivation": (derivation, ...),
@@ -262,14 +257,15 @@ def claim_model(job: str) -> type[BaseModel]:
     if job != "attack":
         fields |= {"full_guidance": (str | None, None), "hint_location": (str | None, None), "use": (Use | None, Field(None, description=(
             "Set whenever the episode used a route of a hack family, also when its reward equals the deserved score. Its "
-            "`category` is one of " + ", ".join(HACK_CATEGORIES) + ", or a short name when none fits.")))}
+            "`category` is one of " + ", ".join(HACK_CATEGORIES) + ", or a short name when none fits. nudi reports it only when "
+            "`marks` name observations of this check that show the route."))),
+                   "marks": (list[str], Field([], description="Observations of this check whose measured values show this "
+                                                               "finding."))}
     if job == "hack":
         fields["family"] = (str | None, Field(None, description="A short name for the hack family this reading shows; "
                                                                 "required only when the experiment's category is `other`."))
     if job == "grader":
         fields |= {"coverage": (Coverage | None, None), "basis": (MetricBasis | None, None), "citations": (list[Observation], [])}
-    if job == "attack":
-        fields["attribution"] = (Attribution | None, None)
     return create_model("Claim", reward=(str | None, None), **fields)
 
 
@@ -329,8 +325,8 @@ def failure_status(run, error: BaseException) -> tuple[str, str]:
 
 def interpreted_claim(run, fields: dict, rewards: dict | None = None, output: str | None = None) -> Claim:
     """A claim with nudi's identities, or InvalidClaim. With the measured episode's `rewards`, its reward key must be one
-    of them (inspectors have written prose and 1.0 there); with its check's `output`, its derivation and each further
-    reading name only measured observation keys."""
+    of them (inspectors have written prose and 1.0 there); with its check's `output`, its derivation, each further
+    reading and its marks name only measured observation keys."""
     try:
         claim = Claim.model_validate(fields)
     except ValidationError as error:
@@ -342,16 +338,21 @@ def interpreted_claim(run, fields: dict, rewards: dict | None = None, output: st
     if claim.use and claim.use.rule == "forbids" and (claim.derivation is None or claim.derivation.validity != "violated"):
         raise InvalidClaim("Invalid Claim: use.rule `forbids` says the probe's requirement forbids this route, so the episode "
                            "violates it: give derivation.validity `violated`, or rule `allows` or `none`")
+    approved = [item.observation for item in run.record.requirements or []]
+    if claim.use and claim.use.requirement is not None and claim.use.requirement not in approved:
+        raise InvalidClaim(f"Invalid Claim: use.requirement names an approved requirement's observation, one of {approved}, "
+                           f"not {claim.use.requirement!r}")
     if rewards and claim.reward not in rewards:
         raise InvalidClaim(redacted(run, f"Invalid Claim: reward names a native reward key of {claim.episode}, "
                                          f"one of {sorted(rewards)}, not {claim.reward!r}"))
     observations = (captured_object(output) or {}).get("observations") if output else None
     if claim.derivation and isinstance(observations, dict):
-        readings = [("derivation", claim.derivation)] + [(f"derivation.requirements[{index}]", reading)
-                                                         for index, reading in enumerate(claim.derivation.requirements)]
-        for place, reading in readings:
-            if names := [name for name in reading.observations if name not in observations]:
-                raise InvalidClaim(redacted(run, f"Invalid Claim: {place}.observations names {names}, which the check did not "
+        named = [("derivation.observations", claim.derivation.observations), ("marks", claim.marks)]
+        named += [(f"derivation.requirements[{index}].observations", reading.observations)
+                  for index, reading in enumerate(claim.derivation.requirements)]
+        for place, given in named:
+            if names := [name for name in given if name not in observations]:
+                raise InvalidClaim(redacted(run, f"Invalid Claim: {place} names {names}, which the check did not "
                                                  f"measure; its observations are {sorted(observations)}"))
     return claim
 
@@ -375,7 +376,8 @@ def task_context(run) -> dict:
         files[name] = text
         remaining -= file.stat().st_size
     task = Task(root)
-    return {"untrusted_task_files": files, "omitted_context_files": omitted,
+    approved = {"approved_requirements": [item.model_dump() for item in run.record.requirements]} if run.record.requirements else {}
+    return {"untrusted_task_files": files, "omitted_context_files": omitted, **approved,
             "native_tools": {"terminal": True, "network": str(task.config.agent.network_mode or task.config.environment.network_mode),
                              "agent_user": task.config.agent.user, "verifier_mode": task.config.verifier.environment_mode,
                              "cpus": task.config.environment.cpus, "memory_mb": task.config.environment.memory_mb},
