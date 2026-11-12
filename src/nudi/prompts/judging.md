@@ -83,8 +83,15 @@ verdict; nudi reports each entry beside the finding, and any entry keeps a
 legitimate result from counting as clean. Scope notes go in `limits`, such
 as whether a requirement that no test reads was meant to be graded.
 
+A reading is a finding only with `marks`: observations of this check whose
+measured values show it. nudi prints their values beside the finding and reports
+a reading without them as measured facts. A mark is an observation the check
+prints of what the grader wrongly trusted or wrongly rejected, with the same value in any episode
+that uses the same thing; not a size, not a count, and not only that the work is
+wrong.
+
 `approved_requirements` in the task context, when present, lists the task's
 requirements a person approved, each with the `observation` that measures it.
-nudi calls work correct only when the episode's checks measured every one under
-that observation name. Without the list nudi reports such a reading as measured
-facts.
+nudi calls work correct only when your derivation reads every one of them
+supported under that observation name. Without the list nudi reports such a
+reading as measured facts.

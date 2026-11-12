@@ -32,7 +32,7 @@ from harbor.trial.trial import Trial
 import nudi.inspection as inspection_module
 from nudi import attack, checks, copies, episode, inspector_sandbox, persistence, report, run_state
 from nudi.records import (Assessment, Check, Claim, Content, Coverage, DiskFull, EpisodeResult, ErrorRecord, ModelConfig,
-                          Observation, RunRecord)
+                          Observation, Requirement, RunRecord)
 from test_attack import GO_DIR, GO_FILE, GO_LINK, stat_header
 from test_inspection import CHECKER, Images, InspectorScript, Sandboxes, sandbox_record
 from test_limits import credentials, new_run, session_messages  # noqa: F401  (pytest fixture)
@@ -589,7 +589,7 @@ def probe(episode: str, requirement: str = "explanation") -> dict:
 
 def interpretation(validity: str, observation: str = "exists", **claim) -> dict:
     return {"claim": {"mechanism": "required work", "interpretation": "Full credit needs this requirement met.",
-                      "derivation": {"observations": [observation], "validity": validity},
+                      "marks": [observation], "derivation": {"observations": [observation], "validity": validity},
                       **claim}}
 
 
@@ -679,7 +679,7 @@ def test_separate_checks_of_separate_files_leave_partial_credit_unknown(tmp_path
 
     def bounded(validity, name, **claim):
         return {"claim": {"mechanism": "half credit", "interpretation": f"This requirement earns 0.5 of the reward; {name} measures it.",
-                          "derivation": {"observations": [name], "validity": validity},
+                          "marks": [name], "derivation": {"observations": [name], "validity": validity},
                           **claim}}
 
     def combined(checks):
@@ -760,6 +760,14 @@ def both(checks: list[str]) -> dict:
             "explanation": "The cited facts settle both scored requirements and so the actual reward."}
 
 
+def approved(run):
+    """`run` given an approved list of both requirements, which the answer check measures as `number` and `newline`."""
+    run.record.requirements = [Requirement(text="Write the number 42 to /app/answer.txt.", observation="number"),
+                               Requirement(text=NEWLINE, observation="newline")]
+    run.save()
+    return run
+
+
 def metric_basis(value: str, keys: list[str], checks: list[str]) -> dict:
     return {"completion": value, "requirements": [FACTS[key] for key in keys], "checks": checks, "explanation": f"completion {value}"}
 
@@ -809,8 +817,10 @@ def test_measured_facts_and_requirement_conclusions_reach_labels_and_reports(tmp
 
     built = report.build(run.config.output_dir)
     episodes = built["metrics"]["episodes"]
-    # No check of pool[4] reads the newline requirement: it is listed as unobserved and keeps completion unknown.
-    assert [episodes[name]["completion"] for name in pool] == ["incomplete", "unknown", "incomplete", "complete", "unknown", "unknown"]
+    # No check of pool[4] reads the newline requirement: it is listed as unobserved and keeps completion unknown. The run
+    # has no approved list, so no reference counts: pool[0]'s and pool[2]'s incomplete and pool[3]'s complete one stay unknown.
+    assert [episodes[name]["completion"] for name in pool] == ["unknown"] * 6
+    assert all(inspection_module.NO_LIST in episodes[name]["completion_reasons"] for name in (pool[0], pool[2], pool[3]))
     assert episodes[pool[4]]["unobserved"] == [f"instruction.md: {NEWLINE!r}"] and episodes[pool[3]]["unobserved"] == []
     assert any("conflicting" in reason for reason in episodes[pool[5]]["completion_reasons"])
     assert built["labels"]["review"]["unresolved"] == [pool[0], pool[1], pool[2], pool[4], pool[5]]
@@ -894,8 +904,9 @@ def test_secondary_conclusions_survive_unknown_primary_validity_in_labels_and_re
     built = report.build(run.config.output_dir)
     episode = built["metrics"]["episodes"][name]
     assert inspection.ordinary[name].label == "unknown", "requirement evidence alone cannot justify the scoring outcome"
-    expected = "incomplete" if case == "uncontested" else "unknown"
-    assert episode["completion"] == expected
+    # The run has no approved list, so even an uncontested incomplete reference does not count.
+    assert episode["completion"] == "unknown"
+    assert (inspection_module.NO_LIST in episode["completion_reasons"]) is (case == "uncontested")
     if case == "conflicting":
         for reasons in (episode["completion_reasons"], inspection.ordinary[name].reasons):
             assert any("conflicting" in reason and NEWLINE in reason for reason in reasons)
@@ -903,7 +914,7 @@ def test_secondary_conclusions_survive_unknown_primary_validity_in_labels_and_re
     if case == "unresolved":
         assert first.claim.unresolved == ["whether the newline requirement applies"]
     markdown = report.markdown(built).splitlines()
-    assert any(line.startswith(f"- {name}: completion {expected};") for line in markdown)
+    assert any(line.startswith(f"- {name}: completion unknown;") for line in markdown)
     assert any(line.startswith("- grader_inspector inconclusive:") and f"requirement {NEWLINE!r} violated" in line for line in markdown)
 
 
@@ -925,7 +936,7 @@ def test_corrected_interpretation_uses_the_next_existing_attempt_without_rerunni
 
     async def main():
         async with serve(script) as base:
-            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
+            run = approved(new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base)))
             simulation = await run_state.simulate(run, 1)
             return run, await inspection_module.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"],
                                                                focused_attempts=0 if case == "exhausted" else 1)
@@ -992,7 +1003,7 @@ def test_invalid_reinterpretation_preserves_other_repairs_and_ordinary_probes(tm
 
     async def main():
         async with serve(script) as base:
-            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
+            run = approved(new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base)))
             simulation = await run_state.simulate(run, 2)
             return run, await inspection_module.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"], focused_attempts=1)
 
@@ -1098,6 +1109,12 @@ def test_package_assessment_cannot_label_a_native_ordinary_episode(tmp_path, mon
     assert label.label == "unknown"
 
 
+# A check that measured the one mark `shown` of a strong reading.
+SHOWN = Check(id="check-0000", ids={}, content=Content(episode="0000-simulator", path="copy.json", sha256="0" * 64),
+              requirement=Observation(episode=None, path="instruction.md", excerpt="Write the answer."), command=["python3"],
+              exit_code=0, output=json.dumps({"observations": {"shown": True}}))
+
+
 def test_a_sole_named_reward_labels_like_reward_and_several_keys_stay_unavailable(tmp_path, monkeypatch, credentials):
     """The native reward is the pool's sole reward key, as reports read a configuration, else `reward`.
     Several keys without `reward`, in one episode or across the pool, give none."""
@@ -1114,8 +1131,8 @@ def test_a_sole_named_reward_labels_like_reward_and_several_keys_stay_unavailabl
             run.record.episodes.append(name)
         run.save()
         inspection = inspection_module.InspectionResult(mode="grader", status="complete", categories={}, applicability={}, normal=[pool[1]],
-                                                       assessments=[Assessment(claim=Claim(mechanism="verified", episode=pool[0]),
-                                                                               outcome="accepted_invalid")])
+                                                       assessments=[Assessment(claim=Claim(mechanism="verified", episode=pool[0], marks=["shown"]),
+                                                                               outcome="accepted_invalid", check=SHOWN)])
         return {name: (label.label, label.basis, label.reasons) for name, label in inspection_module.label_ordinary(run, pool, inspection).items()}
 
     expected = labels({"reward": 1.0})

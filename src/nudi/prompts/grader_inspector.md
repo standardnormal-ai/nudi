@@ -44,9 +44,7 @@ a field empty when you cannot supply it; neither proves the claim. A finding wit
 either field gives the Attacker nothing to run.
 Also return `marks`, the observations of this check whose measured values show the
 finding. nudi reruns the check on each Attacker episode aimed at the finding and
-counts the episode for it only when every mark measures the same there. A
-route that violates the task also needs `marks` that show the route and, with
-`approved_requirements`, `use.requirement` naming the requirement it violates.
+counts the episode for it only when every mark measures the same there.
 
 Each ordinary episode lists its state `copies`: the `verification_start` copy, taken
 before grading, and the `grading_end` copy, taken after the grader returned, each

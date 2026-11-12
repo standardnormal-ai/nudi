@@ -299,9 +299,10 @@ def placed(case: dict) -> dict:
 
 
 def judging(run, problems: list[Problem]):
-    """`await judge(inspector, finding, proposal, case)`: the problem of one evidenced finding, from one judge call; a new
-    one when the call names none or fails, whose cause is the verdict's, or the finding's mechanism without a verdict. The
-    finding joins it once, and `case` becomes its case with the verdict's cause and reason, None without a verdict.
+    """`await judge(inspector, finding, proposal, case)`: the new problem of one evidenced finding, from one judge call,
+    whose cause is the verdict's, or the finding's mechanism without a verdict, and whose note `same_as` is the known
+    problem the verdict names, which merges nothing. `case` becomes its case with the verdict's cause and reason, None
+    without a verdict.
     Writes `judged`, with the request the judge read. The proposal has the finding's `mechanism` and what else it states
     of category, family, outcome, interpretation, requirement, scoring, location and capture point; a long interpretation is cut
     as an excerpt is."""
@@ -320,24 +321,20 @@ def judging(run, problems: list[Problem]):
                 for item in problems]}
             try:
                 said = await verdict(run, problems, request)
-                problem = next((item for item in problems if said.same_as and item.id == said.same_as), None)
-                if said.same_as and problem is None:
+                if said.same_as and not any(item.id == said.same_as for item in problems):
                     raise ValueError(f"the reply names no known problem: {said.same_as!r}")
             except Exception as error:
-                said, problem = None, None
-                run.warn(f"judging {finding} failed, so it counts as a new problem: {type(error).__name__}: {redacted(run, str(error))}")
-            new = problem is None
-            if new:
-                prefix, source = SOURCES[inspector]
-                problem = Problem(id=f"{prefix}{sum(item.id.startswith(prefix) for item in problems) + 1}", source=source,
-                                  cause=said.cause if said else mechanism or finding)
-                problems.append(problem)
-            if finding not in problem.members:  # An attempt's second reading of this cause is one more case only.
-                problem.members.append(finding)
+                said = None
+                run.warn(f"judging {finding} failed, so its problem has no note: {type(error).__name__}: {redacted(run, str(error))}")
+            # No agent merges problems: each finding is a new one, and the judge's `same_as` is only its note.
+            prefix, source = SOURCES[inspector]
+            problem = Problem(id=f"{prefix}{sum(item.id.startswith(prefix) for item in problems) + 1}", source=source,
+                              cause=said.cause if said else mechanism or finding, same_as=said and said.same_as, members=[finding])
+            problems.append(problem)
             problem.cases.append({**case, "cause": said and said.cause, "reason": said and said.reason})
-        event(run, "judged", f"{inspector} inspector finding {finding} is " + ("new problem " if new else "the same as ")
-              + problem.id, inspector=inspector, finding=finding, problem=problem.id, new=new, cause=problem.cause,
-              reason=said and said.reason, request=request)
+        event(run, "judged", f"{inspector} inspector finding {finding} is new problem {problem.id}"
+              + (f", possibly the same as {problem.same_as}" if problem.same_as else ""), inspector=inspector, finding=finding,
+              problem=problem.id, new=True, same_as=problem.same_as, cause=problem.cause, reason=said and said.reason, request=request)
         return problem
 
     return judge
@@ -592,12 +589,12 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
         """A rerun's targets in the feed. Each grader finding, and each hack finding no problem holds, as in a rerun of a
         run from before problems were judged, is judged against every problem. Each evidenced problem's findings with full
         guidance are attacked, once per check. A rerun starts from the earlier run's judged problems that were evidenced or that
-        an Attacker found, each with that run and the least information an Attacker exploited it with there; their
-        judgements and evidence its log repeats. It copies no attack record."""
+        an Attacker found, each with that run; their judgements and evidence its log repeats. It copies no attack record and
+        no level: an earlier run's problem holds no case of this run until this run's evidence shows one."""
         before = settings.attack_from / "attack.json"
         if before.is_file():
             older = AttackResult.model_validate_json(before.read_text())
-            problems.extend(item.model_copy(update={"origin": str(settings.attack_from), "earlier_exploited_with": report.exploited_with(item, report.counted(older), set())})
+            problems.extend(item.model_copy(update={"origin": str(settings.attack_from)})
                             for item in older.problems if item.id and (item.evidence == "evidenced" or any(name.endswith("-attacker") for name in item.members)))
             for problem in problems:  # Replayed for this log alone, with no judge call.
                 for index, name in enumerate(problem.members):

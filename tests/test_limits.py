@@ -100,9 +100,6 @@ def new_run(tmp_path, monkeypatch, credentials, *, name="run", capacity=(8, 4096
     fields.setdefault("task_dir", CONTRACT_TASK)
     config = RunConfig(output_dir=tmp_path / name, credentials_file=credentials, **fields)
     run = start_run(config)
-    # An approved requirement list with nothing to measure, so correct work rests on the readings alone.
-    run.record.requirements = []
-    run.save()
     return run
 
 

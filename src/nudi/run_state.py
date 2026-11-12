@@ -429,8 +429,9 @@ def resolve_credentials(config: RunConfig, models, roles) -> tuple[dict[Role, st
 
 def start_run(config: RunConfig, roles: frozenset[Role] = ROLES, analyses: tuple[str, ...] = ()) -> Run:
     """Settle models, credentials, path, backend and capacity for `roles` before any episode
-    starts. `run_start` names the selected `analyses`. Docker's capacity comes from `docker info`; on Modal, Harbor's preflight
-    checks for a Modal credential instead, which nudi never reads."""
+    starts. `run_start` names the selected `analyses` and the `models` by role, as the report's configuration does.
+    Docker's capacity comes from `docker info`; on Modal, Harbor's preflight checks for a Modal credential instead,
+    which nudi never reads."""
     if not (config.task_dir / "task.toml").exists():
         raise UnsupportedTask(f"{config.task_dir} is not a Harbor task folder: it has no task.toml")
     check_output(config.output_dir, config.task_dir)
@@ -527,7 +528,7 @@ def start_run(config: RunConfig, roles: frozenset[Role] = ROLES, analyses: tuple
           docker_memory_mb=docker_memory_mb, host_cpus=host_cpus, host_memory_mb=host_memory_mb, free_bytes=free,
           docker_free_bytes=docker_free, spending_cap=config.spending_cap, concurrency=concurrency,
           concurrency_setting=config.concurrency, reason=reason, pid=os.getpid(), host=socket.gethostname(),
-          analyses=list(analyses))
+          analyses=list(analyses), models={role: model.model_dump(mode="json") for role, model in record.models.items()})
     return run
 
 

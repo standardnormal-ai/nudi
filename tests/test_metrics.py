@@ -20,12 +20,15 @@ from nudi.records import (
     Conclusion,
     Content,
     DecisionRule,
+    Derivation,
     EpisodeResult,
     ErrorRecord,
     MetricBasis,
     ModelConfig,
     Observation,
     Ordering,
+    Reading,
+    Requirement,
     RunRecord,
     Simulation,
 )
@@ -62,8 +65,8 @@ class RunDir:
             spending_cap=5.0, capacity=Capacity(docker_cpus=8, docker_memory_mb=16384, episode_cpus=1,
                                                 episode_memory_mb=2048, concurrency=4),
             cost_map={"source": "local"}, simulation=Simulation(requested=0, status="complete"),
-            # An approved requirement list with nothing to measure, so correct work rests on the readings alone.
-            requirements=[])
+            # The approved requirement list: an episode's work is correct only when its readings read it supported.
+            requirements=[Requirement(text=text, observation=key) for key, text in REQUIREMENTS.items()])
         self.grader: InspectionResult | None = None
         self.hack: InspectionResult | None = None
         self.attack: AttackResult | None = None
@@ -112,11 +115,11 @@ def checked(episode: str, check: str, key: str, validity: str, *, outcome="unkno
     """A retained assessment whose check of `episode` observed requirement `key`."""
     return Assessment(
         claim=Claim(mechanism="unchecked requirement", episode=episode, check=check, interpretation=f"{key} is {validity}",
-                    unresolved=list(unresolved), basis=basis),
+                    unresolved=list(unresolved), basis=basis, derivation=Derivation(observations=[key], validity=validity), marks=[key]),
         outcome=outcome, validity=validity, discrepancy="unknown" if validity == "unknown" else "none",
         check=Check(id=check, content=Content(episode=episode, path="nudi-evidence/out.json", sha256="a" * 64),
                     ids={"trial_id": episode}, requirement=requirement(key), command=["python", "-c", "check"],
-                    exit_code=0, output="{}"))
+                    exit_code=0, output=json.dumps({"observations": {key: validity == "supported"}})))
 
 
 def basis(completion: str, keys: list[str], checks: list[str], **fields) -> MetricBasis:
@@ -125,11 +128,13 @@ def basis(completion: str, keys: list[str], checks: list[str], **fields) -> Metr
 
 
 def referenced(run: RunDir, completion: str, rewards: dict, *, model="xiaomi_mimo/mimo-v2.6-pro", errors=(), **fields) -> str:
-    """An ordinary episode whose one check settles its single-requirement completion."""
+    """An ordinary episode whose one check settles its single-requirement completion; a second reads the other approved
+    requirement the same way."""
     name = run.episode(rewards=rewards, model=model, errors=errors)
     check = f"check-{name}"
     validity = "supported" if completion == "supported" else "violated"
-    run.label(name, "unknown", checked(name, check, "sorted", validity, basis=basis(completion, ["sorted"], [check], **fields)))
+    run.label(name, "unknown", checked(name, check, "sorted", validity, basis=basis(completion, ["sorted"], [check], **fields)),
+              checked(name, f"{check}-summary", "summary", validity))
     return name
 
 
@@ -544,7 +549,7 @@ def test_a_rejected_episode_output_citation_does_not_veto_a_valid_complete_basis
     valid = checked(name, "c0", "sorted", "supported", basis=basis("supported", ["sorted"], ["c0"], decision=RULE))
     rejected = checked(name, "c1", "sorted", "supported", basis=MetricBasis(
         completion="supported", requirements=[requirement("sorted"), output], checks=["c1"], explanation="sorted output", decision=RULE))
-    run.label(name, "unknown", valid, rejected)
+    run.label(name, "unknown", valid, rejected, checked(name, "c2", "summary", "supported"))
 
     episode = run.report()["metrics"]["episodes"][name]
     assert (episode["completion"], episode["unobserved"]) == ("complete", [])
@@ -590,7 +595,7 @@ def test_a_cited_requirement_inside_a_satisfied_check_excerpt_is_satisfied(tmp_p
     name = run.episode(rewards={"reward": 1.0})
     whole = checked(name, "c0", "sorted", "supported", basis=basis("supported", ["sorted"], ["c0"], decision=RULE))
     whole.check.requirement = Observation(episode=None, path="instruction.md", excerpt="Write the numbers sorted to /app/out.txt.")
-    run.label(name, "unknown", whole)
+    run.label(name, "unknown", whole, checked(name, "c1", "summary", "supported"))
     episode = run.report()["metrics"]["episodes"][name]
     assert episode["completion"] == "complete", episode["completion_reasons"]
 
@@ -667,7 +672,7 @@ def test_an_evidenced_finding_with_an_open_claim_condition_still_counts_in_grade
     assert (group["fp"], group["fn"]) == (1, 1)
 
 
-def test_reports_show_the_mode_and_presumed_and_verified_counts_without_counting_presumption_as_evidence(tmp_path):
+def test_reports_show_the_mode_and_presumed_and_verified_counts_and_keep_presumed_episodes_out_of_the_metrics(tmp_path):
     run = RunDir(tmp_path)
     verified = run.episode(rewards={"reward": 1.0})
     run.label(verified, "legitimate", checked(verified, "c0", "sorted", "supported", outcome="legitimate"),
@@ -683,11 +688,11 @@ def test_reports_show_the_mode_and_presumed_and_verified_counts_without_counting
     assert result["labels"]["basis"] == {"presumed": 1, "verified": 1}
     assert result["labels"]["episodes"][presumed]["basis"] == "presumed"
     assert result["labels"]["review"]["supported"] == [verified]
-    # A presumed label is no completion reference; it enters a binary matrix only as a marked presumption.
+    # A presumed label is no completion reference, so its episode is in no cell.
     (group,) = result["metrics"]["confusion"]
-    assert group["episodes"] == [verified, presumed] and (group["presumed"], group["verified"]) == (1, 1)
+    assert group["episodes"] == [verified] and "presumed" not in group
     assert result["metrics"]["episodes"][presumed]["completion"] == "unknown"
-    assert group["false_negative_rate"]["lower_bound"] is True
+    assert result["metrics"]["coverage"]["excluded"]["inconclusive"] == [presumed]
     text = report.markdown(result)
     assert "Mode: holistic_inspection; presumed 1, verified 1." in text
     assert f"- {presumed}: legitimate (presumed)" in text and f"- {verified}: legitimate (verified)" in text
@@ -741,15 +746,15 @@ def test_false_discovery_and_false_negative_rates_count_the_eligible_binary_subs
     result = run.report()
     (group,) = result["metrics"]["confusion"]
     assert (group["status"], group["reasons"]) == ("supported", [])
-    assert group["episodes"] == eligible and (group["presumed"], group["verified"]) == (0, 20)
+    assert group["episodes"] == eligible
     assert (group["tp"], group["fp"], group["fn"], group["tn"]) == (8, 2, 1, 9)
-    assert group["false_discovery_rate"] == {"value": 0.2, "numerator": 2, "denominator": 10, "lower_bound": False, "unavailable": None}
-    assert group["false_negative_rate"] == {"value": 1 / 9, "numerator": 1, "denominator": 9, "lower_bound": False, "unavailable": None}
+    assert group["false_discovery_rate"] == {"value": 0.2, "numerator": 2, "denominator": 10, "unavailable": None}
+    assert group["false_negative_rate"] == {"value": 1 / 9, "numerator": 1, "denominator": 9, "unavailable": None}
     assert {key: group[key] for key in ("false_discovery_rate", "false_negative_rate", "f1")} == {
         key: before[0][key] for key in ("false_discovery_rate", "false_negative_rate", "f1")}
     assert group["f1"] == 16 / 19
     # The native pass rate counts every usable reward, separate from the eligible subset, with its 95% Wilson interval.
-    assert group["pass_rate"] == {"value": 0.5, "numerator": 11, "denominator": 22, "lower_bound": False, "unavailable": None,
+    assert group["pass_rate"] == {"value": 0.5, "numerator": 11, "denominator": 22, "unavailable": None,
                                   "interval": pytest.approx([0.3072, 0.6928], abs=1e-4)}
     assert result["metrics"]["coverage"] == {
         "ordinary": 22, "resolved": 20, "eligible": 20,
@@ -762,7 +767,7 @@ def test_false_discovery_and_false_negative_rates_count_the_eligible_binary_subs
     assert ("- Coverage: 20 of 22 ordinary episodes have a resolved completion reference; 20 of 22 enter grader agreement; "
             "excluded: unreviewed 1, inconclusive 1") in text
     assert ("TP (Correct work passed) 8, FP (Incorrect work passed) 2, FN (Correct work failed) 1, TN (Incorrect work failed) 9; FDR (Of accepted work, how much was incorrect?) 0.2 (2/10); FNR (Of correct work, how much was rejected?) 0.1111 (1/9); "
-            "presumed 0, verified 20") in text
+            "F1") in text
     assert "- Native pass rate for xiaomi_mimo/mimo-v2.6-pro reward (>= 0.5): 0.5 (11/22), 95% Wilson interval 0.31 to 0.69\n" in text
 
 
@@ -862,7 +867,7 @@ def test_one_reward_contract_per_configuration_keeps_each_decision_rule_group(tm
         names.append(referenced(run, "supported", {"reward": 1.0}, decision=hidden[0]))
         run.grader.assessments.append(checked(names[-1], "other", "sorted", "supported",
                                               basis=basis("supported", ["sorted"], ["other"], decision=hidden[1])))
-    # A presumed label takes its configuration's decision rule only when that rule is the only one.
+    # A presumed label never enters agreement.
     assumed = presumed(run, 1.0)
 
     metrics = run.report()["metrics"]
@@ -871,13 +876,13 @@ def test_one_reward_contract_per_configuration_keeps_each_decision_rule_group(tm
     if status != "supported":
         assert groups[0]["reasons"][0] == {"unsupported": NON_BINARY, "unavailable": UNKNOWN_REWARD}[status]
         assert all(group["episodes"] == [] and group["tp"] is None for group in groups)
-        assert excluded["no_binary_contract"] == names + [assumed]
+        assert excluded["no_binary_contract"] == names
     elif split:
         assert [(group["episodes"], group["tp"], group["tn"]) for group in groups] == [(names[:2], 1, 1), (names[2:], 1, 1)]
-        assert excluded["no_decision_rule"] == [assumed]
     else:
         (group,) = groups
-        assert (group["episodes"], group["tp"], group["tn"], group["presumed"]) == (names + [assumed], 3, 2, 1)
+        assert (group["episodes"], group["tp"], group["tn"]) == (names, 2, 2)
+    assert excluded["inconclusive"] == [assumed]
 
 
 def test_a_binary_contract_without_any_chosen_decision_rule_leaves_agreement_unavailable(tmp_path):
@@ -1000,9 +1005,9 @@ def test_grader_agreement_needs_an_established_binary_reward_contract(tmp_path, 
         assert curve["auroc"] == 1.0
         return
     assert group["reasons"][0] == message and group["episodes"] == []
-    values = [group[key] for key in ("tp", "fp", "fn", "tn", "f1", "presumed", "verified")]
+    values = [group[key] for key in ("tp", "fp", "fn", "tn", "f1")]
     values += [group[key]["value"] for key in ("false_discovery_rate", "false_negative_rate")]
-    assert values == [None] * 9
+    assert values == [None] * 7
     assert (curve["positives"], curve["negatives"], curve["auroc"]) == (None, None, None)
     assert f"grader agreement is {status}" in curve["unavailable"]
     assert message in "\n".join(result["warnings"])
@@ -1019,30 +1024,20 @@ def presumed(run: RunDir, value: float) -> str:
     return name
 
 
-def test_rates_that_use_presumed_labels_are_marked_lower_bounds(tmp_path):
+def test_presumed_labels_stay_out_of_grader_agreement(tmp_path):
+    """A presumed label follows the grader's own reward, so its episode's completion is unknown and it is in no cell."""
     run = RunDir(tmp_path)
     verified = binary_matrix(run, 1, 1, 1, 0)
     assumed = [presumed(run, value) for value in (1.0, 1.0, 0.0)]
 
     result = run.report()
     (group,) = result["metrics"]["confusion"]
-    assert group["episodes"] == verified + assumed and (group["presumed"], group["verified"]) == (3, 3)
-    assert (group["tp"], group["fp"], group["fn"], group["tn"]) == (3, 1, 1, 1)
-    assert [result["metrics"]["episodes"][name]["decision"] for name in assumed] == ["pass", "pass", "fail"]
+    assert group["episodes"] == verified and (group["tp"], group["fp"], group["fn"], group["tn"]) == (1, 1, 1, 0)
+    assert result["metrics"]["coverage"]["excluded"]["inconclusive"] == assumed
     for key in ("false_discovery_rate", "false_negative_rate"):
-        assert group[key] == {"value": 0.25, "numerator": 1, "denominator": 4, "lower_bound": True, "unavailable": None}
+        assert group[key] == {"value": 0.5, "numerator": 1, "denominator": 2, "unavailable": None}
     assert result == json.loads(report.write(run.path)[0].read_text())
-    text = (run.path / "report.md").read_text()
-    assert ("FDR (Of accepted work, how much was incorrect?) at least 0.25 (1/4, lower bound); FNR (Of correct work, how much was rejected?) at least 0.25 (1/4, lower bound); "
-            "presumed 3, verified 3") in text
-    assert any("lower bounds" in note for note in result["notes"])
-
-    # Only a presumed rejection can hide a false negative; it cannot hide a false discovery.
-    rejected = RunDir(tmp_path / "rejected")
-    binary_matrix(rejected, 1, 0, 0, 0)
-    presumed(rejected, 0.0)
-    (group,) = rejected.report()["metrics"]["confusion"]
-    assert group["false_discovery_rate"]["lower_bound"] is False and group["false_negative_rate"]["lower_bound"] is True
+    assert "lower bound" not in (run.path / "report.md").read_text()
 
     # A presumption is never a way around the binary reward contract.
     alone = RunDir(tmp_path / "alone")
@@ -1050,7 +1045,7 @@ def test_rates_that_use_presumed_labels_are_marked_lower_bounds(tmp_path):
     presumed(alone, 1.0)
     presumed(alone, 0.0)
     (group,) = alone.report()["metrics"]["confusion"]
-    assert (group["status"], group["reasons"][0], group["episodes"], group["presumed"]) == ("unavailable", UNKNOWN_REWARD, [], None)
+    assert (group["status"], group["reasons"][0], group["episodes"]) == ("unavailable", UNKNOWN_REWARD, [])
 
 
 def test_native_decisions_use_exact_encodings_without_tolerance(tmp_path):
@@ -1073,6 +1068,9 @@ def test_one_check_supports_one_requirement_while_violating_another(tmp_path):
         name = run.episode(rewards={"reward": 0.5})
         assessment = checked(name, f"check-{name}", "sorted", "supported", basis=basis(completion, keys, [f"check-{name}"]))
         assessment.conclusions = [Conclusion(requirement=requirement("summary"), validity="violated")]
+        assessment.claim.derivation.requirements = [Reading(requirement=requirement("summary"), observations=["summary"],
+                                                            validity="violated", interpretation="the summary is missing")]
+        assessment.check.output = json.dumps({"observations": {"sorted": True, "summary": False}})
         run.label(name, "unknown", assessment)
         return name
 
@@ -1139,6 +1137,8 @@ def test_requested_basis_is_retained_and_partial_credit_can_have_a_noncompletion
         async with serve(script) as base:
             run = new_run(tmp_path, monkeypatch, credentials, task_dir=task,
                           models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
+            run.record.requirements = [Requirement(text="the explanation", observation="exists"),
+                                       Requirement(text="the answer", observation="correct")]
             simulation = await run_state.simulate(run, 1)
             inspection = await inspection_module.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"], focused_attempts=0)
             return run, inspection

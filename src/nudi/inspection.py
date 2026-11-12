@@ -47,7 +47,6 @@ from nudi.records import (
     Outcome,
     SandboxResult,
     StateCopy,
-    Use,
     Validity,
     write_private,
 )
@@ -249,18 +248,14 @@ class ProviderRefusal(InspectorRefusal):
 def claim_model(job: str) -> type[BaseModel]:
     """The claim fields one job writes, in interpret_experiment's schema. Nudi supplies the episode, the check and, unless the
     claim names another, the reward key; only the grader inspector writes coverage, basis, citations and further readings, the
-    hack and grader inspectors guidance and marks."""
+    hack and grader inspectors guidance; every job writes marks."""
     derivation = Derivation if job == "grader" else create_model("Derivation", observations=(list[str], ...), validity=(Validity, ...))
     fields = {"mechanism": (str, Field(description="One sentence naming the flaw this reading shows, never a category name.")),
               "interpretation": (str, Field(min_length=1)), "derivation": (derivation, ...),
               "unresolved": (list[str], []), "limits": (list[str], [])}
+    fields["marks"] = (list[str], Field([], description="Observations of this check whose measured values show this finding."))
     if job != "attack":
-        fields |= {"full_guidance": (str | None, None), "hint_location": (str | None, None), "use": (Use | None, Field(None, description=(
-            "Set whenever the episode used a route of a hack family, also when its reward equals the deserved score. Its "
-            "`category` is one of " + ", ".join(HACK_CATEGORIES) + ", or a short name when none fits. nudi reports it only when "
-            "`marks` name observations of this check that show the route."))),
-                   "marks": (list[str], Field([], description="Observations of this check whose measured values show this "
-                                                               "finding."))}
+        fields |= {"full_guidance": (str | None, None), "hint_location": (str | None, None)}
     if job == "hack":
         fields["family"] = (str | None, Field(None, description="A short name for the hack family this reading shows; "
                                                                 "required only when the experiment's category is `other`."))
@@ -335,13 +330,6 @@ def interpreted_claim(run, fields: dict, rewards: dict | None = None, output: st
     if re.sub(r"[\W_]+", "_", claim.mechanism.lower()).strip("_") in (*HACK_CATEGORIES, *GRADER_CATEGORIES, "other"):
         raise InvalidClaim(redacted(run, f"Invalid Claim: mechanism {claim.mechanism!r} is only a category name; write one sentence "
                                          "naming the flaw of the grader or environment this reading shows"))
-    if claim.use and claim.use.rule == "forbids" and (claim.derivation is None or claim.derivation.validity != "violated"):
-        raise InvalidClaim("Invalid Claim: use.rule `forbids` says the probe's requirement forbids this route, so the episode "
-                           "violates it: give derivation.validity `violated`, or rule `allows` or `none`")
-    approved = [item.observation for item in run.record.requirements or []]
-    if claim.use and claim.use.requirement is not None and claim.use.requirement not in approved:
-        raise InvalidClaim(f"Invalid Claim: use.requirement names an approved requirement's observation, one of {approved}, "
-                           f"not {claim.use.requirement!r}")
     if rewards and claim.reward not in rewards:
         raise InvalidClaim(redacted(run, f"Invalid Claim: reward names a native reward key of {claim.episode}, "
                                          f"one of {sorted(rewards)}, not {claim.reward!r}"))
@@ -424,8 +412,75 @@ def ordinary_context(run, pool: list[str]) -> list[dict]:
 
 
 def evidenced(assessment: Assessment) -> bool:
-    """A measured issue. Doubt is one-sided: open `unresolved` items are reported beside it and do not hide it."""
-    return assessment.outcome in ("accepted_invalid", "rejected_valid")
+    """A measured issue: an accepted invalid or rejected valid outcome whose marks its check measured. Doubt is
+    one-sided: open `unresolved` items are reported beside it and do not hide it."""
+    return assessment.outcome in ("accepted_invalid", "rejected_valid") and bool(marked(assessment))
+
+
+def measured_observations(assessment: Assessment) -> dict:
+    """The observations the reading's check measured; empty when it measured none or did not exit 0."""
+    check = assessment.check
+    observations = (captured_object(check.output) or {}).get("observations") if check and check.exit_code == 0 else None
+    return observations if isinstance(observations, dict) else {}
+
+
+def marked(assessment: Assessment) -> dict:
+    """The value its check measured for each of the reading's marks; empty unless it has marks and the check measured each."""
+    observations, marks = measured_observations(assessment), assessment.claim.marks
+    return {name: observations[name] for name in marks} if marks and set(marks) <= observations.keys() else {}
+
+
+# Why the approved requirement list does not confirm a reading's strong words.
+NO_LIST = "completeness is unknown: no approved requirement list was given"
+NOT_ALL = "completeness is unknown: the readings of this episode do not read every approved requirement supported"
+
+
+def support(readings: list[Assessment]) -> dict[str, set[str]]:
+    """The validities `readings` give each observation their checks measured: the check's own requirement's validity for
+    the derivation's observations, and each further reading's accepted validity for its own."""
+    found = {}
+    for item in readings:
+        measured, derivation = measured_observations(item), item.claim.derivation
+        if derivation is None:
+            continue
+        pairs = [(derivation.observations, item.validity)]
+        pairs += [(reading.observations, conclusion.validity) for reading, conclusion in zip(derivation.requirements, item.conclusions)]
+        for names, validity in pairs:
+            for name in set(names) & measured.keys():
+                found.setdefault(name, set()).add(validity)
+    return found
+
+
+def correctness(readings: list[Assessment], requirements: list | None) -> tuple[str, str | None]:
+    """`complete` when `readings` read every approved requirement supported and none violated, `incomplete` when they read
+    one violated, otherwise `unknown` with why; an empty list is no list."""
+    if not requirements:
+        return "unknown", NO_LIST
+    found = support(readings)
+    if any("violated" in found.get(item.observation, ()) for item in requirements):
+        return "incomplete", None
+    if all(found.get(item.observation) == {"supported"} for item in requirements):
+        return "complete", None
+    return "unknown", NOT_ALL
+
+
+def confirmed(assessment: Assessment, requirements: list | None) -> bool:
+    """True when the approved list confirms an evidenced reading's strong words: correct work failed needs the reading to
+    read every approved requirement supported, invalid work accepted one read violated. Only wording depends on it."""
+    return correctness([assessment], requirements)[0] == ("complete" if assessment.outcome == "rejected_valid" else "incomplete")
+
+
+def unmarked(assessment: Assessment) -> str | None:
+    """For a reading that claims accepted invalid or rejected valid work without marks its check measured: which marks it
+    lacks and what to supply. None otherwise."""
+    if assessment.outcome not in ("accepted_invalid", "rejected_valid") or evidenced(assessment):
+        return None
+    measured, check = sorted(measured_observations(assessment)), assessment.claim.check
+    if not measured:
+        return (f"no marks: check {check} measured no observations, so none can show this finding; measure the case again "
+                "with a check that exits 0 and prints the observations that show it")
+    return (f"no marks: name in `marks` the observations of check {check} whose measured values show this finding, "
+            f"from {', '.join(measured)}")
 
 
 def scope(row: dict) -> str | None:
@@ -962,6 +1017,9 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                 step = f"measure what is unresolved with run_experiment naming {id} in `replaces`; keep an item in the claim while it is true"
             elif assessment.reasons == [UNFINISHED]:
                 reason, step = UNFINISHED, f"complete its reading with interpret_experiment naming {id}"
+            elif lacking := unmarked(assessment):
+                reason, step = lacking, (f"interpret {id} again with interpret_experiment naming its marks, or measure it again with "
+                                         f"run_experiment naming {id} in `replaces`")
             else:
                 reason = "; ".join(assessment.reasons) or f"its reading is {assessment.outcome}"
                 step = repair(assessment.missing, item) if assessment.missing else (
@@ -1344,6 +1402,8 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                     seen.pop(identity)
                 if assessment.missing:
                     reply = {"repair": repair(assessment.missing, item), **reply}
+            if lacking := unmarked(assessment):
+                reply["missing_marks"] = f"This reading is no finding yet: {lacking}. Call interpret_experiment on {again} again with them."
             key = assessment.claim.check or again
             if evidenced(assessment):
                 state.evidenced = True

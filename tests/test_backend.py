@@ -867,14 +867,20 @@ def test_a_run_states_its_backend_capacity_free_space_cap_and_concurrency_in_one
                     f"{run_state.plan_concurrency(8, 4096, None, None)[1][0]}"),
     ]
     docker = {"backend": "docker", "docker_cpus": 8, "docker_memory_mb": 4096, "host_cpus": None, "host_memory_mb": None}
+    # The start also names each role's model, as configuration.models does.
     assert started_events(runs, caplog) == [
         {**docker, "docker_free_bytes": None, "spending_cap": None, "concurrency": 7, "concurrency_setting": 16,
-         "reason": "the task's declared 1 CPUs and 512 MiB per episode fit 7 within 90% of Docker's capacity"},
+         "reason": "the task's declared 1 CPUs and 512 MiB per episode fit 7 within 90% of Docker's capacity", "models": models(runs[0])},
         {**docker, "docker_free_bytes": 50 * 2**30, "spending_cap": 5.0, "concurrency": 2, "concurrency_setting": 2,
-         "reason": None},
+         "reason": None, "models": models(runs[1])},
         {**docker, "docker_free_bytes": None, "spending_cap": None, "concurrency": 1, "concurrency_setting": 16,
-         "reason": run_state.plan_concurrency(8, 4096, None, None)[1][0]},
+         "reason": run_state.plan_concurrency(8, 4096, None, None)[1][0], "models": models(runs[2])},
     ]
+
+
+def models(run) -> dict:
+    """Each role's model as the run's start event names it."""
+    return {role: model.model_dump(mode="json") for role, model in run.record.models.items()}
 
 
 @needs_modal
@@ -891,7 +897,7 @@ def test_a_modal_run_states_this_hosts_capacity_free_space_cap_and_concurrency_i
     assert started_events([run], caplog) == [
         {"backend": "modal", "docker_cpus": None, "docker_memory_mb": None, "host_cpus": host_cpus,
          "host_memory_mb": host_memory_mb, "docker_free_bytes": None, "spending_cap": 0.5, "concurrency": 3,
-         "concurrency_setting": 3, "reason": None},
+         "concurrency_setting": 3, "reason": None, "models": models(run)},
     ]
 
 

@@ -41,9 +41,7 @@ neither proves the claim. A finding without either field gives the Attacker noth
 to run.
 Also return `marks`, the observations of this check whose measured values show the
 finding. nudi reruns the check on each Attacker episode aimed at the finding and
-counts the episode for it only when every mark measures the same there. A
-route that violates the task also needs `marks` that show the route and, with
-`approved_requirements`, `use.requirement` naming the requirement it violates.
+counts the episode for it only when every mark measures the same there.
 
 A setup probe's check reads the grading sandbox's state copies in place: the
 `verification_start` copy shows what setup left before grading, the `grading_end`

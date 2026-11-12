@@ -32,8 +32,8 @@ from nudi import attack, checks, cli, copies, inspection, report, run_state, sen
 from nudi.attack import AttackResult
 from nudi.episode import tree_digest
 from nudi.inspection import EpisodeLabel, InspectionResult
-from nudi.records import (DEFAULT_MODELS, Assessment, Capacity, Claim, DiskFull, EpisodeResult, ModalSandbox, Observation, RunRecord,
-                          SandboxResult, Simulation, StateCopy)
+from nudi.records import (DEFAULT_MODELS, Assessment, Capacity, Check, Claim, Content, DiskFull, EpisodeResult, ModalSandbox, Observation, RunRecord,
+                          Derivation, SandboxResult, Simulation, StateCopy)
 from nudi.run_state import Run
 from test_metrics import RULE, TASK, basis, checked
 
@@ -156,9 +156,21 @@ def after_feed(fake):
     return attack
 
 
+# A check that measured the one mark `shown`, which every strong reading here names.
+SHOWN = Check(id="check-0000", ids={}, content=Content(episode="0000-inspector", path="copy.json", sha256="0" * 64),
+              requirement=Observation(episode=None, path="instruction.md", excerpt="Write the answer."), command=["python3"],
+              exit_code=0, output=json.dumps({"observations": {"shown": True}}))
+# An approved list whose one requirement that check measures, so a reading of correct work there can read it supported.
+APPROVED = '[[requirement]]\ntext = "Write the answer."\nobservation = "shown"\n'
+
+
 def candidate(mechanism, interpretation, outcome="unknown", full_guidance=None, hint_location=None):
-    return Assessment(claim=Claim(mechanism=mechanism, episode="0000-inspector", interpretation=interpretation,
-                                  full_guidance=full_guidance, hint_location=hint_location), outcome=outcome)
+    """An inspector reading whose check measured its one mark; one of correct work failed reads the approved
+    requirement supported."""
+    derivation = Derivation(observations=["shown"], validity="supported") if outcome == "rejected_valid" else None
+    return Assessment(claim=Claim(mechanism=mechanism, episode="0000-inspector", interpretation=interpretation, derivation=derivation,
+                                  full_guidance=full_guidance, hint_location=hint_location, marks=["shown"]), outcome=outcome, check=SHOWN,
+                      validity="supported" if derivation else "unknown")
 
 
 MECHANISM = "Replace the expected digest in the grader and restore it after scoring."
@@ -411,8 +423,8 @@ def test_grader_agreement_availability_is_the_same_in_api_cli_json_and_markdown(
     approved = tmp_path / "requirements.toml"
     approved.write_text('[[requirement]]\ntext = "sorted"\nobservation = "sorted"\n')
     if status == "supported":
-        # One verified reference grounds the binary rule; the other two episodes take it with presumed labels. Its
-        # check measured the one approved requirement, so its work counts as complete.
+        # One verified reference grounds the binary rule; the other two episodes have presumed labels, which stay out of
+        # agreement. Its reading reads the one approved requirement supported, so its work counts as complete.
         reference = checked("0000-simulator", "c0", "sorted", "supported", basis=basis("supported", ["sorted"], ["c0"], decision=RULE))
         reference.check.output = json.dumps({"observations": {"sorted": True}})
         grader = {"assessments": [reference],
@@ -433,11 +445,11 @@ def test_grader_agreement_availability_is_the_same_in_api_cli_json_and_markdown(
     text = capsys.readouterr().out
     assert text == (tmp_path / "cli" / "report.md").read_text() == (tmp_path / "api" / "report.md").read_text()
     if status == "supported":
-        assert (group["tp"], group["fp"], group["fn"], group["tn"], group["presumed"], group["verified"]) == (2, 0, 0, 1, 2, 1)
+        assert (group["tp"], group["fp"], group["fn"], group["tn"], group["episodes"]) == (1, 0, 0, 0, ["0000-simulator"])
         for key in ("false_discovery_rate", "false_negative_rate"):
-            assert group[key] == {"value": 0.0, "numerator": 0, "denominator": 2, "lower_bound": True, "unavailable": None}
-        assert ("FDR (Of accepted work, how much was incorrect?) at least 0 (0/2, lower bound); FNR (Of correct work, how much was rejected?) at least 0 (0/2, lower bound); "
-                "presumed 2, verified 1") in text
+            assert group[key] == {"value": 0.0, "numerator": 0, "denominator": 1, "unavailable": None}
+        assert ("FDR (Of accepted work, how much was incorrect?) 0 (0/1); FNR (Of correct work, how much was rejected?) 0 (0/1); "
+                "F1") in text
         return
     assert (group["status"], group["reasons"][0], group["tp"], group["false_discovery_rate"]["value"]) == (status, message, None, None)
     assert message in "\n".join(result["warnings"])
@@ -570,23 +582,34 @@ def test_each_inspector_candidate_composes_its_own_guidance_without_a_model_call
 
 @pytest.mark.parametrize("only_false_negative", [False, True])
 def test_rejected_valid_hack_findings_become_valid_work_candidates(tmp_path, monkeypatch, only_false_negative):
-    """Rejected valid work is a valid-work candidate with its own guidance, beside exploit candidates."""
+    """Rejected valid work whose reading reads every approved requirement supported is a valid-work candidate with its
+    own guidance, beside exploit candidates."""
     fn = candidate("correct work rejected", "undeserved rejection", outcome="rejected_valid",
                    full_guidance="Write the answer in the documented format.", hint_location="fn/private-grader.py")
     candidates = [fn]
     if not only_false_negative:
         candidates.append(candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION))
     analyses = Analyses(monkeypatch, candidates=candidates)
-    result = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
+    (tmp_path / "requirements.toml").write_text(APPROVED)
+    result = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking", requirements=tmp_path / "requirements.toml")
     sent = analyses.candidates_sent
     assert len(sent) == len(candidates)
     assert [(item.id, item.valid_work) for item in sent] == [("hack-0", True), ("hack-1", False)][:len(candidates)]
     assert sent[0].guidance == {"full": "Write the answer in the documented format.", "minimal": WHERE_TO_LOOK + "\nfn/private-grader.py"}
-    # Without an approved requirement list the report does not call the work correct.
     findings = result["inspections"]["hack_inspector"]["findings"]
-    lowered, = findings["inconclusive"]
-    assert lowered["assessment"]["outcome"] is None and lowered["assessment"]["reasons"] == [report.NO_LIST]
-    assert [item["assessment"]["outcome"] for item in findings["evidenced"]] == ["accepted_invalid"][:len(candidates) - 1]
+    assert [item["assessment"]["outcome"] for item in findings["evidenced"]] == ["rejected_valid", "accepted_invalid"][:len(candidates)]
+
+
+def test_rejected_valid_work_with_marks_and_no_approved_list_is_still_a_candidate(tmp_path, monkeypatch):
+    """The approved list changes only the report's words: a reading of failed work whose check measured its marks is a
+    valid-work candidate whether or not a list was approved."""
+    fn = candidate("correct work rejected", "undeserved rejection", outcome="rejected_valid",
+                   full_guidance="Write the answer in the documented format.", hint_location="fn/private-grader.py")
+    analyses = Analyses(monkeypatch, candidates=[fn])
+    result = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
+    assert [(item.id, item.valid_work) for item in analyses.candidates_sent] == [("hack-0", True)]
+    evidenced, = result["inspections"]["hack_inspector"]["findings"]["evidenced"]
+    assert evidenced["assessment"]["outcome"] == "rejected_valid"
 
 
 @pytest.mark.parametrize(("full_guidance", "hint_location"), [
@@ -603,7 +626,7 @@ def test_missing_or_blank_guidance_field_leaves_that_condition_unavailable(tmp_p
     # Without full guidance a problem's finding is never fed, so no Attacker tries it; the report says it had no guidance.
     if not (isinstance(full_guidance, str) and full_guidance.strip()):
         assert analyses.candidates_sent == [] and report["attack"]["candidates"] == []
-        assert report["attack"]["problems"][0]["exploited_with"] == "no_guidance"
+        assert report["attack"]["problems"][0]["conditions"] == [] and report["answer"][2].endswith("no attempt was assessed.")
         return
     (sent,) = analyses.candidates_sent
     assert sent.id == "hack-0"
@@ -632,7 +655,7 @@ def test_only_evidenced_or_suspected_findings_become_candidates_with_their_check
     Each candidate keeps its check and the category and location of the experiment that measured it."""
     def reading(outcome, check, **guidance):
         return Assessment(claim=Claim(mechanism=MECHANISM, episode="0000-inspector", interpretation=INTERPRETATION,
-                                      check=check, **guidance), outcome=outcome)
+                                      check=check, marks=["shown"], **guidance), outcome=outcome, check=SHOWN)
 
     guided = {"full_guidance": REPRODUCTION, "hint_location": LOCATION}
     hack = InspectionResult(mode="hack", categories={}, applicability={}, assessments=[
@@ -658,7 +681,7 @@ def test_a_guided_unknown_reading_is_a_suspected_candidate_after_the_evidenced_o
     withdraws, superseded or read legitimate, is not; an unguided one supplies nothing."""
     def reading(outcome, check, **guidance):
         return Assessment(claim=Claim(mechanism=f"{MECHANISM} {check}", episode="0000-inspector", interpretation=INTERPRETATION,
-                                      check=check, **guidance), outcome=outcome, reward=1.0)
+                                      check=check, marks=["shown"], **guidance), outcome=outcome, reward=1.0, check=SHOWN)
 
     guided = {"full_guidance": REPRODUCTION, "hint_location": LOCATION}
     hack = InspectionResult(mode="hack", categories={}, applicability={}, assessments=[
@@ -683,7 +706,7 @@ def test_a_later_reading_of_its_check_withdraws_every_earlier_candidate():
     check is never superseded."""
     def reading(check, outcome="accepted_invalid", **guidance):
         return Assessment(claim=Claim(mechanism=MECHANISM, episode="0000-inspector", interpretation=INTERPRETATION,
-                                      check=check, **guidance), outcome=outcome)
+                                      check=check, marks=["shown"], **guidance), outcome=outcome, check=SHOWN)
 
     hack = InspectionResult(mode="hack", categories={}, applicability={}, assessments=[
         reading("check-0000"), reading("check-0001", full_guidance=REPRODUCTION), reading(None), reading(None),
@@ -701,7 +724,7 @@ def test_a_control_is_no_candidate_so_no_problem_is_made_of_it():
     attack phase, which judges candidates no problem holds, makes no problem of it."""
     def reading(check):
         return Assessment(claim=Claim(mechanism=MECHANISM, episode="0000-inspector", interpretation=INTERPRETATION,
-                                      check=check, full_guidance=REPRODUCTION), outcome="accepted_invalid")
+                                      check=check, full_guidance=REPRODUCTION, marks=["shown"]), outcome="accepted_invalid", check=SHOWN)
 
     hack = InspectionResult(mode="hack", categories={}, applicability={}, assessments=[reading("check-0000"), reading("check-0001")],
                             experiments=[{"id": "experiment-0000", "check": "check-0000", "control": True},
@@ -739,7 +762,7 @@ def pipe_findings():
     """One pipe byte forgery read three ways and one calibration flaw."""
     quote = Observation(episode="0000-inspector", path="tests/test_outputs.py", excerpt="assert out.split('|')[1] == expected")
     return [Assessment(claim=Claim(mechanism="Forge the pipe bytes\n in the output.", episode="0000-inspector", interpretation=INTERPRETATION,
-                                   citations=[quote]), outcome="accepted_invalid"),
+                                   citations=[quote], marks=["shown"]), outcome="accepted_invalid", check=SHOWN),
             candidate("Return a constant drift score.", INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION),
             candidate("Forge the pipe bytes on stdout.", INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION),
             candidate("Forge the pipe bytes in the log.", INTERPRETATION, "unknown", full_guidance=REPRODUCTION, hint_location=LOCATION)]
@@ -815,7 +838,8 @@ def test_one_judge_call_per_evidenced_reading_names_its_problem_and_each_problem
     while another is never attacked. Each evidenced reading, as it is recorded, is judged by one call of the inspector
     model against the problems so far, the first against none; a reading of unknown outcome is not judged. A
     problem's first evidenced finding with full guidance is attacked beside the hack inspector: hack-0 has none, so
-    hack-2 stands for the pipe problem. Each finding is a case of its problem."""
+    hack-2 stands for the pipe problem. The judge merges nothing: each judged finding is a new problem, and a verdict
+    naming a known problem is only the new problem's note."""
     requests = judge_replies(monkeypatch, [said(), said(cause=CALIBRATION), said("P1")])
     analyses = Analyses(monkeypatch, candidates=pipe_findings(), judging=True)
     send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
@@ -828,13 +852,14 @@ def test_one_judge_call_per_evidenced_reading_names_its_problem_and_each_problem
         "finding": {"outcome": "accepted_invalid", "mechanism": "Forge the pipe bytes on stdout.", "interpretation": INTERPRETATION}, "known_problems": [
             {"id": "P1", "cause": PIPE, "cases": [case("hack-0")]}, {"id": "P2", "cause": CALIBRATION, "cases": [case("hack-1")]}]}
     saved = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text())
-    assert [(item.id, item.source, item.members, item.findings, item.evidence) for item in saved.problems] == [
-        ("P1", "hack inspector", ["hack-0", "hack-2"], ["hack-0", "hack-2"], "evidenced"),
-        ("P2", "hack inspector", ["hack-1"], ["hack-1"], "evidenced")]
-    assert [[item["id"] for item in problem.cases] for problem in saved.problems] == [["hack-0", "hack-2"], ["hack-1"]]
+    assert [(item.id, item.source, item.members, item.findings, item.evidence, item.same_as) for item in saved.problems] == [
+        ("P1", "hack inspector", ["hack-0"], ["hack-0"], "evidenced", None),
+        ("P2", "hack inspector", ["hack-1"], ["hack-1"], "evidenced", None),
+        ("P3", "hack inspector", ["hack-2"], ["hack-2"], "evidenced", "P1")]
+    assert [[item["id"] for item in problem.cases] for problem in saved.problems] == [["hack-0"], ["hack-1"], ["hack-2"]]
     assert [item.id for item in analyses.candidates_sent] == ["hack-1", "hack-2"]
     assert [(item["finding"], item["problem"], item["new"]) for item in judged_events(tmp_path / "run")] == [
-        ("hack-0", "P1", True), ("hack-1", "P2", True), ("hack-2", "P1", False)]
+        ("hack-0", "P1", True), ("hack-1", "P2", True), ("hack-2", "P3", True)]
     assert not any("judging" in warning for warning in json.loads((tmp_path / "run" / "run.json").read_text())["warnings"])
 
 
@@ -842,7 +867,7 @@ def test_a_new_problems_cause_is_the_judges_sentence_and_known_problems_are_show
     """The judge names each finding's cause in one sentence and says why in another, also for the first finding. A new
     problem's cause is that sentence, not its first finding's mechanism, and a later call sees each known problem by it,
     with where and when its cases look but not their mechanisms. Each case keeps its verdict's cause and reason, in
-    attack.json and report.json."""
+    attack.json and report.json; a verdict naming a known problem is the new problem's note."""
     requests = judge_replies(monkeypatch, [said(), said("P1", reason="Both forge the pipe bytes the grader trusts.")])
     Analyses(monkeypatch, candidates=[pipe_findings()[0], pipe_findings()[2]], judging=True)
     built = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
@@ -856,18 +881,19 @@ def test_a_new_problems_cause_is_the_judges_sentence_and_known_problems_are_show
               "reason": "No known problem trusts the pipe bytes."},
              {"id": "hack-1", "outcome": "accepted_invalid", "mechanism": "Forge the pipe bytes on stdout.", "cause": PIPE,
               "reason": "Both forge the pipe bytes the grader trusts."}]
-    (problem,) = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text()).problems
-    assert (problem.cause, problem.members, problem.cases) == (PIPE, ["hack-0", "hack-1"], cases)
-    (shown,) = built["attack"]["problems"]
-    assert (shown["cause"], shown["cases"]) == (PIPE, cases)
+    problems = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text()).problems
+    assert [(problem.cause, problem.members, problem.cases, problem.same_as) for problem in problems] == [
+        (PIPE, ["hack-0"], cases[:1], None), (PIPE, ["hack-1"], cases[1:], "P1")]
+    assert [(shown["id"], shown["cause"], shown["cases"], shown.get("note")) for shown in built["attack"]["problems"]] == [
+        ("P1", PIPE, cases[:1], None), ("P2", PIPE, cases[1:], {"target": "P1", "kind": "same_as"})]
     assert [item["reason"] for item in events(tmp_path / "run") if item["kind"] == "judged"] == [case["reason"] for case in cases]
 
 
 @pytest.mark.parametrize("reply", [{"same_as": None, "cause": PIPE}, said(reason="  "), {"same_as": None, "reason": "No known problem."}])
 def test_a_verdict_without_its_cause_or_reason_is_refused_and_its_case_records_neither(tmp_path, monkeypatch, reply):
     """A verdict must give the cause it matched and its reason. One without either is refused, as any failed judge call:
-    the finding counts as a new problem, whose cause is then its mechanism, and its case records the cause and reason as
-    missing."""
+    the finding is a new problem without a note, whose cause is then its mechanism, and its case records the cause and
+    reason as missing."""
     judge_replies(monkeypatch, [reply])
     Analyses(monkeypatch, candidates=[pipe_findings()[2]], judging=True)
     built = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
@@ -875,14 +901,14 @@ def test_a_verdict_without_its_cause_or_reason_is_refused_and_its_case_records_n
     (problem,) = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text()).problems
     assert problem.cause == "Forge the pipe bytes on stdout."
     assert [(case["cause"], case["reason"]) for case in problem.cases] == [(None, None)]
-    assert any(warning.startswith("run: judging hack-0 failed, so it counts as a new problem") for warning in built["warnings"])
+    assert any(warning.startswith("run: judging hack-0 failed, so its problem has no note") for warning in built["warnings"])
     (judged,) = [item for item in events(tmp_path / "run") if item["kind"] == "judged"]
     assert judged["reason"] is None
 
 
-def test_one_attempt_is_one_member_of_each_problem_its_readings_are_judged_into(tmp_path, monkeypatch):
-    """An Attacker's attempt can evidence several readings, and each is judged. Two readings of one cause are two cases
-    of its problem but list the attempt once; a reading of another cause makes its own problem, which lists it too."""
+def test_each_reading_an_attempt_evidences_is_a_new_problem_and_the_judges_same_as_is_its_note(tmp_path, monkeypatch):
+    """An Attacker's attempt can evidence several readings, and each is judged into a new problem of its own that lists
+    the attempt; a verdict naming a known problem only notes it."""
     replies = iter([send.Verdict(cause=PIPE, reason="No known problem."), send.Verdict(same_as="A1", cause=PIPE, reason="Same pipe."),
                     send.Verdict(cause=CALIBRATION, reason="A constant is another flaw.")])
 
@@ -901,8 +927,8 @@ def test_one_attempt_is_one_member_of_each_problem_its_readings_are_judged_into(
                         {"id": "0012-attacker", "check": check})
 
     asyncio.run(judge_all())
-    assert [(item.id, item.members, [case["check"] for case in item.cases]) for item in problems] == [
-        ("A1", ["0012-attacker"], ["check-1", "check-2"]), ("A2", ["0012-attacker"], ["check-3"])]
+    assert [(item.id, item.members, [case["check"] for case in item.cases], item.same_as) for item in problems] == [
+        ("A1", ["0012-attacker"], ["check-1"], None), ("A2", ["0012-attacker"], ["check-2"], "A1"), ("A3", ["0012-attacker"], ["check-3"], None)]
 
 
 def test_a_legitimate_reading_and_a_control_make_no_problem(tmp_path, monkeypatch):
@@ -1000,9 +1026,9 @@ GRADER_STEPS, GRADER_LOCATION = "Write the answer in the documented format.", "t
 
 def test_each_grader_finding_is_judged_against_every_problem_and_attacked_whatever_its_problem(tmp_path, monkeypatch):
     """Each evidenced grader inspector finding is judged against the problems of both inspectors as it is recorded:
-    grader-0 is the hack inspector's P1 and grader-1 is new, G1. The judge's grouping decides no Attacker, so both are
-    fed to the same attack, as each check's finding is. An id names its inspector and assessment, so a hack and a grader
-    finding of one index stay distinct."""
+    grader-0, which the judge reads as the hack inspector's P1, is its own problem G1 with that note, and grader-1 is G2. The
+    judge decides no Attacker, so both are fed to the same attack, as each check's finding is. An id names its inspector
+    and assessment, so a hack and a grader finding of one index stay distinct."""
     judge_replies(monkeypatch, [said(cause=MECHANISM), said("P1", cause=MECHANISM), said(cause=GRADER_STEPS)])
     analyses = Analyses(monkeypatch, judging=True, candidates=[
         candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION)], assessments=[
@@ -1011,7 +1037,8 @@ def test_each_grader_finding_is_judged_against_every_problem_and_attacked_whatev
                   hint_location=GRADER_LOCATION),
         candidate("legitimate work", INTERPRETATION, "legitimate", full_guidance=GRADER_STEPS, hint_location=GRADER_LOCATION),
     ])
-    send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
+    (tmp_path / "requirements.toml").write_text(APPROVED)
+    send_nudis(tmp_path / "task", output_dir=tmp_path / "run", requirements=tmp_path / "requirements.toml")
 
     assert analyses.calls[-1] == ("attack", 1, 1, 3)
     hack, same, grader = analyses.candidates_sent
@@ -1019,14 +1046,13 @@ def test_each_grader_finding_is_judged_against_every_problem_and_attacked_whatev
     assert hack.id == "hack-0"
     assert (grader.id, grader.source, grader.valid_work) == ("grader-1", "grader_inspector", True)
     assert grader.guidance == {"full": GRADER_STEPS, "minimal": f"{WHERE_TO_LOOK}\n{GRADER_LOCATION}"}
-    assert [(item.id, item.source, item.members, item.findings) for item in analyses.problems_sent] == [
-        ("P1", "hack inspector", ["hack-0", "grader-0"], ["hack-0", "grader-0"]),
-        ("G1", "grader inspector", ["grader-1"], ["grader-1"])]
+    assert [(item.id, item.source, item.members, item.same_as) for item in analyses.problems_sent] == [
+        ("P1", "hack inspector", ["hack-0"], None), ("G1", "grader inspector", ["grader-0"], "P1"),
+        ("G2", "grader inspector", ["grader-1"], None)]
     assert [(item["inspector"], item["finding"], item["problem"], item["new"]) for item in judged_events(tmp_path / "run")] == [
-        ("hack", "hack-0", "P1", True), ("grader", "grader-0", "P1", False), ("grader", "grader-1", "G1", True)]
-    # Only the change of evidence is logged: P1 was already evidenced, so its grader finding writes no second event.
+        ("hack", "hack-0", "P1", True), ("grader", "grader-0", "G1", True), ("grader", "grader-1", "G2", True)]
     assert [(item["text"].split(" ", 2)[2], item["problem"]) for item in events(tmp_path / "run") if item["kind"] == "reproduced"] == [
-        ("hack inspector found P1", "P1"), ("grader inspector found G1", "G1")]
+        ("hack inspector found P1", "P1"), ("grader inspector found G1", "G1"), ("grader inspector found G2", "G2")]
 
 
 @pytest.mark.parametrize("status", ["complete", "partial"])
@@ -1180,8 +1206,9 @@ def test_the_judge_groups_by_cause_and_reads_each_findings_case_and_each_problem
                        "known_problems": [{"id": "P1", "cause": cause, "cases": [first]}]}
     assert sent[0]["known_problems"] == [] and (sent[0]["finding"]["mechanism"], sent[0]["finding"]["interpretation"]) == ("way 0", "reads 0")
     assert [item["request"] for item in events(tmp_path / "run") if item["kind"] == "judged"] == sent
-    (problem,) = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text()).problems
-    assert [(item["id"], item["location"]) for item in problem.cases] == [("hack-0", "tests/run.sh"), ("hack-1", "tests/helper.sh")]
+    problems = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text()).problems
+    assert [(item.id, item.same_as, [(case["id"], case["location"]) for case in item.cases]) for item in problems] == [
+        ("P1", None, [("hack-0", "tests/run.sh")]), ("P2", "P1", [("hack-1", "tests/helper.sh")])]
     assert "its interpretation of the evidence" in send.JUDGE_PROMPT and "When unsure" not in send.JUDGE_PROMPT
     assert not hasattr(inspection, "IDENTITY")
 
@@ -1217,17 +1244,19 @@ def test_the_judge_groups_by_what_the_grader_wrongly_trusts_and_sees_each_findin
 
 
 def test_a_grader_finding_of_a_known_problem_is_its_new_case_and_states_its_outcome(tmp_path, monkeypatch):
-    """The grader inspector evidences the hack inspector's P1 in an ordinary episode: the judge reads the grader
-    finding's outcome, and the finding becomes P1's case. P1 is attacked with its first finding with full guidance."""
+    """The grader inspector evidences what the judge reads as the hack inspector's P1 in an ordinary episode: the judge
+    reads the grader finding's outcome, and the finding is its own problem G1, whose note names P1. Only the finding with
+    full guidance is attacked."""
     requests = judge_replies(monkeypatch, [said(cause=MECHANISM), said("P1", cause=MECHANISM)])
     analyses = Analyses(monkeypatch, judging=True, candidates=[candidate(MECHANISM, INTERPRETATION, "accepted_invalid")], assessments=[
         candidate("accepted forged output", INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION)])
     send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
     assert [item.id for item in analyses.candidates_sent] == ["grader-0"]
-    assert [(item.id, item.findings, item.evidence) for item in analyses.problems_sent] == [("P1", ["hack-0", "grader-0"], "evidenced")]
+    assert [(item.id, item.findings, item.evidence, item.same_as) for item in analyses.problems_sent] == [
+        ("P1", ["hack-0"], "evidenced", None), ("G1", ["grader-0"], "evidenced", "P1")]
     assert json.loads(requests[1]["messages"][-1]["content"])["finding"]["outcome"] == "accepted_invalid"
-    assert [(item["id"], item["outcome"]) for item in analyses.problems_sent[0].cases] == [
-        ("hack-0", "accepted_invalid"), ("grader-0", "accepted_invalid")]
+    assert [[(item["id"], item["outcome"]) for item in problem.cases] for problem in analyses.problems_sent] == [
+        [("hack-0", "accepted_invalid")], [("grader-0", "accepted_invalid")]]
 
 
 def test_a_time_limit_during_the_attack_still_reports_its_untested_attempts_as_not_tested(tmp_path, monkeypatch, capsys):
@@ -1262,10 +1291,10 @@ def test_a_time_limit_during_the_attack_still_reports_its_untested_attempts_as_n
     assert built["status"] == "time_limit" and built["analyses"]["attack"] == "cancelled"
     (tested,) = built["attack"]["candidates"]
     assert [tested["conditions"][level]["tested"] for level in ("full", "minimal")] == [False, False]
-    assert "- attempt 1 on hack-0 (no category, none) with full instructions did not start: cancelled" in output
-    assert "- Not attempted: hack-0 (no category, none) with only a hint" in output
-    assert (f"- P1 from the hack inspector, ●●○○○ reproduced exploit, evidenced in a native episode, no clear Attacker result: {MECHANISM.rstrip('.')}; "
-            "findings hack-0 (no category, none).") in output
+    assert "- attempt 1 on hack-0 (no category, check-0000) with full instructions did not start: cancelled" in output
+    assert "- Not attempted: hack-0 (no category, check-0000) with only a hint" in output
+    assert (f"- P1 from the hack inspector, ●●○○○ reproduced exploit, evidenced in a native episode: {MECHANISM.rstrip('.')}; "
+            "findings hack-0 (no category, check-0000).") in output
 
 
 def test_no_candidate_leaves_guidance_unavailable_and_still_attacks(tmp_path, monkeypatch):
@@ -2113,14 +2142,16 @@ def sandbox_record(task: Path, **fields) -> str:
                             "task_digest": tree_digest(task), "copy_digest": "0", "environment": {}, **fields}).model_dump_json()
 
 
-def earlier_run(tmp_path, monkeypatch, analysis, **fake):
+def earlier_run(tmp_path, monkeypatch, analysis, requirements=None, **fake):
     """An earlier run of the fake analyses in `run-1` of a task with one file, with one inspector episode, one sandbox and
-    one priced call added as a real inspection leaves them."""
+    one priced call added as a real inspection leaves them; `requirements` is its approved list's TOML text."""
     (tmp_path / "task").mkdir()
     (tmp_path / "task" / "grader.py").write_text("expected = 1\n")
     Analyses(monkeypatch, **fake)
     earlier = tmp_path / "run-1"
-    send_nudis(tmp_path / "task", output_dir=earlier, analysis=analysis)
+    if requirements:
+        (tmp_path / "requirements.toml").write_text(requirements)
+    send_nudis(tmp_path / "task", output_dir=earlier, analysis=analysis, requirements=tmp_path / "requirements.toml" if requirements else None)
     record = json.loads((earlier / "run.json").read_text())
     episode, box = earlier / "episodes" / f"{len(record['episodes']):04d}-inspector", earlier / "sandboxes" / "sandbox-0000"
     for folder in (episode, box):
@@ -2201,9 +2232,9 @@ def test_attack_from_replays_the_earlier_runs_problems_in_its_log_without_a_judg
     assert all(item["text"].endswith("in the earlier run") and item["replayed"] is True for item in log)
 
 
-def test_a_rerun_keeps_only_evidenced_earlier_problems_each_with_the_run_and_level_that_evidenced_it(tmp_path, monkeypatch):
-    """An earlier problem nothing evidenced is dropped. An earlier A problem keeps its run and the help its Attacker
-    needed there; this rerun's Attackers did not find it again, so it shows its earlier level and says so."""
+def test_a_rerun_keeps_only_evidenced_earlier_problems_and_an_earlier_attacker_problem_is_a_lead_here(tmp_path, monkeypatch):
+    """An earlier problem nothing evidenced is dropped. An earlier A problem keeps its run, but its membership there is no
+    evidence here: this rerun's Attackers did not find it again, so it is a lead with no level."""
     found = [candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION)]
     earlier = earlier_run(tmp_path, monkeypatch, "hacking", candidates=found)
     saved = AttackResult.model_validate_json((earlier / "attack.json").read_text())
@@ -2217,10 +2248,8 @@ def test_a_rerun_keeps_only_evidenced_earlier_problems_each_with_the_run_and_lev
     built = send_nudis(tmp_path / "task", output_dir=tmp_path / "run-2", attack_from=earlier)
 
     assert [item.id for item in analyses.problems_sent] == ["P1", "A1"]
-    kept = next(item for item in built["attack"]["problems"] if item["id"] == "A1")
-    where = str(earlier.resolve())
-    assert (kept["origin"], kept["earlier_exploited_with"], kept["level"]) == (where, "none", 5)
-    assert kept["label"] == f"evidenced in run {where} at ●●●●● exploit executable by unaided learner; not found again here"
+    assert [item["id"] for item in built["problems"]] == ["P1"] and built["problems"][0]["level"] == 2
+    assert built["attack"]["leads"] == [{"id": "A1", "cause": "Write the score file.", "origin": str(earlier.resolve())}]
 
 
 def test_a_rerun_whose_copy_fails_still_ends_its_event_log(tmp_path, monkeypatch):
@@ -2243,7 +2272,7 @@ def test_attack_from_a_full_run_keeps_its_simulation_and_attacks_the_grader_find
     findings, all fed to the run's one attack call, as when the attack runs beside both inspectors. The ordinary
     episodes, labels and metrics read the copied records. TOML paths are relative to the file.
     The run's start names only the attack, which is all that runs."""
-    earlier = earlier_run(tmp_path, monkeypatch, "full", rewards=[1.0, 0.0], candidates=[
+    earlier = earlier_run(tmp_path, monkeypatch, "full", APPROVED, rewards=[1.0, 0.0], candidates=[
         candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION)], assessments=[
         candidate("accepted forged output", INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION),
         candidate("rejected documented format", "undeserved rejection", "rejected_valid", full_guidance=GRADER_STEPS,
@@ -2550,7 +2579,8 @@ def hack_findings(*readings) -> InspectionResult:
         result.experiments.append({"id": f"experiment-{index}", "category": category, "status": "assessed", "assessment": index,
                                    "check": f"check-{index}"})
         result.assessments.append(Assessment(claim=Claim(mechanism=f"way {index}", episode="0000-inspector", check=f"check-{index}",
-                                                         full_guidance=full, hint_location=LOCATION), outcome=outcome))
+                                                         full_guidance=full, hint_location=LOCATION, marks=["shown"]),
+                                             outcome=outcome, check=SHOWN))
     return result
 
 
@@ -2638,7 +2668,7 @@ def test_a_later_reading_that_withdraws_a_finding_leaves_its_problem_a_lead(tmp_
     (problem,) = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text()).problems
     assert (problem.id, [case["id"] for case in problem.cases]) == ("P1", ["hack-0"])
     assert built["status"] == "time_limit"
-    assert built["attack"]["problems"] == [] and built["attack"]["leads"] == [{"id": "P1", "cause": "way 0"}]
+    assert built["attack"]["problems"] == [] and built["attack"]["leads"] == [{"id": "P1", "cause": "way 0", "origin": None}]
 
 
 def test_a_time_limit_during_the_hack_inspection_keeps_the_early_reproduction(tmp_path, monkeypatch):

@@ -38,7 +38,7 @@ import nudi.inspection as inspection_module
 from nudi import attack, checks, copies, episode, inspector, inspector_sandbox, persistence, run_state
 from nudi.assessment import assess
 from nudi.checks import host_command as trusted_host_command
-from nudi.records import Assessment, Claim, Derivation, ModelConfig, Observation, RunConfig
+from nudi.records import Assessment, Check, Claim, Content, Derivation, ModelConfig, Observation, RunConfig
 from test_attack import GO_DIR, GO_FILE, SCRIPTED_PROBE, SCRIPTED_READING, scripted, stat_header
 from test_limits import credentials, new_run, session_messages
 from test_runner import (  # noqa: F401
@@ -179,6 +179,19 @@ def plan_order(monkeypatch):
     monkeypatch.setattr(inspection_module, "SLOWEST", ())
 
 
+def marked_reading(found, check):
+    """These scenarios do not measure, so a strong outcome without marks is given as marks what its check measured, a
+    scripted check measuring one when it has none."""
+    if found.outcome not in ("accepted_invalid", "rejected_valid") or found.claim.marks:
+        return found
+    found = found.model_copy(update={"check": found.check or Check(
+        id=check, content=Content(episode=found.claim.episode or "case", path="scripted", sha256="0" * 64), ids={},
+        requirement=Observation(episode=None, path="instruction.md", excerpt="scripted"), command=["scripted"], exit_code=0,
+        output=json.dumps({"observations": {"scripted": True}}))})
+    marks = sorted(inspection_module.measured_observations(found))
+    return found.model_copy(update={"claim": found.claim.model_copy(update={"marks": marks})})
+
+
 def mock_experiments(monkeypatch, callback):
     """Replace measurement and assessment for tests of orchestration.
 
@@ -201,7 +214,9 @@ def mock_experiments(monkeypatch, callback):
                 "check": check.model_dump() if check else {"id": identity, "exit_code": 0, "output": SCRIPTED_OUTPUT}, "scripted_claim": claim}
 
     def assess(claim, directory):
-        return assessments[claim.check] if claim.check in assessments else original(claim, directory)
+        if claim.check not in assessments:
+            return original(claim, directory)
+        return marked_reading(assessments[claim.check], claim.check)
 
     monkeypatch.setattr(inspection_module, "measure_experiment", measure)
     monkeypatch.setattr(inspection_module, "probe_values", lambda run, probe: None)
@@ -1747,9 +1762,9 @@ def setup_probe(**fields) -> dict:
 
 
 VIOLATED = {"claim": {"mechanism": "credit without explanation", "interpretation": "The required file is absent, so no credit is deserved.",
-                      "derivation": {"observations": ["exists"], "validity": "violated"}}}
+                      "marks": ["exists"], "derivation": {"observations": ["exists"], "validity": "violated"}}}
 SUPPORTED = {"claim": {"mechanism": "credit for the answer", "interpretation": "The answer is written, so the credit is deserved.",
-                       "derivation": {"observations": ["answered"], "validity": "supported"}}}
+                       "marks": ["answered"], "derivation": {"observations": ["answered"], "validity": "supported"}}}
 
 
 def deserved_probe(category="package_oracles") -> dict:
@@ -1776,7 +1791,7 @@ def test_measured_violation_without_a_deserved_score_does_not_stop_hack_discover
     Sandboxes(monkeypatch)
     no_native_actor(monkeypatch)
     absent = {"claim": {"mechanism": "credit without explanation", "interpretation": "The required file is absent.",
-                        "derivation": {"observations": ["exists"], "validity": "violated"}}}
+                        "marks": ["exists"], "derivation": {"observations": ["exists"], "validity": "violated"}}}
     requests = inspector_responses(monkeypatch, [{"probes": [setup_probe(program=ABSENCE)]}, absent, {"probes": []}])
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path), concurrency=2)
     result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=1))
@@ -1811,8 +1826,8 @@ def test_the_hack_inspector_measures_no_attacker_episode(tmp_path, monkeypatch, 
 @pytest.mark.parametrize("claim", [
     {**VIOLATED["claim"], "derivation": {"observations": {"exists": False}, "validity": "violated"}},
     {**VIOLATED["claim"], "derivation": {"observations": "exists", "validity": "violated"}},
-    {**VIOLATED["claim"], "derivation": {"observations": ["exists"]}},
-    {**VIOLATED["claim"], "validity": "violated", "derivation": {"observations": ["exists"]}},
+    {**VIOLATED["claim"], "marks": ["exists"], "derivation": {"observations": ["exists"]}},
+    {**VIOLATED["claim"], "validity": "violated", "marks": ["exists"], "derivation": {"observations": ["exists"]}},
     {**VIOLATED["claim"], "mechanism": 7},
 ])
 def test_an_invalid_claim_after_a_completed_check_is_returned_to_the_model(tmp_path, monkeypatch, credentials, claim, unit_sandboxes):
@@ -2465,8 +2480,8 @@ def test_unguided_hack_finding_is_reminded_once_and_its_guided_reading_is_the_ca
         return Assessment(claim=Claim(mechanism=probe["case"], episode="sandbox-0000"), execution_scope="package", outcome=outcome)
 
     mock_experiments(monkeypatch, investigate)
-    monkeypatch.setattr(inspection_module, "assess", lambda claim, directory: Assessment(
-        claim=claim, execution_scope="package", outcome="legitimate" if claim.mechanism == "legitimate" else outcome))
+    monkeypatch.setattr(inspection_module, "assess", lambda claim, directory: marked_reading(Assessment(
+        claim=claim, execution_scope="package", outcome="legitimate" if claim.mechanism == "legitimate" else outcome), claim.check))
     finding = {"mechanism": "finding", "interpretation": "The grader rewards any format."}
     guided = {**finding, "full_guidance": "Write the number in any format.", "hint_location": "tests/test.sh"}
     replies = []
@@ -2504,7 +2519,8 @@ def test_guidance_reminder_names_the_experiment_when_its_check_was_named(tmp_pat
         return Assessment(claim=Claim(mechanism="finding", episode="sandbox-0000"), execution_scope="package", outcome="accepted_invalid")
 
     mock_experiments(monkeypatch, investigate)
-    monkeypatch.setattr(inspection_module, "assess", lambda claim, directory: Assessment(claim=claim, execution_scope="package", outcome="accepted_invalid"))
+    monkeypatch.setattr(inspection_module, "assess", lambda claim, directory: marked_reading(Assessment(
+        claim=claim, execution_scope="package", outcome="accepted_invalid"), claim.check))
     finding = {"mechanism": "finding", "interpretation": "The grader rewards any format."}
     guided = {**finding, "full_guidance": "Write the number in any format.", "hint_location": "tests/test.sh"}
     replies = []
@@ -2536,8 +2552,8 @@ def test_a_later_reading_of_an_evidenced_check_is_a_revision_event(tmp_path, mon
         return Assessment(claim=Claim(mechanism="finding", episode="sandbox-0000"), execution_scope="package", outcome="accepted_invalid")
 
     mock_experiments(monkeypatch, investigate)
-    monkeypatch.setattr(inspection_module, "assess", lambda claim, directory: Assessment(
-        claim=claim, execution_scope="package", outcome="legitimate" if claim.mechanism == "no finding" else "accepted_invalid"))
+    monkeypatch.setattr(inspection_module, "assess", lambda claim, directory: marked_reading(Assessment(
+        claim=claim, execution_scope="package", outcome="legitimate" if claim.mechanism == "no finding" else "accepted_invalid"), claim.check))
     finding = {"mechanism": "finding", "interpretation": "The grader rewards any format."}
 
     async def behave(name, tools, schema):
@@ -2564,8 +2580,8 @@ def test_the_report_written_at_a_revision_has_the_corrected_reading(tmp_path, mo
         return Assessment(claim=Claim(mechanism="finding", episode="sandbox-0000"), execution_scope="package", outcome="accepted_invalid")
 
     mock_experiments(monkeypatch, investigate)
-    monkeypatch.setattr(inspection_module, "assess", lambda claim, directory: Assessment(
-        claim=claim, execution_scope="package", outcome="unknown" if claim.mechanism == "no finding" else "accepted_invalid"))
+    monkeypatch.setattr(inspection_module, "assess", lambda claim, directory: marked_reading(Assessment(
+        claim=claim, execution_scope="package", outcome="unknown" if claim.mechanism == "no finding" else "accepted_invalid"), claim.check))
     finding = {"mechanism": "finding", "interpretation": "The grader rewards any format.",
                "full_guidance": "Write the number in any format.", "hint_location": "tests/test.sh"}
 
@@ -2798,7 +2814,7 @@ def test_only_the_grader_inspector_sees_coverage_basis_and_derivation_requiremen
     assert "check" not in schema["properties"], "nudi supplies the check of an experiment"
     assert ("full_guidance" in schema["properties"]) is (job == "hack")
     assert "attribution" not in schema["properties"] and "Attribution" not in schema["$defs"]
-    assert ("marks" in schema["properties"]) is (job == "hack")
+    assert "marks" in schema["properties"], "Attacker readings carry marks too"
 
 
 @pytest.mark.parametrize("job", ["hack", "attack"])
@@ -3263,7 +3279,7 @@ def test_pending_interpretation_mark_follows_the_receipt(tmp_path, monkeypatch, 
     observations = "exists" if first == "invalid" else ["missing"]
     repair = {"check": "experiment-0000", "claim": {
         "mechanism": "repaired", "interpretation": "The explanation is absent, so no credit is deserved.",
-        "derivation": {"observations": ["exists"], "validity": "violated"}}}
+        "marks": ["exists"], "derivation": {"observations": ["exists"], "validity": "violated"}}}
     inspector_responses(monkeypatch, [
         {"probes": [setup_probe(category="accepted_invalid")]},
         {"claim": {"mechanism": first, "derivation": {"observations": observations, "validity": "violated"}}},
@@ -4428,7 +4444,7 @@ def test_episode_repair_of_a_broad_receipt_settles_its_category(tmp_path, monkey
         await tools["interpret_experiment"].ainvoke({"experiment": receipts[0]["id"], "claim": claim})
         if then == "invalid":
             await tools["interpret_experiment"].ainvoke({"experiment": receipts[0]["id"], "claim": {
-                **claim, "derivation": {"observations": ["exists"], "validity": "supported"}}})
+                **claim, "marks": ["exists"], "derivation": {"observations": ["exists"], "validity": "supported"}}})
         elif then == "cap":
             raise SpendingCapReached("spending cap reached")
         return schema()
@@ -5860,7 +5876,7 @@ print(json.dumps({'observations': {'answer': value}, 'results': {'deserved': int
 
 def public_claim(probe, **fields):
     return {"mechanism": probe["category"], "interpretation": "The decimal integer is 42; full credit follows from the task.",
-            "derivation": {"observations": ["answer"], "validity": "supported"},
+            "marks": ["answer"], "derivation": {"observations": ["answer"], "validity": "supported"},
             **fields}
 
 
@@ -6112,25 +6128,26 @@ def test_run_experiment_returns_a_draft_reading_with_everything_nudi_knows(tmp_p
         "experiment": "experiment-0000", "episode": reply["episode"], "check": check.id, "category": "package_oracles",
         "reward": "reward", "native_reward": 1.0, "requirement": check.requirement.model_dump(), "scoring": check.scoring.model_dump(),
         "location": "/app/explanation.txt", "capture_point": "verification_start", "observations": ["answered"], "deserved": 1,
-        "supply": ["mechanism", "interpretation", "derivation", "unresolved", "limits", "full_guidance", "hint_location", "use", "marks", "family"]}
+        "supply": ["mechanism", "interpretation", "derivation", "unresolved", "limits", "marks", "full_guidance", "hint_location", "family"]}
     assert reply["id"] == "experiment-0000" and reply["check"]["id"] == check.id
 
 
-def test_a_reading_records_a_hack_route_the_episode_used_and_the_task_rule_on_it(tmp_path, monkeypatch, credentials):
-    """An episode can reach its deserved reward through a hack category's route. The reading records that category and
-    the task's own rule on it; a route the probe's requirement forbids violates it, so a supported reading of it is refused."""
+def test_a_strong_reading_without_marks_is_told_which_marks_to_supply_and_stays_open(tmp_path, monkeypatch, credentials):
+    """An accepted invalid reading without marks shows no finding. The reply names what to supply, from the observations its
+    check measured, and so does its `open` entry; no claim contract has a field for the task's rule on a route."""
     Sandboxes(monkeypatch)
-    used = {"category": "leakage_metadata", "rule": "none"}
-    forbidden = {"claim": {**SUPPORTED["claim"], "use": {**used, "rule": "forbids"}}}
-    script = AgentScript(("run_experiment", {"probe": deserved_probe()}), ("interpret_experiment", forbidden),
-                         ("interpret_experiment", {"claim": {**SUPPORTED["claim"], "use": used}}), SUMMARY)
+    bare = {"claim": {**VIOLATED["claim"], "marks": []}}
+    script = AgentScript(("run_experiment", {"probe": setup_probe()}), ("interpret_experiment", bare), ("InspectionSummary", {}))
     run, result = scripted_hack_inspection(tmp_path, monkeypatch, credentials, script)
-    refused = json.loads(script.tool_results()[1])
-    assert refused["status"] == "invalid_claim" and "forbids" in refused["reason"]
+    reply = json.loads(script.tool_results()[1])
+    check, = run.record.checks
+    lacking = f"no marks: name in `marks` the observations of check {check.id} whose measured values show this finding, from exists"
+    assert reply["missing_marks"] == f"This reading is no finding yet: {lacking}. Call interpret_experiment on experiment-0000 again with them."
+    assert reply["open"][0]["reason"] == lacking and "naming its marks" in reply["open"][0]["next"]
     assessment, = result.assessments
-    assert assessment.outcome == "legitimate" and assessment.claim.use.model_dump() == used | {"requirement": None}
-    assert all("use" in inspection_module.claim_model(job).model_fields for job in ("hack", "grader"))
-    assert "use" not in inspection_module.claim_model("attack").model_fields
+    assert assessment.outcome == "accepted_invalid" and not inspection_module.evidenced(assessment)
+    assert result.categories["package_oracles"] != "evidenced_issue"
+    assert not any("use" in inspection_module.claim_model(job).model_fields for job in ("hack", "grader", "attack"))
 
 
 def test_a_second_run_experiment_with_a_draft_open_runs_nothing_and_returns_the_draft(tmp_path, monkeypatch, credentials):
@@ -6159,7 +6176,7 @@ def test_interpret_experiment_without_an_id_assesses_the_open_draft(tmp_path, mo
 def test_a_derivation_naming_an_unmeasured_key_is_refused_at_once_and_kept_in_revisions(tmp_path, monkeypatch, credentials):
     """Nothing is assessed, so the draft stays open for the corrected claim."""
     Sandboxes(monkeypatch)
-    wrong = {"claim": {**SUPPORTED["claim"], "derivation": {"observations": ["exists"], "validity": "supported"}}}
+    wrong = {"claim": {**SUPPORTED["claim"], "marks": ["exists"], "derivation": {"observations": ["exists"], "validity": "supported"}}}
     script = AgentScript(("run_experiment", {"probe": deserved_probe()}), ("interpret_experiment", wrong),
                          ("interpret_experiment", SUPPORTED), SUMMARY)
     run, result = scripted_hack_inspection(tmp_path, monkeypatch, credentials, script)
@@ -6177,7 +6194,7 @@ def test_a_secondary_reading_naming_an_unmeasured_key_is_refused(tmp_path, monke
     reading = {"requirement": {"episode": None, "path": "instruction.md", "excerpt": "Write the answer"},
                "observations": ["never_measured"], "validity": "supported", "interpretation": "Scripted reading."}
     fields = {**SUPPORTED["claim"], "episode": "0000-simulator", "check": "check-0000",
-              "derivation": {"observations": ["exists"], "validity": "supported", "requirements": [reading]}}
+              "marks": ["exists"], "derivation": {"observations": ["exists"], "validity": "supported", "requirements": [reading]}}
     with pytest.raises(inspection_module.InvalidClaim, match=r"derivation.requirements\[0\].observations names \['never_measured'\], which the check did not measure"):
         inspection_module.interpreted_claim(run, fields, None, output)
 
