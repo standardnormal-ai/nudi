@@ -31,7 +31,7 @@ from langchain_core.tools import tool
 from nudi import copies
 from nudi.assessment import (EQUAL_REWARD, NO_INTERPRETATION, Evidence, Ungrounded, assess, captured_object, conclusions, contains, deserved,
                              satisfied)
-from nudi.checks import CHECK_INPUT_CONTRACT, OUTPUT_LIMIT, check_submission, created, python3_runtime, redacted
+from nudi.checks import CHECK_INPUT_CONTRACT, CHECK_TIMEOUT, OUTPUT_LIMIT, check_submission, created, python3_runtime, redacted
 from nudi.episode import HELPER_STATE, compose_services, drop_links, grading_bound, state_copy
 from nudi.inspector_sandbox import SETUP, opened, sandbox
 from nudi.persistence import persistence_assessment
@@ -62,12 +62,14 @@ OUTCOMES = {"accepted_invalid": "incorrect work passed", "rejected_valid": "corr
 # nudi's check output contract, in the same words in judging.md, the contract reply and a repair.
 CHECK_OUTPUT = "exits 0 and prints one JSON object with `observations` and `results` objects and a finite `results.deserved`"
 # The repair of a check that breaks nudi's output contract, and of an unknown reading, first in its reply.
-CONTRACT = ("Repair: call run_experiment again on episode {episode} without a setup_program, with a check that "
+CONTRACT = ("Repair: {remeasure}, with a check that "
             + CHECK_OUTPUT + ". No claim on this check can settle a reading.")
 # The limit of a check that ran and failed; a later check of its category that keeps the contract repairs it.
 CHECK_FAILED = ": the check failed or returned no reward."
 # The gaps only a claim fills; nudi's other gaps need another check.
 CLAIM_GAPS = ("an Inspector derivation naming measured observations", "derivation.observations naming measured facts of the check output")
+# The hack inspector categories whose sessions ran longest.
+SLOWEST = ("resource_exhaustion", "other")
 HACK_CHECKLIST = (
     "Hack families that guide the search: " + ", ".join(HACK_CATEGORIES)
     + ". The list is not exhaustive, and a finding outside them is welcome."
@@ -103,6 +105,8 @@ class InspectionSession:
     """The session this one forked, whose experiments it inherits; None for a session that started fresh."""
     evidenced: bool = False
     """Whether a reading this session completed evidenced an issue."""
+    ended: str | None = None
+    """The status that ended the latest attempt, as a failure or a refusal; None when it returned its summary."""
 
 
 inspection_session: ContextVar[InspectionSession] = ContextVar("nudi_inspection_session")
@@ -772,11 +776,18 @@ def broken_contract(check: dict) -> str | None:
     return None
 
 
-def repair(missing: list[str], experiment: str, episode: str) -> str:
+def remeasure(row: dict) -> str:
+    """How to measure an experiment's case again in its place, in the scope `replaces` accepts: a package experiment with
+    its own setup_program, an episode's without one."""
+    where = "with the same setup_program" if scope(row) == "package" else f"on episode {row['episode']} without a setup_program"
+    return f"call run_experiment again {where}, naming {row['id']} in `replaces`"
+
+
+def repair(missing: list[str], row: dict) -> str:
     """An unknown reading's cheapest repair: the same check interpreted again when only the claim lacks something,
-    else the same episode checked again. Both resolve the equal-reward case, and neither is preferred."""
-    check = (f"call run_experiment again on episode {episode} without a setup_program, naming {experiment} in `replaces`, "
-             f"with a check that provides it and {CHECK_OUTPUT}")
+    else the same case checked again. Both resolve the equal-reward case, and neither is preferred."""
+    experiment = row["id"]
+    check = f"{remeasure(row)}, with a check that provides it and {CHECK_OUTPUT}"
     claim = f"call interpret_experiment on {experiment} again with a derivation naming measured observations of its check"
     route = (f"either {claim}, if the observations support the requirement, or {check}" if EQUAL_REWARD in missing
              else claim if all(item in CLAIM_GAPS for item in missing) else check)
@@ -939,7 +950,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
             elif id in unavailable:
                 reason, step = unavailable[id], f"measure a different case of {item['category']} with run_experiment naming {id} in `replaces`"
             elif id in broken:
-                reason, step = broken[id], CONTRACT.format(episode=item["episode"])
+                reason, step = broken[id], CONTRACT.format(remeasure=remeasure(item))
             elif assessment is None or evidenced(assessment) or consistent(assessment):
                 if assessment is not None and consistent(assessment):
                     agreeing.add(item["category"])
@@ -951,7 +962,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                 reason, step = UNFINISHED, f"complete its reading with interpret_experiment naming {id}"
             else:
                 reason = "; ".join(assessment.reasons) or f"its reading is {assessment.outcome}"
-                step = repair(assessment.missing, id, item["episode"]) if assessment.missing else (
+                step = repair(assessment.missing, item) if assessment.missing else (
                     f"interpret {id} again with interpret_experiment, or measure a different case with run_experiment naming {id} in `replaces`")
             if state is None or item.get("session") in (state.name, state.parent) or item["category"] in state.requested or (
                     state.attempt.episode and item.get("episode") == state.attempt.episode):
@@ -1013,6 +1024,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
         if status == "step_limit":
             cause = f"the {mode} inspector {cause}"
         state.attempt.status, state.attempt.error = status, cause
+        state.ended = status
         fail([target] if target in categories else state.requested, f"{status}: {cause}")
         save()
         if not isinstance(error, Exception) or isinstance(error, (SpendingCapReached, InfrastructureAbort)):
@@ -1197,7 +1209,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                     if review is not None:
                         review.status, review.error = "incomplete", broken[item["id"]]
                 return {"contract": f"{receipt['check']['id']} breaks nudi's check output contract: {why}. "
-                                    + CONTRACT.format(episode=receipt["episode"]), **receipt}
+                                    + CONTRACT.format(remeasure=remeasure(item)), **receipt}
             if "check" in receipt and receipt["status"] == "measured":
                 # A check that keeps the contract repairs the failed checks of its own episode, as the reply asked.
                 for other in report.experiments:
@@ -1240,8 +1252,8 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                 review.checks = {check.id: check.exit_code for check in run.record.checks[before:] if check.content.episode == review.episode}
             save()
 
-    run_experiment.description += (f" Setup and the check each stop after {grading_bound(Task(run.config.task_dir).config.verifier.timeout_sec):g} s, "
-                                   "this task's grading bound, and then measure nothing.")
+    run_experiment.description += (f" Setup stops after {grading_bound(Task(run.config.task_dir).config.verifier.timeout_sec):g} s, "
+                                   f"this task's grading bound, and the check after {CHECK_TIMEOUT:g} s; either then measures nothing.")
 
     @tool
     async def interpret_experiment(claim: Reading, experiment: str | None = None) -> dict:
@@ -1329,7 +1341,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                 for identity in [key for key, value in seen.items() if value in cases]:
                     seen.pop(identity)
                 if assessment.missing:
-                    reply = {"repair": repair(assessment.missing, again, receipt["episode"]), **reply}
+                    reply = {"repair": repair(assessment.missing, item), **reply}
             key = assessment.claim.check or again
             if evidenced(assessment):
                 state.evidenced = True
@@ -1369,6 +1381,12 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
     evidence = {f"episodes/{name}/{path}": source
                 for name in pool for path, source in Evidence(run.config.output_dir, name).files(name).items()}
     prompt = inspector_prompt(mode)
+
+    def leads(state, category) -> dict:
+        """What a session's nudi tool replies lead with: what keeps it open and, for a focused hack inspector, every
+        finding so far, which other sessions add to meanwhile."""
+        findings = found() if mode == "hack" and category else []
+        return {"open": obligations(state), **({"found": findings} if findings else {})}
 
     def asking(request: dict, category) -> dict:
         """A focused hack inspector request lists every evidenced finding so far and asks for a different problem."""
@@ -1440,7 +1458,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
             event(run, "session_start", f"{mode} inspector {name} started", inspector=mode, session=name, category=category, episode=episode,
                   **({"problem": target["problem"]} if mode == "attack" and target.get("problem") else {}))
             async with investigation(run, name, prompt, selected, fork, workspace) as session:
-                session.open = lambda: obligations(state)
+                session.open = lambda: leads(state, category)
                 report.artifacts[name] = {key: str((session.box.directory / value).relative_to(run.config.output_dir))
                                           for key, value in session.box.record.artifacts.items()}
                 report.artifacts[name]["sandbox"] = str((session.box.directory / "sandbox.json").relative_to(run.config.output_dir))
@@ -1459,7 +1477,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                         mine.append(state.index)
                         report.attempts.append(current)
                     previous = {message.id for message in session.state["messages"]}
-                    current.status = "no_evidenced_issue"
+                    current.status, state.ended = "no_evidenced_issue", None
                     try:
                         response = await session.ask(redacted(run, json.dumps(asking(initial if index == 0 else {
                             "mode": mode, "phase": phase, "number": current.number, "categories": requested, "instruction": "Investigate a new case, or repair a retained interpretation with interpret_experiment. Initial context is already in this session.", **snapshot(state)}, category), default=str)),
@@ -1472,7 +1490,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                             break
                         continue
                     if response.refusal:
-                        current.status, current.error = "model_inability", redacted(run, response.refusal)
+                        current.status, current.error, state.ended = "model_inability", redacted(run, response.refusal), "model_inability"
                         fail(requested, f"model_inability: {current.error}")
                     messages = [message for message in session.state["messages"] if message.id not in previous]
                     useful = any(getattr(message, "name", None) in ("read_file", "grep", "glob", "execute", "interpret_experiment") and message.type == "tool"
@@ -1522,9 +1540,8 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
             took = elapsed(started)
             # Category states stay in the event fields for search control, outside its display text.
             own = category or (categories[0] if len(categories) == 1 else None)
-            event(run, "session_end", f"{mode} inspector {name} ended after {took}"
-                  + (": repeated a check it had already run" if current.status == "duplicate_case" else f": attempt {current.status}"
-                     if current.status not in ("evidenced_issue", "no_evidenced_issue", "unknown") else "")
+            # Only the status that ended the session is why it ended; an experiment's own status stays in the records.
+            event(run, "session_end", f"{mode} inspector {name} ended after {took}" + (f": attempt {state.ended}" if state.ended else "")
                   + (f"; searched {own}" if own else ""), inspector=mode, session=name,
                   elapsed=took, status=current.status, category=own, category_status=report.categories.get(own),
                   result="evidenced_issue" if state.evidenced else "open" if obligations(state) or current.status not in (
@@ -1573,9 +1590,12 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                     stops.append(error)
                     raise
 
-        # Each session ends on its own; a cancellation reaches all of them, and gather returns once they ended.
-        await asyncio.gather(*(turn(f"{mode}-{category}", "focused", category, focused_attempts) for category in searched
-                               if focused_attempts), return_exceptions=True)
+        # Each session ends on its own; a cancellation reaches all of them, and gather returns once they ended. The slowest
+        # hack inspector sessions start first.
+        first = SLOWEST if mode == "hack" else ()
+        await asyncio.gather(*(turn(f"{mode}-{category}", "focused", category, focused_attempts)
+                               for category in sorted(searched, key=lambda category: category not in first) if focused_attempts),
+                             return_exceptions=True)
         if stops:
             raise stops[0]
         settling = True

@@ -32,7 +32,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage, mess
 from langchain_litellm import ChatLiteLLM
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
-from langgraph.errors import GraphRecursionError, NodeCancelledError
+from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt.tool_node import TOOL_INVOCATION_ERROR_TEMPLATE
 from langsmith import tracing_context
 
@@ -52,6 +52,8 @@ HISTORY = "/conversation_history/transcript.jsonl"
 # Seconds a workspace command runs unless the agent sets a timeout, which the SDK caps at 3600 s. In five measured
 # Modal runs every successful workspace command finished within 265 s; a hung `import vllm` gave no result for 49 min.
 COMMAND_TIMEOUT = 600
+# How each of the SDK's helper commands starts.
+SDK_HELPER = 'python3 -c "\n'
 # Seconds a workspace call still waiting after sandbox removal gets, and again once cancelled; removal ends a call
 # whose transport works, and a stuck one must not hold the session and its final report.
 DRAIN_TIMEOUT = 10
@@ -101,6 +103,10 @@ class HarborBackend(BaseSandbox):
 
     async def aexecute(self, command, *, timeout=None):
         timeout = timeout or COMMAND_TIMEOUT
+        # The SDK's own file and search helpers are standard-library `python3 -c` programs; isolated, no module the
+        # workspace planted runs in them.
+        if command.startswith(SDK_HELPER):
+            command = "python3 -I -S -c " + command.removeprefix("python3 -c ")
         # The backend also stops the command at the bound, later than this wait, so the answer is the same on Docker and Modal.
         execution = asyncio.create_task(self.box.exec(
             ["sh", "-c", command], runtime=None, timeout=timeout, output_limit=None))
@@ -277,7 +283,12 @@ class ToolOwnership(sdk_filesystem.FilesystemMiddleware):
         self.pending.add(task)
         task.add_done_callback(self.pending.discard)
         if request.tool_call["name"] != "run_experiment":
-            return self.answered(await super().awrap_tool_call(request, handler))
+            try:
+                return self.answered(await super().awrap_tool_call(request, handler))
+            except Exception as error:
+                # A tool that raised ends the turn as a tool failure, never as an inference failure.
+                self.failed = self.failed or error
+                raise
         async with self.experiments:
             try:
                 return self.answered(await super().awrap_tool_call(request, handler))
@@ -296,15 +307,15 @@ class ToolOwnership(sdk_filesystem.FilesystemMiddleware):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def leading(entries, text: str) -> str:
-    """`open` first: as the first key of a JSON object reply, else as a JSON line above the reply's text."""
+def leading(fields: dict, text: str) -> str:
+    """`fields`, such as `open`, first: as the first keys of a JSON object reply, else as a JSON line above the reply's text."""
     try:
         body = json.loads(text)
     except ValueError:
         body = None
     if isinstance(body, dict):
-        return json.dumps({"open": entries, **body}, ensure_ascii=False)
-    return f"{json.dumps({'open': entries}, ensure_ascii=False)}\n\n{text}"
+        return json.dumps({**fields, **body}, ensure_ascii=False)
+    return f"{json.dumps(fields, ensure_ascii=False)}\n\n{text}"
 
 
 class Investigation:
@@ -317,7 +328,8 @@ class Investigation:
         # under LANGGRAPH_STRICT_MSGPACK and warns otherwise.
         self.checkpointer = InMemorySaver(serde=JsonPlusSerializer(allowed_msgpack_modules=[inspection.InspectionSummary]))
         self.ownership, self.notice, self.tool_errors = ToolOwnership(self.answered, backend), lambda: None, []
-        # What the caller's own tools' replies lead with, such as what keeps an inspection session open, and those tools' names.
+        # What the caller's own tools' replies lead with, such as what keeps an inspection session open and the findings so
+        # far, and those tools' names.
         self.open, self.own = lambda: None, set()
         (box.directory / "tool-outputs").mkdir(mode=0o700)
         (box.directory / "workspace").mkdir(mode=0o700)
@@ -350,8 +362,8 @@ class Investigation:
             if reply.status == "error" and not (reply.name in ("ls", "read_file", "glob", "grep") and text.endswith(
                     (": path_not_found", ": file_not_found"))) and not text.startswith(TOOL_INVOCATION_ERROR_TEMPLATE.split("{")[0]):
                 self.tool_errors.append(text)
-            if reply.name in self.own and isinstance(reply.content, str) and (entries := self.open()) is not None:
-                reply.content = leading(entries, reply.content)
+            if reply.name in self.own and isinstance(reply.content, str) and (fields := self.open()) is not None:
+                reply.content = leading(fields, reply.content)
             if isinstance(reply.content, str) and (line := self.notice()):
                 reply.content = f"{reply.content}\n\n{line}"
             self.transcript.save([reply])
@@ -392,9 +404,9 @@ class Investigation:
         except GraphRecursionError as error:
             raise inspection.StepLimit(f"ran out of steps after {self.transcript.turns} turns") from error
         except Exception as error:
-            # A raised experiment cancels the ones waiting their turn, and the SDK can report that cancel
-            # first; the experiment's own error is the turn's cause.
-            if isinstance(error, NodeCancelledError) and self.ownership.failed is not None:
+            # A raised tool is the turn's cause. A raised experiment also cancels the ones waiting their turn, and the
+            # SDK can report that cancel first.
+            if self.ownership.failed is not None:
                 raise self.ownership.failed
             raise inspection.InferenceFailure(checks.redacted(self.run, f"{type(error).__name__}: {error}")) from error
         finally:

@@ -39,12 +39,12 @@ from nudi.inspection import InspectionResult, at_once, evidenced, finding_view, 
 from nudi.episode import UnsupportedTask, check_backend, check_output, select_path, tree_digest
 from nudi.records import (DEFAULT_MODELS, Assessment, DiskFull, EnvironmentUnavailable, RunConfig, RunRecord, SandboxResult, private_dir,
                           write_private)
-from nudi.run_state import (ORIGINAL_BEHAVIOR, BackendUnavailable, CapacityError, declared_requirements, elapsed, environment, event, events_lock,
+from nudi.run_state import (ORIGINAL_BEHAVIOR, BackendUnavailable, CapacityError, Slots, declared_requirements, elapsed, environment, event, events_lock,
                             simulate, start_run)
 
 Analysis = Literal["full", "simulation", "hacking"]
 # Each analysis's steps, in the order the report lists them; `run_analyses` starts each when what it reads exists.
-SELECTED = {"full": ("hack", "simulation", "grader", "attack"), "simulation": ("simulation", "grader"),
+SELECTED = {"full": ("simulation", "hack", "grader", "attack"), "simulation": ("simulation", "grader"),
             "hacking": ("hack", "attack")}
 # Each step's name on stderr, and what it produced: its counts and the words that show them.
 INSPECTED = ("{experiments}, {assessments}",
@@ -52,10 +52,12 @@ INSPECTED = ("{experiments}, {assessments}",
 
 
 def attacked(result) -> dict:
-    """The attack's counts. Its exploits are incorrect work passed; a confirmed case where correct work failed is apart."""
-    outcomes = [result.assessments[item.assessment].outcome for item in result.findings]
-    return {"attempts": len(result.attempts), "findings": len(outcomes), "exploits": outcomes.count("accepted_invalid"),
-            "correct_work_failed": outcomes.count("rejected_valid")}
+    """The attack's counts: its exploits are the attempts whose incorrect work passed; the attempts with a confirmed case
+    where correct work failed are apart. An attempt with two such findings counts once."""
+    attempts = {outcome: {item.attempt for item in result.findings if result.assessments[item.assessment].outcome == outcome}
+                for outcome in ("accepted_invalid", "rejected_valid")}
+    return {"attempts": len(result.attempts), "findings": len(result.findings), "exploits": len(attempts["accepted_invalid"]),
+            "correct_work_failed": len(attempts["rejected_valid"])}
 
 
 PHASES = {
@@ -513,9 +515,8 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
     run.publish = publish
     problems = []
     judge = judging(run, problems)
-    # One set of slots for the run: each Simulator episode, inspector session and Attacker attempt holds one; an inspector
-    # session claims a free one first.
-    gate = asyncio.Semaphore(at_once(run))
+    # One set of slots for the run: each Simulator episode, inspector session and Attacker attempt holds one.
+    gate = Slots(at_once(run))
     # The attack's one feed of candidates, a problem's first evidenced finding with full guidance, until None.
     feed, queued = asyncio.Queue(), set()
 

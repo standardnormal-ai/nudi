@@ -12,6 +12,7 @@ import math
 import operator
 import re
 import statistics
+import textwrap
 from collections import Counter
 from datetime import datetime, timedelta
 from fractions import Fraction
@@ -507,8 +508,12 @@ def ordinary(record: RunRecord, results: dict, warnings: list[str], notes: list[
         by_episode = {name: {key: value if value is not None and math.isfinite(value) else None
                              for key, value in results[name].rewards.items()} for name in names}
         summaries.append({"configuration": config, "episodes": names, "rewards": rewards, "episode_rewards": by_episode})
+    # Each pool episode without a usable reward, with its model calls: one with none never started.
+    calls = Counter(call.episode for call in record.calls)
+    no_reward = {name: {"model_calls": calls[name]} for name in simulation.episodes if results.get(name) is None
+                 or not any(value is not None and math.isfinite(value) for value in results[name].rewards.values())}
     return {"requested": simulation.requested, "attempted": len(simulation.episodes), "status": simulation.status,
-            "unrecorded": unrecorded, "refusals": simulation.refusals,
+            "unrecorded": unrecorded, "refusals": simulation.refusals, "no_reward": no_reward, "retries": simulation.retries,
             "failures": {name: [f"{error.type}: {error.message}" for error in errors] for name, errors in simulation.failures.items()},
             "groups": summaries}
 
@@ -1302,11 +1307,15 @@ UNPRICED = {"no response before its calls ended": "without a response before the
             "the request failed": "whose request failed"}
 
 
+def call_count(count: int) -> str:
+    return f"{count} call" + "s" * (count != 1)
+
+
 def left_out(item: dict) -> str:
     """What a known cost leaves out, with the reasons calls have no price. Reports from before the reasons give a count."""
     why = ", ".join(f"{count} {UNPRICED.get(reason, f'not priced: {brief(reason)}')}" for reason, count in item.get("unknown_reasons", {}).items())
-    parts = ([f"{item['unknown_cost_calls']} calls with unknown prices" + f" ({why})" * bool(why)] * bool(item["unknown_cost_calls"])
-             + [f"{item['cancelled_calls']} calls cancelled in flight"] * bool(item["cancelled_calls"]))
+    parts = ([f"{call_count(item['unknown_cost_calls'])} with unknown prices" + f" ({why})" * bool(why)] * bool(item["unknown_cost_calls"])
+             + [f"{call_count(item['cancelled_calls'])} cancelled in flight"] * bool(item["cancelled_calls"]))
     return f", excluding {' and '.join(parts)}" if parts else ""
 
 
@@ -1339,7 +1348,8 @@ def still_open(mode: str, item: dict) -> list[str]:
         if entry["id"] == entry["category"] and entry["reason"].startswith("an attempt failed: "):
             failed.setdefault(entry["reason"], []).append(entry["category"])
         else:
-            groups.setdefault(entry["category"] or "ordinary episodes", []).append(f"{entry['id']}: {entry['reason']}")
+            # An unavailable measurement's reason can already start with its id.
+            groups.setdefault(entry["category"] or "ordinary episodes", []).append(f"{entry['id']}: {entry['reason'].removeprefix(entry['id'] + ': ')}")
     counts = Counter(entry["category"] or "no category" for entry in item["findings"]["legitimate"] if entry["superseded_by"] is None)
     return ([f"- {mode} {category} leads: {'; '.join(entries)}" for category, entries in groups.items()]
             + [f"- {mode} ●○○○○ suspected exploit ({entry['category'] or 'no category'}, {entry['check']})" for entry in item.get("suspected", [])]
@@ -1434,8 +1444,8 @@ def rewards(attempt: dict) -> str:
 
 # An Attacker attempt that did not run or was not judged: it shows nothing, so no count of attempts includes it.
 UNASSESSED = {*SESSION_FAILURES, "cancelled", "spending_exhausted", "environment_unavailable", "infrastructure_failure", "native_timeout",
-              "episode_failure", "running"}
-STOPPED = {"unknown": "result unclear", "cancelled": "cancelled", "spending_exhausted": "stopped by the spending cap", "running": "unfinished",
+              "episode_failure", "no_reward", "running"}
+STOPPED = {"unknown": "result unclear", "no_reward": "the grader wrote no reward", "cancelled": "cancelled", "spending_exhausted": "stopped by the spending cap", "running": "unfinished",
            "insufficient_time": "its agent timeout is longer than the time left before the time limit"}
 WAITING = {"unattempted": "Not attempted", "unavailable": "Not attempted, no guidance", "not_requested": "Not attempted, hints not requested",
            "not_needed": "Not run, the previous step did not exploit it",
@@ -1762,26 +1772,44 @@ def lost(report: dict) -> dict[str, list[str]]:
     """By step, the work that failed to execute, also when a later attempt recovered it, named by the agent that failed.
     An inspector session that failed with its experiment's error is that experiment's failure."""
     found, attempts = {}, {}
+    pool = report["ordinary"] or {}
+    for started, verb in ((False, "did not start"), (True, "ended without a reward")):
+        names = [name for name, item in pool.get("no_reward", {}).items() if bool(item["model_calls"]) == started]
+        if names:
+            found.setdefault("simulation", []).append(f"{len(names)} of {pool['attempted']} Simulator episodes {verb}: " + ", ".join(
+                f"{name} ({textwrap.shorten(pool['failures'][name][0], 200, placeholder='...')})" if pool["failures"].get(name) else name
+                for name in names))
     for item in (report["attack"] or {}).get("attempts", []):
         if item["status"] in FAILURES:
             attempts.setdefault(item.get("failed"), []).append(item["episode"] or item["context"])
     for agent, names in attempts.items():
-        found.setdefault("attack", []).append(
-            f"the Attacker failed to run in {', '.join(names)}" if agent == "Attacker"
-            else f"the attack inspector failed on {', '.join(names)}, " + ("its reward kept" if len(names) == 1 else "their rewards kept")
-            if agent == "attack inspector" else f"an attack attempt failed in {', '.join(names)}")
+        listed = ", ".join(names)
+        found.setdefault("attack", []).append({
+            "Attacker": f"the Attacker failed to run in {listed}",
+            "attack inspector": f"the attack inspector failed on {listed}, " + ("its reward kept" if len(names) == 1 else "their rewards kept"),
+            }.get(agent, f"an attack attempt failed in {listed}"))
     for step, name in (("hack", "hack inspector"), ("grader", "grader inspector")):
         inspection = report["inspections"].get(f"{step}_inspector") or {}
         rows = [row for row in inspection.get("experiments", []) if row.get("status") in FAILURES]
         errors = {row.get("error") for row in rows}
+        sessions = {}
         for item in inspection.get("attempts", []):
             if item["status"] in FAILURES and item.get("error") not in errors:
-                of = item.get("category") or item.get("episode")
-                found.setdefault(step, []).append(f"the {name}'s {item['phase']} session{f' of {of}' if of else ''} failed ({item['status']})")
+                sessions.setdefault((item["phase"], item.get("category") or item.get("episode")), []).append(item)
+        for (phase, of), items in sessions.items():
+            how = (f"({items[0]['status']})" if len(items) == 1
+                   else "in " + " and ".join(f"attempt {item['number']} ({item['status']})" for item in items))
+            found.setdefault(step, []).append(f"the {name}'s {phase} session{f' of {of}' if of else ''} failed {how}")
         if rows:
             found.setdefault(step, []).append(("a " if len(rows) == 1 else "") + f"{name} experiment{'s' * (len(rows) > 1)} failed: "
                                               + ", ".join(f"{row['id']} ({row['status']})" for row in rows))
     return found
+
+
+def unjudged(report: dict) -> dict[str, list[str]]:
+    """By step, work that ran and left nothing to judge: Attacker episodes whose grader wrote no reward."""
+    names = [item["episode"] for item in (report["attack"] or {}).get("attempts", []) if item["status"] == "no_reward"]
+    return {"attack": [f"the grader wrote no reward in {', '.join(names)}"]} if names else {}
 
 
 def headline(report: dict, record: RunRecord, stop=None) -> str:
@@ -1791,14 +1819,15 @@ def headline(report: dict, record: RunRecord, stop=None) -> str:
         minutes = int((datetime.fromisoformat(record.ended_at) - datetime.fromisoformat(record.started_at)).total_seconds()) // 60
         took = f" after {minutes // 60}:{minutes % 60:02d}"
     # A partial step that is no failed phase ran to its end, with an attempt that failed to run: its lost work says which.
-    work, gaps = lost(report), []
+    work, gaps, why = lost(report), [], unjudged(report)
     for name, state in report["unfinished"].items():
-        partial = state == "partial" and name not in record.failed_phases
-        gaps.append("; ".join(work.pop(name)) if partial and work.get(name) else f"{STEPS[name]} " + (
-            "did not run" if state == "not run" else "had an attempt that failed to run" if partial else STOPPED.get(state, "failed")))
+        partial = state == "partial"
+        gaps.append("; ".join(work.pop(name) + why.pop(name, [])) if partial and work.get(name) else f"{STEPS[name]} " + (
+            "did not run" if state == "not run" else "had an attempt that failed to run" if partial and name not in record.failed_phases
+            else STOPPED.get(state, "failed")))
     also = "; ".join(phrase for phrases in work.values() for phrase in phrases)
-    unresolved = "".join(f" Evidence stayed unresolved in {', '.join(STEPS[name] for name in report['unresolved'])}, so the run may miss more."
-                         for _ in report["unresolved"][:1])
+    named = [STEPS[name] + "".join(f" ({clause})" for clause in why.get(name, [])) for name in report["unresolved"]]
+    unresolved = f" Evidence stayed unresolved in {', '.join(named)}, so the run may miss more." if named else ""
     failed = "".join(f"; before that {', '.join(f'{STEPS[name]} failed' for name in record.failed_phases)}" for _ in record.failed_phases[:1])
     if record.stop_reason:
         return f"Stopped{took}: {record.stop_reason.rstrip('.')}{failed}. Results below are what was found so far."
@@ -1859,7 +1888,7 @@ def markdown(report: dict) -> str:
     lines += [f"- Task: {config['task_dir']}; execution path {config['path']}: {'; '.join(config['path_reasons'])}",
               f"- Spending cap: {config['spending_cap']}; {cost(config)}"]
     lines += ["- Known cost per job:"] * bool(config["cost_by_job"]) + [
-        f"  - {name}: known cost ${item['known_cost']:.6f} in {item['calls']} calls, {item['prompt_tokens']} prompt and "
+        f"  - {name}: known cost ${item['known_cost']:.6f} in {call_count(item['calls'])}, {item['prompt_tokens']} prompt and "
         f"{item['completion_tokens']} completion tokens{left_out(item)}" for name, item in config["cost_by_job"].items()]
     if modal := config["modal_cost"]:
         lines.append(f"- Modal compute: estimated ${modal['at_requests']:.2f} at requested CPU and memory, ${modal['at_limits']:.2f} "
@@ -1903,7 +1932,10 @@ def markdown(report: dict) -> str:
     else:
         lines.append(f"{pool['attempted']} of {pool['requested']} requested episodes attempted; status {pool['status']}.")
         lines += [f"- {name}: no retained record; {'; '.join(errors) or 'cause unknown'}" for name, errors in pool["unrecorded"].items()]
-        lines += [f"- {name} recorded {'; '.join(errors)}; its retained reward is summarized below"
+        replaced = {original: retry for retry, original in pool.get("retries", {}).items()}
+        lines += [f"- {name} recorded {oneline('; '.join(errors))}; " + (
+                      f"it made no model call, so {replaced[name]} replaced it" if name in replaced
+                      else "it has no reward" if name in pool.get("no_reward", {}) else "its retained reward is summarized below")
                   for name, errors in pool["failures"].items() if errors and name not in pool["unrecorded"]]
         for group in pool["groups"]:
             setup = group["configuration"]

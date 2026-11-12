@@ -761,14 +761,64 @@ async def run_role_episode(run: Run, role: Role, *, instruction: str | None = No
         run.save()
 
 
+class Slots:
+    """The run's one set of slots. Work takes a free slot in the order it asked for one, except that work entering
+    `ahead()` takes the next free slot before work that did not; running work is never interrupted."""
+
+    def __init__(self, count: int):
+        self.free, self.queues = count, ([], [])  # Waiters ahead, then the others, each in the order they asked.
+
+    def locked(self) -> bool:
+        return self.free == 0
+
+    async def acquire(self, ahead: bool = False) -> None:
+        if self.free and not any(self.queues):
+            self.free -= 1
+            return
+        queue, granted = self.queues[0 if ahead else 1], asyncio.get_running_loop().create_future()
+        queue.append(granted)
+        try:
+            await granted
+        except asyncio.CancelledError:
+            if granted.done() and not granted.cancelled():
+                self.release()  # The slot came as the wait was cancelled; it goes to the next waiter.
+            elif granted in queue:
+                queue.remove(granted)
+            raise
+
+    def release(self) -> None:
+        for queue in self.queues:
+            while queue:
+                granted = queue.pop(0)
+                if not granted.done():
+                    granted.set_result(None)
+                    return
+        self.free += 1
+
+    async def __aenter__(self):
+        await self.acquire()
+
+    async def __aexit__(self, *exc):
+        self.release()
+
+    @contextlib.asynccontextmanager
+    async def ahead(self):
+        await self.acquire(ahead=True)
+        try:
+            yield
+        finally:
+            self.release()
+
+
 async def simulate(run: Run, episodes: int = 12, *, gate: contextlib.AbstractAsyncContextManager | None = None) -> Simulation:
     """Run `episodes` ordinary Simulator episodes of the original task and harness.
 
     Every count takes this path. As many workers as the run's queue runs at once admit
     an episode only while the spending cap allows; admitted episodes finish. With `gate`
     each episode holds one of its slots, which other work shares, from before admission to its end. Failed
-    episodes stay recorded and are not retried; the pool is partial only when one has no
-    usable reward. Each episode's state copies serve grader inspection, which reuses this pool."""
+    episodes stay recorded; one that ended without a reward and without a model call gets one fresh attempt in its
+    place. The pool is partial only when one has no usable reward. Each episode's state copies serve grader
+    inspection, which reuses this pool."""
     from nudi.checks import finish_cleanup, redacted
 
     if type(episodes) is not int or episodes < 1:
@@ -776,24 +826,27 @@ async def simulate(run: Run, episodes: int = 12, *, gate: contextlib.AbstractAsy
     simulation = Simulation(requested=episodes)
     run.record.simulation = simulation
     run.save()
-    unusable = set()
+    unusable, replaced, unclaimed = set(), [], episodes
 
     async def worker():
-        # Harbor's shielded environment stop consumes a cancellation and the trial returns normally.
-        while not asyncio.current_task().cancelling() and len(simulation.episodes) < episodes:
+        nonlocal unclaimed
+        # A worker claims an episode before it waits for a slot, so none waits once no episode is left. Harbor's shielded
+        # environment stop consumes a cancellation and the trial returns normally.
+        while unclaimed and not asyncio.current_task().cancelling():
+            unclaimed -= 1
             async with gate or contextlib.nullcontext():
-                # Other workers may have started the last episodes while this one waited for its slot.
-                if len(simulation.episodes) >= episodes:
-                    return
+                # Waits for room here, so run_role_episode admits at once and assigns this name before its first await.
+                # The cap is checked after the wait, which can outlast it.
+                await run.admit_container("native")
                 try:
                     run.check_cap()
                 except SpendingCapReached:
                     simulation.status = "spending_exhausted"
                     return
-                # Waits for room here, so run_role_episode admits at once and assigns this name before its first await.
-                await run.admit_container("native")
                 name = f"{len(run.record.episodes):04d}-simulator"
                 simulation.episodes.append(name)
+                if replaced:
+                    simulation.retries[name] = replaced.pop(0)
                 try:
                     result = await run_role_episode(run, "simulator")
                     if result.errors:
@@ -801,6 +854,12 @@ async def simulate(run: Run, episodes: int = 12, *, gate: contextlib.AbstractAsy
                                                      for error in result.errors]
                     if not any(value is not None and math.isfinite(value) for value in result.rewards.values()):
                         unusable.add(name)
+                        # Nothing ran, as when the agent setup failed: a fresh attempt takes its place.
+                        if name not in simulation.retries and not any(call.episode == name for call in run.record.calls):
+                            simulation.episodes.remove(name)
+                            unusable.discard(name)
+                            replaced.append(name)
+                            unclaimed += 1
                 except Exception as error:
                     simulation.failures[name] = [ErrorRecord(type=type(error).__name__, message=redacted(run, str(error)))]
                     unusable.add(name)
@@ -819,12 +878,14 @@ async def simulate(run: Run, episodes: int = 12, *, gate: contextlib.AbstractAsy
     try:
         await asyncio.gather(*workers)
         if simulation.status == "running":
-            simulation.status = "partial" if unusable else "complete"
+            simulation.status = "partial" if unusable or replaced else "complete"
     except asyncio.CancelledError:
         simulation.status = "cancelled"
         raise
     finally:
         # gather passes on one worker's stop, a full disk among them, while the others keep running.
         await finish_cleanup(asyncio.create_task(stop()))
+        # An episode whose fresh attempt never started, as at the spending cap, stays in the pool.
+        simulation.episodes += replaced
         run.save()
     return simulation

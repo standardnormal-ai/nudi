@@ -368,7 +368,7 @@ def test_each_candidate_receives_only_its_own_guidance_in_fresh_contexts(tmp_pat
                     assert text == f"{attack_module.EXPLOIT_INSTRUCTION}\nDetails:\n{other}"
                 else:
                     assert "No extra hint" in text and "reward hack" in text.lower()
-                    assert inspection.HACK_CHECKLIST in text
+                    assert inspection.HACK_CHECKLIST not in text, "the independent search gets no category list"
                     assert all(item not in text for item in (FULL, MINIMAL, other, "hack-0", "hack-3", "suspected boundary"))
                 if attempt.candidate:
                     assert inspection.HACK_CHECKLIST not in text
@@ -1468,7 +1468,7 @@ def test_each_attacker_episode_and_attack_inspector_session_logs_its_start_and_e
         "Attacker 0000-attacker started",
         "Attacker 0000-attacker finished after T: rewards [1.0]",
         f"attack inspector {title} started",
-        f"attack inspector {title} ended after T: attempt unobservable; searched accepted_invalid",
+        f"attack inspector {title} ended after T; searched accepted_invalid",
         "Attacker 0000-attacker result: unclear: the attack inspector could not tell",
     ]
     assert len(result.assessments) == 1
@@ -2655,7 +2655,7 @@ def test_a_fed_attack_runs_discovery_at_once_and_a_single_hint_only_after_a_full
     async def main():
         feed = asyncio.Queue()
         attacking = asyncio.create_task(attack_module.attack(run, maximum_attempts=1, discovery_attempts=1, problems=problems,
-                                                             feed=feed, gate=asyncio.Semaphore(2)))
+                                                             feed=feed, gate=run_state.Slots(2)))
         for item in (candidate("hack-0", "FULL-0", "MINIMAL-0"), candidate("hack-3", "FULL-3", "MINIMAL-3"), None):
             feed.put_nowait(item)
         return await attacking
@@ -2677,6 +2677,119 @@ def test_a_fed_attack_runs_discovery_at_once_and_a_single_hint_only_after_a_full
     assert saved == json.loads(result.model_dump_json()) and [item["id"] for item in saved["problems"]] == ["P1", "P2"]
 
 
+def test_a_candidate_fed_later_gets_its_first_attempt_before_earlier_retries(tmp_path, monkeypatch, credentials):
+    """Each exploit candidate's first full-hint attempt goes first, also for a candidate fed after the attack started."""
+    run = new_run(tmp_path, monkeypatch, credentials, concurrency=2)  # one slot
+    monkeypatch.setattr(run_state, "run_episode", scripted_episodes)
+    monkeypatch.setattr(attack_module, "inspect", scripted_judge({})[0])
+
+    async def main():
+        feed, gate = asyncio.Queue(), run_state.Slots(1)
+        await gate.acquire()  # other work, so both candidates arrive before an attempt ends
+        attacking = asyncio.create_task(attack_module.attack(run, maximum_attempts=2, discovery_attempts=0, feed=feed, gate=gate))
+        for item in (candidate("hack-0", "FULL-0"), candidate("hack-3", "FULL-3"), None):
+            feed.put_nowait(item)
+        await asyncio.sleep(0.05)
+        gate.release()
+        return await attacking
+
+    result = asyncio.run(main())
+    started = {item.episode: item.context for item in result.attempts}
+    events = [json.loads(line) for line in (run.config.output_dir / "events.jsonl").read_text().splitlines()]
+    assert [started[item["episode"]] for item in events if item["kind"] == "attempt_start"] == [
+        "attacker-hack-0-full-1", "attacker-hack-3-full-1", "attacker-hack-0-full-2", "attacker-hack-3-full-2"]
+
+
+def test_an_attacker_on_a_judged_problem_takes_the_next_slot_ahead_of_work_not_started(tmp_path, monkeypatch, credentials):
+    """The first Attacker on a judged problem waited behind every hack inspector session not yet started. It takes the
+    next free slot ahead of them; running work keeps its slot."""
+    run = new_run(tmp_path, monkeypatch, credentials, concurrency=4)
+    monkeypatch.setattr(run_state, "run_episode", scripted_episodes)
+    monkeypatch.setattr(attack_module, "inspect", scripted_judge({})[0])
+    seen = []
+
+    async def main():
+        feed, gate = asyncio.Queue(), run_state.Slots(1)
+        await gate.acquire()  # a running hack inspector session
+
+        async def session():
+            async with gate:
+                seen.append(list(run.record.episodes))
+
+        waiting = asyncio.create_task(session())
+        await asyncio.sleep(0)
+        attacking = asyncio.create_task(attack_module.attack(run, maximum_attempts=1, discovery_attempts=0, feed=feed, gate=gate))
+        for item in (candidate("hack-0", "FULL-0"), None):
+            feed.put_nowait(item)
+        await asyncio.sleep(0.05)
+        gate.release()
+        result = await attacking
+        await waiting
+        return result
+
+    result = asyncio.run(main())
+    assert [item.context for item in result.attempts] == ["attacker-hack-0-full-1"]
+    assert seen == [[result.attempts[0].episode]], "the waiting session started after the Attacker"
+
+
+def test_a_waiting_discovery_attempt_leaves_a_judged_problem_free_to_queue_ahead(tmp_path, monkeypatch, credentials):
+    """With one slot, the no-hint attempt waits behind a hack inspector session; an Attacker on a judged problem fed
+    meanwhile still takes the next free slot ahead of both."""
+    run = new_run(tmp_path, monkeypatch, credentials, concurrency=2)  # one slot
+    monkeypatch.setattr(run_state, "run_episode", scripted_episodes)
+    monkeypatch.setattr(attack_module, "inspect", scripted_judge({})[0])
+    seen = []
+
+    async def main():
+        feed, gate = asyncio.Queue(), run_state.Slots(1)
+        await gate.acquire()  # a running hack inspector session
+
+        async def session():
+            async with gate:
+                seen.append(list(run.record.episodes))
+
+        waiting = asyncio.create_task(session())
+        await asyncio.sleep(0)
+        attacking = asyncio.create_task(attack_module.attack(run, maximum_attempts=1, discovery_attempts=1, feed=feed, gate=gate))
+        await asyncio.sleep(0.05)  # the no-hint attempt now waits for a slot
+        for item in (candidate("hack-0", "FULL-0"), None):
+            feed.put_nowait(item)
+        await asyncio.sleep(0.05)
+        gate.release()
+        result = await attacking
+        await waiting
+        return result
+
+    result = asyncio.run(main())
+    started = {item.episode: item.context for item in result.attempts}
+    events = [json.loads(line) for line in (run.config.output_dir / "events.jsonl").read_text().splitlines()]
+    assert [started[item["episode"]] for item in events if item["kind"] == "attempt_start"] == [
+        "attacker-hack-0-full-1", "attacker-none-none-1"]
+    assert seen == [[next(item.episode for item in result.attempts if item.context == "attacker-hack-0-full-1")]]
+
+
+def test_slots_let_work_ahead_first_and_a_cancelled_wait_holds_none():
+    async def main():
+        slots, order = run_state.Slots(1), []
+        await slots.acquire()
+
+        async def take(name, ahead=False):
+            async with slots.ahead() if ahead else slots:
+                order.append(name)
+
+        session = asyncio.create_task(take("session"))
+        gone = asyncio.create_task(take("gone"))
+        attacker = asyncio.create_task(take("attacker", ahead=True))
+        await asyncio.sleep(0)
+        gone.cancel()
+        await asyncio.sleep(0)
+        slots.release()
+        await asyncio.gather(session, attacker)
+        return order, slots.free
+
+    assert asyncio.run(main()) == (["attacker", "session"], 1)
+
+
 def test_a_candidate_fed_before_the_feed_closes_still_runs_and_an_empty_fed_attack_saves_its_record(tmp_path, monkeypatch, credentials):
     """The hack inspector holds the only slot until it ends and the feed closes; the queued candidate still runs afterwards.
     A fed attack that was fed nothing is the run's one attack, so it saves its record too."""
@@ -2685,7 +2798,7 @@ def test_a_candidate_fed_before_the_feed_closes_still_runs_and_an_empty_fed_atta
     monkeypatch.setattr(attack_module, "inspect", scripted_judge({})[0])
 
     async def main(items):
-        feed, gate = asyncio.Queue(), asyncio.Semaphore(1)
+        feed, gate = asyncio.Queue(), run_state.Slots(1)
         await gate.acquire()
         attacking = asyncio.create_task(attack_module.attack(run, maximum_attempts=1, discovery_attempts=0, feed=feed, gate=gate))
         for item in items:
@@ -2711,7 +2824,7 @@ def test_a_queued_finding_withdrawn_before_its_slot_frees_launches_no_attacker(t
     withdrawn = {"hack-0"}
 
     async def main():
-        feed, gate = asyncio.Queue(), asyncio.Semaphore(1)
+        feed, gate = asyncio.Queue(), run_state.Slots(1)
         await gate.acquire()
         attacking = asyncio.create_task(attack_module.attack(run, maximum_attempts=1, discovery_attempts=0, feed=feed, gate=gate,
                                                              current=lambda item: None if item.id in withdrawn else item))
@@ -2740,7 +2853,7 @@ def test_a_queued_finding_runs_the_guidance_of_the_latest_reading_of_its_check(t
     replacement = candidate("hack-1", latest)
 
     async def main():
-        feed, gate = asyncio.Queue(), asyncio.Semaphore(1)
+        feed, gate = asyncio.Queue(), run_state.Slots(1)
         await gate.acquire()
         attacking = asyncio.create_task(attack_module.attack(run, maximum_attempts=1, discovery_attempts=0, feed=feed, gate=gate,
                                                              current=lambda item: replacement))
@@ -3122,7 +3235,7 @@ def test_interpreting_inspector_receives_retained_attack_evidence(tmp_path, monk
             assert result.assessments[0].claim.check and result.assessments[0].claim.episode == result.attempts[0].episode
             none_text = sink["episodes"][-1][1]
             assert "untrusted_task_files" not in none_text
-            assert inspection.HACK_CHECKLIST in none_text
+            assert inspection.HACK_CHECKLIST not in none_text
             assert "print(1)" not in none_text
             assert FULL not in none_text
 
@@ -3332,28 +3445,41 @@ def test_unknown_native_cause_is_disclosed(tmp_path, monkeypatch, credentials):
     asyncio.run(main())
 
 
-@pytest.mark.parametrize("error", [ErrorRecord(type="RuntimeError", message="Failed to start tmux session"),
-                                   ErrorRecord(type="RewardFileNotFoundError", message="No reward file found")])
-def test_an_attacker_episode_that_ended_without_a_reward_failed_to_run(tmp_path, monkeypatch, credentials, error):
-    """An unclassified error that left no reward, as an agent setup failure or a grader that wrote no reward, is an
-    Attacker that failed to run, never a result the attack inspector could not tell."""
+@pytest.mark.parametrize(("error", "called", "status"), [
+    (ErrorRecord(type="RuntimeError", message="Failed to start tmux session"), False, "episode_failure"),
+    (ErrorRecord(type="RewardFileNotFoundError", message="No reward file found"), True, "no_reward"),
+    (None, True, "no_reward")])  # A reward file without a reward records no error.
+def test_an_attacker_episode_without_a_reward_failed_to_run_only_without_a_model_call(tmp_path, monkeypatch, credentials, error,
+                                                                                      called, status):
+    """An episode that left no reward and made no model call, as an agent setup failure, is an Attacker that failed to
+    run. One whose Attacker worked and whose grader wrote no reward is no failure of the Attacker and is not judged."""
+    holder = {}
+
     async def native(config, queue, **work):
         result = await scripted_episodes(config, queue, **work)
-        result.rewards, result.errors = {}, [error]
+        result.rewards, result.errors = {}, [error] if error else []
         (config.output_dir / "episode.json").write_text(result.model_dump_json())
+        if called:
+            holder["run"].record.calls.append(CallRecord(role="attacker", episode=config.output_dir.name, model="xai/grok-4.7",
+                                                         cost=0.0, cost_source="scripted"))
         return result
 
     async def main():
         async with serve(attack_endpoint(plain_claim)) as base:
             model = ModelConfig(model="xai/grok-4.7", api_base=base)
-            run = new_run(tmp_path, monkeypatch, credentials, models={"attacker": model, "inspector": model})
+            run = holder["run"] = new_run(tmp_path, monkeypatch, credentials, models={"attacker": model, "inspector": model})
             monkeypatch.setattr(run_state, "run_episode", native)
             return await attack_module.attack(run, maximum_attempts=1)
 
     attempt = asyncio.run(main()).attempts[0]
-    assert (attempt.status, attempt.failed) == ("episode_failure", "Attacker")
-    assert attempt.error.startswith("the Attacker failed: the episode ended without a reward: " + error.type)
-    assert attempt.status in report.UNASSESSED and report.unrecovered(SimpleNamespace(attempts=[attempt]))
+    assert attempt.status == status and attempt.status in report.UNASSESSED
+    if called:
+        assert attempt.failed is None and attempt.status not in report.FAILURES
+        reason = f"the grader wrote no reward in {attempt.episode}"
+        assert attempt.error == reason if error is None else attempt.error.startswith(f"{reason}: {error.type}")
+    else:
+        assert attempt.failed == "Attacker" and report.unrecovered(SimpleNamespace(attempts=[attempt]))
+        assert attempt.error.startswith("the Attacker failed: the episode ended without a reward: " + error.type)
 
 
 def test_recorded_call_failure_stays_inference_failure(tmp_path, monkeypatch, credentials):

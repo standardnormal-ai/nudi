@@ -16,7 +16,7 @@ Each focused hack inspector session starts its own conversation. With `--focused
 
 ## Slots
 
-Each Simulator episode, inspector session and Attacker attempt holds one of `--concurrency // 2` slots, at least one. A Simulator episode uses one container of its slot; an attempt keeps its slot through its attack inspector. On Docker there is one slot when a workspace needs more memory than an episode. Work takes free slots in the order it asked for them, and a grader inspector focused session whose category already has an evidenced issue takes none. Judge calls hold none.
+Each Simulator episode, inspector session and Attacker attempt holds one of `--concurrency // 2` slots, at least one. A Simulator episode uses one container of its slot; an attempt keeps its slot through its attack inspector. On Docker there is one slot when a workspace needs more memory than an episode. Work takes free slots in the order it asked for them, except that an Attacker attempt on a judged problem takes the next free slot ahead of work that has not started; running work is never interrupted. The Simulator asks first, and a Simulator episode asks for a slot only while one of its episodes is left. Among the hack inspector's focused sessions, `resource_exhaustion` and `other`, the slowest, ask first. A grader inspector focused session whose category already has an evidenced issue takes none. Judge calls hold none.
 
 A container that does not fit waits for another to end. Only one that cannot fit beside a lone held workspace is refused, and an experiment's reply then says so. `--concurrency` counts sandboxes, so helper containers can exceed it.
 

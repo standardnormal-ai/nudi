@@ -694,9 +694,9 @@ def test_cost_is_given_per_job_summing_to_the_known_cost_and_cancelled_calls_are
     assert "1 model calls were cancelled in flight, so their usage is unknown; the known cost excludes them" in result["warnings"]
 
     text = report.markdown(result)
-    assert "known cost $1.120000, excluding 1 calls with unknown prices (1 not priced: no price) and 1 calls cancelled in flight" in text
+    assert "known cost $1.120000, excluding 1 call with unknown prices (1 not priced: no price) and 1 call cancelled in flight" in text
     assert "  - grader inspector: known cost $0.250000 in 2 calls, 200 prompt and 20 completion tokens\n" in text
-    assert "  - attack inspector: known cost $0.020000 in 2 calls, 0 prompt and 0 completion tokens, excluding 1 calls cancelled in flight" in text
+    assert "  - attack inspector: known cost $0.020000 in 2 calls, 0 prompt and 0 completion tokens, excluding 1 call cancelled in flight" in text
     assert "; 0 Attacker and attack inspector calls with unknown prices and 1 cancelled in flight." in text
 
 
@@ -1821,6 +1821,51 @@ def failing(tmp_path, attempts=(), experiments=(), hack_attempts=(), hack_status
     for attempt in attempts:
         assert run.episode("attacker", attempt.rewards) == attempt.episode
     return run.report(selected=["hack", "attack"])["answer"][0]
+
+
+def test_a_grader_that_wrote_no_reward_is_named_and_no_failure_to_run(tmp_path):
+    """An Attacker that worked in an episode whose grader wrote no reward did not fail to run; the attack's unresolved
+    evidence says what happened."""
+    attempts = [AttackAttempt(level="none", number=1, context="attacker-none-1", episode="0000-attacker", status="no_reward",
+                              error="the grader wrote no reward in 0000-attacker: RewardFileNotFoundError: no file")]
+    assert failing(tmp_path, attempts) == ("Finished. Every step ran. Evidence stayed unresolved in the attack (the grader wrote no "
+                                           "reward in 0000-attacker), so the run may miss more.")
+
+
+def test_a_simulator_episode_that_never_started_is_named_with_its_reason_and_claims_no_reward(tmp_path):
+    """One line names the episode and why; the ordinary rewards section claims no retained reward it does not have, and
+    a replaced episode names the fresh attempt that took its place."""
+    run = RunDir(tmp_path)
+    setup = ErrorRecord(type="RuntimeError", message="Failed to start tmux session.\nError: tmux: command not found\n")
+    replaced = run.episode(rewards={}, errors=[setup])
+    run.record.simulation.episodes.remove(replaced)
+    run.record.simulation.requested -= 1
+    first, retry = run.episode(rewards={"reward": 1.0}), run.episode(rewards={}, errors=[setup])
+    run.record.simulation.retries = {retry: replaced}
+    run.record.simulation.status, run.record.failed_phases = "partial", ["simulation"]
+    result = run.report(selected=["simulation"])
+    assert result["answer"][0] == (f"Finished with gaps: 1 of 2 Simulator episodes did not start: {retry} (RuntimeError: Failed to "
+                                   "start tmux session. Error: tmux: command not found). Results below are what was found.")
+    text = report.markdown(result)
+    assert (f"- {replaced} recorded RuntimeError: Failed to start tmux session. Error: tmux: command not found; it made no model call, "
+            f"so {retry} replaced it") in text
+    assert f"- {retry} recorded RuntimeError: Failed to start tmux session. Error: tmux: command not found; it has no reward" in text
+    assert first not in result["ordinary"]["no_reward"]
+
+
+def test_a_lead_whose_reason_starts_with_its_id_names_it_once():
+    item = {"open": [{"id": "experiment-0025", "category": "grader_tampering",
+                      "reason": "experiment-0025: its episode has no native reward to compare"}], "findings": {"legitimate": []}}
+    assert report.still_open("hack_inspector", item) == [
+        "- hack_inspector grader_tampering leads: experiment-0025: its episode has no native reward to compare"]
+
+
+def test_failed_attempts_of_one_session_are_numbered_in_one_clause(tmp_path):
+    attempts = [InspectionAttempt(phase="focused", category="package_oracles", number=1, status="inference_failure", error="slow"),
+                InspectionAttempt(phase="focused", category="package_oracles", number=2, status="out_of_memory", error="oom")]
+    assert failing(tmp_path, hack_attempts=attempts) == (
+        "Finished, but work was lost: the hack inspector's focused session of package_oracles failed in attempt 1 (inference_failure) "
+        "and attempt 2 (out_of_memory). Results below are what was found.")
 
 
 def test_the_headline_names_the_agent_that_failed_and_the_work_lost(tmp_path):

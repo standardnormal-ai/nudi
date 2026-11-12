@@ -195,7 +195,7 @@ def trial_config(tmp_path, backend, task=CONTRACT_TASK):
 
 def test_docker_is_the_default_and_its_resource_compose_file_is_unchanged(tmp_path):
     config = RunConfig(task_dir=CONTRACT_TASK, output_dir=tmp_path / "run")
-    assert (config.backend, config.concurrency) == ("docker", 8)
+    assert (config.backend, config.concurrency) == ("docker", 16)
     native = trial_config(tmp_path, "docker").environment
     assert (native.type, native.import_path) == (None, "nudi.episode:NativeDocker")
     assert native.cpu_enforcement_policy == native.memory_enforcement_policy == ResourceMode.LIMIT
@@ -860,19 +860,19 @@ def test_a_run_states_its_backend_capacity_free_space_cap_and_concurrency_in_one
     docker = "backend docker; Docker has 8 CPUs and 4096 MiB; 123.4 GiB free where records go"
     unmeasured = "free space where Docker stores data not measured; no spending cap"
     assert nudi_lines(caplog) == [
-        ("INFO", f"{docker} ({tmp_path / 'lower'}); {unmeasured}; concurrency 7 of 8: the task's declared 1 CPUs and 512 MiB "
+        ("INFO", f"{docker} ({tmp_path / 'lower'}); {unmeasured}; concurrency 7 of 16: the task's declared 1 CPUs and 512 MiB "
                  "per episode fit 7 within 90% of Docker's capacity"),
         ("INFO", f"{docker} ({tmp_path / 'setting'}); 50.0 GiB free where Docker stores data; spending cap $5.00; concurrency 2 of 2"),
-        ("WARNING", f"{docker} ({tmp_path / 'undeclared'}); {unmeasured}; concurrency 1 of 8: "
+        ("WARNING", f"{docker} ({tmp_path / 'undeclared'}); {unmeasured}; concurrency 1 of 16: "
                     f"{run_state.plan_concurrency(8, 4096, None, None)[1][0]}"),
     ]
     docker = {"backend": "docker", "docker_cpus": 8, "docker_memory_mb": 4096, "host_cpus": None, "host_memory_mb": None}
     assert started_events(runs, caplog) == [
-        {**docker, "docker_free_bytes": None, "spending_cap": None, "concurrency": 7, "concurrency_setting": 8,
+        {**docker, "docker_free_bytes": None, "spending_cap": None, "concurrency": 7, "concurrency_setting": 16,
          "reason": "the task's declared 1 CPUs and 512 MiB per episode fit 7 within 90% of Docker's capacity"},
         {**docker, "docker_free_bytes": 50 * 2**30, "spending_cap": 5.0, "concurrency": 2, "concurrency_setting": 2,
          "reason": None},
-        {**docker, "docker_free_bytes": None, "spending_cap": None, "concurrency": 1, "concurrency_setting": 8,
+        {**docker, "docker_free_bytes": None, "spending_cap": None, "concurrency": 1, "concurrency_setting": 16,
          "reason": run_state.plan_concurrency(8, 4096, None, None)[1][0]},
     ]
 

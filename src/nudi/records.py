@@ -112,7 +112,7 @@ class RunConfig(BaseModel):
     and the task's declared memory_mb, on Modal the task's. Experiments and native episodes keep
     the task's limits."""
     backend: Backend = "docker"
-    concurrency: int = Field(8, ge=1, strict=True)
+    concurrency: int = Field(16, ge=1, strict=True)
     """Containers at once: the limit on Modal, and on Docker a cap on what Docker's capacity allows."""
     time_limit: float | None = Field(None, gt=0, allow_inf_nan=False)
     """Optional whole-run time limit in minutes; no default. At the limit the run stops and
@@ -244,10 +244,14 @@ class Content(BaseModel):
 
 
 class Simulation(BaseModel):
-    """The ordinary Simulator episodes of a run, every attempted one in start order."""
+    """The ordinary Simulator episodes of a run, every attempted one in start order, except one a fresh attempt replaced."""
 
     requested: int
     episodes: list[str] = []
+    retries: dict[str, str] = {}
+    """Each fresh attempt of an episode that ended without a reward and without a model call, as when its agent setup
+    failed, by the episode it replaces. The replaced episode keeps its records and failures but leaves `episodes`; a
+    fresh attempt is not attempted again."""
     failures: dict[str, list[ErrorRecord]] = {}
     """Episodes whose runner raised or whose native result reported errors; their
     records keep any partial evidence, including a reward Harbor still graded."""

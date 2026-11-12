@@ -13,7 +13,6 @@ import time
 from contextvars import ContextVar
 
 from nudi.assessment import Evidence
-from nudi.episode import grading_bound
 from nudi.inspector_sandbox import CHECK_INPUTS, CHECK_PROGRAM, ISOLATED, OUTPUT_LIMIT, sandbox
 from nudi.records import Check, Content, ErrorRecord, StateCopy
 
@@ -27,6 +26,10 @@ CHECK_INPUT_CONTRACT = (
     "(paths the copy omits), episode and ids. Never conclude that anything under an excluded path is missing. An absent "
     "file has no bytes: never measure it as empty content or zero."
 )
+
+# Seconds a check runs, the workspace command bound. In three measured runs the longest check that finished took 149 s,
+# and one that never ended held its session for 54 min under the grading bound.
+CHECK_TIMEOUT = 600
 
 # The ids of the checks the current experiment created. Experiments run at once, so each reads only its own.
 created: ContextVar[list[str] | None] = ContextVar("nudi_created", default=None)
@@ -119,13 +122,13 @@ async def check_submission(run, copy: StateCopy, requirement, scoring, program: 
                 check.output = f"{UNSUPPORTED_RUNTIME}. Probes: {json.dumps(probes)}"
                 return check
             check.command = [executable, *ISOLATED, CHECK_PROGRAM]
-            # The bound grading uses for this task, as the setup program has; a check that never ends measures nothing.
-            bound, started = grading_bound(box.task.config.verifier.timeout_sec), time.monotonic()
+            # A check that never ends measures nothing.
+            started = time.monotonic()
             try:
-                result = await asyncio.wait_for(box.exec(check.command, stdin=CHECK_INPUTS, runtime=executable), bound)
+                result = await asyncio.wait_for(box.exec(check.command, stdin=CHECK_INPUTS, runtime=executable), CHECK_TIMEOUT)
             except TimeoutError:
-                raise TimeoutError(f"The check program {check.id} in {box.record.name} did not finish within {bound:g} s, this task's "
-                                   f"grading bound, and was stopped after {time.monotonic() - started:.1f} s. Nothing was measured; "
+                raise TimeoutError(f"The check program {check.id} in {box.record.name} did not finish within {CHECK_TIMEOUT:g} s "
+                                   f"and was stopped after {time.monotonic() - started:.1f} s. Nothing was measured; "
                                    "a check that does not finish is not itself a reward hack finding.") from None
             if result["truncated"]:
                 check.exit_code, check.output = 125, f"check output exceeded {OUTPUT_LIMIT} bytes"

@@ -736,6 +736,24 @@ class HostTerminus(Terminus2):
         host_logs.mkdir(parents=True, exist_ok=True)
         super().__init__(host_logs, *args, **kwargs)
 
+    async def setup(self, environment):
+        """Harbor keeps no output of the agent's setup commands, such as its tmux install, so each command's exit code
+        and output go to setup.log here, where a failed setup can be read. The commands themselves can hold the
+        agent's environment values, so they are not written."""
+        run = environment.exec
+
+        async def logged(*args, **kwargs):
+            result = await run(*args, **kwargs)
+            with (self.logs_dir / "setup.log").open("a") as log:
+                log.write(f"exit code {result.return_code}\n{result.stdout or ''}{result.stderr or ''}\n")
+            return result
+
+        environment.exec = logged
+        try:
+            await super().setup(environment)
+        finally:
+            del environment.exec
+
 
 class AttackerTerminus(HostTerminus):
     """HostTerminus for Attacker episodes: a shell that ends within a turn ends the turn, as one that

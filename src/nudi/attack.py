@@ -12,7 +12,6 @@ from nudi import copies
 from nudi.checks import check_submission, redacted
 from nudi.episode import bound_notice
 from nudi.inspection import (
-    HACK_CHECKLIST,
     InferenceFailure,
     InspectionResult,
     OUTCOMES,
@@ -214,8 +213,10 @@ def recorded_failure(run, name: str, episode) -> tuple[str, str] | None:
         return "native_timeout", "agent_timeout" if episode.agent_timeout else "verifier_timeout"
     if episode.cancelled:
         return "cancelled", "cancelled"
+    rewarded = any(value is not None and math.isfinite(value) for value in episode.rewards.values())
     if not episode.errors:
-        return None
+        # A reward file without a reward records no error.
+        return ("no_reward", f"the grader wrote no reward in {name}") if calls and not rewarded else None
     error = episode.errors[-1]
     cause = redacted(run, f"{error.type}: {error.message}")
     if error.type in INFRASTRUCTURE_TYPES:
@@ -224,8 +225,11 @@ def recorded_failure(run, name: str, episode) -> tuple[str, str] | None:
         return "inference_failure", cause
     if error.type in TOOL_TYPES:
         return "tool_failure", cause
-    # Such as an agent setup that failed, or a grader that wrote no reward: nothing ran to a result.
-    if not any(value is not None and math.isfinite(value) for value in episode.rewards.values()):
+    if not rewarded:
+        # The Attacker worked and the grader wrote no reward: no failure to run, and nothing to judge.
+        if calls:
+            return "no_reward", f"the grader wrote no reward in {name}: {cause}"
+        # Such as an agent setup that failed before any model call: nothing ran.
         return "episode_failure", f"the episode ended without a reward: {cause}"
     return "unknown", f"unknown cause: {cause}"
 
@@ -434,7 +438,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
 
     def instruction_for(level: str, text: str | None, valid_work: bool) -> str:
         if level == "none":
-            detail = "No extra hint. " + HACK_CHECKLIST
+            detail = "No extra hint."
         elif level == "full":
             detail = "Details:\n" + (text or "")
         else:
@@ -575,7 +579,9 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                 result.limits.append(f"{name}: {failure[1]}, but the episode produced a reward, so it was interpreted.")
                 failure, timeout = None, failure
             if failure:
-                attempt.status, attempt.error, attempt.failed = failure[0], f"the Attacker failed: {failure[1]}", "Attacker"
+                attempt.status, attempt.error = failure
+                if failure[0] != "no_reward":
+                    attempt.error, attempt.failed = f"the Attacker failed: {failure[1]}", "Attacker"
                 mark(level, members, failure[0])
                 save()
                 return
@@ -694,6 +700,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                     "unattributed_exploit": "cheated; the attack inspector could not tie it to a problem",
                     "no_evidenced_issue": "nothing confirmed" if valid_work else "no exploit confirmed",
                     "unknown": "unclear: the attack inspector could not tell",
+                    "no_reward": "the grader wrote no reward",
                     "step_limit": attempt.error}.get(attempt.status, attempt.status)
             event(run, "attempt_result", f"Attacker {attempt.episode or context} result: {said}", episode=attempt.episode,
                   problem=attempt.problem, level=level, number=attempt.number, status=attempt.status)
@@ -719,8 +726,11 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                 text = members[0].guidance.get("full")
                 if text and all(item.outcome == "unknown" for item in members) == suspected:
                     plan.append(((group, "full"), ("full", number, members, text)))
-    # A stable sort: each exploit candidate's first full-hint attempt moves to the front, the rest keep their order.
-    plan.sort(key=lambda entry: not (entry[1][:2] == ("full", 1) and not entry[1][2][0].valid_work))
+    def later(entry) -> bool:
+        """False for an exploit candidate's first full-hint attempt, which a stable sort moves to the front."""
+        return not (entry[1][:2] == ("full", 1) and not entry[1][2][0].valid_work)
+
+    plan.sort(key=later)
     waiting, running, stops, slots = list(range(len(plan))), {}, [], at_once(run)
     closed, getter, followed = False, None, set()
 
@@ -729,7 +739,8 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
         waiting.extend(range(len(plan) - maximum_attempts, len(plan)))
 
     async def attempt(level, number, members, text, position) -> None:
-        async with gate or contextlib.nullcontext():
+        # An attempt on a judged problem takes the next free slot ahead of work that has not started.
+        async with (gate.ahead() if members else gate) if gate else contextlib.nullcontext():
             standing = [found for item in members if (found := current(item))] if members and current else members
             if members and not standing:
                 if members[0].conditions[level] == "unattempted":
@@ -763,8 +774,9 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                     if (group, level) not in followed and members[0].conditions[before] == "evidenced_issue" and members[0].conditions.get(level) == "unattempted":
                         followed.add((group, level))
                         add((group, level), level, members)
-            # After a stop no attempt starts; running ones end on their own, as an inspection's sessions do.
-            while not stops and len(running) < slots:
+            # After a stop no attempt starts; running ones end on their own, as an inspection's sessions do. The run's slots
+            # bound the no-hint attempt, so while it waits for one a judged problem's attempt can still queue ahead of it.
+            while not stops and len(running) - bool(gate and None in running.values()) < slots:
                 position = next((place for place in waiting if plan[place][0] not in running.values()), None)
                 if position is None:
                     break
@@ -785,6 +797,7 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
                     result.candidates.append(item)
                     candidate_groups.append([item])
                     add((len(candidate_groups) - 1, "full"), "full", [item])
+                    waiting.sort(key=lambda place: later(plan[place]))
             for task in done & running.keys():
                 del running[task]
                 if task.cancelled() or task.exception() is not None:

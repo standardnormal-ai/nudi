@@ -9,9 +9,9 @@ belong to one inspector candidate. Full adds only that
 candidate's loophole details. Minimal adds only that candidate's short hint.
 Neither receives the static hack-family checklist or another candidate's hint.
 The no-hint instruction is one discovery stream for the environment. It adds
-the static checklist, which is not exhaustive, no grader or hack inspector findings and
-no privileged material. Nudi copies the grading environment of every episode at
-the same two points, before grading and after the grader returns. The native agent
+no checklist, no grader or hack inspector findings and no privileged material.
+Nudi copies the grading environment of every episode at the same two points,
+before grading and after the grader returns. The native agent
 never sees the copies.
 
 The native agent reasons in its original harness, under the shared queue,

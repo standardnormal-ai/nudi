@@ -156,7 +156,8 @@ def test_the_time_limit_is_one_deadline_split_over_rounds(tmp_path, monkeypatch)
     monkeypatch.setattr(send, "MODAL_START_GAP", 0)
     runs = Runs(monkeypatch)
     names = [f"task-{index}" for index in range(5)]
-    built = send_environments(tasks(tmp_path, *names), output_dir=tmp_path / "batch", backend="modal", time_limit=60)
+    built = send_environments(tasks(tmp_path, *names), output_dir=tmp_path / "batch", backend="modal", concurrency=8,
+                              time_limit=60)
     assert built["rounds"] == 2 and runs.options("time_limit") == dict.fromkeys(names, 30)
     runs = Runs(monkeypatch)
     send_environments([tmp_path / "tasks" / name for name in names[:2]], output_dir=tmp_path / "unlimited")
@@ -164,7 +165,7 @@ def test_the_time_limit_is_one_deadline_split_over_rounds(tmp_path, monkeypatch)
     # The second round's start comes after the deadline of 0.06 s.
     runs = Runs(monkeypatch, hold=0.2)
     built = send_environments([tmp_path / "tasks" / name for name in names], output_dir=tmp_path / "late", backend="modal",
-                              time_limit=0.001)
+                              concurrency=8, time_limit=0.001)
     assert statuses(tmp_path / "late") == {**dict.fromkeys(names[:4], "complete"), "task-4": "not_started"}
     assert all(0 < limit <= 0.0005 for limit in runs.options("time_limit").values())
     assert (built["status"], built["exit_code"]) == ("partial", 1)

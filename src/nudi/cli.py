@@ -75,7 +75,7 @@ def main(argv=None) -> int:
     send.add_argument("--backend", choices=get_args(Backend),
                       help="where episodes and sandboxes run, default docker; modal needs a Modal credential")
     send.add_argument("--concurrency", type=int,
-                      help="containers at once, default 8: the limit on Modal, a cap on Docker's capacity")
+                      help="containers at once, default 16: the limit on Modal, a cap on Docker's capacity")
     rebuild = commands.add_parser("report", help="write a run's report again from its records, such as after nudi was killed")
     rebuild.add_argument("run_dir", type=Path, help="the run directory, with its run.json")
     rebuild.add_argument("--credentials-file", type=Path, help="the run's dotenv file of credentials, so the report redacts them")

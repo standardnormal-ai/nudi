@@ -1018,16 +1018,16 @@ def test_public_compaction_preserves_records_when_summary_spending_is_exhausted(
 
     async def main():
         async with serve(script) as base:
-            # One session at a time: the stop prevents the other session.
+            # One session at a time: the `other` session starts first and the stop prevents the next.
             run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": inspector_model(base)}, spending_cap=1.0, concurrency=2)
             runs.append(run)
             return run, await inspection.inspect_hacks(run, categories=["package_oracles"])
 
     run, result = asyncio.run(main())
     assert result.status == "spending_exhausted" and result.categories == {"package_oracles": "unknown"}
-    assert len(result.attempts) == 1 and stored_run(run).refused_calls == {"hack-package_oracles": 3}
+    assert len(result.attempts) == 1 and stored_run(run).refused_calls == {"hack-other": 3}
     assert len(script.requests) == 5 and all(body.get("tools") for _, body in script.requests)
-    artifact = run.config.output_dir / result.artifacts["hack-package_oracles"]["transcript"]
+    artifact = run.config.output_dir / result.artifacts["hack-other"]["transcript"]
     entries = [json.loads(line) for line in artifact.read_text().splitlines()]
     assert sum(entry["type"] == "tool" for entry in entries) == 4
     assert all(sandbox_record(run, name)["cleanup"]["removed"] for name in run.record.sandboxes)
@@ -1055,7 +1055,7 @@ def test_public_cancelled_inference_retains_accounting_and_artifact_references(t
 
         script = Blocked(*[("inspection_status", {}) for _ in range(4)], "overflow") if phase == "summary" else Blocked(("inspection_status", {}))
         async with serve(script) as base:
-            # One session at a time: the cancellation prevents the other session.
+            # One session at a time: the `other` session starts first and the cancellation prevents the next.
             run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": inspector_model(base)}, concurrency=2)
             running = asyncio.create_task(inspection.inspect_hacks(run, categories=["package_oracles"]))
             await asyncio.wait_for(blocked.wait(), 20)
@@ -1072,7 +1072,7 @@ def test_public_cancelled_inference_retains_accounting_and_artifact_references(t
     assert result.status == "cancelled" and result.categories == {"package_oracles": "unknown"}
     assert len(stored_run(run).calls) == len(script.requests)
     assert stored_run(run).calls[-1].error == "CancelledError" and stored_run(run).calls[-1].cost is None
-    assert (run.config.output_dir / result.artifacts["hack-package_oracles"]["transcript"]).is_file()
+    assert (run.config.output_dir / result.artifacts["hack-other"]["transcript"]).is_file()
     assert all(sandbox_record(run, name)["cleanup"]["removed"] for name in run.record.sandboxes)
 
 

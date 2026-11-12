@@ -349,6 +349,29 @@ def test_simulate_starts_nothing_while_a_hack_session_holds_the_only_slot(tmp_pa
     assert started == ["simulator"] * 3 and peak == [1]
 
 
+def test_a_simulator_worker_waits_for_a_slot_only_while_an_episode_is_left(tmp_path, monkeypatch, credentials):
+    """A worker queued for a slot before it knew an episode was left, then took one only to find none. Each worker
+    claims its episode first, so the slots taken are the episodes run."""
+    run = new_run(tmp_path, monkeypatch, credentials, capacity=(3, 4096))
+    assert run.record.capacity.concurrency == 2
+
+    async def episode(run, role):
+        await asyncio.sleep(0.02)
+        return SimpleNamespace(errors=[], rewards={"reward": 1.0})
+
+    monkeypatch.setattr(run_state, "run_role_episode", episode)
+
+    class Gate(run_state.Slots):
+        taken = 0
+
+        async def acquire(self, ahead=False):
+            await super().acquire(ahead)
+            Gate.taken += 1
+
+    simulation = asyncio.run(run_state.simulate(run, 2, gate=Gate(1)))
+    assert simulation.status == "complete" and len(simulation.episodes) == 2 and Gate.taken == 2
+
+
 def test_a_worker_whose_cancellation_harbor_consumes_starts_no_episode_after_a_full_disk(tmp_path, monkeypatch, credentials):
     """Such a worker must not go back to its loop and start a third episode."""
     run = new_run(tmp_path, monkeypatch, credentials, capacity=(3, 4096))
@@ -396,8 +419,9 @@ def test_a_worker_whose_cancellation_harbor_consumes_starts_no_episode_after_ctr
 @pytest.mark.parametrize("reward, status", [(0.0, "complete"), (None, "partial")])
 def test_returned_native_failure_counts_without_a_raise(tmp_path, monkeypatch, credentials, reward, status):
     """Harbor returns exception_info and still grades. The failure stays recorded; the pool is partial only
-    when the episode has no usable reward."""
+    when the episode has no usable reward. Its agent made a model call, so it is not attempted again."""
     native = Native(monkeypatch, rewards={"0001-simulator": reward})
+    native.agents["0001-simulator"] = terminus
     native.returned = {"0001-simulator": "AgentTimeoutError"}
 
     async def main():
@@ -412,6 +436,69 @@ def test_returned_native_failure_counts_without_a_raise(tmp_path, monkeypatch, c
     timed_out = json.loads((run.config.output_dir / "episodes" / "0001-simulator" / "episode.json").read_text())
     assert timed_out["agent_timeout"] and timed_out["rewards"] == ({} if reward is None else {"reward": reward})
     assert stored(run).simulation == simulation
+
+
+def test_an_episode_that_never_started_gets_one_fresh_attempt_and_keeps_its_records(tmp_path, monkeypatch, credentials):
+    """An episode with no reward and no model call, as when its agent setup failed, is replaced once; the fresh attempt
+    is not replaced again, so the pool stays partial when it fails too."""
+    native = Native(monkeypatch, rewards={"0001-simulator": None, "0002-simulator": None})
+    native.returned = {"0001-simulator": "RuntimeError", "0002-simulator": "RuntimeError"}
+
+    async def main():
+        async with serve(InspectorScript([])) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, capacity=(1, 4096), models=inspector(base))
+            return run, await run_state.simulate(run, 2)
+
+    run, simulation = asyncio.run(main())
+    assert run.record.episodes == ["0000-simulator", "0001-simulator", "0002-simulator"]
+    assert simulation.episodes == ["0000-simulator", "0002-simulator"]
+    assert simulation.retries == {"0002-simulator": "0001-simulator"}
+    assert list(simulation.failures) == ["0001-simulator", "0002-simulator"]
+    assert simulation.status == "partial"
+    assert stored(run).simulation == simulation
+
+
+def test_a_cap_reached_while_a_fresh_attempt_waits_for_room_starts_nothing(tmp_path, monkeypatch, credentials):
+    """The cap is checked once the container is admitted, so the pool names only recorded episodes; the episode
+    whose fresh attempt never started stays in it."""
+    native = Native(monkeypatch, rewards={"0001-simulator": None})
+    native.returned = {"0001-simulator": "RuntimeError"}
+
+    async def main():
+        async with serve(InspectorScript([])) as base:
+            run = new_run(tmp_path, monkeypatch, credentials, capacity=(1, 4096), spending_cap=1.0, models=inspector(base))
+            admit = run.admit_container
+
+            async def waiting(purpose):
+                if len(run.record.episodes) == 2:  # The fresh attempt's wait, during which the cap is reached.
+                    run.record.known_cost = 1.0
+                await admit(purpose)
+
+            monkeypatch.setattr(run, "admit_container", waiting)
+            return run, await run_state.simulate(run, 2)
+
+    run, simulation = asyncio.run(main())
+    assert run.record.episodes == ["0000-simulator", "0001-simulator"]
+    assert simulation.episodes == run.record.episodes and simulation.retries == {}
+    assert simulation.status == "spending_exhausted"
+    assert stored(run).simulation == simulation
+
+
+def test_agent_setup_output_is_kept_beside_the_trajectory(tmp_path, monkeypatch):
+    """Harbor keeps no output of the agent's setup commands; the host agent directory keeps each one's exit code and output."""
+    async def setup(self, environment):
+        await environment.exec("tmux -V", user="root")
+
+    class Environment:
+        async def exec(self, command, cwd=None, env=None, timeout_sec=None, user=None):
+            return SimpleNamespace(return_code=127, stdout="", stderr="sh: tmux: not found\n")
+
+    monkeypatch.setattr(episode.Terminus2, "setup", setup)
+    agent, environment = object.__new__(episode.HostTerminus), Environment()
+    agent.logs_dir = tmp_path
+    asyncio.run(agent.setup(environment))
+    assert (tmp_path / "setup.log").read_text() == "exit code 127\nsh: tmux: not found\n\n"
+    assert "exec" not in vars(environment)
 
 
 class Provider:
