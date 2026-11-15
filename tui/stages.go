@@ -286,19 +286,19 @@ func reading(r Report, found []Finding, e string) string {
 		s = verdictWords[label]
 	}
 	if id := episodeProblem(r, found, e); id != "" {
-		s = strings.TrimPrefix(s+", problem "+id, ", ")
+		s = strings.TrimPrefix(s+", cause "+id, ", ")
 	}
 	return s
 }
 
-// episodeProblem is the problem an episode belongs to, by its sessions or its findings' episodes.
+// episodeProblem is the cause an episode belongs to, by its sessions or its findings' episodes.
 func episodeProblem(r Report, found []Finding, e string) string {
 	if r.Attack == nil {
 		return ""
 	}
 	for _, p := range r.Attack.Problems {
 		if slices.Contains(p.Members, e) || slices.ContainsFunc(found, func(f Finding) bool { return f.Claim.Episode == e && slices.Contains(p.readings(), f.ID) }) {
-			return p.ID
+			return cmp.Or(r.causeOf(p).ID, p.ID)
 		}
 	}
 	return ""
@@ -341,7 +341,7 @@ func episodesTable(r Report, found []Finding, p *page) {
 		}
 		what := reading(r, found, e)
 		problem := episodeProblem(r, found, e)
-		what = strings.TrimSuffix(strings.TrimSuffix(what, "problem "+problem), ", ")
+		what = strings.TrimSuffix(strings.TrimSuffix(what, "cause "+problem), ", ")
 		if what == "" {
 			what = dim("-")
 		}
@@ -574,7 +574,7 @@ func scope(r Report, in *Inspection, job, key string, p *page) {
 				status = strings.ReplaceAll(at.Status, "_", " ")
 			}
 			if at.Error != "" {
-				status += ": " + strings.SplitN(at.Error, "\n", 2)[0]
+				status += ": " + errorLine(at.Error)
 			}
 			p.add(cols(p.w, "   ", []int{14, 30}, fmt.Sprintf("%s %d", at.Phase, at.Number), searchTarget(at), status))
 		}
@@ -597,14 +597,18 @@ func hacksPage(r Report, found []Finding, p *page) {
 		})
 		widths := []int{46, 14, 12}
 		if len(ps) == 0 {
-			p.add(titled("Problems Found", 0), " None found in this run.")
+			p.add(titled("Findings", 0), " None found in this run.")
 		} else {
-			p.add(spread(titled("Problems Found", len(ps)), p.fold("e"), p.w))
+			p.add(spread(titled("Findings", len(ps)), p.fold("e"), p.w))
 			if p.open["e"] {
 				p.add(cols(p.w, "   ", []int{15}, dim("Reproduced?"), dim("The Hack Inspector made it happen in a copy of the task.")),
 					cols(p.w, "   ", []int{15}, dim("Attacker?"), dim("An Attacker made it happen in a real episode. The Attack tab shows how.")), "")
 			}
-			p.add(cols(p.w, "   ", widths, dim("Problem"), dim("Reproduced?"), dim("Attacker?"), dim("Ref")))
+			heads := []string{dim("Finding"), dim("Reproduced?"), dim("Attacker?"), dim("Ref")}
+			if !slices.ContainsFunc(ps, func(pr Problem) bool { return evidenceOf(found, pr) == 0 }) {
+				heads = heads[:3] // every row opens with Enter, and its reference is on its screen
+			}
+			p.add(cols(p.w, "   ", widths, heads...))
 		}
 		for _, pr := range ps {
 			p.pick(evidenceOf(found, pr), "", func(mark string, on bool) string {
@@ -614,7 +618,11 @@ func hacksPage(r Report, found []Finding, p *page) {
 					reproduced = map[bool]string{true: "yes", false: "no"}[*e]
 				}
 				attacker := best(r.tried(pr, "none"), r.tried(pr, "minimal"), r.tried(pr, "full"))
-				return cols(p.w, mark, widths, name, under("Reproduced?", glyph(reproduced)), under("Attacker?", glyph(attacker)), dim(pr.ID))
+				ref := "" // a row that opens shows its reference on its screen
+				if evidenceOf(found, pr) == 0 {
+					ref = dim(pr.ID)
+				}
+				return cols(p.w, mark, widths, name, under("Reproduced?", glyph(reproduced)), under("Attacker?", glyph(attacker)), ref)
 			})
 		}
 		p.add("")
@@ -666,9 +674,10 @@ func hacksPage(r Report, found []Finding, p *page) {
 	}
 }
 
-// experimentWords say how an inspector's experiment ended, when it did not fail or stop.
+// experimentWords say how an inspector's experiment ended, when it did not fail or stop. known_problem, in older reports
+// only, is a probe the judge read as already known before it ran, so it measured nothing.
 var experimentWords = map[string]string{"assessed": "Done", "measured": "Ran, not read", "unfinished": "Ran, not read",
-	"incomplete": "Check broken", "known_problem": "Known problem", "running": "Not finished"}
+	"incomplete": "Check broken", "known_problem": "Not run: judged as already known", "running": "Not finished"}
 
 // experimentEnd is how an experiment ended: its words, else an error, whose cause Work left names, else stopped.
 func experimentEnd(status string) string {
@@ -699,22 +708,7 @@ func attackPage(r Report, found []Finding, p *page) {
 	if a.Problems == nil {
 		triesTable(r, found, a.Attempts, nil, p)
 	} else {
-		groups := map[string][]Problem{}
-		for _, pr := range problems(r) {
-			name := map[string]string{"Hack": "Hacks", "False positive": "Hacks", "False negative": "Correct Work Rejected",
-				"Incorrect work passed": "Incorrect Work Passed", "Correct work failed": "Correct Work Failed"}[resultType(pr)]
-			groups[cmp.Or(name, "Type Unknown")] = append(groups[cmp.Or(name, "Type Unknown")], pr)
-		}
-		// A group with no problem is left out; with no problem at all, the empty Hacks group is the tab's result.
-		// When no problem's type is known, the one group is the problems.
-		names := slices.DeleteFunc([]string{"Hacks", "Incorrect Work Passed", "Correct Work Rejected", "Correct Work Failed", "Type Unknown"},
-			func(n string) bool { return len(groups[n]) == 0 })
-		switch {
-		case len(names) == 0:
-			names = []string{"Hacks"}
-		case len(names) == 1 && names[0] == "Type Unknown":
-			names, groups["Problems"] = []string{"Problems"}, groups["Type Unknown"]
-		}
+		names, groups := causeGroups(r)
 		for i, name := range names {
 			attackTable(r, found, name, groups[name], i == 0, p)
 		}
@@ -732,7 +726,7 @@ func attackPage(r Report, found []Finding, p *page) {
 	case len(alone) > 0:
 		widths := []int{6, 21, 15}
 		p.add(cols(p.w, "   ", widths, dim("Try"), dim("Hack demonstrated?"), dim("New finding?"), dim(map[bool]string{true: "Same cause as", false: "Same as"}[r.SchemaVersion >= 2])))
-		for i, at := range alone {
+		for _, at := range alone {
 			demonstrated, fresh, same := "-", "-", ""
 			if r.started(at) {
 				res, _ := lookup(attemptResults, at.Status)
@@ -747,13 +741,15 @@ func attackPage(r Report, found []Finding, p *page) {
 					demonstrated = "-"
 				}
 			}
-			for _, pr := range a.Problems {
+			for _, pr := range r.allFindings() {
 				if r.SchemaVersion >= 2 { // its exploit made pr, or the attack inspector read it as pr's cause
 					switch {
+					case pr.judged() && pr.Finding == deref(at.Episode):
+						demonstrated, fresh, same = "yes", "no", r.causeOf(pr).name()
 					case pr.Source == "Attacker" && pr.Finding == deref(at.Episode):
 						demonstrated, fresh, same = "yes", "yes", ""
 					case pr.ID != "" && pr.ID == at.Problem && fresh == "-":
-						demonstrated, fresh, same = "yes", "no", strings.Join(strings.Fields(pr.Cause), " ")
+						demonstrated, fresh, same = "yes", "no", r.causeOf(pr).name()
 					}
 					continue
 				}
@@ -768,7 +764,11 @@ func attackPage(r Report, found []Finding, p *page) {
 					}
 				}
 			}
-			p.add(cols(p.w, "   ", widths, strconv.Itoa(i+1), under("Hack demonstrated?", glyph(demonstrated)), under("New finding?", glyph(fresh)), same))
+			try := "-"
+			if at.Episode != nil {
+				try = strings.TrimPrefix(sessionName(*at.Episode), "Try ")
+			}
+			p.add(cols(p.w, "   ", widths, try, under("Hack demonstrated?", glyph(demonstrated)), under("New finding?", glyph(fresh)), same))
 		}
 	case d == nil:
 		p.add(" No try recorded.")
@@ -787,41 +787,50 @@ func tryNote(r Report, at Attempt) string {
 	case at.Status == "no_evidenced_issue" && at.Assessment == nil && slices.ContainsFunc(slices.Collect(maps.Values(at.Rewards)), func(x *float64) bool { return x != nil && *x == 0 }):
 		return "The grader paid nothing, so nudi did not inspect it."
 	case at.Status == "unknown" && at.Error != nil:
-		return "Result unclear: " + strings.TrimSuffix(strings.SplitN(*at.Error, "\n", 2)[0], ".") + "."
+		return "Result unclear: " + strings.TrimSuffix(errorLine(*at.Error), ".") + "."
 	}
 	return ""
 }
 
-// attackTable lists problems with the answer under each hint level; Enter expands a row into its tries, which then
-// carry its answers.
-func attackTable(r Report, found []Finding, name string, ps []Problem, first bool, p *page) {
+// attackTable lists causes with the answer under each hint level; Enter expands a row into the tries at its findings,
+// which then carry its answers.
+func attackTable(r Report, found []Finding, name string, cs []Cause, first bool, p *page) {
 	if first {
-		attackHead(titled(name, len(ps)), p)
+		attackHead(titled(name, len(cs)), p)
 	} else {
-		p.add(titled(name, len(ps)))
+		p.add(titled(name, len(cs)))
 	}
-	if len(ps) == 0 {
+	if len(cs) == 0 {
 		p.add(" None in this run.", "")
 		return
 	}
-	widths := []int{44, 6, 6} // a try given no information is aimed at no problem, so no problem has a No info cell
-	p.add(cols(p.w, "     ", widths, dim("Problem"), dim("Hint"), dim("Full"), dim("Ref")))
-	for _, pr := range ps {
-		key := "tries " + pr.ID + " " + pr.Cause
-		aimed := r.aimed(pr)
+	// Each cause under its number, as on Results. A try given no information is aimed at no finding, so no cause has a
+	// No info cell.
+	widths := []int{width(strconv.Itoa(len(r.Causes))) + 2, 44, 6}
+	p.add(cols(p.w, "     ", widths, "", dim("Cause"), dim("Hint"), dim("Full")))
+	for _, c := range cs {
+		key := "tries " + c.ID + " " + c.Cause
+		fs := measured(c.Findings)
 		p.pick(0, key, func(mark string, on bool) string {
 			arrow := dim("▸") + " "
 			if p.open[key] {
 				arrow = dim("▾") + " "
 			}
-			cause := strings.Join(strings.Fields(pr.Cause), " ")
+			cause, n := strings.Join(strings.Fields(c.Cause), " "), fg(teal, strconv.Itoa(c.N))
 			if p.open[key] {
-				return cols(p.w, mark+arrow, widths, cause, "", "", dim(pr.ID))
+				return cols(p.w, mark+arrow, widths, n, cause)
 			}
-			return cols(p.w, mark+arrow, widths, cause, under("Hint", glyph(r.tried(pr, "minimal"))), under("Full", glyph(r.tried(pr, "full"))), dim(pr.ID))
+			cause = clip(cause, fit(p.w, mark+arrow, widths)[1]-2) // a folded row keeps its sentence to one line
+			return cols(p.w, mark+arrow, widths, n, cause, under("Hint", glyph(r.causeTried(fs, "minimal"))), under("Full", glyph(r.causeTried(fs, "full"))))
 		})
 		if p.open[key] {
-			triesTable(r, found, aimed, &pr, p)
+			var aimed []Attempt
+			for _, at := range r.Attack.Attempts {
+				if slices.ContainsFunc(fs, func(f Problem) bool { return r.aimedAt(at, f) }) {
+					aimed = append(aimed, at)
+				}
+			}
+			triesTable(r, found, aimed, fs, p)
 		}
 	}
 	p.add("")
@@ -835,11 +844,12 @@ func attackHead(title string, p *page) {
 	}
 }
 
-// triesTable lists attempts: their hint level, whether each succeeded, how it ended, its reward and its session, or the
-// problem its exploit became; Enter opens an attempt's finding. Under a problem pr, from schema 2 on, an attempt
-// succeeded when it was an exploit. Reports without problems pass no pr and also name what each tested.
-func triesTable(r Report, found []Finding, attempts []Attempt, pr *Problem, p *page) {
-	indent, flat := "       ", pr == nil
+// triesTable lists attempts: their hint level, whether each succeeded, how it ended, its reward and its session; Enter
+// opens an attempt's finding. Under a cause, with its measured findings fs, an attempt succeeded from schema 2 on when it
+// was an exploit of the finding it was aimed at, which a cause of several findings names. Reports without problems pass
+// no fs and name what each tested.
+func triesTable(r Report, found []Finding, attempts []Attempt, fs []Problem, p *page) {
+	indent, flat := "       ", fs == nil
 	if flat {
 		indent = "   "
 		attackHead(titled("Tries", len(attempts)), p)
@@ -848,18 +858,22 @@ func triesTable(r Report, found []Finding, attempts []Attempt, pr *Problem, p *p
 		p.add(indent+dim("No try recorded."), "")
 		return
 	}
+	// Each try by its session's number, as Try 7 for 0007-attacker; under a cause of several findings, the last column
+	// names the one it was aimed at.
 	widths := []int{5, 9, 12, 13, 8}
-	heads := []string{"Try", "Help", "Succeeded", "Status", "Reward", "Ref"}
+	heads := []string{"Try", "Help", "Succeeded", "Status", "Reward"}
 	if flat {
-		widths = []int{5, 12, 9, 12, 13, 8}
+		widths = []int{5, 12, 9, 12, 13}
 		heads = slices.Insert(heads, 1, "Tested")
+	} else if len(fs) > 1 {
+		heads = append(heads, "Finding")
 	}
 	var cells []string
 	for _, h := range heads {
 		cells = append(cells, dim(h))
 	}
 	p.add(cols(p.w, indent, widths, cells...))
-	for i, at := range attempts {
+	for _, at := range attempts {
 		res, _ := lookup(attemptResults, at.Status)
 		succeeded, status := glyph("-"), resultWords[res]
 		if r.started(at) {
@@ -867,8 +881,8 @@ func triesTable(r Report, found []Finding, attempts []Attempt, pr *Problem, p *p
 				status = stoppedWords(at.Status) // its episode started
 			}
 			succeeded = glyph(answers[res])
-			if r.SchemaVersion >= 2 && pr != nil {
-				succeeded = glyph(r.succeeded(at, *pr))
+			if i := slices.IndexFunc(fs, func(f Problem) bool { return r.aimedAt(at, f) }); r.SchemaVersion >= 2 && i >= 0 {
+				succeeded = glyph(r.succeeded(at, fs[i]))
 			}
 		} else {
 			status = resultWords[NotTested]
@@ -878,19 +892,27 @@ func triesTable(r Report, found []Finding, attempts []Attempt, pr *Problem, p *p
 			reward = num(at.Rewards[k])
 			break
 		}
-		episode := "-"
-		n := 0
+		try, n := "-", 0
 		if at.Episode != nil {
-			episode = *at.Episode
+			episode := *at.Episode
+			try = strings.TrimPrefix(sessionName(episode), "Try ")
 			n = slices.IndexFunc(found, func(f Finding) bool { return f.Source == "attack" && f.Claim.Episode == episode }) + 1
 		}
 		help := helpWords[at.Level]
 		if help == "" {
 			help = "-"
 		}
-		row := []string{strconv.Itoa(i + 1), help, under("Succeeded", succeeded), status, reward, dim(episode)}
+		row := []string{try, help, under("Succeeded", succeeded), status, reward}
 		if flat {
 			row = slices.Insert(row, 1, strings.Join(tested(at), ", "))
+		} else if len(fs) > 1 {
+			var names []string
+			for _, f := range fs {
+				if r.aimedAt(at, f) {
+					names = append(names, shortName(found, f))
+				}
+			}
+			row = append(row, clip(strings.Join(names, ", "), max(12, p.w-width(indent)-sum(widths))))
 		}
 		p.pick(n, "", func(mark string, _ bool) string { return cols(p.w, indent[:len(indent)-3]+mark, widths, row...) })
 		if why := tryNote(r, at); why != "" && !flat {

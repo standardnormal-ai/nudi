@@ -97,7 +97,7 @@ func TestLiveScreen(t *testing.T) {
 		"Agents  2 running", "Attacker", "No information", "Looking for any hack", "Try 1",
 		"Attack Inspector", "Checks try 1, full",
 		"Findings So Far (0)", "None yet.",
-		"Can an Attacker Succeed Without Any Information?", "Try   Status        Hack demonstrated?  New finding?  Problem",
+		"Can an Attacker Succeed Without Any Information?", "Try   Status        Hack demonstrated?  New finding?  Cause",
 		"Logs", "l expand", "Attack Inspector  Ended, no evidence found: check of try 2 with only a hint",
 		"Attacker          Episode returned, reward 1: try 2 with only a hint",
 		"? Help   Tab next tab   Up/Down scroll   l logs   q Stop following",
@@ -206,7 +206,7 @@ func TestFollowRefuses(t *testing.T) {
 		{stopped, "", "", "the run ended with status stopped and nudi wrote no report.json"},
 		{ev("00:00", "run_start", "") + ev("00:01", "run_end", `, "status": "complete", "report": "report.json"`), `{"status": "complete"}`, "", "older than 0.0.0"},
 		{ev("00:00", "run_start", "") + `{"v": 2, "kind": "run_start"}` + "\n", "", "", "line 2 has format version 2; this viewer reads version 1"},
-		{stopped, "", "1", "--follow takes a run folder and no finding number"},
+		{stopped, "", "1", "--follow takes a run folder and no finding or cause"},
 	} {
 		dir := t.TempDir()
 		addLog(t, dir, c.log)
@@ -457,7 +457,7 @@ func TestLiveLogSaysWithdrawnAndRevisedInWords(t *testing.T) {
 		ev("00:02", "revised", `, "inspector": "hack", "id": "check-7", "index": 1, "before": "accepted_invalid", "after": "legitimate"`)+
 		ev("00:03", "withdrawn", `, "candidate": "hack-0", "problem": "P1", "level": "full"`))
 	for i, want := range map[int]string{1: "Read a check again: its earlier finding is withdrawn or corrected",
-		2: "Not started, a later reading withdrew the finding: with full instructions, for c1"} {
+		2: "Not started, the inspector that found it later withdrew it: with full instructions, for c1"} {
 		if got := plainText(l.logWords(l.Recent[i])); got != want {
 			t.Errorf("event %d says %q, want %q", i, got, want)
 		}
@@ -492,12 +492,12 @@ func TestLiveWithdrawnProblemLeavesTheCount(t *testing.T) {
 		ev("00:03", "revised", `, "inspector": "hack", "id": "check-0", "index": 1, "before": "accepted_invalid", "after": "legitimate"`) +
 		ev("00:04", "withdrawn", `, "candidate": "hack-0", "problem": "P1", "level": "full"`)
 	s := plainText(liveFrom(t, log).resultsBody(Report{}, at9("00:05"), "", 100))
-	if !strings.Contains(s, "0 problems so far") || cells(s, "C1") != "✓ ✗ - -" {
+	if !strings.Contains(s, "0 causes so far") || cells(s, "C1") != "✓ ✗ - -" {
 		t.Errorf("withdrawn P1 row %q:\n%s", cells(s, "C1"), s)
 	}
 	s = plainText(liveFrom(t, log+ev("00:05", "attempt_result", `, "episode": null, "problem": "P1", "level": "none", "number": 1, "status": "evidenced_issue"`)).
 		resultsBody(Report{}, at9("00:06"), "", 100))
-	if !strings.Contains(s, "1 problem so far") {
+	if !strings.Contains(s, "1 cause so far") {
 		t.Errorf("an Attacker's exploit keeps it:\n%s", s)
 	}
 }
@@ -530,7 +530,7 @@ func TestLiveResultsKeepsTheFinishedSections(t *testing.T) {
 	l := pipelineLive(t, "pipeline-grader")
 	s := liveKeys(t, l, l.Last.at(), 100, 0, "tab", "tab", "tab")
 	at := -1
-	for _, h := range []string{"Problems (5)", "Abandoned Problems", "Simulation Rewards", "Grader Accuracy", "Work Left", "\n Cost"} {
+	for _, h := range []string{"Causes (5)", "Abandoned Findings", "Simulation Rewards", "Grader Accuracy", "Work Left", "\n Cost"} {
 		i := strings.Index(s, h)
 		if i < at {
 			t.Fatalf("%s missing or out of order:\n%s", h, s)
@@ -542,18 +542,37 @@ func TestLiveResultsKeepsTheFinishedSections(t *testing.T) {
 	}
 }
 
-// A cause event, and the same event as older logs name it, is the judge's reading, which the live view leaves out; a
-// no-hint exploit the attack inspector read as a known problem's cause says so with that problem's cause sentence,
-// which its event does not carry.
+// A cause event is a log line; a judged finding names its cause id,
+// and a no-hint exploit the attack inspector read as a known cause says so with that cause's sentence, which its event
+// does not carry.
 func TestLiveCauseReadings(t *testing.T) {
-	l := liveFrom(t, ev("00:01", "judged", `, "inspector": "hack", "problem": "P1", "finding": "hack-1", "new": true, "cause": "a planted conftest"`)+
+	l := liveFrom(t, ev("00:01", "judged", `, "inspector": "hack", "problem": "P1", "finding": "hack-1", "new": true, "cause": "a planted conftest", "cause_id": "C1"`)+
+		ev("00:02", "judged", `, "inspector": "hack", "finding": "hack-1", "replayed": true, "text": "nudi: 00:02:00 hack inspector finding hack-1 was judged in the earlier run"`)+
 		ev("00:02", "cause", `, "finding": "hack-2", "problem": "P2", "cause": "C1"`)+
-		ev("00:02", "hole", `, "finding": "hack-3", "problem": "P3", "hole": "H1"`)+
-		ev("00:03", "judged", `, "inspector": "attack", "problem": "P1", "finding": "0002-attacker", "new": false`))
-	if len(l.Recent) != 2 || l.Recent[1].Kind != "judged" {
+		ev("00:03", "judged", `, "inspector": "attack", "problem": "P1", "finding": "0002-attacker", "new": false`)+
+		ev("00:04", "judged", `, "inspector": "attack", "problem": "P1", "finding": "0003-attacker", "new": false, "cause_id": "C1"`))
+	if len(l.Recent) != 5 || l.Recent[2].Kind != "cause" || l.Recent[3].Kind != "judged" {
 		t.Fatalf("recent: %+v", l.Recent)
 	}
-	if got := l.logWords(l.Recent[1]); got != "Read as the cause of an earlier finding: a planted conftest" {
-		t.Errorf("judged says %q", got)
+	if got := plainText(l.logRow(l.Recent[1], 120)); !strings.Contains(got, "hack inspector finding hack-1 was judged in the earlier run") {
+		t.Errorf("replayed: %q", got)
+	}
+	for i, want := range map[int]string{0: "New cause C1: a planted conftest", 3: "Judged to use a known cause: a planted conftest", 4: "Judged to use cause C1: a planted conftest"} {
+		if got := l.logWords(l.Recent[i]); got != want {
+			t.Errorf("judged says %q, want %q", got, want)
+		}
+	}
+}
+
+// The live no-information table numbers its rows itself: every no-information try of a run can carry number 1, the
+// number of its slot.
+func TestLiveNoInfoNumbersItsRows(t *testing.T) {
+	l := liveFrom(t, ev("00:01", "attempt_start", `, "episode": "0001-attacker", "level": "none", "number": 1`)+
+		ev("00:02", "attempt_result", `, "episode": "0001-attacker", "level": "none", "number": 1, "status": "no_evidenced_issue"`)+
+		ev("00:03", "attempt_start", `, "episode": "0002-attacker", "level": "none", "number": 1`)+
+		ev("00:04", "attempt_result", `, "episode": "0002-attacker", "level": "none", "number": 1, "status": "no_evidenced_issue"`))
+	s := plainText(strings.Join(l.noInfo(at9("00:05"), "", 100), "\n"))
+	if row(s, "1 ") == "" || row(s, "2 ") == "" {
+		t.Errorf("rows not numbered 1 and 2:\n%s", s)
 	}
 }

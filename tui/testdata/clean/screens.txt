@@ -6,12 +6,12 @@
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
  ✓ Finished                                                                         1 open question
- No problems demonstrated in this run.
+ No cause demonstrated in this run.
 
  Findings (0)
  None evidenced in this run.
 
- ▸ Abandoned Problems                                                                      o expand
+ ▸ Abandoned Findings                                                                      o expand
  ▸ What the References Mean                                                                i expand
 
  Simulation Rewards                               Grader Accuracy
@@ -25,7 +25,9 @@
 
  Work Left (1)
  Where              What                                  Why
- Find Hacks         unchecked requirement (hack-0)        Unresolved: Reason not recorded
+ Find Hacks         The test script runs bash from PATH,  Unresolved: Reason not recorded
+                    so a shim the agent plants first on
+                    PATH decides the result. (hack-0)
 
  Cost
  Model cost                  $0.00 of $5.00 cap    ━━━━━━━━━━━━━━━━
@@ -70,7 +72,9 @@
 
  Open Questions (1)
    Question                                      Why it is open
-   unchecked requirement (hack-0)                Reason not recorded
+   The test script runs bash from PATH, so a     Reason not recorded
+   shim the agent plants first on PATH decides
+   the result. (hack-0)
 
  ▸ Search Scope (3 categories)                                                             s expand
 === tab 3

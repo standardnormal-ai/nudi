@@ -585,13 +585,13 @@ func (l *Live) noInfo(now time.Time, sp string, w int) []string {
 				cause = capital(n.Cause)
 			}
 		}
-		rows = append(rows, cols(w, "   ", widths, strconv.Itoa(t.Start.Number), status, shown, isNew, cause))
+		rows = append(rows, cols(w, "   ", widths, strconv.Itoa(len(rows)+1), status, shown, isNew, cause)) // a try's own number is its slot's
 	}
 	if len(rows) == 0 {
 		return nil
 	}
 	return append([]string{" " + bold("Can an Attacker Succeed Without Any Information?"),
-		cols(w, "   ", widths, dim("Try"), dim("Status"), dim("Hack demonstrated?"), dim("New finding?"), dim("Problem"))}, rows...)
+		cols(w, "   ", widths, dim("Try"), dim("Status"), dim("Hack demonstrated?"), dim("New finding?"), dim("Cause"))}, rows...)
 }
 
 // logClock splits nudi's line into its clock time and its message.
@@ -607,7 +607,7 @@ func (l *Live) logRow(e Event, w int) string {
 	}
 	job := "nudi"
 	switch {
-	case e.Kind == "judged":
+	case e.Kind == "judged" || e.Kind == "cause":
 		job = "novelty_judge"
 	case strings.HasPrefix(e.Kind, "attempt_"):
 		job = "Attacker"
@@ -629,8 +629,12 @@ func (l *Live) logWords(e Event) string {
 		if e.Replayed {
 			return ""
 		}
+		id := ""
+		if e.CauseID != "" {
+			id = " " + e.CauseID
+		}
 		if e.New {
-			return "New finding: " + e.Cause
+			return "New cause" + id + ": " + e.Cause
 		}
 		cause := e.Cause
 		if n := l.lane(e.Problem); cause == "" && n != nil {
@@ -640,9 +644,12 @@ func (l *Live) logWords(e Event) string {
 		case cause == "":
 			return ""
 		case e.Inspector == "attack": // the attack inspector read a no-hint exploit as a known problem's cause
-			return "Read as the cause of an earlier finding: " + cause
+			if id == "" {
+				return "Judged to use a known cause: " + cause
+			}
+			return "Judged to use cause" + id + ": " + cause
 		}
-		return "Same as an earlier finding: " + cause
+		return "Known cause" + id + ": " + cause
 	case "phase_start", "phase_end":
 		i := slices.IndexFunc(phases, func(p struct{ Name, Analysis string }) bool { return p.Analysis == e.Phase })
 		if i < 0 {
@@ -717,7 +724,7 @@ func (l *Live) logWords(e Event) string {
 		return capital(triedWords[res]) + ": " + aim
 	case "withdrawn":
 		if n := l.lane(e.Problem); n != nil {
-			return "Not started, a later reading withdrew the finding: with " + word(levelWords, e.Level) + ", for " + n.Cause
+			return "Not started, the inspector that found it later withdrew it: with " + word(levelWords, e.Level) + ", for " + n.Cause
 		}
 	case "revised":
 		return "Read a check again: its earlier finding is withdrawn or corrected"
@@ -773,7 +780,7 @@ func (l *Live) tryAim(e Event) string {
 	return out
 }
 
-// resultsBody is the Results tab while the run goes on, in the sections of a finished run: the problems so far, the
+// resultsBody is the Results tab while the run goes on, in the sections of a finished run: the causes so far, the
 // Attacker with no information and the cost; the sections the events do not fill say they come at the end.
 func (l *Live) resultsBody(r Report, now time.Time, sp string, w int) string {
 	n := 0
@@ -781,15 +788,15 @@ func (l *Live) resultsBody(r Report, now time.Time, sp string, w int) string {
 		n += boolInt(lane.Same == "" && (!lane.Withdrawn || l.exploited(lane))) // an Attacker's exploit outlasts a withdrawal
 	}
 	out := []string{
-		spread(" "+"Run not finished"+"  "+dim("running for "+elapsed(l.ran(now).Seconds())), dim(fmt.Sprintf("%d problem%s so far", n, plural(n))), w),
+		spread(" "+"Run not finished"+"  "+dim("running for "+elapsed(l.ran(now).Seconds())), dim(fmt.Sprintf("%d cause%s so far", n, plural(n))), w),
 		" " + dim("Findings so far. The result is final when the run ends."), "",
 	}
-	out = append(out, l.findings("Problems", now, sp, w, -1)...)
+	out = append(out, l.findings("Causes", now, sp, w, -1)...)
 	if block := l.noInfo(now, sp, w); len(block) > 0 {
 		out = append(append(out, ""), block...)
 	}
 	later := " " + dim("Available when the run ends.")
-	out = append(out, "", " "+bold("Abandoned Problems"), later, "")
+	out = append(out, "", " "+bold("Abandoned Findings"), later, "")
 	left, right := heading("Simulation Rewards", "")+"\n"+later, heading("Grader Accuracy", "")+"\n"+later
 	if w >= 100 {
 		out = append(out, lipgloss.JoinHorizontal(lipgloss.Top, lipgloss.NewStyle().Width(48).Render(left), right))

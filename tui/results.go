@@ -73,34 +73,37 @@ func (p *page) String() string { return strings.Join(p.lines, "\n") }
 // the rewards beside grader accuracy, the work left and the cost.
 func resultsPage(r Report, found []Finding, p *page) {
 	p.add(ending(r, found, p.w)...)
-	// The Answer's causes fold under one line, which a opens.
-	if causes := r.causeLines(); len(causes) > 0 {
-		n := len(slices.DeleteFunc(slices.Clone(causes), func(s string) bool { return !causeLine.MatchString(s) }))
-		if p.toggle("a", "Causes", "("+strconv.Itoa(n)+")") {
-			for _, line := range causes {
-				p.add(hang(line, p.w, "   "))
-			}
-		}
-	}
 	p.add("")
 	if r.Attack != nil && r.Attack.Problems != nil {
-		problemsTable(r, found, p)
+		causesTable(r, found, p)
 	} else {
 		findingsTable(found, "", p)
 	}
 	p.add("")
-	if others, opens := otherFindings(r); len(others) > 0 && p.toggle("o", "Abandoned Problems", "") {
-		widths := []int{36, 28, 18}
-		p.add(cols(p.w, "   ", widths, dim("Finding"), dim("State"), dim("Found by"), dim("Ref")))
+	if others, opens := otherFindings(r); len(others) > 0 && p.toggle("o", "Abandoned Findings", "") {
+		// An evidenced finding on the list opens with Enter, and its references are on its screen; a row with no detail
+		// keeps its reference, in a Ref column only when there is such a row.
+		heads := []string{dim("Finding"), dim("State"), dim("Found by"), dim("Ref")}
+		if !slices.Contains(opens, 0) {
+			heads = heads[:3]
+		}
+		state, by := 21, 18
+		if p.w < 80 {
+			state, by = 18, 18
+		}
+		widths := []int{max(12, p.w-3-state-by-10*boolInt(len(heads) == 4)), state, by}
+		name := fit(p.w, "   ", widths[:len(heads)-1])[0] - 2
+		p.add(cols(p.w, "   ", widths, heads...))
 		for i, o := range others {
-			// An evidenced finding on the list opens with Enter; the other rows have no detail.
+			row := []string{clip(o[0], name), o[1], o[2], dim(sessionName(o[3]))}
 			if n := opens[i]; n > 0 {
-				p.pick(n, "", func(mark string, _ bool) string { return cols(p.w, mark, widths, o[0], o[1], o[2], dim(o[3])) })
+				row[3] = ""
+				p.pick(n, "", func(mark string, _ bool) string { return cols(p.w, mark, widths, row[:len(heads)]...) })
 			} else {
-				p.add(cols(p.w, "   ", widths, o[0], o[1], o[2], dim(o[3])))
+				p.add(cols(p.w, "   ", widths, row[:len(heads)]...))
 			}
 		}
-		p.add(wrap("Suspected problems that didn't have enough evidence", p.w, "   ", dim))
+		p.add(wrap("Suspected findings that didn't have enough evidence", p.w, "   ", dim))
 	}
 	if p.toggle("i", "What the References Mean", "") {
 		widths := []int{17, 62}
@@ -108,7 +111,7 @@ func resultsPage(r Report, found []Finding, p *page) {
 		for _, x := range references {
 			p.add(cols(p.w, "   ", widths, fg(teal, x[0]), x[1], dim(x[2])))
 		}
-		p.add(wrap("A problem groups the findings that share one cause. References never change between views.", p.w, "   ", dim))
+		p.add(wrap("A cause groups the findings a judge model read as sharing one. References never change between views.", p.w, "   ", dim))
 	}
 	p.add("")
 	left, right := rewardsSummary(r, p.w), accuracySummary(r, p.w)
@@ -135,9 +138,10 @@ func resultsPage(r Report, found []Finding, p *page) {
 
 // references say what each kind of reference on the screens names, with an example.
 var references = [][3]string{
-	{"P", "Problem found by the Hack Inspector's search", "P1"},
-	{"G", "Problem found by the Grader Inspector in the simulations", "G1"},
-	{"A", "Problem found only by an Attacker", "A1"},
+	{"C", "Cause: the findings a judge model read as sharing one", "C1"},
+	{"P", "Cause of an older report, found by the Hack Inspector's search", "P1"},
+	{"G", "Cause of an older report, found by the Grader Inspector in the simulations", "G1"},
+	{"A", "Finding of an Attacker alone", "A1"},
 	{"hack-N", "Finding: an evidence record of the Hack Inspector", "hack-1"},
 	{"grader-N", "Finding: an evidence record of the Grader Inspector", "grader-7"},
 	{"experiment-N", "One idea the Hack Inspector tested", "experiment-0002"},
@@ -146,20 +150,40 @@ var references = [][3]string{
 	{"NNNN-simulator", "One Simulator episode", "0004-simulator"},
 }
 
+// errorLine is an error's first line up to any structured payload a provider appended, such as " - {...}", which
+// stays in report.json.
+func errorLine(s string) string {
+	s = strings.SplitN(s, "\n", 2)[0]
+	if i := strings.Index(s, " - {"); i >= 0 {
+		s = s[:i]
+	}
+	return s
+}
+
 // ending is how the run ended, with its time or cost, the count of problems on the right, and the verdict under it
 // as Python wrote it. A failed phase names its error; a stop says that the results come from before it.
 func ending(r Report, found []Finding, w int) []string {
-	head, notes := endingParts(r, false)
-	out := []string{spread(" "+head, tally(r, found), w)}
+	head, notes := endingParts(r)
+	right := tally(r, found)
+	out := []string{spread(" "+head, right, w)}
+	// A finished run whose work was partly lost warns of it beside the count, or on a line of its own when that does
+	// not fit; Work Left says what was lost.
+	if lost := lostWork(r); lost != "" {
+		warn := yellowStyle.Render("! " + lost)
+		if width(head)+width(warn)+width(right)+7 <= w {
+			out[0] = spread(" "+head, warn+strings.Repeat(" ", 3*boolInt(right != ""))+right, w)
+		} else {
+			out = append(out, wrap("! "+lost, w, " ", amber))
+		}
+	}
 	for _, note := range notes {
-		out = append(out, hang(note, w, " "))
+		out = append(out, wrap(note, w, " ", plain))
 	}
 	return out
 }
 
 // endingParts are the ending's headline, with its time or cost beside it, and the lines under it.
-// The Answer's causes follow the verdict when causes is set.
-func endingParts(r Report, causes bool) (string, []string) {
+func endingParts(r Report) (string, []string) {
 	clock := ""
 	if r.Elapsed != nil {
 		clock = elapsed(*r.Elapsed)
@@ -170,7 +194,7 @@ func endingParts(r Report, causes bool) (string, []string) {
 	amber, verdict := yellowStyle, r.verdict()
 	var errs []string
 	for _, p := range failed {
-		errs = append(errs, redStyle.Render("Error")+"  "+strings.SplitN(r.PhaseErrors[p.Analysis], "\n", 2)[0], failedNote(r, p.Name, p.Analysis))
+		errs = append(errs, redStyle.Render("Error")+"  "+errorLine(r.PhaseErrors[p.Analysis]), failedNote(r, p.Name, p.Analysis))
 	}
 	switch {
 	case r.Stop != nil: // a stop ends the run even after a phase failed; the failure stays a note
@@ -200,6 +224,11 @@ func endingParts(r Report, causes bool) (string, []string) {
 		head, notes = redStyle.Render(failed[0].Name+" failed"), append(errs, verdict)
 	case strings.HasPrefix(r.Answer[0], "Could not start"):
 		head, notes = amber.Render("Could not start"), []string{strings.TrimPrefix(r.Answer[0], "Could not start: ")}
+	case lostWork(r) != "": // its work ended, but some was lost: the warning beside it says what
+		head, notes = greenStyle.Render("Finished"), []string{verdict}
+		if clock != "" {
+			beside = "after " + clock
+		}
 	case r.Status == "complete":
 		head, notes = greenStyle.Render("✓ Finished"), []string{verdict}
 		if clock != "" {
@@ -207,35 +236,84 @@ func endingParts(r Report, causes bool) (string, []string) {
 		}
 	case r.Status == "time_limit":
 		head, notes = amber.Render("Stopped at the time limit"), []string{verdict, stopWords["time_limit"][1]}
-	case r.Status == "partial":
-		head, notes = amber.Render("Partly finished"), []string{verdict, "Work left says what did not finish."}
 	default:
 		head, notes = amber.Render("Stopped"), []string{verdict}
 	}
 	if beside != "" {
 		head += "  " + dim(beside)
 	}
-	if i := slices.Index(notes, verdict); i >= 0 && verdict != "" && causes {
-		notes = slices.Insert(notes, i+1, r.causeLines()...)
-	}
 	return head, slices.DeleteFunc(notes, func(s string) bool { return s == "" })
 }
 
-// causeLines are the Answer's causes as Python wrote them: the paragraph over them, then each cause with its problems'
-// lines under it, which start "  - ". Empty when the Answer has none.
-func (r Report) causeLines() []string {
-	i := slices.IndexFunc(r.Answer, func(s string) bool { return strings.HasPrefix(s, "Causes, ") })
-	if i < 0 {
-		return nil
+// lostWork says what failed, and where, in a finished run whose Answer says work was lost or in a partial run, whose
+// work ended with some of it lost, as "Find Hacks: 1 search failed"; "" for any other run. It counts the failures the Answer's first line names: an inspector session that failed with
+// its experiment's error is that experiment's search, and an evidence copy belongs to no phase.
+func lostWork(r Report) string {
+	failed := slices.ContainsFunc(slices.Collect(maps.Values(r.PhaseErrors)), func(e string) bool { return e != "" })
+	if r.Stop != nil || failed || strings.HasPrefix(r.Answer[0], "Could not start") ||
+		r.Status != "partial" && !(r.Status == "complete" && strings.HasPrefix(r.Answer[0], "Finished, but ")) {
+		return ""
 	}
-	j := i + 1
-	for j < len(r.Answer) && (strings.HasPrefix(r.Answer[j], "  - ") || causeLine.MatchString(r.Answer[j])) {
-		j++
+	var out []string
+	count := func(where string, n int, one, many string) {
+		if n > 0 {
+			out = append(out, fmt.Sprintf("%s: %d %s", where, n, map[bool]string{true: one, false: many}[n == 1]))
+		}
 	}
-	return r.Answer[i:j]
+	if o := r.Ordinary; o != nil {
+		count(phases[0].Name, len(o.NoReward), "episode without a reward", "episodes without a reward")
+	}
+	for i, source := range []string{"grader_inspector", "hack_inspector"} {
+		in := r.Inspections[source]
+		if in == nil {
+			continue
+		}
+		searches, lost := 0, map[string]bool{}
+		for _, ex := range in.Experiments {
+			if attemptResults[ex.Status] == Failed {
+				searches, lost[ex.Error] = searches+1, true
+			}
+		}
+		for _, at := range in.Attempts {
+			if attemptResults[at.Status] == Failed && !lost[at.Error] {
+				searches++
+			}
+		}
+		count(phases[i+1].Name, searches, "search failed", "searches failed")
+	}
+	if r.Attack != nil {
+		n := 0
+		for _, at := range r.Attack.Attempts {
+			n += boolInt(attemptResults[at.Status] == Failed)
+		}
+		count(phases[3].Name, n, "try failed", "tries failed")
+	}
+	copies := 0
+	for _, c := range r.Copies {
+		copies += boolInt(c.Error != nil)
+	}
+	if copies > 0 {
+		out = append(out, fmt.Sprintf("%d evidence %s failed", copies, map[bool]string{true: "copy", false: "copies"}[copies == 1]))
+	}
+	if len(out) == 0 { // the Answer names lost work that no listed record shows
+		return "Some work was lost"
+	}
+	return strings.Join(out, "; ")
 }
 
-var causeLine = regexp.MustCompile(`^C\d+: `)
+// causeWords are the Answer's sentence over its causes, which says what kind of claim a cause is, or "": the line before
+// the first that starts with a cause's id, after the verdict. The cause lines repeat the cause rows, so no screen shows them.
+func (r Report) causeWords() string {
+	i := slices.IndexFunc(r.Answer, func(s string) bool {
+		return slices.ContainsFunc(r.Causes, func(c Cause) bool {
+			return c.ID != "" && (strings.HasPrefix(s, c.ID+": ") || strings.HasPrefix(s, c.ID+", "))
+		})
+	})
+	if i < 3 || r.Answer[i-1] == r.verdict() {
+		return ""
+	}
+	return r.Answer[i-1]
+}
 
 // verdict is Python's verdict line: the answer's second line after a headline, or its first in reports from before headlines.
 // Python's line for a run that evidenced nothing reads as the plan's words.
@@ -250,17 +328,17 @@ func (r Report) verdict() string {
 		}
 	}
 	if line == "No cheat and no misjudged work was evidenced." {
-		return "No problems demonstrated in this run."
+		return "No cause demonstrated in this run."
 	}
 	return line
 }
 
-// tally is the count on the right of the ending: the problems, or the evidenced findings of a report without
+// tally is the count on the right of the ending: the causes, or the evidenced findings of a report without
 // problems, else the open questions.
 func tally(r Report, found []Finding) string {
 	n, noun := len(found), "evidenced finding"
 	if r.Attack != nil && r.Attack.Problems != nil {
-		n, noun = len(problems(r)), "problem"
+		n, noun = len(r.Causes), "cause"
 	}
 	if n > 0 {
 		return redStyle.Render(fmt.Sprintf("%d %s%s", n, noun, plural(n)))
@@ -303,6 +381,16 @@ func findingType(f Finding) string {
 }
 
 var jobNames = map[string]string{"grader_inspector": "Grader Inspector", "hack_inspector": "Hack Inspector", "attack": "Attacker"}
+
+// sessionName is how the screens name an Attacker session, as Try 7 for 0007-attacker; any other reference is kept.
+func sessionName(ref string) string {
+	if n, ok := strings.CutSuffix(ref, "-attacker"); ok {
+		if i, err := strconv.Atoi(n); err == nil {
+			return "Try " + strconv.Itoa(i)
+		}
+	}
+	return ref
+}
 
 // ref is how the screens refer to a finding: its id, or for an Attacker's finding its session.
 func ref(f Finding) string {
@@ -434,128 +522,242 @@ func tested(a Attempt) []string {
 	return nil
 }
 
-// problemsTable lists the problems, each with its evidence and, behind e, the legend of its cells; Enter expands a problem into its evidence records,
-// and Enter on a record opens it.
-func problemsTable(r Report, found []Finding, p *page) {
-	ps := problems(r)
-	if len(ps) == 0 {
-		p.add(titled("Problems", 0), " None demonstrated in this run.")
+// causeGroups are the causes under the headings of their type, each group in the causes' order: Hacks (Hack or False
+// positive), Incorrect Work Passed, Correct Work Rejected (False negative), Correct Work Failed, then Type Unknown for
+// a cause whose type is not known or whose findings' types differ. An empty group is left out; with no cause at all,
+// the empty Hacks group is the result, and when no cause's type is known the one group is Causes.
+func causeGroups(r Report) ([]string, map[string][]Cause) {
+	groups := map[string][]Cause{}
+	for _, c := range r.Causes {
+		name := cmp.Or(map[string]string{"Hack": "Hacks", "False positive": "Hacks", "False negative": "Correct Work Rejected",
+			"Incorrect work passed": "Incorrect Work Passed", "Correct work failed": "Correct Work Failed"}[causeType(c.Findings)], "Type Unknown")
+		groups[name] = append(groups[name], c)
+	}
+	names := slices.DeleteFunc([]string{"Hacks", "Incorrect Work Passed", "Correct Work Rejected", "Correct Work Failed", "Type Unknown"},
+		func(n string) bool { return len(groups[n]) == 0 })
+	switch {
+	case len(names) == 0:
+		names = []string{"Hacks"}
+	case len(names) == 1 && names[0] == "Type Unknown":
+		names, groups["Causes"] = []string{"Causes"}, groups["Type Unknown"]
+	}
+	return names, groups
+}
+
+// causesTable lists the causes under the headings of their type, best level first, with the legend of its cells behind
+// e. A cause of one finding is that finding's row, which Enter opens; Enter expands a cause of several into its
+// findings, and opens a finding.
+func causesTable(r Report, found []Finding, p *page) {
+	if len(r.Causes) == 0 {
+		p.add(titled("Causes", 0), " None demonstrated in this run.")
 		return
 	}
-	p.add(spread(titled("Problems", len(ps)), p.fold("e"), p.w))
-	attacked := len(r.Attack.Attempts) > 0 || slices.ContainsFunc(ps, func(p Problem) bool { return p.Conditions != nil })
-	inspected := r.SchemaVersion >= 2 || slices.ContainsFunc(ps, func(p Problem) bool { return p.EvidencedByInspector != nil })
-	// The columns of how much an Attacker was told. A try given no information is aimed at no problem, so none of
-	// them is No info; an Attacker problem's level says when an Attacker told nothing made it.
+	// The columns of how much an Attacker was told. A try given no information is aimed at no finding, so none of
+	// them is No info; a cause's level says when an Attacker told nothing made it.
 	var levels []string
-	if attacked {
+	if len(r.Attack.Attempts) > 0 || slices.ContainsFunc(r.Attack.Problems, func(p Problem) bool { return p.Conditions != nil }) {
 		levels = []string{"minimal", "full"}
 	}
-	// Without a problem of known type a column of ? would say nothing.
-	typed := slices.ContainsFunc(ps, func(p Problem) bool { return resultType(p) != "" })
-	heads, widths := []string{"Problem"}, []int{44}
-	if typed { // the Problem column gives way first, so that a nine-letter Ref still fits at 100 columns
-		heads, widths = []string{"Problem", "Type"}, []int{39, 23}
+	refW := width(strconv.Itoa(len(r.Causes))) + 2 // each cause's number
+	// The cause sentence takes what the other columns leave.
+	widths := []int{refW, max(12, p.w-5-refW-6*len(levels)-7)}
+	for range levels {
+		widths = append(widths, 6)
 	}
-	for _, level := range levels {
-		heads, widths = append(heads, helpWords[level]), append(widths, 6)
-	}
-	if inspected {
-		heads, widths = append(heads, "Inspector"), append(widths, 11)
-	}
-	heads = append(heads, "Ref")
-	if p.open["e"] {
-		var legend, told []string
-		for _, level := range levels {
-			told = append(told, helpWords[level])
+	widths = append(widths, 7)
+	// cells are a cause's or a finding's text, its Hint and Full and its level.
+	cells := func(text string, fs []Problem, level int) []string {
+		out := []string{text}
+		for _, l := range levels {
+			out = append(out, under(helpWords[l], glyph(r.causeTried(fs, l))))
 		}
-		if len(told) > 0 {
-			legend = append(legend, strings.Join(told, ", ")+": an Attacker, by how much it was told.")
-		}
-		if inspected {
-			legend = append(legend, "Inspector: an inspector evidenced it.")
-		}
-		p.add(symbols)
-		if len(legend) > 0 {
-			p.add(wrap(strings.Join(legend, " "), p.w, " ", dim))
-		}
-		p.add("")
+		return append(out, dots(level))
 	}
-	var cells []string
-	for _, h := range heads {
-		cells = append(cells, dim(h))
-	}
-	p.add(cols(p.w, "     ", widths, cells...))
-	for i, pr := range ps {
-		key := "problem " + strconv.Itoa(i)
-		p.pick(0, key, func(mark string, on bool) string {
-			arrow := dim("▸") + " "
-			if p.open[key] {
-				arrow = dim("▾") + " "
-			}
-			name := strings.Join(strings.Fields(pr.Cause), " ")
-			cells := []string{name}
-			if typed && resultType(pr) == "" {
-				cells = append(cells, under("Type", glyph("?")))
-			} else if typed {
-				cells = append(cells, redStyle.Render(resultType(pr)))
-			}
-			for _, level := range levels {
-				cells = append(cells, under(helpWords[level], glyph(r.tried(pr, level))))
-			}
-			if inspected {
-				answer := "-"
-				if e := pr.EvidencedByInspector; e != nil {
-					answer = map[bool]string{true: "yes", false: "no"}[*e]
-				} else if r.SchemaVersion >= 2 && pr.Source != "Attacker" {
-					answer = "yes" // an inspector problem is an evidenced reading
+	names, groups := causeGroups(r)
+	for i, name := range names {
+		// The heading names the type and heads the columns; the first also has the key of the legend.
+		heads := []string{titled(name, len(groups[name]))}
+		if i == 0 {
+			heads[0] += "  " + p.fold("e")
+		}
+		for _, l := range levels {
+			heads = append(heads, dim(helpWords[l]))
+		}
+		head := cols(p.w, "", append([]int{5 + widths[0] + widths[1]}, widths[2:len(widths)-1]...), append(heads, "")...)
+		if i > 0 {
+			p.add("", head)
+		} else {
+			p.add(head)
+			if p.open["e"] {
+				p.add(symbols)
+				if len(levels) > 0 {
+					p.add(wrap("Hint, Full: an Attacker, by how much it was told, for the findings attacked on their own.", p.w, " ", dim))
 				}
-				cells = append(cells, under("Inspector", glyph(answer)))
+				if words := r.causeWords(); words != "" {
+					p.add(wrap(words, p.w, " ", dim))
+				}
+				p.add("")
 			}
-			return cols(p.w, mark+arrow, widths, append(cells, dim(pr.ID))...)
+		}
+		for _, c := range groups[name] {
+			causeRows(r, found, c, widths, cells, p)
+		}
+	}
+}
+
+// causeRows are cause c's row under its number, and when it is open its findings, indented: each by its short name on
+// one line, with on a dim line why its cells are empty or dim, and its type when it differs from the cause's.
+func causeRows(r Report, found []Finding, c Cause, widths []int, cells func(string, []Problem, int) []string, p *page) {
+	// Under its sentence, how many findings it has, and why it has no level or how many of them no Attacker attacked on
+	// their own; a run without Attacker tries attacked none.
+	var notes []string
+	if len(c.Findings) > 1 {
+		notes = append(notes, fmt.Sprintf("%d findings", len(c.Findings)))
+	}
+	alone := len(slices.DeleteFunc(slices.Clone(c.Findings), func(f Problem) bool { return !f.notAttackedAlone() }))
+	switch {
+	case c.Level == 0 && !slices.ContainsFunc(c.Findings, func(f Problem) bool { return !f.ReadAs }):
+		notes = append(notes, "no level of its own, only findings associated to it")
+	case alone > 0 && len(r.Attack.Attempts) > 0:
+		notes = append(notes, fmt.Sprintf("%d not attacked on %s own", alone, map[bool]string{true: "its", false: "their"}[alone == 1]))
+	}
+	// A folded row keeps its sentence to one line; opening the cause, or for one finding the finding, shows it whole.
+	key := "cause " + c.ID
+	name := func(indent string) string {
+		out := strings.Join(strings.Fields(c.Cause), " ")
+		if !p.open[key] || len(c.Findings) == 1 {
+			out = clip(out, fit(p.w, indent, widths[:len(widths)-1])[1]-2)
+		}
+		if len(notes) > 0 {
+			out += "\n" + dim(capital(strings.Join(notes, ", ")))
+		}
+		return out
+	}
+	if len(c.Findings) == 1 {
+		p.pick(evidenceOf(found, c.Findings[0]), "", func(mark string, _ bool) string {
+			return cols(p.w, mark+"  ", widths, append([]string{fg(teal, strconv.Itoa(c.N))}, cells(name(mark+"  "), c.Findings, c.Level)...)...)
 		})
-		if p.open[key] {
-			evidenceRows(r, found, pr, p)
-			levelRows(r, pr, inspected, p)
-		}
+		return
 	}
-	if p.lines[len(p.lines)-1] == "" { // an expanded last problem already ends in a blank line
-		p.lines = p.lines[:len(p.lines)-1]
+	p.pick(0, key, func(mark string, _ bool) string {
+		arrow := map[bool]string{true: "▾", false: "▸"}[p.open[key]]
+		return cols(p.w, mark+dim(arrow)+" ", widths, append([]string{fg(teal, strconv.Itoa(c.N))}, cells(name(mark+dim(arrow)+" "), c.Findings, c.Level)...)...)
+	})
+	if !p.open[key] {
+		return
+	}
+	inner := append([]int{widths[0], widths[1] - 2}, widths[2:]...)
+	room := fit(p.w, "       ", inner[:len(inner)-1])[1] - 2
+	for _, f := range c.Findings {
+		var why []string
+		switch {
+		case f.judged():
+			why = append(why, "associated to this cause")
+		case f.notAttackedAlone() && len(r.Attack.Attempts) > 0: // a run without Attacker tries attacked none
+			why = append(why, "not attacked on its own")
+		}
+		if t := resultType(f); t != "" && t != causeType(c.Findings) {
+			why = append(why, t)
+		}
+		text := clip(shortName(found, f), room)
+		if len(why) > 0 {
+			text += "\n" + dim(strings.Join(why, ", "))
+		}
+		row := cells(text, []Problem{f}, f.ladder())
+		switch {
+		case f.judged(): // its own exploit, made with no information, is its level
+			row = append(append([]string{row[0]}, slices.Repeat([]string{""}, len(row)-2)...), dots(5))
+		case f.notAttackedAlone(): // its cause's line counts it
+			for i := range row {
+				row[i] = dim(plainText(row[i]))
+			}
+		}
+		p.pick(evidenceOf(found, f), "", func(mark string, _ bool) string {
+			return cols(p.w, "  "+mark+"  ", inner, append([]string{""}, row...)...)
+		})
 	}
 }
 
-// evidenceRows are a problem's evidence records: its inspector findings, then the Attacker findings that demonstrated it.
-func evidenceRows(r Report, found []Finding, pr Problem, p *page) {
-	before := len(p.items)
-	for i, f := range found {
-		if f.Source != "attack" && slices.Contains(pr.readings(), f.ID) || f.Source == "attack" && r.demonstrates(f, pr) {
-			p.pick(i+1, "", func(mark string, _ bool) string {
-				return cols(p.w, "     "+mark, []int{44, 18}, title(f), jobNames[f.Source], dim(ref(f)))
-			})
+// shortName is a finding's name on its row: the label of the category its evidence was found in, else its mechanism.
+// A grader category's label only repeats the type heading above it, so the mechanism names such a finding.
+func shortName(found []Finding, f Problem) string {
+	var category *string
+	if n := evidenceOf(found, f); n > 0 {
+		if c := deref(found[n-1].Category); c != "accepted_invalid" && c != "rejected_valid" && checkNames[c] != "" {
+			return checkNames[c]
 		}
+		category = found[n-1].Category
 	}
-	if len(p.items) == before {
-		p.add("       " + dim("No evidence record on the list."))
-	}
+	return mechanismName(f.Cause, category)
 }
 
-// levelRows are, under an expanded problem's evidence records, what its cells do not say: without the Inspector column,
-// the problem's level; the report's reason when it records no type; and its note. Work left says why a cell is not
-// tested.
-func levelRows(r Report, pr Problem, inspected bool, p *page) {
-	if !inspected {
-		p.add(cols(p.w, "       ", []int{12}, dim("Level"), dim(level(r, pr))))
+// findingName names finding p by its cause and its short name, as "Cause 3, Hard-codes answers"; a finding no cause
+// holds, by its short name alone.
+func (r Report) findingName(found []Finding, p Problem) string {
+	if c := r.causeOf(p); c.N > 0 {
+		return c.name() + ", " + shortName(found, p)
 	}
-	if pr.Help != nil {
-		p.add(cols(p.w, "       ", []int{12}, dim("Help"), dim(*pr.Help)))
+	return shortName(found, p)
+}
+
+// generic is whether mechanism only names a category, as older reports wrote it, and is no sentence.
+func generic(mechanism string) bool {
+	m := strings.Join(strings.Fields(mechanism), " ")
+	return mechanismName(m, nil) != m
+}
+
+// mechanismName names a finding by its mechanism, the sentence an agent wrote. Older reports can hold only a category
+// name there, such as grader_tampering; the label of the finding's category, or of that name, stands in for it.
+func mechanismName(mechanism string, category *string) string {
+	m := strings.Join(strings.Fields(mechanism), " ")
+	key := strings.ReplaceAll(m, " ", "_")
+	_, known := checkNames[key]
+	_, plural := checkNames[key+"s"]
+	if !known && !plural && (strings.Contains(m, " ") || !strings.Contains(m, "_")) {
+		return m
 	}
-	if pr.Reason != nil && problemType(pr) == "" {
-		p.add(wrap(capital(*pr.Reason), p.w, "       ", dim))
+	for _, k := range []string{deref(category), key, key + "s"} {
+		if checkNames[k] != "" {
+			return checkNames[k]
+		}
 	}
-	if n := unrewarded(pr); n != "" {
-		p.add(wrap(n, p.w, "       ", dim))
+	return capital(strings.ReplaceAll(m, "_", " "))
+}
+
+// measured are the findings whose tries say what a cause's cells say: those attacked on their own, not those read as it.
+func measured(fs []Problem) []Problem {
+	return slices.DeleteFunc(slices.Clone(fs), func(f Problem) bool { return f.judged() || f.notAttackedAlone() })
+}
+
+// causeTried is the best answer of the measured findings fs when an Attacker was told as much as level says.
+func (r Report) causeTried(fs []Problem, level string) string {
+	out := "-"
+	for _, f := range measured(fs) {
+		out = best(out, r.tried(f, level))
 	}
-	p.add("")
+	return out
+}
+
+// causeType is what the findings fs show the grader do, each kind once, or "" when none is recorded.
+func causeType(fs []Problem) string {
+	var types []string
+	for _, f := range fs {
+		if t := resultType(f); t != "" && !f.ReadAs && !slices.Contains(types, t) {
+			types = append(types, t)
+		}
+	}
+	if len(types) == 0 && len(fs) == 1 {
+		return resultType(fs[0])
+	}
+	return strings.Join(types, ", ")
+}
+
+// dots is a level, 1 to 5, as the list draws it; "" without one.
+func dots(level int) string {
+	if level < 1 || level > 5 {
+		return ""
+	}
+	return strings.Repeat("●", level) + strings.Repeat("○", 5-level)
 }
 
 // unrewarded counts the attempts at a problem that the grader paid nothing, which nudi did not inspect, or "".
@@ -621,15 +823,14 @@ func findingsTable(found []Finding, source string, p *page) {
 		p.add(" None evidenced in this run.")
 		return
 	}
-	widths := []int{44, 16, 18}
-	p.add(cols(p.w, "   ", widths, dim("Finding"), dim("Type"), dim("Found by"), dim("Ref")))
+	widths := []int{44, 16} // every row opens with Enter, so its reference waits on its screen
+	p.add(cols(p.w, "   ", widths, dim("Finding"), dim("Type"), dim("Found by")))
 	for i, f := range found {
 		if source != "" && f.Source != source {
 			continue
 		}
 		p.pick(i+1, "", func(mark string, on bool) string {
-			name := title(f)
-			return cols(p.w, mark, widths, name, redStyle.Render(findingType(f)), jobNames[f.Source], dim(ref(f)))
+			return cols(p.w, mark, widths, title(f), redStyle.Render(findingType(f)), jobNames[f.Source])
 		})
 	}
 }
@@ -918,7 +1119,7 @@ var notTestedWords = map[string]string{
 	"spending_exhausted": "spending cap",
 	"insufficient_time":  "not enough time left",
 	"running":            "no result recorded",
-	"withdrawn":          "a later reading withdrew the finding",
+	"withdrawn":          "the inspector that found it later withdrew it",
 	"not_needed":         "no exploit was made with more help",
 }
 
@@ -938,7 +1139,7 @@ func workLeft(r Report, found []Finding) [][3]string {
 		a := p.Analysis
 		switch status, ok := unfinished[a]; {
 		case r.PhaseErrors[a] != "":
-			out = append(out, [3]string{p.Name, "The whole phase", "Error: " + strings.SplitN(r.PhaseErrors[a], "\n", 2)[0]})
+			out = append(out, [3]string{p.Name, "The whole phase", "Error: " + errorLine(r.PhaseErrors[a])})
 		case ok && !slices.Contains(r.Unresolved, a):
 			what := "Remaining work"
 			if o := r.Ordinary; i == 0 && o != nil {
@@ -975,11 +1176,11 @@ func workLeft(r Report, found []Finding) [][3]string {
 				}
 				lost[ex.Error] = true
 				if !slices.ContainsFunc(in.Open, func(o Open) bool { return o.ID == ex.ID }) { // an open one has its open row
-					out = append(out, [3]string{name, word(checkNames, ex.Category) + " (" + ex.ID + ")", "Error: " + strings.SplitN(ex.Error, "\n", 2)[0]})
+					out = append(out, [3]string{name, word(checkNames, ex.Category) + " (" + ex.ID + ")", "Error: " + errorLine(ex.Error)})
 				}
 			}
 			for _, at := range in.Attempts {
-				why := strings.SplitN(at.Error, "\n", 2)[0]
+				why := errorLine(at.Error)
 				if why == "" && slices.Contains(searchFailures, at.Status) {
 					why = strings.ReplaceAll(at.Status, "_", " ")
 				}
@@ -994,7 +1195,7 @@ func workLeft(r Report, found []Finding) [][3]string {
 	}
 	if r.Attack.Problems != nil {
 		for _, p := range problems(r) {
-			if best(r.tried(p, "none"), r.tried(p, "minimal"), r.tried(p, "full")) != "-" {
+			if best(r.tried(p, "none"), r.tried(p, "minimal"), r.tried(p, "full")) != "-" || p.notAttackedAlone() {
 				continue
 			}
 			why := p.why()
@@ -1008,23 +1209,23 @@ func workLeft(r Report, found []Finding) [][3]string {
 			if !ok {
 				reason = "no Attacker attempt recorded"
 			}
-			out = append(out, [3]string{"Attack", strings.TrimSpace(p.ID + " " + strings.Join(strings.Fields(p.Cause), " ")), "Not tested: " + reason})
+			out = append(out, [3]string{"Attack", r.findingName(found, p), "Not tested: " + reason})
 		}
 	}
 	for _, at := range r.Attack.Attempts {
 		if res, _ := lookup(attemptResults, at.Status); res == Failed {
 			what := "Try " + strconv.Itoa(at.Number)
 			if at.Episode != nil {
-				what = *at.Episode
+				what = sessionName(*at.Episode)
 			}
 			why := strings.ReplaceAll(at.Status, "_", " ")
 			if at.Error != nil {
-				why = strings.SplitN(*at.Error, "\n", 2)[0]
+				why = errorLine(*at.Error)
 			}
 			out = append(out, [3]string{"Attack", what, "Error: " + why})
 		}
 	}
-	out = append(out, untriedLevels(r, out)...)
+	out = append(out, untriedLevels(r, found, out)...)
 	if d := r.Attack.Discovery; d != nil && d.MaximumAttempts > 0 && d.Attempts == 0 {
 		out = append(out, [3]string{"Attack", "Search with no information", "Not tested: " + word(notTestedWords, d.Status)})
 	}
@@ -1039,13 +1240,12 @@ var settled = []string{"evidenced_issue", "no_evidenced_issue", "unavailable", "
 
 // untriedLevels are the Attacker conditions of each candidate without a result, as Python warns of them, for each
 // candidate whose problem is not already a Work left row.
-func untriedLevels(r Report, rows [][3]string) [][3]string {
+func untriedLevels(r Report, found []Finding, rows [][3]string) [][3]string {
 	var out [][3]string
 	for _, c := range r.Attack.Candidates {
 		what := c.ID
 		if i := slices.IndexFunc(r.Attack.Problems, func(p Problem) bool { return deref(p.Candidate) == c.ID || p.Finding == c.ID }); i >= 0 {
-			p := r.Attack.Problems[i]
-			what = strings.TrimSpace(p.ID + " " + strings.Join(strings.Fields(p.Cause), " "))
+			what = r.findingName(found, r.Attack.Problems[i])
 		}
 		if slices.ContainsFunc(rows, func(row [3]string) bool { return row[1] == what }) {
 			continue
@@ -1123,7 +1323,10 @@ func warningRows(r Report, rows [][3]string) [][3]string {
 				break
 			}
 		}
-		out = append(out, [3]string{where, capital(what), capital(strings.TrimSuffix(why, ": "))})
+		if !strings.Contains(what, "/") { // a model id or a path keeps its spelling
+			what = capital(what)
+		}
+		out = append(out, [3]string{where, what, capital(strings.TrimSuffix(why, ": "))})
 	}
 	return out
 }

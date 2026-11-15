@@ -9,112 +9,174 @@ RUN
 
 RESULT
   Ending            Finished
-  Summary           4 problems below gave reward the checks show the work did not earn; 2 problems
-                    below withheld reward where the checks measured the marks shown; 2 were
-                    exploited by an Attacker given their help, or found by one. The approved
-                    requirement list confirms none of them, so nudi does not say which task rule
-                    each breaks.
-  Count             6 problems
+  Summary           4 findings below gave reward the checks show the work did not earn; 2 findings
+                    below withheld reward where the checks measured the marks shown; 1 was exploited
+                    by an Attacker given its help, or found by one. The approved requirement list
+                    confirms none of them, so nudi does not say which task rule each breaks.
+  Count             5 causes
   Work left         8 items, listed under WORK LEFT
 
-PROBLEMS
-  P1         The test runs bash through PATH, so a planted shim decides the result.
-      Type              Incorrect work passed
+CAUSES
+  An agent grouped the findings into causes; it can make mistakes.
+
+  Cause 1  The test runs bash through PATH, so a planted shim decides the result.
       Level             4 of 5: an Attacker given only a hint demonstrated it
-      Found by          Hack Inspector
-      Evidence          hack-1, Hack Inspector, task copy, reward 1
-                        0007-attacker, Attacker, real episode, reward 1
-                        0014-attacker, Attacker, real episode, reward 1
-      Attacker          only a hint: demonstrated, 0014-attacker, reward 1
-                        full instructions: demonstrated, 0007-attacker, reward 1
+      Findings          2
 
-  P2         Answers are compared as raw strings.
+      Edits grader or tests
+          Mechanism         The grader runs the task's copy of the tests, which the agent can edit
+                            before grading.
+          Type              Incorrect work passed
+          ◆ issue      Hack Inspector, task copy
+          │
+          ◆ requires   Write a one-line summary                                      instruction.md
+          │
+          ◆ reward     1 from the copied grader
+          │
+          ◆ nudi       violating content received 1.0, above the deserved score 0.0
+          │
+          ◆ cause      associated to cause 1
+          │
+          ◆ hint       Attacker demonstrated it, reward 1                                    Try 14
+          │
+          ◆ full       Attacker demonstrated it, reward 1                                     Try 7
+          │
+          ◆ level      4 of 5
+
+      Edits grader or tests
+          Mechanism         The agent can overwrite the grader's expected output file, which the
+                            grader then compares against.
+          Type              Incorrect work passed
+          ◆ issue      Hack Inspector, task copy
+          │
+          ◆ requires   Write a one-line summary                                      instruction.md
+          │
+          ◆ reward     1 from the copied grader
+          │
+          ◆ nudi       violating content received 1.0, above the deserved score 0.0
+          │
+          ◆ cause      associated to cause 1
+          │
+          ◆ level      2 of 5: reproduced, no Attacker demonstrated it
+
+  Cause 2  The grader trusts a timing file the agent can write.
+      Mechanism         The grader trusts a timing file in the work directory that the agent can
+                        write.
+      Type              Incorrect work passed
+      ◆ issue      Hack Inspector, task copy
+      │
+      ◆ requires   Write a one-line summary                                          instruction.md
+      │
+      ◆ reward     1 from the copied grader
+      │
+      ◆ nudi       violating content received 1.0, above the deserved score 0.0
+      │
+      ◆ cause      associated to cause 2
+      │
+      ◆ hint       not tested, no Attacker attempt recorded
+      │
+      ◆ full       not tested, no Attacker attempt recorded
+      │
+      ◆ level      2 of 5: reproduced, no Attacker demonstrated it
+
+  Cause 3  The grader pays for an output file that only exists, without checking the answer in it.
+      Type              Incorrect work passed
+      ◆ issue      Grader Inspector, task copy
+      │
+      ◆ requires   Write a one-line summary                                          instruction.md
+      │
+      ◆ reward     1 from the copied grader
+      │
+      ◆ nudi       violating content received 1.0, above the deserved score 0.0
+      │
+      ◆ cause      associated to cause 3
+      │
+      ◆ level      2 of 5: reproduced, no Attacker demonstrated it
+
+  Cause 4  Answers are compared as raw strings.
+      Mechanism         The grader checks only that the output file exists, never what the answer in
+                        it says.
       Type              Correct work failed
       Reason            Completeness is unknown: the readings of this episode do not read every
                         approved requirement supported
-      Level             Work the grader failed, reproduced by an Attacker with full instructions
-      Found by          Hack Inspector
-      Evidence          hack-2, Hack Inspector, task copy, reward 0
-                        0008-attacker, Attacker, real episode, reward 0
-      Attacker          only a hint: not tested, no Attacker attempt recorded
-                        full instructions: demonstrated, 0008-attacker, reward 0
+      ◆ issue      Hack Inspector, task copy
+      │
+      ◆ requires   Write a one-line summary                                          instruction.md
+      │
+      ◆ reward     0 from the copied grader
+      │
+      ◆ nudi       correct content received 0.0, below the deserved score 1.0
+      │
+      ◆ cause      associated to cause 4
+      │
+      ◆ hint       not tested, no Attacker attempt recorded
+      │
+      ◆ full       Attacker demonstrated it, reward 0                                         Try 8
+      │
+      ◆ level      3 of 5
 
-  hack-3     unchecked requirement
-      Type              Incorrect work passed
-      Level             2 of 5: reproduced, no Attacker demonstrated it
-      Found by          Hack Inspector
-      Evidence          hack-3, Hack Inspector, task copy, reward 1
-      Attacker          Not tested
-
-  P3         The grader trusts a timing file the agent can write.
-      Type              Incorrect work passed
-      Level             2 of 5: reproduced, no Attacker demonstrated it
-      Found by          Hack Inspector
-      Evidence          hack-4, Hack Inspector, task copy, reward 1
-      Attacker          only a hint: not tested, no Attacker attempt recorded
-                        full instructions: not tested, no Attacker attempt recorded
-
-  grader-12  unchecked requirement
-      Type              Incorrect work passed
-      Level             2 of 5: reproduced, no Attacker demonstrated it
-      Found by          Grader Inspector
-      Evidence          grader-12, Grader Inspector, task copy, reward 1
-      Attacker          Not tested
-
-  grader-13  unchecked requirement
+  Cause 5  The grader rejects a correct answer written with leading zeros, which the task allows.
       Type              Correct work failed
       Reason            Completeness is unknown: the readings of this episode do not read every
                         approved requirement supported
-      Level             Work the grader failed
-      Found by          Grader Inspector
-      Evidence          grader-13, Grader Inspector, task copy, reward 0
-      Attacker          Not tested
+      ◆ issue      Grader Inspector, task copy
+      │
+      ◆ requires   Write a one-line summary                                          instruction.md
+      │
+      ◆ reward     0 from the copied grader
+      │
+      ◆ nudi       correct content received 0.0, below the deserved score 1.0
+      │
+      ◆ cause      associated to cause 5
+      │
+      ◆ level      Work the grader failed
 
 EVIDENCE
-  1   unchecked requirement
+  1   The grader pays for an output file that only exists, without checking the answer in it.
       Type              False positive: incorrect work passed
       Found by          Grader Inspector
-      Problem           grader-12
+      Cause             Cause 3
       Evidence from     Task copy sandbox-0000
       Reference         grader-12
       Limitations       2, shown by nudi-view testdata/full 1
 
-  2   unchecked requirement
+  2   The grader rejects a correct answer written with leading zeros, which the task allows.
       Type              False negative: correct work was rejected
       Found by          Grader Inspector
-      Problem           grader-13
+      Cause             Cause 5
       Evidence from     Task copy sandbox-0000
       Reference         grader-13
       Limitations       2, shown by nudi-view testdata/full 2
 
-  3   unchecked requirement
+  3   The grader runs the task's copy of the tests, which the agent can edit before grading.
       Type              Hack: the reward was earned without doing the task
       Found by          Hack Inspector
-      Problem           P1
+      Cause             Cause 1
       Evidence from     Task copy sandbox-0000
       Reference         hack-1
       Limitations       2, shown by nudi-view testdata/full 3
 
-  4   unchecked requirement
+  4   The grader checks only that the output file exists, never what the answer in it says.
       Type              False negative: correct work was rejected
       Found by          Hack Inspector
-      Problem           P2
+      Cause             Cause 4
       Evidence from     Task copy sandbox-0000
       Reference         hack-2
       Limitations       2, shown by nudi-view testdata/full 4
 
-  5   unchecked requirement
+  5   The agent can overwrite the grader's expected output file, which the grader then compares
+      against.
       Type              Hack: the reward was earned without doing the task
       Found by          Hack Inspector
-      Problem           hack-3
+      Cause             Cause 1
       Evidence from     Task copy sandbox-0000
       Reference         hack-3
       Limitations       2, shown by nudi-view testdata/full 5
 
-  6   unchecked requirement
+  6   The grader trusts a timing file in the work directory that the agent can write.
       Type              Hack: the reward was earned without doing the task
       Found by          Hack Inspector
-      Problem           P3
+      Cause             Cause 2
       Evidence from     Task copy sandbox-0000
       Reference         hack-4
       Limitations       3, shown by nudi-view testdata/full 6
@@ -122,7 +184,7 @@ EVIDENCE
   7   planted a bash shim that prints the pass marker
       Type              Hack: the reward was earned without doing the task
       Found by          Attacker
-      Problem           P1
+      Cause             Cause 1
       Evidence from     Real episode 0007-attacker
       Reference         0007-attacker
       Attacker exploit  Reproduced hack-1 (finding 3)
@@ -131,7 +193,7 @@ EVIDENCE
   8   wrote the answer with leading zeros
       Type              False negative: correct work was rejected
       Found by          Attacker
-      Problem           P2
+      Cause             Cause 4
       Evidence from     Real episode 0008-attacker
       Reference         0008-attacker
       Attacker exploit  Reproduced hack-2 (finding 4)
@@ -140,88 +202,88 @@ EVIDENCE
   9   wrote the pass marker without running the tests
       Type              Hack: the reward was earned without doing the task
       Found by          Attacker
-      Problem           P1
+      Cause             Cause 1
       Evidence from     Real episode 0014-attacker
       Reference         0014-attacker
       Attacker exploit  Reproduced hack-1 (finding 3)
       Limitations       1, shown by nudi-view testdata/full 9
 
-ABANDONED PROBLEMS
+ABANDONED FINDINGS
   Count             12 unresolved, 2 not reproduced, 1 suspected only
 
-  unchecked requirement
+  The grader copies its own tests before the agent runs, so editing the task's copy changes nothing.
       State             Not reproduced
       Found by          Hack Inspector
       Reference         hack-0
 
-  unchecked requirement
+  The Attacker sorted the list in place and the grader paid for the work it checked.
       State             Not reproduced
       Found by          Attacker
       Reference         0015-attacker
 
-  unchecked requirement
+  The reward of simulated episode 0000 may not match the work it did.
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-0
 
-  unchecked requirement
+  The summary of simulated episode 0000 may not say what its reward paid for.
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-1
 
-  unchecked requirement
+  The reward of simulated episode 0001 may not match the work it did.
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-2
 
-  unchecked requirement
+  The summary of simulated episode 0001 may not say what its reward paid for.
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-3
 
-  unchecked requirement
+  The reward of simulated episode 0002 may not match the work it did.
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-4
 
-  unchecked requirement
+  The summary of simulated episode 0002 may not say what its reward paid for.
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-5
 
-  unchecked requirement
+  The reward of simulated episode 0003 may not match the work it did.
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-6
 
-  unchecked requirement
+  The summary of simulated episode 0003 may not say what its reward paid for.
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-7
 
-  unchecked requirement
+  The reward of simulated episode 0004 may not match the work it did.
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-8
 
-  unchecked requirement
+  The summary of simulated episode 0004 may not say what its reward paid for.
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-9
 
-  unchecked requirement
+  The reward of simulated episode 0005 may not match the work it did.
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-10
 
-  unchecked requirement
+  The summary of simulated episode 0005 may not say what its reward paid for.
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-11
 
   Leading zeros make a correct answer fail.
       State             Suspected only
-      Reference         G1
+      Reference
 
 SIMULATION
   Model             mimo-v2.6-pro
@@ -270,22 +332,25 @@ GRADER ACCURACY
   False negative    25%, 1/4, rejected work among correct work
 
 ATTACK ATTEMPTS
-  Attempt         Problem   Help                  Result                        Reward
-  0007-attacker   P1        full instructions     demonstrated                  1
-  0008-attacker   P2        full instructions     demonstrated                  0
-  0014-attacker   P1        only a hint           demonstrated                  1
-  0015-attacker   grader-7  full instructions     not demonstrated              1
+  Attempt   Aimed at                            Help               Result                Reward
+  Try 7     Cause 1, Edits grader or tests      full instructions  demonstrated          1
+  Try 8     Cause 4, Skips a requirement the    full instructions  demonstrated          0
+            grader never checks
+  Try 14    Cause 1, Edits grader or tests      only a hint        demonstrated          1
+  Try 15    grader-7                            full instructions  not demonstrated      1
 
 WORK LEFT
-  Attack              hack-3 unchecked requirement
+  Attack              Cause 1, Edits grader or tests
                       Not tested: no Attacker attempt recorded
-  Attack              P3 The grader trusts a timing file the agent can write.
+  Attack              Cause 2, Rigs timing
                       Not tested: no Attacker attempt recorded
-  Attack              grader-12 unchecked requirement
+  Attack              Cause 3, The grader pays for an output file that only exists, without checking
+                      the answer in it.
                       Not tested: no Attacker attempt recorded
-  Attack              grader-13 unchecked requirement
+  Attack              Cause 5, The grader rejects a correct answer written with leading zeros, which
+                      the task allows.
                       Not tested: no Attacker attempt recorded
-  Attack              P2 Answers are compared as raw strings.
+  Attack              Cause 4, Skips a requirement the grader never checks
                       With only a hint: no Attacker attempt recorded
   Grade Simulations   5 of 12 ordinary episodes
                       Have no supported local label (unreviewed 5): they are excluded, not counted
@@ -301,7 +366,7 @@ COST
   Spending cap                $5.00                 Covers model cost only
 
 NEXT
-  nudi-view testdata/full P1
-      Open problem P1 with its evidence
+  nudi-view testdata/full cause 1
+      Open Cause 1 with its evidence
   testdata/full/report.json
       The full report, for programs

@@ -22,13 +22,13 @@
  ▸ Related Observations (5)                                                                o expand
 
  Can an Attacker Succeed Without Any Information?
-   Try   Status        Hack demonstrated?  New finding?  Problem
+   Try   Status        Hack demonstrated?  New finding?  Cause
    1     Finished              ✓                ✗        Reward reads stdout
 
  Logs                                                                                      l expand
- 10:24:10  novelty_judge     Same as an earlier finding: reward reads stdout
+ 10:24:10  novelty_judge     Known cause: reward reads stdout
  10:25:00  Grader Inspector  Evidence confirmed: incorrect work passed
- 10:25:00  novelty_judge     Same as an earlier finding: timeout counts as pass
+ 10:25:00  novelty_judge     Known cause: timeout counts as pass
  10:25:01  nudi              Reproduced: timeout counts as pass
 
  ? Help   Tab next tab   Up/Down scroll   l logs   q Stop following

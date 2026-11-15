@@ -38,63 +38,53 @@ func showTab(r Report, found []Finding, n, tab, w int) string {
 	case 2:
 		return referencesTab(r, found, n, w)
 	}
-	return evidence(found[n-1], w)
+	return evidence(r, found, n, w)
 }
 
-// showHead names the finding after the tab it was opened from, with its problem's reference on the right, then its
-// full type and who found it, its problem, where its evidence comes from and what an Attacker made of it.
+// showHead names the finding after the tab it was opened from and its cause, then gives its full type, and its own
+// mechanism, exploit and marks when the report has them. The Evidence tab's timeline says who found it, its cause and
+// what an Attacker made of it.
 func showHead(r Report, found []Finding, n int, from string, w int) string {
 	f := found[n-1]
 	p := findingProblem(r, f)
-	right := ref(f)
-	problem := "None"
-	if p != nil {
-		right, problem = p.ID, p.ID
-		if p.ID == "" {
-			right, problem = ref(f), fmt.Sprintf("Problem %d of %d", slices.IndexFunc(r.Attack.Problems, func(x Problem) bool { return x.Cause == p.Cause })+1, len(r.Attack.Problems))
-		}
+	crumb := from + " › "
+	if p != nil && r.causeOf(*p).N > 0 {
+		crumb += r.causeOf(*p).name() + " › "
 	}
 	name := detailName(r, f)
-	crumb := " " + dim(from+" › ")
 	var out []string
-	if one := crumb + bold(name); width(one)+width(right)+3 <= w {
-		out = append(out, spread(one, dim(right), w))
+	if one := " " + dim(crumb) + bold(name); width(one) <= w {
+		out = append(out, one)
 	} else {
-		out = append(out, spread(crumb, dim(right), w), wrap(name, w, " ", bold))
+		out = append(out, " "+dim(strings.TrimSuffix(crumb, " ")), wrap(name, w, " ", bold))
 	}
-	out = append(out, wrap(typeNames[findingType(f)], w, " ", func(s string) string { return redStyle.Render(s) }), "")
-	where := cmp.Or(strings.TrimSpace(capital(word(scopeWords, f.ExecutionScope))+" "+f.Claim.Episode), "Not recorded")
-	pairs := [][2]string{{"Found by", jobNames[f.Source]}, {"Problem", problem}, {"Evidence from", where}, {"Attacker result", attackerResult(r, p)}}
-	if w >= 100 {
-		widths := []int{18, 24, 19}
-		out = append(out, cols(w, " ", widths, dim(pairs[0][0]), pairs[0][1], dim(pairs[2][0]), pairs[2][1]),
-			cols(w, " ", widths, dim(pairs[1][0]), pairs[1][1], dim(pairs[3][0]), pairs[3][1]))
-	} else {
-		for _, kv := range pairs {
-			out = append(out, cols(w, " ", []int{18}, dim(kv[0]), kv[1]))
-		}
-	}
-	if name != title(f) && title(f) != "" {
-		out = append(out, cols(w, " ", []int{18}, dim("Mechanism"), title(f)))
+	out = append(out, wrap(typeNames[findingType(f)], w, " ", func(s string) string { return redStyle.Render(s) }))
+	var rows [][2]string
+	if name != title(f) && title(f) != "" && !generic(f.Claim.Mechanism) {
+		rows = append(rows, [2]string{"Mechanism", title(f)})
 	}
 	if f.Confirms != "" {
-		out = append(out, cols(w, " ", []int{18}, dim("Attacker exploit"), capital(f.Confirms)))
+		rows = append(rows, [2]string{"Attacker exploit", capital(f.Confirms)})
 	}
 	if p != nil {
-		for _, kv := range [][2]string{{"Marks", markValues(*p)}, {"Requirement", deref(p.Requirement)}, {"Help", deref(p.Help)}} {
-			if kv[1] != "" {
-				out = append(out, cols(w, " ", []int{18}, dim(kv[0]), kv[1]))
-			}
+		rows = append(rows, [2]string{"Marks", markValues(*p)}, [2]string{"Requirement", deref(p.Requirement)})
+	}
+	for i, kv := range slices.DeleteFunc(rows, func(kv [2]string) bool { return kv[1] == "" }) {
+		if i == 0 {
+			out = append(out, "")
 		}
+		out = append(out, cols(w, " ", []int{18}, dim(kv[0]), kv[1]))
 	}
 	return strings.Join(out, "\n")
 }
 
-// detailName names a finding in its detail: the cause of the problem that holds it, else its own mechanism, which
+// detailName names a finding in its detail: the sentence of the cause that holds it, else its own mechanism, which
 // the detail then shows on a line of its own.
 func detailName(r Report, f Finding) string {
-	if p := findingProblem(r, f); p != nil && strings.TrimSpace(p.Cause) != "" {
-		return strings.Join(strings.Fields(p.Cause), " ")
+	if p := findingProblem(r, f); p != nil {
+		if s := strings.Join(strings.Fields(cmp.Or(r.causeOf(*p).Cause, p.Cause)), " "); s != "" {
+			return s
+		}
 	}
 	return title(f)
 }
@@ -121,31 +111,12 @@ func findingProblem(r Report, f Finding) *Problem {
 	if r.Attack == nil {
 		return nil
 	}
-	for i, p := range r.Attack.Problems {
+	for _, p := range append(r.allFindings(), slices.DeleteFunc(slices.Clone(r.Attack.Problems), func(p Problem) bool { return p.CauseID != "" })...) {
 		if f.Source != "attack" && slices.Contains(p.readings(), f.ID) || f.Source == "attack" && r.demonstrates(f, p) {
-			return &r.Attack.Problems[i]
+			return &p
 		}
 	}
 	return nil
-}
-
-// attackerResult is the least an Attacker was told when it reproduced problem p, else what its tries settled.
-func attackerResult(r Report, p *Problem) string {
-	if p == nil {
-		return "Not tested"
-	}
-	for _, level := range []string{"none", "minimal", "full"} {
-		if r.tried(*p, level) == "yes" {
-			return "Reproduced with " + levelWords[level]
-		}
-	}
-	switch best(r.tried(*p, "none"), r.tried(*p, "minimal"), r.tried(*p, "full")) {
-	case "no":
-		return "Not reproduced"
-	case "?":
-		return "Unresolved"
-	}
-	return "Not tested"
 }
 
 // tabs is the finding's tab strip, the tab on view underlined, over a rule.
@@ -161,34 +132,10 @@ func tabs(f Finding, tab, w int) string {
 	return " " + strings.Join(names, "    ") + "\n " + dim(strings.Repeat("─", max(0, w-2)))
 }
 
-// evidence is what happened, one marker per step and red where nudi says the grader went wrong,
-// then the Inspector's interpretation and its citations.
-func evidence(f Finding, w int) string {
-	var steps [][]string
-	if f.Claim.Episode != "" {
-		steps = append(steps, step(violet, "episode", f.Claim.Episode, word(scopeWords, f.ExecutionScope), w))
-	}
-	if c := f.Captured.Check; c != nil && c.Requirement != nil {
-		steps = append(steps, step(violet, "requires", c.Requirement.Excerpt, c.Requirement.Path, w))
-	}
-	source := "native grader"
-	if f.ExecutionScope == "package" {
-		source = "copied grader"
-	}
-	steps = append(steps, step(violet, "reward", num(f.reward())+" from the "+source, "", w))
-	for _, reason := range f.Assessment.Reasons {
-		steps = append(steps, step(red, "nudi", reason, "", w))
-	}
-	for _, condition := range f.Claim.Unresolved {
-		steps = append(steps, step(yellow, "open", condition, "", w))
-	}
-	var out []string
-	for i, s := range steps {
-		if i > 0 {
-			out = append(out, " "+dim("│"))
-		}
-		out = append(out, s...)
-	}
+// evidence is the finding's timeline, then the interpretation its finder wrote and its citations.
+func evidence(r Report, found []Finding, n, w int) string {
+	f := found[n-1]
+	out := timeline(r, &f, findingProblem(r, f), w)
 	if text := f.Interpretation.Interpretation; text != "" {
 		out = append(out, "", heading("Interpretation", ""), wrap(cmp.Or(writers[f.Source], "The Inspector")+" wrote: \""+text+"\"", w, " ", plain))
 	}
@@ -199,6 +146,104 @@ func evidence(f Finding, w int) string {
 		}
 	}
 	return strings.Join(out, "\n")
+}
+
+// timeline is a finding's evidence, one marker per step and red where the grader went wrong: who found it and where,
+// the requirement its check read, the reward, nudi's check, the cause it is associated to, each Attacker try by the help
+// it was given, and its level. A step shows only when the report records it: f, its evidence record, and p, the finding
+// under its cause, can each be nil.
+func timeline(r Report, f *Finding, p *Problem, w int) []string {
+	var steps [][]string
+	if f != nil {
+		issue := jobNames[f.Source]
+		if scope := word(scopeWords, f.ExecutionScope); scope != "" {
+			issue += ", " + scope
+		}
+		try := "" // an Attacker finding's own try, unless a step below names it
+		if f.Source == "attack" && p == nil {
+			try = sessionName(f.Claim.Episode)
+		}
+		steps = append(steps, step(violet, "issue", issue, try, w))
+		if c := f.Captured.Check; c != nil && c.Requirement != nil {
+			steps = append(steps, step(violet, "requires", c.Requirement.Excerpt, c.Requirement.Path, w))
+		}
+		source := "native grader"
+		if f.ExecutionScope == "package" {
+			source = "copied grader"
+		}
+		steps = append(steps, step(violet, "reward", num(f.reward())+" from the "+source, "", w))
+		for _, reason := range f.Assessment.Reasons {
+			steps = append(steps, step(red, "nudi", reason, "", w))
+		}
+	} else if p != nil && sourceName(p.Source) != "" {
+		steps = append(steps, step(violet, "issue", sourceName(p.Source), "", w))
+	}
+	if p != nil {
+		if c := r.causeOf(*p); c.N > 0 {
+			text := "associated to cause " + strconv.Itoa(c.N)
+			steps = append(steps, step(violet, "cause", text, "", w))
+		}
+		steps = append(steps, triesSteps(r, *p, w)...)
+		if l := p.ladder(); l >= 1 && l <= 5 {
+			// Its number alone when a try above shows how it was reached; in words when none does.
+			text := level(r, *p)
+			if slices.ContainsFunc(r.aimed(*p), func(at Attempt) bool { return tryResult(r, at, p) == "demonstrated" }) {
+				text = fmt.Sprintf("%d of 5", l) + levelRun(*p)
+			}
+			steps = append(steps, step(violet, "level", text, "", w))
+		}
+	}
+	var out []string
+	for i, s := range steps {
+		if i > 0 {
+			out = append(out, " "+dim("│"))
+		}
+		out = append(out, s...)
+	}
+	return out
+}
+
+// triesSteps are the Attacker's tries at finding p, by the help each was given, or one step saying it was not attacked
+// on its own; a help no try was given says why, when the report records it.
+func triesSteps(r Report, p Problem, w int) [][]string {
+	if p.notAttackedAlone() {
+		return [][]string{step(violet, "attacker", "not attacked on its own", "", w)}
+	}
+	var out [][]string
+	for _, level := range []string{"minimal", "full", "none"} {
+		what := strings.ToLower(helpWords[level])
+		tried := false
+		for _, at := range r.aimed(p) {
+			if at.Level != level {
+				continue
+			}
+			tried = true
+			text := map[string]string{"demonstrated": "Attacker demonstrated it", "not demonstrated": "Attacker did not demonstrate it"}[tryResult(r, at, &p)]
+			if text == "" {
+				text = capital(tryResult(r, at, &p))
+			}
+			if note := tryNote(r, at); strings.HasPrefix(note, "Result unclear") {
+				text = strings.TrimSuffix(note, ".")
+			}
+			for _, k := range slices.Sorted(maps.Keys(at.Rewards)) {
+				text += ", " + k + " " + num(at.Rewards[k])
+			}
+			c := violet
+			if strings.HasPrefix(text, "Attacker demonstrated") {
+				c = red
+			}
+			out = append(out, step(c, what, text, sessionName(deref(at.Episode)), w))
+		}
+		if tried || r.tried(p, level) != "-" {
+			continue
+		}
+		for _, c := range p.Conditions {
+			if c.Condition == level || level == "none" && c.Condition == "independent" {
+				out = append(out, step(yellow, what, "not tested, "+word(notTestedWords, c.Status), "", w))
+			}
+		}
+	}
+	return out
 }
 
 // writers name who wrote a finding's interpretation, by its source.
@@ -302,11 +347,9 @@ func referencesTab(r Report, found []Finding, n, w int) string {
 	out := []string{row(dim("Reference"), dim("Value"), "What it is")}
 	again := strconv.Itoa(n)
 	if p := findingProblem(r, f); p != nil && p.ID != "" {
-		what := "A problem: the findings that share one cause"
-		if i := strings.Index("PGA", p.ID[:1]); i >= 0 {
-			what = references[i][1]
+		if c := r.causeOf(*p).ID; c != "" {
+			out = append(out, row("Cause", c, "Findings a judge read as one cause"))
 		}
-		out = append(out, row("Problem", p.ID, what))
 		if evidenceOf(found, *p) == n {
 			again = p.ID
 		}
@@ -333,7 +376,7 @@ func referencesTab(r Report, found []Finding, n, w int) string {
 	if p := findingProblem(r, f); p != nil {
 		for _, at := range r.aimed(*p) {
 			if at.Episode != nil && *at.Episode != f.Claim.Episode {
-				out = append(out, row("Attempt", *at.Episode, fmt.Sprintf("Attacker try %d, %s", at.Number, levelWords[at.Level])))
+				out = append(out, row("Attempt", *at.Episode, sessionName(*at.Episode)+", "+levelWords[at.Level]))
 			}
 		}
 	}

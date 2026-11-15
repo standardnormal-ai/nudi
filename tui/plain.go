@@ -38,7 +38,7 @@ func plainReport(r Report, w int) string {
 	section("RUN", runFields(r, w)...)
 	section("RESULT", resultFields(r, found, w)...)
 	if r.Attack != nil && r.Attack.Problems != nil {
-		section("PROBLEMS", problemFields(r, found, w)...)
+		section("CAUSES", causeFields(r, found, w)...)
 	}
 	section("EVIDENCE", evidenceFields(r, found, w)...)
 	if others, _ := otherFindings(r); len(others) > 0 {
@@ -50,7 +50,7 @@ func plainReport(r Report, w int) string {
 			}
 			lines = append(lines, field(w, "      ", "Reference", o[3]))
 		}
-		section("ABANDONED PROBLEMS", lines...)
+		section("ABANDONED FINDINGS", lines...)
 	}
 	section("SIMULATION", simulationFields(r, found, w)...)
 	section("GRADER ACCURACY", accuracyFields(r, w)...)
@@ -71,8 +71,8 @@ func plainReport(r Report, w int) string {
 	}
 	section("COST", cost...)
 	var next []string
-	if p, _ := r.topProblem(found); p != nil && p.ID != "" {
-		next = append(next, "  nudi-view "+r.Dir+" "+p.ID, "      Open problem "+p.ID+" with its evidence")
+	if c := r.topCause(found); c.N > 0 {
+		next = append(next, "  nudi-view "+r.Dir+" cause "+strconv.Itoa(c.N), "      Open "+c.name()+" with its evidence")
 	} else if len(found) > 0 {
 		next = append(next, "  nudi-view "+r.Dir+" 1", "      Open finding 1 with its evidence")
 	}
@@ -108,18 +108,17 @@ func runFields(r Report, w int) []string {
 }
 
 func resultFields(r Report, found []Finding, w int) []string {
-	head, notes := endingParts(r, true)
+	head, notes := endingParts(r)
 	out := []string{field(w, "  ", "Ending", strings.TrimPrefix(plainText(head), "✓ "))}
+	if lost := lostWork(r); lost != "" {
+		out = append(out, field(w, "  ", "Warning", lost+", listed under WORK LEFT"))
+	}
 	for i, note := range notes {
 		name := ""
 		if i == 0 {
 			name = "Summary"
 		}
-		if strings.HasPrefix(note, "  - ") {
-			out = append(out, hang(note, w, strings.Repeat(" ", 20)))
-		} else {
-			out = append(out, field(w, "  ", name, note))
-		}
+		out = append(out, field(w, "  ", name, note))
 	}
 	if t := plainText(tally(r, found)); t != "" {
 		out = append(out, field(w, "  ", "Count", t))
@@ -135,11 +134,7 @@ func resultFields(r Report, found []Finding, w int) []string {
 // step and says how an Attacker reproduced it. A rerun's problem its Attackers did not find again keeps the earlier
 // run's level, and says so.
 func level(r Report, p Problem) string {
-	again := ""
-	if run, ok := strings.CutPrefix(p.Label, "evidenced in run "); ok && strings.HasSuffix(p.Label, "; not found again here") {
-		run, _, _ = strings.Cut(run, " at ")
-		again = " in run " + run + "; not found again here"
-	}
+	again := levelRun(p)
 	if problemType(p) == "False negative" || p.Outcome == "rejected_valid" {
 		if r.SchemaVersion >= 2 {
 			return p.Label
@@ -149,70 +144,93 @@ func level(r Report, p Problem) string {
 	return fmt.Sprintf("%d of 5: %s", p.ladder(), strings.TrimLeft(cmp.Or(ladderWords[p.ladder()], p.Label), "●○ ")) + again
 }
 
-// problemFields are the problems, highest level first, each with its type, level, evidence records and Attacker tries.
-func problemFields(r Report, found []Finding, w int) []string {
-	ps := problems(r)
-	if len(ps) == 0 {
+// levelRun says which earlier run a level was imported from, as " in run r1; not found again here", or is empty.
+func levelRun(p Problem) string {
+	if run, ok := strings.CutPrefix(p.Label, "evidenced in run "); ok && strings.HasSuffix(p.Label, "; not found again here") {
+		run, _, _ = strings.Cut(run, " at ")
+		return " in run " + run + "; not found again here"
+	}
+	return ""
+}
+
+// causeFields are the causes in the order of the Results tab, each with its findings beneath it, after the Answer's
+// words on them. The fields of a cause's one finding follow it directly.
+func causeFields(r Report, found []Finding, w int) []string {
+	if len(r.Causes) == 0 {
 		return []string{"  None demonstrated in this run."}
 	}
 	var out []string
-	idw := 4 // a problem no judge numbered keeps its finding id or Attacker episode
-	for _, p := range ps {
-		idw = max(idw, width(p.ID)+2)
+	if words := r.causeWords(); words != "" {
+		out = append(out, wrap(words, w, "  ", plain), "")
 	}
-	for i, p := range ps {
+	for i, c := range r.Causes {
 		if i > 0 {
 			out = append(out, "")
 		}
-		out = append(out, cols(w, "  ", []int{idw}, p.ID, strings.Join(strings.Fields(p.Cause), " ")))
-		kv := func(name, value string) {
-			if value != "" {
-				out = append(out, field(w, "      ", name, value))
-			}
+		out = append(out, causeBlock(r, found, c.ID, w)...)
+	}
+	return out
+}
+
+// causeBlock is cause id under its name, Cause 1, then its findings beneath it, each by its short name with its
+// timeline.
+func causeBlock(r Report, found []Finding, id string, w int) []string {
+	c := r.Causes[slices.IndexFunc(r.Causes, func(c Cause) bool { return c.ID == id })]
+	out := []string{cols(w, "  ", []int{width(c.name()) + 2}, c.name(), strings.Join(strings.Fields(c.Cause), " "))}
+	if len(c.Findings) == 1 { // its one finding's fields follow it, with the finding's own mechanism
+		f := c.Findings[0]
+		if f.Cause != c.Cause && !generic(f.Cause) {
+			out = append(out, field(w, "      ", "Mechanism", strings.Join(strings.Fields(f.Cause), " ")))
 		}
-		kv("Type", cmp.Or(typeNames[resultType(p)], resultType(p)))
-		if p.Reason != nil && problemType(p) == "" {
-			kv("Reason", capital(*p.Reason))
+		if c.Level == 0 && f.judged() {
+			out = append(out, field(w, "      ", "Cause level", "No level of its own, only findings associated to it"))
 		}
-		kv("Level", level(r, p))
-		kv("Help", deref(p.Help))
-		kv("Not inspected", unrewarded(p))
-		kv("Found by", sourceName(p.Source))
-		var evidence []string
-		for _, f := range found {
-			if f.Source != "attack" && slices.Contains(p.readings(), f.ID) || f.Source == "attack" && r.demonstrates(f, p) {
-				evidence = append(evidence, ref(f)+", "+jobNames[f.Source]+", "+word(scopeWords, f.ExecutionScope)+", reward "+num(f.reward()))
-			}
+		return append(out, findingFields(r, found, f, w, "      ")...)
+	}
+	top := Problem{Level: c.Level, Label: c.Label}
+	if len(c.Findings) > 0 {
+		top.Outcome, top.Type = c.Findings[0].Outcome, c.Findings[0].Type
+	}
+	if c.Level == 0 {
+		out = append(out, field(w, "      ", "Level", "No level of its own, only findings associated to it"))
+	} else {
+		out = append(out, field(w, "      ", "Level", level(r, top)))
+	}
+	out = append(out, field(w, "      ", "Findings", strconv.Itoa(len(c.Findings))))
+	for _, f := range c.Findings {
+		name, sentence := shortName(found, f), strings.Join(strings.Fields(f.Cause), " ")
+		out = append(out, "", cols(w, "      ", nil, name))
+		if name != sentence && !generic(sentence) {
+			out = append(out, field(w, "          ", "Mechanism", sentence))
 		}
-		if len(evidence) == 0 {
-			evidence = []string{"No evidence record on the list"}
+		out = append(out, findingFields(r, found, f, w, "          ")...)
+	}
+	return out
+}
+
+// findingFields are a finding's type and the findings a judge matched to it, then its timeline, after indent.
+func findingFields(r Report, found []Finding, p Problem, w int, indent string) []string {
+	var out []string
+	kv := func(name, value string) {
+		if value != "" {
+			out = append(out, field(w, indent, name, value))
 		}
-		kv("Evidence", strings.Join(evidence, "\n"))
-		if related := slices.DeleteFunc(slices.Clone(p.Members), func(id string) bool { return slices.Contains(p.readings(), id) }); len(related) > 0 {
-			kv("Related", strings.Join(related, ", ")+": novelty_judge matched them to "+cmp.Or(p.ID, "this problem"))
-		}
-		var tries []string
-		for _, level := range []string{"none", "minimal", "full"} {
-			for _, at := range r.aimed(p) {
-				if at.Level == level {
-					tries = append(tries, levelWords[level]+": "+tryWords(r, at, &p))
-					if why := tryNote(r, at); why != "" {
-						tries = append(tries, "  "+why)
-					}
-				}
-			}
-			if r.tried(p, level) == "-" && !slices.ContainsFunc(r.aimed(p), func(at Attempt) bool { return at.Level == level }) {
-				for _, c := range p.Conditions {
-					if c.Condition == level || level == "none" && c.Condition == "independent" {
-						tries = append(tries, levelWords[level]+": not tested, "+word(notTestedWords, c.Status))
-					}
-				}
-			}
-		}
-		if len(tries) == 0 {
-			tries = []string{"Not tested"}
-		}
-		kv("Attacker", strings.Join(tries, "\n"))
+	}
+	kv("Type", cmp.Or(typeNames[resultType(p)], resultType(p)))
+	if p.Reason != nil && problemType(p) == "" {
+		kv("Reason", capital(*p.Reason))
+	}
+	if related := slices.DeleteFunc(slices.Clone(p.Members), func(id string) bool { return slices.Contains(p.readings(), id) }); len(related) > 0 {
+		kv("Related", strings.Join(related, ", ")+": novelty_judge matched them to "+cmp.Or(p.ID, "this finding"))
+	}
+	var f *Finding
+	if n := evidenceOf(found, p); n > 0 {
+		f = &found[n-1]
+	} else {
+		kv("Evidence", "No evidence record on the list")
+	}
+	for _, l := range timeline(r, f, &p, w-width(indent)+1) {
+		out = append(out, indent[1:]+l)
 	}
 	return out
 }
@@ -247,7 +265,7 @@ func tryResult(r Report, at Attempt, p *Problem) string {
 		out = strings.ToLower(stoppedWords(at.Status)) // its episode started
 	}
 	if at.Error != nil && (res == Failed || res == NoReward) {
-		out += ": " + strings.SplitN(*at.Error, "\n", 2)[0]
+		out += ": " + errorLine(*at.Error)
 	}
 	return out
 }
@@ -266,8 +284,8 @@ func evidenceFields(r Report, found []Finding, w int) []string {
 		kv := func(name, value string) { out = append(out, field(w, "      ", name, value)) }
 		kv("Type", typeNames[findingType(f)])
 		kv("Found by", jobNames[f.Source])
-		if p := findingProblem(r, f); p != nil {
-			kv("Problem", cmp.Or(p.ID, strings.Join(strings.Fields(p.Cause), " ")))
+		if p := findingProblem(r, f); p != nil && r.causeOf(*p).N > 0 {
+			kv("Cause", r.causeOf(*p).name())
 		}
 		kv("Evidence from", cmp.Or(strings.TrimSpace(capital(word(scopeWords, f.ExecutionScope))+" "+f.Claim.Episode), "Not recorded"))
 		kv("Reference", ref(f))
@@ -363,20 +381,24 @@ func accuracyFields(r Report, w int) []string {
 	return out
 }
 
-// attemptRows are every Attacker try: its session, the problem it aimed at, how much it was told and how it ended.
+// attemptRows are every Attacker try: its session, the finding it aimed at, how much it was told and how it ended.
 func attemptRows(r Report, w int) []string {
-	widths := []int{16, 10, 22, 30}
-	out := []string{cols(w, "  ", widths, "Attempt", "Problem", "Help", "Result", "Reward")}
+	found := r.findings()
+	widths := []int{10, 36, 19, 22}
+	out := []string{cols(w, "  ", widths, "Attempt", "Aimed at", "Help", "Result", "Reward")}
 	for _, at := range r.Attack.Attempts {
 		episode, problem := "-", cmp.Or(at.Problem, strings.Join(tested(at), ", "), "none")
-		if at.Episode != nil {
-			episode = *at.Episode
+		if r.SchemaVersion >= 3 && at.Level == "none" { // aimed at no finding; its candidate is the slot's
+			problem = "none"
 		}
-		var aimed *Problem // the problem its result is about
+		if at.Episode != nil {
+			episode = sessionName(*at.Episode)
+		}
+		var aimed *Problem // the problem its result is about, named by its cause
 		for i, p := range r.Attack.Problems {
 			old := p.ID == at.Problem || at.Problem == "" && slices.ContainsFunc(tested(at), func(id string) bool { return slices.Contains(p.readings(), id) })
 			if p.ID != "" && aimed == nil && (r.SchemaVersion >= 2 && r.aimedAt(at, p) || r.SchemaVersion < 2 && old) {
-				problem, aimed = p.ID, &r.Attack.Problems[i]
+				problem, aimed = r.findingName(found, p), &r.Attack.Problems[i]
 			}
 		}
 		var rewards []string

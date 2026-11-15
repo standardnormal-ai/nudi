@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,6 +59,7 @@ type Event struct {
 	Finding  string   `json:"finding"`  // the probe, finding or attempt the judge judged
 	New      bool     `json:"new"`      // the judge found no known problem it is the same as
 	Cause    string   `json:"cause"`
+	CauseID  string   `json:"cause_id"` // C1, C2, ...: the cause a judged finding has
 	Result   string   `json:"result"`   // evidenced; older logs also have not_reproduced
 	Replayed bool     `json:"replayed"` // a judged or reproduced event a rerun repeats from the earlier run
 	Error    string   `json:"error"`    // why a phase failed or stopped, in its phase_end
@@ -220,9 +222,6 @@ const recent = 40
 // apply adds one event, in the order nudi wrote them.
 func (l *Live) apply(e Event) {
 	l.Last = &e
-	if e.Kind == "cause" || e.Kind == "hole" { // the judge's reading of a finding's cause, by its older name too; not shown
-		return
-	}
 	l.Recent = append(l.Recent, e)
 	l.Recent = l.Recent[max(0, len(l.Recent)-recent):]
 	if e.Slots != nil && e.Kind == "phase_start" && e.Phase == "hack" {
@@ -245,8 +244,8 @@ func (l *Live) apply(e Event) {
 		a := Agent{Who: e.Inspector, Name: e.Session, Title: e.Session, Episode: text(e.Episode), Category: text(e.Category), Since: e.at(), Last: "started"}
 		if t := l.try(text(e.Episode)); e.Inspector == "attack" && t != nil {
 			t.Inspecting = true
-			if e.Problem != "" {
-				a.Title = e.Problem + " " + word(levelWords, t.Start.Level)
+			if id := cmp.Or(e.Problem, text(e.Candidate)); id != "" {
+				a.Title = id + " " + word(levelWords, t.Start.Level)
 			}
 		}
 		l.Agents = append(l.Agents, a)

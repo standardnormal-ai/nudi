@@ -8,9 +8,10 @@ import (
 )
 
 // The fixtures are written by testdata/make_reports.py with nudi's own report code, except full-0.0.0,
-// a report in the shape nudi 0.0.0 wrote, and pipeline-full, written by hand with problems formed during the run.
+// a report in the shape nudi 0.0.0 wrote, pipeline-full, written by hand with problems formed during the run, and causes,
+// written by hand from full in the shape of schema 4.
 var fixtures = []string{"full", "full-0.0.0", "clean", "time-limit", "pipeline-full", "full-before-levels", "clean-before-levels",
-	"time-limit-before-levels"}
+	"time-limit-before-levels", "causes"}
 
 func fixture(t *testing.T, name string) Report {
 	t.Helper()
@@ -122,7 +123,7 @@ func TestFolderNameIsCleaned(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, out, _ := run(dir)
-	if code != 0 || strings.ContainsAny(out, "\u0007\u202e") || !strings.Contains(out, "run- P1") {
+	if code != 0 || strings.ContainsAny(out, "\u0007\u202e") || !strings.Contains(out, "run- cause 1") {
 		t.Fatalf("exit %d:\n%q", code, out)
 	}
 	code, _, errs := run(dir+"-none", "1")
@@ -202,15 +203,19 @@ func TestLoadReadsRunFactsAndOlderReportsLackThem(t *testing.T) {
 // labels, open questions, the no-hint search and each attempt's reward.
 func TestLoadReadsTheFactsTheScreensTabulate(t *testing.T) {
 	r := fixture(t, "full")
-	ps := r.Attack.Problems
-	if r.SchemaVersion != 3 || ps[0].ID != "P1" || ps[0].Finding != "hack-1" || ps[0].Outcome != "accepted_invalid" || ps[0].Type != nil ||
-		ps[1].ID != "P2" || ps[1].Outcome != "rejected_valid" || ps[1].Reason == nil || ps[0].Conditions[0].Attempts != 1 || ps[0].Conditions[0].Status == "" {
-		t.Fatalf("problems: %+v", ps)
+	c := r.Causes
+	if r.SchemaVersion != 4 || c[0].ID != "C1" || c[0].Level != 4 || len(c[0].Findings) != 2 || c[3].ID != "C2" || c[3].N != 4 {
+		t.Fatalf("causes: %+v", c)
+	}
+	ps := []Problem{c[0].Findings[0], c[3].Findings[0]}
+	if ps[0].ID != "hack-1" || ps[0].Finding != "hack-1" || ps[0].Outcome != "accepted_invalid" || ps[0].Type != nil || !*ps[0].Attacked ||
+		ps[1].ID != "hack-2" || ps[1].Outcome != "rejected_valid" || ps[1].Reason == nil || ps[0].Conditions[0].Attempts != 1 || ps[0].Conditions[0].Status == "" {
+		t.Fatalf("findings: %+v", ps)
 	}
 	if at := r.Attack.Attempts; at[0].Status != "evidenced_issue" || *at[0].Assessment != 0 || at[3].Status != "no_evidenced_issue" {
 		t.Fatalf("attempts: %+v", at)
 	}
-	if strings.Join(r.Ungrouped, ",") != "hack-3,grader-12,grader-13" {
+	if strings.Join(r.Ungrouped, ",") != "grader-12,grader-13" {
 		t.Fatalf("ungrouped: %v", r.Ungrouped)
 	}
 	group := r.Ordinary.Groups[0]

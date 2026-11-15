@@ -9,17 +9,17 @@ RUN
 
 RESULT
   Ending            Finished
-  Summary           No problems demonstrated in this run.
+  Summary           No cause demonstrated in this run.
   Count             1 open question
   Work left         1 item, listed under WORK LEFT
 
 EVIDENCE
   None evidenced in this run.
 
-ABANDONED PROBLEMS
+ABANDONED FINDINGS
   Count             1 unresolved
 
-  unchecked requirement
+  The test script runs bash from PATH, so a shim the agent plants first on PATH decides the result.
       State             Unresolved
       Found by          Hack Inspector
       Reference         hack-0
@@ -43,7 +43,8 @@ GRADER ACCURACY
   Not available     Grade Simulations not selected
 
 WORK LEFT
-  Find Hacks          unchecked requirement (hack-0)
+  Find Hacks          The test script runs bash from PATH, so a shim the agent plants first on PATH
+                      decides the result. (hack-0)
                       Unresolved: Reason not recorded
 
 COST

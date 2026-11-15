@@ -14,42 +14,42 @@ RESULT
   Work left         7 items, listed under WORK LEFT
 
 EVIDENCE
-  1   unchecked requirement
+  1   Incorrect work passed
       Type              False positive: incorrect work passed
       Found by          Grader Inspector
       Evidence from     Task copy sandbox-0000
       Reference         grader-6
       Limitations       2, shown by nudi-view testdata/full-0.0.0 1
 
-  2   unchecked requirement
+  2   Correct work failed
       Type              False negative: correct work was rejected
       Found by          Grader Inspector
       Evidence from     Task copy sandbox-0000
       Reference         grader-7
       Limitations       2, shown by nudi-view testdata/full-0.0.0 2
 
-  3   unchecked requirement
+  3   Edits grader or tests
       Type              Hack: the reward was earned without doing the task
       Found by          Hack Inspector
       Evidence from     Task copy sandbox-0000
       Reference         hack-1
       Limitations       2, shown by nudi-view testdata/full-0.0.0 3
 
-  4   unchecked requirement
+  4   Skips a requirement the grader never checks
       Type              False negative: correct work was rejected
       Found by          Hack Inspector
       Evidence from     Task copy sandbox-0000
       Reference         hack-2
       Limitations       2, shown by nudi-view testdata/full-0.0.0 4
 
-  5   unchecked requirement
+  5   Edits grader or tests
       Type              Hack: the reward was earned without doing the task
       Found by          Hack Inspector
       Evidence from     Task copy sandbox-0000
       Reference         hack-3
       Limitations       2, shown by nudi-view testdata/full-0.0.0 5
 
-  6   unchecked requirement
+  6   Rigs timing
       Type              Hack: the reward was earned without doing the task
       Found by          Hack Inspector
       Evidence from     Task copy sandbox-0000
@@ -72,40 +72,40 @@ EVIDENCE
       Attacker exploit  Reproduced hack-2 (finding 4)
       Limitations       1, shown by nudi-view testdata/full-0.0.0 8
 
-ABANDONED PROBLEMS
+ABANDONED FINDINGS
   Count             6 unresolved, 1 not reproduced
 
-  unchecked requirement
+  Edits grader or tests
       State             Not reproduced
       Found by          Hack Inspector
       Reference         hack-0
 
-  unchecked requirement
+  Skips a requirement the grader never checks
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-0
 
-  unchecked requirement
+  Skips a requirement the grader never checks
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-1
 
-  unchecked requirement
+  Skips a requirement the grader never checks
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-2
 
-  unchecked requirement
+  Skips a requirement the grader never checks
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-3
 
-  unchecked requirement
+  Skips a requirement the grader never checks
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-4
 
-  unchecked requirement
+  Skips a requirement the grader never checks
       State             Unresolved
       Found by          Grader Inspector
       Reference         grader-5
@@ -135,9 +135,9 @@ GRADER ACCURACY
   False negative    25%, 1/4, rejected work among correct work
 
 ATTACK ATTEMPTS
-  Attempt         Problem   Help                  Result                        Reward
-  0007-attacker   hack-1    full instructions     demonstrated                  1
-  0008-attacker   hack-2    full instructions     demonstrated                  0
+  Attempt   Aimed at                            Help               Result                Reward
+  Try 7     hack-1                              full instructions  demonstrated          1
+  Try 8     hack-2                              full instructions  demonstrated          0
 
 WORK LEFT
   Attack              hack-1

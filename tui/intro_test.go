@@ -121,7 +121,7 @@ func TestIntroSkipQuitAndLateTick(t *testing.T) {
 		}
 		next, cmd := m.Update(tea.KeyPressMsg{Text: "x"})
 		m = next.(model)
-		if m.intro != nil || cmd != nil || m.n != 6 || !strings.Contains(ansi.Strip(m.View().Content), "Results › "+detailName(m.r, m.found[5])) {
+		if m.intro != nil || cmd != nil || m.n != 6 || !strings.Contains(ansi.Strip(m.View().Content), "Results › Cause ") || !strings.Contains(ansi.Strip(m.View().Content), detailName(m.r, m.found[5])) {
 			t.Fatal("skip did not immediately open the requested finding")
 		}
 		next, cmd = m.Update(frameMsg{})

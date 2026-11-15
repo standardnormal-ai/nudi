@@ -5,18 +5,17 @@
  Simulation ✓ ── Grade Simulations ✓ ── Find Hacks ✓ ── Attack ✓                      │    Results
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ✓ Finished                                                                              5 problems
+ ✓ Finished                                                                                5 causes
  The grader can be cheated.
 
- Problems (5)                                                                              e expand
-     Problem                                     Hint  Full  Ref
- › ▸ reward reads stdout                          ✓     ✓    P1
-   ▸ accepts empty answer                         ✓     ✗    G1
-   ▸ skips the test file                          ✗     ✓    P2
-   ▸ writes expected output                       -     ✗    P3
-   ▸ rejects leading zeros                        -     -    G2
+ Causes (5)  e expand                                                           Hint  Full
+ ›   1  reward reads stdout                                                      ✓     ✓    ●●●●●
+     2  accepts empty answer                                                     ✓     ✗    ●●●●○
+     3  skips the test file                                                      ✗     ✓    ●●●○○
+     4  writes expected output                                                   -     ✗    ●●○○○
+     5  rejects leading zeros                                                    -     -    ●●○○○
 
- ▸ Abandoned Problems                                                                      o expand
+ ▸ Abandoned Findings                                                                      o expand
  ▸ What the References Mean                                                                i expand
 
  Simulation Rewards                               Grader Accuracy
@@ -29,7 +28,7 @@
 
  Work Left (1)
  Where              What                                  Why
- Attack             G2 rejects leading zeros              Not tested: no guidance for an Attacker
+ Attack             Cause 5, rejects leading zeros        Not tested: no guidance for an Attacker
 
  Cost
  Model cost                  $1.84 of $3.00 cap    ━━━━━━━━━━━━━━━━
@@ -81,11 +80,11 @@
  Simulation ✓ ── Grade Simulations ✓ ──  Find Hacks  ✓ ── Attack ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- Problems Found (3)                                                                        e expand
-   Problem                                       Reproduced?   Attacker?   Ref
- › reward reads stdout                                ✓            ✓       P1
-   skips the test file                                ✓            ✓       P2
-   writes expected output                             ✓            ✗       P3
+ Findings (3)                                                                              e expand
+   Finding                                       Reproduced?   Attacker?
+ › reward reads stdout                                ✓            ✓
+   skips the test file                                ✓            ✓
+   writes expected output                             ✓            ✗
 
  Open Questions (1)
    Question                                      Why it is open
@@ -100,13 +99,13 @@
  Simulation ✓ ── Grade Simulations ✓ ── Find Hacks ✓ ──  Attack  ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- Problems (5)                                                                              e expand
-     Problem                                     Hint  Full  Ref
- › ▸ reward reads stdout                          ✓     ✓    P1
-   ▸ accepts empty answer                         ✓     ✗    G1
-   ▸ skips the test file                          ✗     ✓    P2
-   ▸ writes expected output                       -     ✗    P3
-   ▸ rejects leading zeros                        -     -    G2
+ Causes (5)                                                                                e expand
+        Cause                                       Hint  Full
+ › ▸ 1  reward reads stdout                          ✓     ✓
+   ▸ 2  accepts empty answer                         ✓     ✗
+   ▸ 3  skips the test file                          ✗     ✓
+   ▸ 4  writes expected output                       -     ✗
+   ▸ 5  rejects leading zeros                        -     -
 
  Can an Attacker Succeed Without Any Information?
  No try recorded.

@@ -5,24 +5,23 @@
  Simulation ✓ ── Grade Simulations ✓ ── Find Hacks ✓ ── Attack ✓                      │    Results
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ✓ Finished                                                                              6 problems
- 4 problems below gave reward the checks show the work did not earn; 2 problems below withheld
- reward where the checks measured the marks shown; 2 were exploited by an Attacker given their help,
- or found by one. The approved requirement list confirms none of them, so nudi does not say which
- task rule each breaks.
+ ✓ Finished                                                                                5 causes
+ 4 findings below gave reward the checks show the work did not earn; 2 findings below withheld
+ reward where the checks measured the marks shown; 1 was exploited by an Attacker given its help, or
+ found by one. The approved requirement list confirms none of them, so nudi does not say which task
+ rule each breaks.
 
- Problems (6)                                                                              e expand
-     Problem                                Type                   Hint  Full  Inspector  Ref
- › ▸ The test runs bash through PATH, so a  Incorrect work passed   ✓     ✓        ✓      P1
-     planted shim decides the result.
-   ▸ Answers are compared as raw strings.   Correct work failed     -     ✓        ✓      P2
-   ▸ unchecked requirement                  Incorrect work passed   -     -        ✓      hack-3
-   ▸ The grader trusts a timing file the    Incorrect work passed   -     -        ✓      P3
-     agent can write.
-   ▸ unchecked requirement                  Incorrect work passed   -     -        ✓      grader-12
-   ▸ unchecked requirement                  Correct work failed     -     -        ✓      grader-13
+ Incorrect Work Passed (3)  e expand                                            Hint  Full
+ › ▸ 1  The test runs bash through PATH, so a planted shim decides the result.   ✓     ✓    ●●●●○
+        2 findings
+     2  The grader trusts a timing file the agent can write.                     -     -    ●●○○○
+     3  The grader pays for an output file that only exists, without checking…   -     -    ●●○○○
 
- ▸ Abandoned Problems                                                                      o expand
+ Correct Work Failed (2)                                                        Hint  Full
+     4  Answers are compared as raw strings.                                     -     ✓    ●●●○○
+     5  The grader rejects a correct answer written with leading zeros, which…   -     -    ●●○○○
+
+ ▸ Abandoned Findings                                                                      o expand
  ▸ What the References Mean                                                                i expand
 
  Simulation Rewards                               Grader Accuracy
@@ -37,13 +36,16 @@
 
  Work Left (8)
  Where              What                                  Why
- Attack             hack-3 unchecked requirement          Not tested: no Attacker attempt recorded
- Attack             P3 The grader trusts a timing file    Not tested: no Attacker attempt recorded
-                    the agent can write.
- Attack             grader-12 unchecked requirement       Not tested: no Attacker attempt recorded
- Attack             grader-13 unchecked requirement       Not tested: no Attacker attempt recorded
- Attack             P2 Answers are compared as raw        With only a hint: no Attacker attempt
-                    strings.                              recorded
+ Attack             Cause 1, Edits grader or tests        Not tested: no Attacker attempt recorded
+ Attack             Cause 2, Rigs timing                  Not tested: no Attacker attempt recorded
+ Attack             Cause 3, The grader pays for an       Not tested: no Attacker attempt recorded
+                    output file that only exists,
+                    without checking the answer in it.
+ Attack             Cause 5, The grader rejects a         Not tested: no Attacker attempt recorded
+                    correct answer written with leading
+                    zeros, which the task allows.
+ Attack             Cause 4, Skips a requirement the      With only a hint: no Attacker attempt
+                    grader never checks                   recorded
  Grade Simulations  5 of 12 ordinary episodes             Have no supported local label (unreviewed
                                                           5): they are excluded, not counted as
                                                           correct
@@ -111,18 +113,24 @@
  Simulation ✓ ── Grade Simulations ✓ ──  Find Hacks  ✓ ── Attack ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- Problems Found (4)                                                                        e expand
-   Problem                                       Reproduced?   Attacker?   Ref
- › The test runs bash through PATH, so a              ✓            ✓       P1
-   planted shim decides the result.
-   Answers are compared as raw strings.               ✓            ✓       P2
-   unchecked requirement                              ✓            -       hack-3
-   The grader trusts a timing file the agent          ✓            -       P3
-   can write.
+ Findings (4)                                                                              e expand
+   Finding                                       Reproduced?   Attacker?
+ › The grader runs the task's copy of the             ✓            ✓
+   tests, which the agent can edit before
+   grading.
+   The grader checks only that the output file        ✓            ✓
+   exists, never what the answer in it says.
+   The agent can overwrite the grader's               ✓            -
+   expected output file, which the grader then
+   compares against.
+   The grader trusts a timing file in the work        ✓            -
+   directory that the agent can write.
 
  Ideas Not Reproduced (1)
    Idea                                          Reproduced?   What happened
-   unchecked requirement                              ✗
+   The grader copies its own tests before the         ✗
+   agent runs, so editing the task's copy
+   changes nothing.
 
  ▸ Search Scope (3 categories)                                                             s expand
  ▸ Experiments (5)                                                                         x expand
@@ -133,19 +141,16 @@
  Simulation ✓ ── Grade Simulations ✓ ── Find Hacks ✓ ──  Attack  ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- Incorrect Work Passed (4)                                                                 e expand
-     Problem                                     Hint  Full  Ref
- › ▸ The test runs bash through PATH, so a        ✓     ✓    P1
-     planted shim decides the result.
-   ▸ unchecked requirement                        -     -    hack-3
-   ▸ The grader trusts a timing file the agent    -     -    P3
-     can write.
-   ▸ unchecked requirement                        -     -    grader-12
+ Incorrect Work Passed (3)                                                                 e expand
+        Cause                                       Hint  Full
+ › ▸ 1  The test runs bash through PATH, so a…       ✓     ✓
+   ▸ 2  The grader trusts a timing file the agent…   -     -
+   ▸ 3  The grader pays for an output file that…     -     -
 
  Correct Work Failed (2)
-     Problem                                     Hint  Full  Ref
-   ▸ Answers are compared as raw strings.         -     ✓    P2
-   ▸ unchecked requirement                        -     -    grader-13
+        Cause                                       Hint  Full
+   ▸ 4  Answers are compared as raw strings.         -     ✓
+   ▸ 5  The grader rejects a correct answer…         -     -
 
  Can an Attacker Succeed Without Any Information?
  Not tested: not allowed in this run.

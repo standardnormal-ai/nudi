@@ -155,7 +155,7 @@
               "marks": [
                 "sorted"
               ],
-              "mechanism": "unchecked requirement",
+              "mechanism": "The test script runs bash from PATH, so a shim the agent plants first on PATH decides the result.",
               "reward": "reward",
               "unresolved": []
             },
@@ -278,8 +278,7 @@
   "outcome": "Finished. Every step ran. Evidence stayed unresolved in the hack inspector, so the run may miss more.",
   "persistence": [],
   "phase_errors": {},
-  "problems": [],
-  "schema_version": 3,
+  "schema_version": 4,
   "status": "complete",
   "stop": null,
   "unfinished": {},

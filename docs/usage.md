@@ -277,17 +277,17 @@ It prints Modal's bill for that run's sandboxes and exits `0`, or prints one lin
 (cd tui && go build -o nudi-view .)
 ```
 
-Then, from the same directory, open a run folder, go straight to the evidence for its cause C2, or to its finding 3:
+Then, from the same directory, open a run folder, go straight to its cause 2 with its findings, or to its finding 3:
 
 ```sh
 tui/nudi-view runs/first
-tui/nudi-view runs/first C2
-tui/nudi-view runs/first 3
+tui/nudi-view runs/first 2
+tui/nudi-view runs/first hack-6
 ```
 
-A cause id, C with its number as the report names it, opens the first finding of that cause.
+A number N, or `cause N`, opens cause N as the Results tab numbers them, 1 at the top, or its finding when it has only one. An id from `report.json` also works: a cause id such as `C2` opens that cause, and a finding id such as `hack-6` or `A2` opens that finding. A report without causes, from before them, keeps numbering its findings as the plain report's EVIDENCE section does. The screens show causes and Attacker tries by number, as `Cause 2` and `Try 7`; the ids appear only under a finding's References.
 
-The viewer opens on Results, with the four phase tabs to its left. Use `tab`, `←` and `→`, or `h` and `l`, to move between tabs, `↑` and `↓` to select a row, `enter` to expand it or open its evidence, and the key shown beside a section to expand it. `m` shows the models, `c` the cost and `?` what every symbol means. On a finding, `←` and `→` move between findings, `tab` switches between Evidence, Limitations and References, and `esc` or backspace goes back. `q` or Ctrl-C quits. Pass `--no-intro` to skip the opening animation, which is also skipped when `CI` is set. In a pipe the viewer prints plain text for scripts and agents: the whole report in sections, in the order of the Results tab, or the finding a cause id or N names. `nudi-view --help` lists its options and the related `nudi` commands. It exits `0` for a complete run, whose steps all ran, `1` for any other run, such as one in which a step failed or stopped or one that reached its time limit, and `2` when the folder holds no readable report.
+The viewer opens on Results, with the four phase tabs to its left. Use `tab`, `←` and `→`, or `h` and `l`, to move between tabs, `↑` and `↓` to select a row, `enter` to expand it or open its evidence, and the key shown beside a section to expand it. `m` shows the models, `c` the cost and `?` what every symbol means. On a finding, `←` and `→` move between findings, `tab` switches between Evidence, Limitations and References, and `esc` or backspace goes back. `q` or Ctrl-C quits. Pass `--no-intro` to skip the opening animation, which is also skipped when `CI` is set. In a pipe the viewer prints plain text for scripts and agents: the whole report in sections, in the order of the Results tab, or the cause or finding the words after RUN name, each finding with the timeline of its evidence. `nudi-view --help` lists its options and the related `nudi` commands. Results heads a run whose work ended `Finished`, also a partial one, with a short yellow warning beside it when some work was lost, such as `! Find Hacks: 1 search failed`; only a stopped, failed or still running run has a heading of its own. It exits `0` for a complete run, whose steps all ran, `1` for any other run, such as one in which a step failed or stopped or one that reached its time limit, and `2` when the folder holds no readable report.
 
 A run with `--backend modal` keeps its folder on the machine that ran nudi. If nudi itself ran on Modal and wrote to a Modal Volume, download the folder first:
 

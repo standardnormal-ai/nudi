@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"image/color"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -50,8 +51,9 @@ func pad(s string, w int) string { return s + strings.Repeat(" ", max(0, w-width
 
 func kind(f Finding) string { return word(kindTags, f.Source+" "+f.Assessment.Outcome) }
 
-// title is the finding's mechanism, in the Inspector's words, on one line.
-func title(f Finding) string { return strings.Join(strings.Fields(f.Claim.Mechanism), " ") }
+// title is the finding's mechanism, in the Inspector's words, on one line; an older report's category name there
+// reads as its label.
+func title(f Finding) string { return mechanismName(f.Claim.Mechanism, f.Category) }
 
 // num prints a number from the report as Python's number() does, with up to four significant digits.
 func num(x *float64) string {
@@ -93,20 +95,6 @@ func wrap(s string, w int, indent string, style func(string) string) string {
 
 func plain(s string) string { return s }
 
-// hang is s wrapped after indent as wrap draws it; a line that starts "  - ", a problem under a cause in Python's
-// Answer, keeps its text right of the dash on every line.
-func hang(s string, w int, indent string) string {
-	body, ok := strings.CutPrefix(s, "  - ")
-	if !ok {
-		return wrap(s, w, indent, plain)
-	}
-	lines := breakLines(body, w-width(indent)-4)
-	for i, l := range lines {
-		lines[i] = indent + map[bool]string{true: "  - ", false: "    "}[i == 0] + l
-	}
-	return strings.Join(lines, "\n")
-}
-
 func heading(s, note string) string { return " " + bold(s) + "  " + dim(note) }
 
 // titled is a section's title with its count, as in PROBLEMS (3).
@@ -127,16 +115,8 @@ func spread(left, right string, w int) string {
 // a cell too long for its column wraps inside it. A narrow window first shrinks the widest columns, then puts the
 // first cell on a line of its own above the others.
 func cols(w int, indent string, widths []int, cells ...string) string {
-	ws := slices.Clone(widths[:len(cells)-1])
-	room := w - width(indent) - 8
-	for len(ws) > 0 && sum(ws) > room {
-		i := slices.Index(ws, slices.Max(ws))
-		if ws[i] <= 12 {
-			break
-		}
-		ws[i]--
-	}
-	if sum(ws) > room && len(cells) > 2 {
+	ws := fit(w, indent, widths[:len(cells)-1])
+	if sum(ws) > w-width(indent)-8 && len(cells) > 2 {
 		return cols(w, indent, nil, cells[0]) + "\n" + cols(w, strings.Repeat(" ", width(indent)+2), widths[1:], cells[1:]...)
 	}
 	blocks := []string{indent}
@@ -153,6 +133,40 @@ func cols(w int, indent string, widths []int, cells ...string) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// fit is the widths of the columns before the last of a cols row after indent in a window w wide: a narrow window
+// shrinks the widest first, to no less than 12.
+func fit(w int, indent string, widths []int) []int {
+	ws := slices.Clone(widths)
+	room := w - width(indent) - 8
+	for len(ws) > 0 && sum(ws) > room {
+		i := slices.Index(ws, slices.Max(ws))
+		if ws[i] <= 12 {
+			break
+		}
+		ws[i]--
+	}
+	return ws
+}
+
+// clip is s on one line of at most w cells, ending in "…" when it is longer. It ends at a space when one is within
+// the last half of the line, else inside a word, but never inside a ref such as C4 or hack-17.
+func clip(s string, w int) string {
+	if width(s) <= w {
+		return s
+	}
+	head := ansi.Truncate(s, w-1, "")
+	if i := strings.LastIndex(head, " "); i > 0 && !strings.HasPrefix(s[len(head):], " ") {
+		word, _, _ := strings.Cut(s[i+1:], " ")
+		if width(head[:i]) >= w/2 || idWord.MatchString(strings.TrimRight(word, ".,;:)")) {
+			head = head[:i]
+		}
+	}
+	return strings.TrimRight(head, " ,;:") + "…"
+}
+
+// idWord is a word that names something by id, such as C4, hack-17 or 0010-attacker.
+var idWord = regexp.MustCompile(`^([A-Za-z]+-?\d+|\d+-[a-z]+)$`)
 
 // box draws lines in a rounded frame w wide with its title in the top edge and foot, when given, in the bottom one.
 func box(title, foot string, w int, lines ...string) string {

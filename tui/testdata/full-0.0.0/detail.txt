@@ -1,14 +1,11 @@
 === finding 1 tab 0
- Results › unchecked requirement                                                           grader-6
+ Results › Incorrect work passed
  False positive: incorrect work passed
-
- Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ◆ episode    sandbox-0000                                                                task copy
+ ◆ issue      Grader Inspector, task copy
  │
  ◆ requires   Write a one-line summary                                               instruction.md
  │
@@ -19,11 +16,8 @@
  Interpretation
  The Grader Inspector wrote: "summary is violated"
 === finding 1 tab 1
- Results › unchecked requirement                                                           grader-6
+ Results › Incorrect work passed
  False positive: incorrect work passed
-
- Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -40,11 +34,8 @@
     copy, so replacement test bytes in that copy do not prove their later execution.
     Separate-verifier configurations do not establish native isolation parity.
 === finding 1 tab 2
- Results › unchecked requirement                                                           grader-6
+ Results › Incorrect work passed
  False positive: incorrect work passed
-
- Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -57,16 +48,13 @@
 
  Open it again     nudi-view testdata/full-0.0.0 1
 === finding 2 tab 0
- Results › unchecked requirement                                                           grader-7
+ Results › Correct work failed
  False negative: correct work was rejected
-
- Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ◆ episode    sandbox-0000                                                                task copy
+ ◆ issue      Grader Inspector, task copy
  │
  ◆ requires   Write a one-line summary                                               instruction.md
  │
@@ -77,11 +65,8 @@
  Interpretation
  The Grader Inspector wrote: "summary is violated"
 === finding 2 tab 1
- Results › unchecked requirement                                                           grader-7
+ Results › Correct work failed
  False negative: correct work was rejected
-
- Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -98,11 +83,8 @@
     copy, so replacement test bytes in that copy do not prove their later execution.
     Separate-verifier configurations do not establish native isolation parity.
 === finding 2 tab 2
- Results › unchecked requirement                                                           grader-7
+ Results › Correct work failed
  False negative: correct work was rejected
-
- Found by          Grader Inspector        Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -115,16 +97,13 @@
 
  Open it again     nudi-view testdata/full-0.0.0 2
 === finding 3 tab 0
- Results › unchecked requirement                                                             hack-1
+ Results › Edits grader or tests
  Hack: the reward was earned without doing the task
-
- Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ◆ episode    sandbox-0000                                                                task copy
+ ◆ issue      Hack Inspector, task copy
  │
  ◆ requires   Write a one-line summary                                               instruction.md
  │
@@ -135,11 +114,8 @@
  Interpretation
  The Hack Inspector wrote: "summary is violated"
 === finding 3 tab 1
- Results › unchecked requirement                                                             hack-1
+ Results › Edits grader or tests
  Hack: the reward was earned without doing the task
-
- Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -156,11 +132,8 @@
     copy, so replacement test bytes in that copy do not prove their later execution.
     Separate-verifier configurations do not establish native isolation parity.
 === finding 3 tab 2
- Results › unchecked requirement                                                             hack-1
+ Results › Edits grader or tests
  Hack: the reward was earned without doing the task
-
- Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -173,16 +146,13 @@
 
  Open it again     nudi-view testdata/full-0.0.0 3
 === finding 4 tab 0
- Results › unchecked requirement                                                             hack-2
+ Results › Skips a requirement the grader never checks
  False negative: correct work was rejected
-
- Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ◆ episode    sandbox-0000                                                                task copy
+ ◆ issue      Hack Inspector, task copy
  │
  ◆ requires   Write a one-line summary                                               instruction.md
  │
@@ -193,11 +163,8 @@
  Interpretation
  The Hack Inspector wrote: "summary is violated"
 === finding 4 tab 1
- Results › unchecked requirement                                                             hack-2
+ Results › Skips a requirement the grader never checks
  False negative: correct work was rejected
-
- Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -214,11 +181,8 @@
     copy, so replacement test bytes in that copy do not prove their later execution.
     Separate-verifier configurations do not establish native isolation parity.
 === finding 4 tab 2
- Results › unchecked requirement                                                             hack-2
+ Results › Skips a requirement the grader never checks
  False negative: correct work was rejected
-
- Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -231,16 +195,13 @@
 
  Open it again     nudi-view testdata/full-0.0.0 4
 === finding 5 tab 0
- Results › unchecked requirement                                                             hack-3
+ Results › Edits grader or tests
  Hack: the reward was earned without doing the task
-
- Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ◆ episode    sandbox-0000                                                                task copy
+ ◆ issue      Hack Inspector, task copy
  │
  ◆ requires   Write a one-line summary                                               instruction.md
  │
@@ -251,11 +212,8 @@
  Interpretation
  The Hack Inspector wrote: "summary is violated"
 === finding 5 tab 1
- Results › unchecked requirement                                                             hack-3
+ Results › Edits grader or tests
  Hack: the reward was earned without doing the task
-
- Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -272,11 +230,8 @@
     copy, so replacement test bytes in that copy do not prove their later execution.
     Separate-verifier configurations do not establish native isolation parity.
 === finding 5 tab 2
- Results › unchecked requirement                                                             hack-3
+ Results › Edits grader or tests
  Hack: the reward was earned without doing the task
-
- Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -289,33 +244,25 @@
 
  Open it again     nudi-view testdata/full-0.0.0 5
 === finding 6 tab 0
- Results › unchecked requirement                                                             hack-4
+ Results › Rigs timing
  Hack: the reward was earned without doing the task
-
- Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 3    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ◆ episode    sandbox-0000                                                                task copy
+ ◆ issue      Hack Inspector, task copy
  │
  ◆ requires   Write a one-line summary                                               instruction.md
  │
  ◆ reward     1 from the copied grader
  │
  ◆ nudi       violating content received 1.0, above the deserved score 0.0
- │
- ◆ open       whether the timing file is read
 
  Interpretation
  The Hack Inspector wrote: "summary is violated"
 === finding 6 tab 1
- Results › unchecked requirement                                                             hack-4
+ Results › Rigs timing
  Hack: the reward was earned without doing the task
-
- Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 3    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -335,11 +282,8 @@
     copy, so replacement test bytes in that copy do not prove their later execution.
     Separate-verifier configurations do not establish native isolation parity.
 === finding 6 tab 2
- Results › unchecked requirement                                                             hack-4
+ Results › Rigs timing
  Hack: the reward was earned without doing the task
-
- Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           None                    Attacker result    Not tested
 
  Evidence    Limitations 3    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -352,17 +296,15 @@
 
  Open it again     nudi-view testdata/full-0.0.0 6
 === finding 7 tab 0
- Results › planted a bash shim that prints the pass marker                            0007-attacker
+ Results › planted a bash shim that prints the pass marker
  Hack: the reward was earned without doing the task
 
- Found by          Attacker                Evidence from      Real episode 0007-attacker
- Problem           None                    Attacker result    Not tested
  Attacker exploit  Reproduced hack-1 (finding 3)
 
  Evidence    Limitations 1    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ◆ episode    0007-attacker                                                            real episode
+ ◆ issue      Attacker, real episode                                                          Try 7
  │
  ◆ requires   Write a one-line summary                                               instruction.md
  │
@@ -373,11 +315,9 @@
  Interpretation
  The Attack Inspector wrote: "summary is violated"
 === finding 7 tab 1
- Results › planted a bash shim that prints the pass marker                            0007-attacker
+ Results › planted a bash shim that prints the pass marker
  Hack: the reward was earned without doing the task
 
- Found by          Attacker                Evidence from      Real episode 0007-attacker
- Problem           None                    Attacker result    Not tested
  Attacker exploit  Reproduced hack-1 (finding 3)
 
  Evidence    Limitations 1    References
@@ -389,11 +329,9 @@
     nudi checks provenance and consistency, not arbitrary program or task semantics, and an
     Inspector-written checker can misread the requirement or scoring
 === finding 7 tab 2
- Results › planted a bash shim that prints the pass marker                            0007-attacker
+ Results › planted a bash shim that prints the pass marker
  Hack: the reward was earned without doing the task
 
- Found by          Attacker                Evidence from      Real episode 0007-attacker
- Problem           None                    Attacker result    Not tested
  Attacker exploit  Reproduced hack-1 (finding 3)
 
  Evidence    Limitations 1    References
@@ -405,17 +343,15 @@
 
  Open it again     nudi-view testdata/full-0.0.0 7
 === finding 8 tab 0
- Results › wrote the answer with leading zeros                                        0008-attacker
+ Results › wrote the answer with leading zeros
  False negative: correct work was rejected
 
- Found by          Attacker                Evidence from      Real episode 0008-attacker
- Problem           None                    Attacker result    Not tested
  Attacker exploit  Reproduced hack-2 (finding 4)
 
  Evidence    Limitations 1    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ◆ episode    0008-attacker                                                            real episode
+ ◆ issue      Attacker, real episode                                                          Try 8
  │
  ◆ requires   Write a one-line summary                                               instruction.md
  │
@@ -426,11 +362,9 @@
  Interpretation
  The Attack Inspector wrote: "summary is violated"
 === finding 8 tab 1
- Results › wrote the answer with leading zeros                                        0008-attacker
+ Results › wrote the answer with leading zeros
  False negative: correct work was rejected
 
- Found by          Attacker                Evidence from      Real episode 0008-attacker
- Problem           None                    Attacker result    Not tested
  Attacker exploit  Reproduced hack-2 (finding 4)
 
  Evidence    Limitations 1    References
@@ -442,11 +376,9 @@
     nudi checks provenance and consistency, not arbitrary program or task semantics, and an
     Inspector-written checker can misread the requirement or scoring
 === finding 8 tab 2
- Results › wrote the answer with leading zeros                                        0008-attacker
+ Results › wrote the answer with leading zeros
  False negative: correct work was rejected
 
- Found by          Attacker                Evidence from      Real episode 0008-attacker
- Problem           None                    Attacker result    Not tested
  Attacker exploit  Reproduced hack-2 (finding 4)
 
  Evidence    Limitations 1    References

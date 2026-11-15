@@ -9,7 +9,7 @@ import (
 	"charm.land/lipgloss/v2"
 )
 
-var screenFixtures = []string{"full", "clean", "full-0.0.0", "time-limit", "pipeline-full"}
+var screenFixtures = []string{"full", "clean", "full-0.0.0", "time-limit", "pipeline-full", "causes"}
 
 // Every tab of each fixture at 100 columns, as it opens: Results first, then the four phases with nothing expanded.
 func TestScreens(t *testing.T) {
@@ -77,7 +77,7 @@ func TestHelpScreen(t *testing.T) {
 func TestEndings(t *testing.T) {
 	for body, want := range map[string]string{
 		`"status": "complete", "answer": ["Finished", "No hack found."]`:                                         "✓ Finished",
-		`"status": "partial", "answer": ["Finished", "x"]`:                                                       "Partly finished",
+		`"status": "partial", "answer": ["Finished", "x"], "elapsed": 300`:                                       "Finished  after 5:00",
 		`"answer": ["Stopped", "x"], "stop": {"kind": "cancelled"}`:                                              "Stopped by you",
 		`"answer": ["Stopped", "x"], "stop": {"kind": "terminated"}`:                                             "Stopped by a termination signal",
 		`"answer": ["Stopped", "x"], "stop": {"kind": "time_limit", "minutes": 5}, "elapsed": 300`:               "Stopped at the time limit  5:00 of 5:00",

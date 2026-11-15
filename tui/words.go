@@ -34,8 +34,8 @@ var phases = []struct{ Name, Analysis string }{
 // roleNames are each model role in report.json's configuration and the jobs it runs.
 var roleNames = map[string][2]string{
 	"simulator": {"Simulator", "Simulator, which runs the simulated episodes"},
-	"inspector": {"Inspector", "Grader Inspector, Hack Inspector, Attack Inspector, and the judge that groups findings into problems"},
-	"attacker":  {"Attacker", "Attacker, which tries to demonstrate each problem in a real episode"},
+	"inspector": {"Inspector", "Grader Inspector, Hack Inspector, Attack Inspector, and the judge that groups findings into causes"},
+	"attacker":  {"Attacker", "Attacker, which tries to demonstrate each cause in a real episode"},
 }
 
 // stopWords say how a run stopped, by its stop's kind, and what the screens say of the results.

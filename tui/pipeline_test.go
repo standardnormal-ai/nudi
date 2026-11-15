@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -172,7 +173,7 @@ func TestPipelineGraderScreen(t *testing.T) {
 	snapshot(t, "pipeline-grader", "screen-24.txt", liveScreen(t, l, l.Last.at(), 100, 24))
 	for _, want := range []string{
 		"Find Hacks ✓", "Grade Simulations  ⣾", "Grader Inspector", "Agents  1 running", "General review",
-		"novelty_judge     Same as an earlier finding: timeout counts as pass", "Related Observations (5)",
+		"novelty_judge     Known cause: timeout counts as pass", "Related Observations (5)",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("lacks %q:\n%s", want, s)
@@ -225,10 +226,10 @@ func TestPipelineAttackerProblem(t *testing.T) {
 	if got := cells(s, "1     Finished"); got != "✓ ✓ Prints the marker early" {
 		t.Errorf("no-information row: %q\n%s", got, s)
 	}
-	if got := cells(s, "C1"); got != "✓ ✗ - -" || !strings.Contains(s, "Problems (1)") {
+	if got := cells(s, "C1"); got != "✓ ✗ - -" || !strings.Contains(s, "Causes (1)") {
 		t.Errorf("Results:\n%s", s)
 	}
-	if !strings.Contains(s, "2 problems so far") {
+	if !strings.Contains(s, "2 causes so far") {
 		t.Errorf("Results does not count the Attacker's problem")
 	}
 	if p, x := l.hackCounts(); p != 2 || x != 1 {
@@ -442,30 +443,27 @@ func TestProblemsByHelpNeeded(t *testing.T) {
 		t.Fatal(err)
 	}
 	plain := plainReport(r, 100)
-	levels := map[string]string{"A1": "5 of 5: an Attacker given no information demonstrated it", "P4": "5 of 5", "P5": "4 of 5: an Attacker given only a hint demonstrated it",
-		"P8": "4 of 5", "P3": "3 of 5: an Attacker given full instructions demonstrated it", "P7": "3 of 5", "P2": "2 of 5: reproduced, no Attacker demonstrated it", "G1": "2 of 5", "P6": "2 of 5"}
-	at := -1
-	for _, id := range []string{"A1", "P4", "P5", "P8", "P3", "P7", "P2", "G1", "P6"} {
-		i := strings.Index(plain, "\n  "+id+"  ")
-		if i < at || !strings.HasPrefix(row(plain[i+1:], "Level"), "      Level             "+levels[id]) {
-			t.Fatalf("%s out of order or at the wrong level:\n%s", id, plain)
+	levels := map[string]string{"c4": "5", "c6": "5", "c7": "4", "c10": "4", "c5": "3", "c9": "3", "c2": "2", "c3": "2", "c8": "2"}
+	for n, cause := range []string{"c4", "c6", "c7", "c10", "c5", "c9", "c2", "c3", "c8"} {
+		i := strings.Index(plain, fmt.Sprintf("\n  Cause %d  %s\n", n+1, cause))
+		if i < 0 || !strings.Contains(row(plain[i+1:], "◆ level"), "◆ level      "+levels[cause]+" of 5") {
+			t.Fatalf("%s out of order or at the wrong level:\n%s", cause, plain)
 		}
-		at = i
 	}
-	if !strings.Contains(plain, "Count             9 problems") || strings.Contains(plain, "  P1  c1") || !strings.Contains(plain, "State             Suspected only") {
+	if !strings.Contains(plain, "Count             9 causes") || strings.Contains(plain, "  P1  c1") || !strings.Contains(plain, "State             Suspected only") {
 		t.Errorf("the lead:\n%s", plain)
 	}
 	// Results lists the same problems in the same order, and the lead among the other findings.
 	s := plainTab(r, results, "o")
-	at = -1
-	for _, id := range []string{"A1", "P4", "P5", "P8", "P3", "P7", "P2", "G1", "P6"} {
-		i := strings.Index(s, "  "+id+"\n")
+	at := -1
+	for n, cause := range []string{"c4", "c6", "c7", "c10", "c5", "c9", "c2", "c3", "c8"} {
+		i := strings.Index(s, fmt.Sprintf(" %d  %s ", n+1, cause))
 		if i < at {
-			t.Fatalf("%s out of order:\n%s", id, s)
+			t.Fatalf("%s out of order:\n%s", cause, s)
 		}
 		at = i
 	}
-	if !strings.Contains(s, "c1                                  Suspected only              Hack Inspector    P1") {
+	if !strings.Contains(oneLine(s), "c1 Suspected only Hack Inspector P1") {
 		t.Errorf("lead missing:\n%s", s)
 	}
 }
@@ -480,7 +478,7 @@ func TestPlainCountsOlderPendingProblemsAsLeads(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := plainReport(r, 120)
-	if !strings.Contains(s, "Count             1 problem\n") || strings.Contains(s, "  P1  pending") {
+	if !strings.Contains(s, "Count             1 cause\n") || strings.Contains(s, "  P1  pending") {
 		t.Errorf("older pending problem:\n%s", s)
 	}
 }
@@ -513,7 +511,7 @@ func TestLiveAttackerProblemFromAGuidedTry(t *testing.T) {
 	if got := cells(s, "1     Finished"); got != "✓ ✗ Prints the marker early" {
 		t.Errorf("no-information row: %q\n%s", got, s)
 	}
-	if r := liveKeys(t, l, at9("05:01"), 100, 0, "tab", "tab"); !strings.Contains(r, "2 problems so far") || !strings.Contains(row(r, "Prints the marker early"), "✓") {
+	if r := liveKeys(t, l, at9("05:01"), 100, 0, "tab", "tab"); !strings.Contains(r, "2 causes so far") || !strings.Contains(row(r, "Prints the marker early"), "✓") {
 		t.Errorf("Results:\n%s", r)
 	}
 }
@@ -538,7 +536,7 @@ func TestLiveLongErrorLeavesFindingsToResults(t *testing.T) {
 	if s := liveScreen(t, l, at9("01:00"), 100, 24); !strings.Contains(s, "seven") || strings.Contains(s, "Findings So Far") {
 		t.Errorf("failed tab:\n%s", s)
 	}
-	if s := liveKeys(t, l, at9("01:00"), 100, 0, "tab", "tab"); !strings.Contains(s, "Problems (2)") || !strings.Contains(s, "C2") {
+	if s := liveKeys(t, l, at9("01:00"), 100, 0, "tab", "tab"); !strings.Contains(s, "Causes (2)") || !strings.Contains(s, "C2") {
 		t.Errorf("Results:\n%s", s)
 	}
 }

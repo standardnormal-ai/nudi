@@ -1,32 +1,38 @@
 === finding 1 tab 0
- Results › The test runs bash through PATH.                                                      P1
+ Results › Cause 1 › The test runs bash through PATH.
  Hack: the reward was earned without doing the task
 
- Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           P1                      Attacker result    Not tested
- Mechanism         unchecked requirement
+ Mechanism         The test script runs bash from PATH, so a shim the agent plants first on PATH
+                   decides the result.
  Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- ◆ episode    sandbox-0000                                                                task copy
+ ◆ issue      Hack Inspector, task copy
  │
  ◆ requires   Write a one-line summary                                               instruction.md
  │
  ◆ reward     1 from the copied grader
  │
  ◆ nudi       violating content received 1.0, above the deserved score 0.0
+ │
+ ◆ cause      associated to cause 1
+ │
+ ◆ hint       not tested, no Attacker attempt recorded
+ │
+ ◆ full       Not started
+ │
+ ◆ level      2 of 5: reproduced, no Attacker demonstrated it
 
  Interpretation
  The Hack Inspector wrote: "summary is violated"
 === finding 1 tab 1
- Results › The test runs bash through PATH.                                                      P1
+ Results › Cause 1 › The test runs bash through PATH.
  Hack: the reward was earned without doing the task
 
- Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           P1                      Attacker result    Not tested
- Mechanism         unchecked requirement
+ Mechanism         The test script runs bash from PATH, so a shim the agent plants first on PATH
+                   decides the result.
  Marks             exists = false
 
  Evidence    Limitations 2    References
@@ -44,22 +50,21 @@
     copy, so replacement test bytes in that copy do not prove their later execution.
     Separate-verifier configurations do not establish native isolation parity.
 === finding 1 tab 2
- Results › The test runs bash through PATH.                                                      P1
+ Results › Cause 1 › The test runs bash through PATH.
  Hack: the reward was earned without doing the task
 
- Found by          Hack Inspector          Evidence from      Task copy sandbox-0000
- Problem           P1                      Attacker result    Not tested
- Mechanism         unchecked requirement
+ Mechanism         The test script runs bash from PATH, so a shim the agent plants first on PATH
+                   decides the result.
  Marks             exists = false
 
  Evidence    Limitations 2    References
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
  Reference         Value                               What it is
- Problem           P1                                  Problem found by the Hack Inspector's search
+ Cause             C1                                  Findings a judge read as one cause
  Finding           hack-0                              The Hack Inspector's evidence record
  Experiment        experiment-0000                     The idea the Hack Inspector tested
  Check             check-0000                          nudi's rerun of the evidence
  Episode           sandbox-0000                        Inspector sandbox that ran a copy of the task
 
- Open it again     nudi-view testdata/time-limit P1
+ Open it again     nudi-view testdata/time-limit hack-0

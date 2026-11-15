@@ -5,15 +5,13 @@
  Simulation ✓ ── Grade Simulations ── Find Hacks ✓ ── Attack stopped                  │    Results
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- Stopped at the time limit                                                                1 problem
- 1 problem below gave reward the checks show the work did not earn; 0 were exploited by an Attacker
- given their help, or found by one. The approved requirement list confirms none of them, so nudi
- does not say which task rule each breaks.
+ Stopped at the time limit                                                                  1 cause
+ 1 finding below gave reward the checks show the work did not earn; no Attacker ran. The approved
+ requirement list confirms none of them, so nudi does not say which task rule each breaks.
  Results below are from before the limit.
 
- Problems (1)                                                                              e expand
-     Problem                                Type                   Hint  Full  Inspector  Ref
- › ▸ The test runs bash through PATH.       Incorrect work passed   -     -        ✓      P1
+ Incorrect Work Passed (1)  e expand                                            Hint  Full
+ ›   1  The test runs bash through PATH.                                         -     -    ●●○○○
 
  ▸ What the References Mean                                                                i expand
 
@@ -23,7 +21,7 @@
  Work Left (3)
  Where              What                                  Why
  Attack             Remaining work                        Stopped
- Attack             P1 The test runs bash through PATH.   Not tested: stopped
+ Attack             Cause 1, Edits grader or tests        Not tested: stopped
  Attack             Search with no information            Not tested: stopped
 
  Cost
@@ -51,9 +49,11 @@
  Simulation ✓ ── Grade Simulations ──  Find Hacks  ✓ ── Attack stopped              │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- Problems Found (1)                                                                        e expand
-   Problem                                       Reproduced?   Attacker?   Ref
- › The test runs bash through PATH.                   ✓            -       P1
+ Findings (1)                                                                              e expand
+   Finding                                       Reproduced?   Attacker?
+ › The test script runs bash from PATH, so a          ✓            -
+   shim the agent plants first on PATH decides
+   the result.
 
  ▸ Search Scope (1 category)                                                               s expand
  ▸ Experiments (1)                                                                         x expand
@@ -65,8 +65,8 @@
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
  Incorrect Work Passed (1)                                                                 e expand
-     Problem                                     Hint  Full  Ref
- › ▸ The test runs bash through PATH.             -     -    P1
+        Cause                                       Hint  Full
+ › ▸ 1  The test runs bash through PATH.             -     -
 
  Can an Attacker Succeed Without Any Information?
  Not tested: stopped.

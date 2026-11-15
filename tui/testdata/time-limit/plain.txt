@@ -9,28 +9,40 @@ RUN
 
 RESULT
   Ending            Stopped at the time limit
-  Summary           1 problem below gave reward the checks show the work did not earn; 0 were
-                    exploited by an Attacker given their help, or found by one. The approved
-                    requirement list confirms none of them, so nudi does not say which task rule
-                    each breaks.
+  Summary           1 finding below gave reward the checks show the work did not earn; no Attacker
+                    ran. The approved requirement list confirms none of them, so nudi does not say
+                    which task rule each breaks.
                     Results below are from before the limit.
-  Count             1 problem
+  Count             1 cause
   Work left         3 items, listed under WORK LEFT
 
-PROBLEMS
-  P1  The test runs bash through PATH.
+CAUSES
+  Cause 1  The test runs bash through PATH.
+      Mechanism         The test script runs bash from PATH, so a shim the agent plants first on
+                        PATH decides the result.
       Type              Incorrect work passed
-      Level             2 of 5: reproduced, no Attacker demonstrated it
-      Found by          Hack Inspector
-      Evidence          hack-0, Hack Inspector, task copy, reward 1
-      Attacker          only a hint: not tested, no Attacker attempt recorded
-                        full instructions: not started
+      ◆ issue      Hack Inspector, task copy
+      │
+      ◆ requires   Write a one-line summary                                          instruction.md
+      │
+      ◆ reward     1 from the copied grader
+      │
+      ◆ nudi       violating content received 1.0, above the deserved score 0.0
+      │
+      ◆ cause      associated to cause 1
+      │
+      ◆ hint       not tested, no Attacker attempt recorded
+      │
+      ◆ full       Not started
+      │
+      ◆ level      2 of 5: reproduced, no Attacker demonstrated it
 
 EVIDENCE
-  1   unchecked requirement
+  1   The test script runs bash from PATH, so a shim the agent plants first on PATH decides the
+      result.
       Type              Hack: the reward was earned without doing the task
       Found by          Hack Inspector
-      Problem           P1
+      Cause             Cause 1
       Evidence from     Task copy sandbox-0000
       Reference         hack-0
       Limitations       2, shown by nudi-view testdata/time-limit 1
@@ -42,13 +54,13 @@ GRADER ACCURACY
   Not available     Grade Simulations not selected
 
 ATTACK ATTEMPTS
-  Attempt         Problem   Help                  Result                        Reward
-  -               P1        full instructions     not started                   -
+  Attempt   Aimed at                            Help               Result                Reward
+  -         Cause 1, Edits grader or tests      full instructions  not started           -
 
 WORK LEFT
   Attack              Remaining work
                       Stopped
-  Attack              P1 The test runs bash through PATH.
+  Attack              Cause 1, Edits grader or tests
                       Not tested: stopped
   Attack              Search with no information
                       Not tested: stopped
@@ -58,7 +70,7 @@ COST
   Spending cap                $5.00                 Covers model cost only
 
 NEXT
-  nudi-view testdata/time-limit P1
-      Open problem P1 with its evidence
+  nudi-view testdata/time-limit cause 1
+      Open Cause 1 with its evidence
   testdata/time-limit/report.json
       The full report, for programs

@@ -1,10 +1,11 @@
-usage: nudi-view [-h] [-v] [--follow] [--no-intro] RUN [N | PROBLEM]
+usage: nudi-view [-h] [-v] [--follow] [--no-intro] RUN [N | cause N | REF]
 
 open a nudi run in the terminal; in a pipe, print the whole report as plain text
 
 positional arguments:
   RUN                   a run directory that nudi send-nudis wrote
-  N | PROBLEM           open finding N, or the evidence of problem PROBLEM such as P1
+  N, cause N            open cause N, numbered as Results numbers them
+  REF                   open a cause or finding by its id in report.json, such as C1, hack-6 or A2
 
 options:
   -h, --help            show this help message and exit
@@ -18,13 +19,13 @@ commands:
 
 examples:
   nudi-view runs/git-multibranch            open the run
-  nudi-view runs/git-multibranch P1         open problem P1 with its evidence
-  nudi-view runs/git-multibranch 1          open finding 1 with its evidence
+  nudi-view runs/git-multibranch 1          open cause 1 with its findings
+  nudi-view runs/git-multibranch hack-6     open finding hack-6 with its evidence
   nudi-view --follow runs/git-multibranch   follow a run that is still going
 
 in a pipe:
-  nudi-view RUN prints every section of the report as plain text, nudi-view RUN N one finding;
-  with --follow it prints each event's line, then the report
+  nudi-view RUN prints every section of the report as plain text, nudi-view RUN N one cause and
+  nudi-view RUN REF one cause or finding; with --follow it prints each event's line, then the report
 
 related commands:
   nudi send-nudis TASK  run nudi on one or more Harbor tasks and write their reports

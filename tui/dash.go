@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"image/color"
+	"slices"
 	"strings"
 	"time"
 
@@ -319,4 +320,15 @@ func names(found []Finding, ids []string) []string {
 		out = append(out, id)
 	}
 	return out
+}
+
+// openCause opens the Results tab with cause id expanded and its row selected, as nudi-view RUN C1 does.
+func (m model) openCause(id string) model {
+	key := "cause " + id
+	m.open[fmt.Sprint(results)+key] = true
+	m = m.layout()
+	if i := slices.IndexFunc(m.items, func(it item) bool { return it.key == key }); i >= 0 {
+		m.sel[results] = i
+	}
+	return m.reveal()
 }

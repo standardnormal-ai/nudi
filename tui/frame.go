@@ -237,7 +237,7 @@ func helpPanel(w int, live bool) string {
 		unfinished = "partly: the phase ended with some results unresolved or some work not finished; the report says which. stopped: it ended before its work was done."
 	}
 	out := []string{spread(" "+fg(teal, bold("Help")), keyText("?")+" "+dim("or")+" "+keyText("Esc")+" "+dim("close"), w), "", heading("Symbols", ""),
-		row(greenStyle.Render("✓")+" "+redStyle.Render("✓"), "Yes. Green beside a phase that finished; red for a demonstrated problem."),
+		row(greenStyle.Render("✓")+" "+redStyle.Render("✓"), "Yes. Green beside a phase that finished; red for a demonstrated cause."),
 		row(dim("✗"), "No. Not shown in the tests that ran."),
 		row(dim("-"), untested),
 		row(yellowStyle.Render("?"), "Unresolved. The evidence did not decide it."),
@@ -246,7 +246,7 @@ func helpPanel(w int, live bool) string {
 		row(dim("▸ ▾"), toggle),
 	}
 	if !live {
-		out = append(out, row(fg(teal, "›"), "The selected row. Enter opens it."), row(fg(violet, "◆")+" "+dim("│"), "A step in an evidence timeline."))
+		out = append(out, row(fg(teal, "›"), "The selected row. Enter opens it."), row(fg(violet, "◆")+" "+dim("│"), "A step in a finding's timeline: who found it, the reward, nudi's check, its cause, each Attacker try, its level."))
 	}
 	out = append(out, row(dim("──"), "Joins the four phase tabs on the left, in the order they run."),
 		row(dim("[ ")+"Results"+dim(" ]"), "The Results tab, alone on the right. Tab moves between tabs."))
@@ -256,14 +256,14 @@ func helpPanel(w int, live bool) string {
 			row(dim("↓"), "More rows below. f opens them all."))
 	}
 	out = append(out, "", heading("Colours", ""),
-		row(redStyle.Render("red"), "A demonstrated problem, or a wrong grader decision."),
+		row(redStyle.Render("red"), "A demonstrated cause, or a wrong grader decision."),
 		row(greenStyle.Render("green"), "A finished phase, or a correct grader decision."),
 		row(yellowStyle.Render("amber"), "Work that needs attention: stopped, partly finished, not tested."),
 		row(dim("grey"), "Background information."),
 		"", heading("Words", ""),
 		row("Real episode", "A normal run of the task by an agent, scored by the task's own grader."),
 		row("Task copy", "A copy of the task package that an inspector ran on its own."),
-		row("Full instructions", "The Attacker was told the problem and how to use it. Full in short."),
+		row("Full instructions", "The Attacker was told the cause and how to use it. Full in short."),
 		row("Only a hint", "The Attacker was told only where to look. Hint in short."),
 		row("No information", "The Attacker got the task and was asked to find any hack. No info in short."))
 	if !live {

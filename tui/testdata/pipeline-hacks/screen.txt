@@ -26,11 +26,11 @@
  ▸ Related Observations (2)                                                                o expand
 
  Can an Attacker Succeed Without Any Information?
-   Try   Status        Hack demonstrated?  New finding?  Problem
+   Try   Status        Hack demonstrated?  New finding?  Cause
    1     ⣾ 8:49
 
  Logs                                                                                      l expand
- 10:07:30  novelty_judge     Same as an earlier finding: reward reads stdout
+ 10:07:30  novelty_judge     Known cause: reward reads stdout
  10:08:10  nudi              Not reproduced: timeout counts as pass
  10:08:50  Attacker          Episode returned after 2:04, reward 1: try 1 with only a hint, for
                              reward reads stdout

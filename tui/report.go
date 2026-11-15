@@ -42,7 +42,35 @@ type Report struct {
 	Stop        *Stop             `json:"stop"`         // nil for a run that ended on its own; a report without PhaseErrors predates it
 	PhaseErrors map[string]string `json:"phase_errors"` // the error each analysis raised
 	Ungrouped   []string          `json:"ungrouped"`    // evidenced inspector findings no problem holds
+	Causes      []Cause           `json:"causes"`       // from schema 3 on; load puts every report's findings under causes
+	Copies      []struct {
+		Error *string `json:"error"` // set when the evidence copy could not be made
+	} `json:"copies"`
 }
+
+// Cause is one thing the grader trusts, with the findings the judge read as it, best level first. Schema 4 writes its
+// findings; schema 3 writes the ids of the problems it groups, and load fills Findings from them.
+type Cause struct {
+	ID         string    `json:"id"`
+	Cause      string    `json:"cause"`
+	Level      int       `json:"level"`
+	Label      string    `json:"label"`
+	Attempts   *int      `json:"attempts"`
+	Reproduced *int      `json:"reproduced"`
+	Unrewarded *int      `json:"unrewarded"`
+	Findings   []Problem `json:"findings"`
+
+	// Schema 3 only.
+	Problems    []string `json:"problems"`     // its problems, best first
+	Readings    []string `json:"readings"`     // the no-hint exploit episodes the attack inspector read as it
+	NotAttacked []string `json:"not_attacked"` // its problems after the first that no Attacker attacked
+
+	key string // what its findings' CauseID names: its id, or for an older problem its place
+	N   int    // its number on the screens, 1 to the count, in the order of the Results tab
+}
+
+// name is how the screens name a cause, as Cause 1; report.json keeps its id.
+func (c Cause) name() string { return fmt.Sprintf("Cause %d", c.N) }
 
 // Stop is why a run stopped before its end.
 type Stop struct {
@@ -358,6 +386,12 @@ type Problem struct {
 	Help        *string        `json:"help"`        // the help an Attacker had and the problem it was written for
 	Unrewarded  *int           `json:"unrewarded"`  // attempts the grader paid nothing, which nudi did not inspect
 	Assessment  *int           `json:"assessment"`  // for an Attacker problem, the attack reading it comes from
+
+	// Schema 4 findings carry these.
+	Attacked  *bool  `json:"attacked"`  // false when no Attacker attempt got this finding's help
+	ReadAs    bool   `json:"read_as"`   // placed under its cause by an agent's reading, not first found as it
+	Mechanism string `json:"mechanism"` // the finding's own mechanism
+	CauseID   string `json:"-"`         // the cause load placed it under
 }
 
 // Condition is one condition an Attacker tried a problem under.
@@ -496,7 +530,8 @@ func load(dir string) (Report, error) {
 			}
 		}
 	}
-	shortRefs(&r)
+	reproducedValidWork(&r)
+	groupCauses(&r)
 	r.Dir = shown(dir)
 	return r, nil
 }
@@ -540,6 +575,137 @@ func shortRefs(r *Report) {
 			}
 		}
 	}
+}
+
+// reproducedValidWork restores what an Attacker finding of work the grader failed reproduced. From 0.5.0 such a finding
+// is no exploit, so the report lists no exploit entry for it; as in the Markdown report, it reproduced the candidate of
+// the try whose episode it was found in.
+func reproducedValidWork(r *Report) {
+	a := r.Attack
+	if a == nil || a.Exploits == nil {
+		return
+	}
+	for _, f := range a.Findings["evidenced"] {
+		listed := slices.ContainsFunc(slices.Concat(slices.Collect(maps.Values(a.Exploits))...), func(e *Exploit) bool {
+			return e != nil && e.Assessment != nil && f.Index != nil && *e.Assessment == *f.Index
+		})
+		if f.Index == nil || listed || f.SupersededBy != nil || f.Assessment.Outcome != "rejected_valid" || f.ExecutionScope != "native" {
+			continue
+		}
+		i := slices.IndexFunc(a.Attempts, func(at Attempt) bool { return deref(at.Episode) == f.Claim.Episode && at.Status == "evidenced_issue" })
+		if i >= 0 {
+			a.Exploits["reproduction"] = append(a.Exploits["reproduction"], &Exploit{Assessment: f.Index, Candidate: a.Attempts[i].Candidate, Sources: a.Attempts[i].Sources, Attempt: &i})
+		}
+	}
+}
+
+// groupCauses gives every report one model: causes holding findings, best level first. Schema 4 writes them. In
+// schema 3 a cause row groups its problems, and its readings, no-hint exploits judged to use it, become findings read
+// as it; earlier, and in schema 3 for a problem no row groups, each problem is a cause of its own, named by its id.
+// r.Attack.Problems then holds every finding but those read as a cause, in cause order, and the leads after them.
+func groupCauses(r *Report) {
+	if r.Attack == nil && r.SchemaVersion >= 4 && len(r.Causes) > 0 {
+		r.Attack = &Attack{}
+	}
+	if r.Attack == nil || r.SchemaVersion < 4 && r.Attack.Problems == nil {
+		r.Causes = nil
+		return
+	}
+	causes, all := []Cause{}, []Problem{}
+	if r.SchemaVersion >= 4 {
+		causes = r.Causes
+		for i, c := range causes {
+			causes[i].key = c.ID
+			for j, f := range c.Findings {
+				if j == 0 { // a cause the judge gave no sentence is named by its best finding's mechanism
+					causes[i].Cause = cmp.Or(c.Cause, f.Mechanism, f.Text)
+				}
+				f.CauseID, f.Cause, f.Finding = c.ID, cmp.Or(f.Mechanism, f.Text, c.Cause), cmp.Or(f.Finding, f.ID)
+				all = append(all, f)
+			}
+		}
+	} else {
+		byID, grouped, found := map[string]Problem{}, map[string]bool{}, r.findings()
+		for _, p := range r.Attack.Problems {
+			byID[p.ID] = p
+		}
+		for _, c := range r.Causes {
+			c.key = c.ID
+			for _, id := range c.Problems {
+				if p, ok := byID[id]; ok && id != "" {
+					p.CauseID, grouped[id] = c.ID, true
+					p.ReadAs = slices.Contains(c.NotAttacked, id)
+					all = append(all, p)
+				}
+			}
+			for _, episode := range c.Readings {
+				read := Problem{ID: episode, Finding: episode, Source: "Attacker", Level: 5, Label: c.Label, ReadAs: true, CauseID: c.ID}
+				if i := slices.IndexFunc(found, func(f Finding) bool { return f.Source == "attack" && f.Claim.Episode == episode }); i >= 0 {
+					read.Cause, read.Mechanism, read.Assessment = found[i].Claim.Mechanism, found[i].Claim.Mechanism, found[i].Index
+				}
+				all = append(all, read)
+			}
+			causes = append(causes, c)
+		}
+		for i, p := range problems(*r) {
+			if !grouped[p.ID] {
+				p.CauseID = fmt.Sprint("#", i)
+				all = append(all, p)
+				cause := p.Cause
+				if generic(cause) { // an older finding's generic mechanism names no cause
+					cause = shortName(found, p)
+				}
+				causes = append(causes, Cause{ID: p.ID, Cause: cause, Level: p.ladder(), Label: p.Label, key: p.CauseID})
+			}
+		}
+		all = append(all, slices.DeleteFunc(slices.Clone(r.Attack.Problems), func(p Problem) bool { return !p.lead() })...)
+	}
+	slices.SortStableFunc(causes, func(a, b Cause) int { return b.Level - a.Level })
+	r.Attack.Problems = all
+	shortRefs(r)
+	for i, c := range causes {
+		causes[i].Findings = slices.DeleteFunc(slices.Clone(r.Attack.Problems), func(p Problem) bool { return p.CauseID != c.key })
+		if strings.HasPrefix(c.key, "#") { // an older problem's cause takes its short ref
+			causes[i].ID = causes[i].Findings[0].ID
+		}
+	}
+	// Numbered in the order the Results tab lists them: by the heading of their type, best level first under each.
+	r.Causes = causes
+	names, groups := causeGroups(*r)
+	r.Causes = []Cause{}
+	for _, name := range names {
+		r.Causes = append(r.Causes, groups[name]...)
+	}
+	for i := range r.Causes {
+		r.Causes[i].N = i + 1
+	}
+	r.Attack.Problems = slices.DeleteFunc(r.Attack.Problems, Problem.judged)
+}
+
+// allFindings are the findings under every cause, those read as one included.
+func (r Report) allFindings() []Problem {
+	var out []Problem
+	for _, c := range r.Causes {
+		out = append(out, c.Findings...)
+	}
+	return out
+}
+
+// causeOf is the cause finding f is under.
+func (r Report) causeOf(f Problem) Cause {
+	i := slices.IndexFunc(r.Causes, func(c Cause) bool { return c.key == f.CauseID })
+	if i < 0 {
+		return Cause{}
+	}
+	return r.Causes[i]
+}
+
+// judged says whether p is a no-hint exploit the attack inspector judged to use its cause.
+func (p Problem) judged() bool { return p.ReadAs && p.Source == "Attacker" }
+
+// notAttackedAlone says whether p is an inspector finding read as its cause that no Attacker was given the help of.
+func (p Problem) notAttackedAlone() bool {
+	return p.ReadAs && !p.judged() && (p.Attacked == nil || !*p.Attacked)
 }
 
 // shown is the run folder's name for display only, cleaned as report text is; files are read through the name as given.
@@ -628,6 +794,9 @@ func (r Report) confirms(found []Finding, index *int) string {
 			}
 			if index == nil || *e.Assessment != *index {
 				continue
+			}
+			if kind == "discovery" && r.SchemaVersion >= 3 { // its candidate is the slot's, which it was not told
+				return word(exploitWords, kind)
 			}
 			ids := e.Sources
 			if len(ids) == 0 && e.Candidate != nil {
@@ -726,20 +895,18 @@ func evidenceOf(found []Finding, p Problem) int {
 	}) + 1
 }
 
-// topProblem is the problem highest on the list whose evidence is on the list of findings, and that evidence's number;
-// nil and 1 without one, as in reports whose problems lack exploited_with and help_needed.
-func (r Report) topProblem(found []Finding) (*Problem, int) {
+// topCause is the cause highest on the list whose evidence opens, or none: a cause of several findings opens its
+// findings. Reports whose problems lack exploited_with and help_needed name none.
+func (r Report) topCause(found []Finding) Cause {
 	if !r.helpNeeded() {
-		return nil, 1
+		return Cause{}
 	}
-	ps := slices.DeleteFunc(slices.Clone(r.Attack.Problems), Problem.lead)
-	slices.SortStableFunc(ps, byRung)
-	for _, p := range ps {
-		if n := evidenceOf(found, p); n > 0 && p.ID != "" {
-			return &p, n
+	for _, c := range r.Causes {
+		if c.ID != "" && (len(c.Findings) > 1 || len(c.Findings) == 1 && evidenceOf(found, c.Findings[0]) > 0) {
+			return c
 		}
 	}
-	return nil, 1
+	return Cause{}
 }
 
 // helpNeeded says whether the report's problems were formed during the run: every problem of schema 2, or one carrying
