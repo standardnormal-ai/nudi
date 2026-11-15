@@ -1020,9 +1020,9 @@ def test_valid_work_given_its_deserved_score_is_still_judged(tmp_path, monkeypat
     assert len(requests) == 1 and result.attempts[0].status != "no_evidenced_issue"
 
 
-def test_a_problem_whose_named_attempt_never_started_is_not_settled(tmp_path, monkeypatch, credentials):
+def test_a_finding_whose_named_attempt_never_started_is_not_settled(tmp_path, monkeypatch, credentials):
     """Native admission can fail before an attempt's episode is named and starts. The candidate stays untested, and an
-    attack-only report, which has no current inspector problem, names the judge's problem only as a lead."""
+    attack-only report, which has no current inspector finding, names the stored finding only as a lead."""
     async def refuse(*args):
         raise run_state.CapacityUnavailable("no native capacity")
 
@@ -1040,7 +1040,7 @@ def test_a_problem_whose_named_attempt_never_started_is_not_settled(tmp_path, mo
     built = report.build(run.config.output_dir, selected=["attack"])
     assert result.attempts[0].episode is None and not built["other_episodes"]["attacker"]
     assert built["attack"]["candidates"][0]["conditions"]["full"]["tested"] is False
-    assert report.problem_lines(built) == [f"- Leads, which no evidence confirmed: an older problem ({CAUSE_A.rstrip('.')})."]
+    assert report.cause_lines(built) == [f"- Leads, which no evidence confirmed: hack-0 ({CAUSE_A.rstrip('.')})."]
 
 
 def test_exact_duplicate_reproduction_marks_every_source(tmp_path, monkeypatch, credentials):
@@ -1750,6 +1750,8 @@ def test_attempt_failures_stay_distinct(tmp_path, monkeypatch, credentials, kind
             # The line names the agent that failed.
             lost = {"Attacker": "the Attacker failed to run in", "attack inspector": "the attack inspector failed on",
                     None: "an attack attempt failed in"}[result.attempts[0].failed]
+            if kind == "native_timeout":
+                lost = "the Attacker ran out of time without a reward in"
             assert built["answer"][0].startswith(f"Finished with gaps: {lost} {result.attempts[0].episode}")
 
     asyncio.run(main())
@@ -4247,7 +4249,7 @@ def test_a_no_hint_exploit_naming_a_known_cause_is_that_problem_and_a_new_senten
         readings[-1].claim.cause = cause
     attempts = [attack_module.AttackAttempt(level="none", number=number + 1, context="c", episode=item.claim.episode)
                 for number, item in enumerate(readings)]
-    assert [send.attributed(run, problems, attempt, item, {}) for attempt, item in zip(attempts, readings)] == ["P1", "A1", "A2"]
+    assert [send.attributed(problems, attempt, item, {}) for attempt, item in zip(attempts, readings)] == ["P1", "A1", "A2"]
     assert [(item.id, item.source, item.cause, item.members) for item in problems[1:]] == [
         ("A1", "Attacker", "The grader trusts the log.", ["0001-attacker"]),
         ("A2", "Attacker", "Output A is never checked, reading 2.", ["0002-attacker"])]

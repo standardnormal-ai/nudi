@@ -39,8 +39,9 @@ file, interface, or component to examine, which tells this finding apart from
 those in `found`. `hint_location` must not contain a solution or a reproduction recipe. Leave a field empty when you cannot supply it;
 neither proves the claim. A finding without either field gives the Attacker nothing
 to run.
-Also return `marks`, as defined above, and `cause`: one sentence on what the grader
-trusts that this finding uses, never how to cheat it.
+Also return `marks`, as defined above, and `cause`: one sentence on the one thing the
+grader trusts that this finding cannot work without; not how the cheat gets in, and no
+second thing.
 
 A setup probe's check reads the grading sandbox's state copies in place: the
 `verification_start` copy shows what setup left before grading, the `grading_end`

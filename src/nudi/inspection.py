@@ -249,9 +249,10 @@ class ProviderRefusal(InspectorRefusal):
 
 
 # The `cause` field: an inspector finding's own sentence, or the attack inspector's reading of a no-hint exploit.
-CAUSE_FIELD = ("For a finding: one sentence on what the grader trusts that this finding uses, never how to cheat it.",
-               "For a no-hint exploit: the id of the entry in `known_causes` it used, or one sentence on what the grader trusts "
-               "when none fits, never how to cheat it.")
+CAUSE_FIELD = ("For a finding: one sentence on the one thing the grader trusts that this finding cannot work without; not how "
+               "the cheat gets in, and no second thing.",
+               "For a no-hint exploit: the id of the entry in `known_causes` it used, or, when none fits, one sentence on the one "
+               "thing the grader trusts that it cannot work without; not how the cheat gets in, and no second thing.")
 
 
 def claim_model(job: str) -> type[BaseModel]:
@@ -1516,6 +1517,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
         try:
             target = (request or {}).get("target_candidate") or {}
             event(run, "session_start", f"{mode} inspector {name} started", inspector=mode, session=name, category=category, episode=episode,
+                  **({"candidate": target["id"]} if mode == "attack" and target.get("id") else {}),
                   **({"problem": target["problem"]} if mode == "attack" and target.get("problem") else {}))
             async with investigation(run, name, prompt, selected, fork, workspace) as session:
                 session.open = lambda: leads(state, category)

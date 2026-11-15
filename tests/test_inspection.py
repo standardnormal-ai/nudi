@@ -1105,7 +1105,7 @@ def test_inference_and_tool_failures_remain_distinct(tmp_path, monkeypatch, cred
             built = report_module.build(run.config.output_dir, selected=["hack"])
             assert (built["status"], built["unfinished"], built["unresolved"]) == ("partial", {"hack": "partial"}, [])
             # It ran, so its line says what failed rather than that the hack inspector failed.
-            assert built["answer"][0] == ("Finished with gaps: the hack inspector's broad session failed (inference_failure). "
+            assert built["answer"][0] == ("Finished with gaps: one hack inspector broad search stopped early because a model call failed. "
                                           "Results below are what was found.")
     asyncio.run(main())
 
@@ -3156,7 +3156,8 @@ def test_another_failure_in_the_session_does_not_hide_a_failed_check(tmp_path, m
     assert (built["status"], built["unfinished"], built["unresolved"]) == ("complete", {}, ["hack"])
     assert any(warning.startswith(f"hack inspector focused attempt 1 (package_oracles) {status}") for warning in built["warnings"])
     headline = built["answer"][0]
-    assert headline.startswith("Finished, but work was lost: ") and f"focused session of package_oracles failed ({status})" in headline
+    assert headline.startswith("Finished, but work was lost: ")
+    assert "search (package oracles) stopped early because the model returned an unusable answer" in headline
     assert headline.endswith("Evidence stayed unresolved in the hack inspector, so the run may miss more.")
 
 
@@ -7860,7 +7861,7 @@ def test_each_claim_states_its_cause_and_a_no_hint_attack_claim_names_a_known_on
     for job in ("hack", "grader"):
         schema = inspection_module.claim_model(job).model_json_schema()
         assert schema["properties"]["cause"]["description"] == inspection_module.CAUSE_FIELD[0]
-        assert "`cause`: one sentence on what the grader" in " ".join(inspection_module.inspector_prompt(job).split())
+        assert "`cause`: one sentence on the one thing the grader trusts" in " ".join(inspection_module.inspector_prompt(job).split())
     attack = inspection_module.claim_model("attack").model_json_schema()
     assert "known_causes" in attack["properties"]["cause"]["description"]
     prompt = " ".join(inspection_module.inspector_prompt("attack").split())

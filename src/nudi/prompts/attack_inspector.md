@@ -30,4 +30,5 @@ by a reading, and got less than it deserves.
 
 `known_causes`, given when the Attacker had no hint, lists what the grader is known to
 trust, each with its id. For an exploit, set the claim's `cause` to the id of the one
-it used, or to one new sentence on what the grader trusts when none fits.
+it used, or, when none fits, to one new sentence on the one thing the grader trusts that
+the exploit cannot work without; not how the cheat gets in, and no second thing.

@@ -1239,7 +1239,7 @@ def test_one_reading_for_several_approved_requirements_supports_none_of_them(tmp
     reading.check.output = json.dumps({"observations": {"sorted": True, "summary": False}})
     run.label(name, "rejected_valid", reading)
     built = run.report()
-    assert [(item["type"], item["label"], item["reason"]) for item in built["problems"]] == [
+    assert [(item["type"], item["label"], item["reason"]) for cause in built["causes"] for item in cause["findings"]] == [
         (None, "Work the grader failed", inspection_module.NOT_ALL)]
     assert built["metrics"]["episodes"][name]["completion"] == "unknown"
     assert [group["fn"] for group in built["metrics"]["confusion"]] in ([], [0])
@@ -1254,6 +1254,6 @@ def test_findings_and_metrics_read_an_episodes_completion_from_the_same_readings
               checked(name, "c2", "summary", "supported", basis=basis("supported", ["sorted", "summary"], ["c1", "c2"], decision=RULE)))
     built = run.report()
     assert [group["fn"] for group in built["metrics"]["confusion"]] == [1]
-    assert [(item["type"], item["label"], item["reason"]) for item in built["problems"]] == [
+    assert [(item["type"], item["label"], item["reason"]) for cause in built["causes"] for item in cause["findings"]] == [
         ("false_negative", "Correct work failed", None)]
     assert built["answer"][1] == "The grader misjudges work."

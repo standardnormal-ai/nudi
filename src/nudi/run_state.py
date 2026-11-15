@@ -226,7 +226,7 @@ class Run:
     last_line: float = field(default_factory=time.monotonic)
     """When the last progress line was logged, a `time.monotonic()` value."""
     jobs: dict[str, tuple[str, str | None]] = field(default_factory=dict)
-    """Inspector sessions and Attacker episodes between their start and end events: each one's job and problem."""
+    """Inspector sessions and Attacker episodes between their start and end events: each one's job and candidate."""
     time_limit: tuple[float, float] | None = None
     """The run's time limit while it runs: its deadline on the event loop's clock and its length in seconds."""
     publish: Callable[[], None] | None = None
@@ -397,7 +397,7 @@ def event(run, kind: str, message: str, severity: int | None = logging.INFO, /, 
         # The open jobs change with the log, in its order; the heartbeat reads them under the same lock.
         key = fields.get("session") or fields.get("episode")
         if kind in ("session_start", "attempt_start"):
-            run.jobs[key] = ("Attacker" if kind == "attempt_start" else f"{fields['inspector']} inspector session", fields.get("problem"))
+            run.jobs[key] = ("Attacker" if kind == "attempt_start" else f"{fields['inspector']} inspector session", fields.get("candidate"))
         elif kind in ("session_end", "attempt_end", "attempt_result"):
             run.jobs.pop(key, None)
         if severity is not None:

@@ -648,9 +648,10 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
         finally:
             # The saved status: `attempt_end` comes before the attack inspector.
             read = next((item.problem for item in result.findings if item.attempt == index and item.problem), None)
-            said = {"evidenced_issue": f"{OUTCOMES['rejected_valid']} on {attempt.problem}" if valid_work
-                    else f"an exploit with no extra information, its cause read as {read}'s" if level == "none" and read
-                    else f"an exploit with help written for {attempt.problem or identity}" if level != "none" else "an exploit",
+            read = next((cause.id for cause in result.causes if read in cause.problems), None)
+            said = {"evidenced_issue": f"{OUTCOMES['rejected_valid']} on {identity}" if valid_work
+                    else f"an exploit with no extra information, of cause {read}" if level == "none" and read
+                    else f"an exploit with help written for {identity}" if level != "none" else "an exploit",
                     "no_evidenced_issue": "nothing confirmed" if valid_work else "no exploit confirmed",
                     "unknown": f"unclear: {attempt.error or 'no reading decided whether the work is invalid'}",
                     "no_reward": "the grader wrote no reward",

@@ -10,6 +10,7 @@
 </p>
 
 `nudi` is an open source CLI tool for red-teaming and simulating RL environments before training. It uses agent swarms to find flaws in grading. And answers how likely they are.
+Currently works with non-rubric tasks.
 
 This readme is written by humans, for humans.
 The boring stuff for your coding agents is here:  
