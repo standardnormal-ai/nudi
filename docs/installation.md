@@ -15,14 +15,14 @@ A run needs either a running Docker daemon or a Modal account for its sandboxes.
 
 A run's first line states what it found: the backend, the CPUs and memory, the free space, the spending cap and the concurrency.
 
-## Install v0.5.0
+## Install v0.5.1
 
 Install the release tag in a virtual environment:
 
 ```sh
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install "nudi @ git+https://github.com/standardnormal-ai/nudi.git@v0.5.0"
+python -m pip install "nudi @ git+https://github.com/standardnormal-ai/nudi.git@v0.5.1"
 nudi --version
 nudi --help
 ```
@@ -60,7 +60,7 @@ Docker needs enough CPU and memory for the task's declared resources and inspect
 ## Optional Modal backend
 
 ```sh
-python -m pip install "nudi[modal] @ git+https://github.com/standardnormal-ai/nudi.git@v0.5.0"
+python -m pip install "nudi[modal] @ git+https://github.com/standardnormal-ai/nudi.git@v0.5.1"
 modal setup
 ```
 

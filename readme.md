@@ -2,7 +2,7 @@
   <img src="docs/assets/nudi-startup.png" alt="nudi startup animation" width="683">
 </p>
 <p align="center">
-  <a href="pyproject.toml"><img src="https://img.shields.io/badge/version-0.5.0-555?style=flat" alt="Version"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/version-0.5.1-555?style=flat" alt="Version"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.12-3776AB?style=flat" alt="Python"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-555?style=flat" alt="License: MIT"></a>
   <a href="docs/usage.md#run-an-analysis"><img src="https://img.shields.io/badge/Integration-Harbor-171717?style=flat" alt="Integration: Harbor"></a>
@@ -34,6 +34,49 @@ We try to answer two questions about a selected (harbor format) environment.
 		- ... compute error rates: how often grader would make flawed decisions in practice?
 		- ... find new overseen flaws: coming from natural behavior, instead of directed exploit hunting.
 
+### Featuring
+
+- Agent-first CLI & Python Library
+- TUI for humans, with live progress
+- Harbor Environments: Ran through native Harbor
+- Modal Sandboxes: Built for cloud sandboxes.
+- Parallelization: Parallel sandboxes, automatically scheduled and (if ran locally) constrained by available CPU/RAM. (i.e. inspector on flaw B would run in parallel with attackers of flaw A.)
+- Reports with rewards, traces, and evidence for each finding (optimized for coding agents)
+- Bring your own model... inference through any OpenAI-compatible API
+- Everything configurable
+	- What to run (full analysis vs. only pre-hacking, vs. only simulations.)
+	- Intensity of search: number of simulations, tries per flaw, etc.
+	- Spending cap & Time limit
+
+### Soon to be released
+
+- Concurrent inspection of multiple environments.
+- Outer loop for autonomous patching: Find flaws, patch them, test again. Terminate with a patch report, when no new flaws found.
+- More environment framework integrations: [verifiers](https://github.com/PrimeIntellect-ai/verifiers), [verl](https://github.com/XiaomiMiMo/verl), [hud](https://github.com/hud-evals/hud-python)
+
+## How does it compare to human-led flaw finding?
+
+It's not easy to evaluate the autonomous swarm on finding loopholes in frontier environments. There simply are no independent benchmarks yet. 
+However, Terminal Bench 4.0.0 has been extensively investigated by Epoch AI (common issues sourced by community) and Preference Model (human-led investigations). We use the joint list of unique flaws - found by either human researchers or community - as target for nudi. 
+
+Over 4 randomly sampled tasks, nudi has shown to detect 80% of the flaws. Moreover, it found a variety of issues that have been unreported thus far... nearly doubling the amount of unique flaws. 
+
+![Evaluation on Terminal Bench 4.0.0](docs/nudi-vs-published.png)
+
+## "Agentic Uno Reverse Card" inspired by real-life Pokemon
+
+**Nudibranchs** are sea slugs that evolution has formed into some of the most aesthetically appealing water creatures. But most importantly, they evolved into *weapon theft (kleptocnidy)*.
+
+So, they share their habitat with some jellyfish species. Those species prey approaching fish by stinging them with nematocysts; which are poison capsules, that explode inside the enemies body.
+
+Nudibranchs like *Glaucus atlanticus* eat (parts of) the jellyfish. They are able to swallow unexploded nematocysts, and repurpose the arsenal as their own shield.
+
+![Glaucus atlanticus](docs/assets/glaucus.jpg)
+
+
+
+
+## Conceptual Details behind nudi
 ### Pre-Hacking
 
 <img src="docs/diagrams/hacks.svg" alt="Hack inspection and attacker disclosure levels" width="516">
@@ -99,35 +142,6 @@ The labels are then used to compute FDR and FNR.
 | **False negative rate** [FN/(TP+FN)]  | Of valid runs, how many were rejected?                           | Correct submissions are not reward ($\Rightarrow$ indirectly inviting reward hacking, when agent gets fed up with impossible task) |
 
 (For now, it's only compatible with pass/fail graders. Rubric based environments are not covered by this analysis yet.)
-### Featuring
-
-- Agent-first CLI & Python Library
-- TUI for humans, with live progress
-- Harbor Environments: Ran through native Harbor
-- Modal Sandboxes: Built for cloud sandboxes.
-- Parallelization: Parallel sandboxes, automatically scheduled and (if ran locally) constrained by available CPU/RAM. (i.e. inspector on flaw B would run in parallel with attackers of flaw A.)
-- Reports with rewards, traces, and evidence for each finding (optimized for coding agents)
-- Bring your own model... inference through any OpenAI-compatible API
-- Everything configurable
-	- What to run (full analysis vs. only pre-hacking, vs. only simulations.)
-	- Intensity of search: number of simulations, tries per flaw, etc.
-	- Spending cap & Time limit
-
-### Soon to be released
-
-- Concurrent inspection of multiple environments.
-- Outer loop for autonomous patching: Find flaws, patch them, test again. Terminate with a patch report, when no new flaws found.
-- More environment framework integrations: [verifiers](https://github.com/PrimeIntellect-ai/verifiers), [verl](https://github.com/XiaomiMiMo/verl), [hud](https://github.com/hud-evals/hud-python)
-
-## "Agentic Uno Reverse Card" inspired by real-life Pokemon
-
-**Nudibranchs** are sea slugs that evolution has formed into some of the most aesthetically appealing water creatures. But most importantly, they evolved into *weapon theft (kleptocnidy)*.
-
-So, they share their habitat with some jellyfish species. Those species prey approaching fish by stinging them with nematocysts; which are poison capsules, that explode inside the enemies body.
-
-Nudibranchs like *Glaucus atlanticus* eat (parts of) the jellyfish. They are able to swallow unexploded nematocysts, and repurpose the arsenal as their own shield.
-
-![Glaucus atlanticus](docs/assets/glaucus.jpg)
 
 ## Citation
 
