@@ -564,6 +564,54 @@ def test_a_sandbox_command_whose_output_is_not_utf8_returns_it_with_replacement_
     assert (result["output"], result["exit_code"], result["error"]) == ("half \ufffd\n", 0, None)
 
 
+def refusing(aio, times):
+    """Modal SDK call `aio`, refused `times` times for the credential, as Modal can refuse it mid-run."""
+    calls = []
+
+    async def call(*args, **kwargs):
+        calls.append(args)
+        if len(calls) <= times:
+            raise modal_sdk.exception.AuthError("refused")
+        return await aio.aio(*args, **kwargs)
+
+    return Aio(call)
+
+
+@needs_modal
+def test_a_modal_copy_and_a_refused_command_start_are_tried_again_and_a_started_command_is_not(tmp_path, monkeypatch):
+    """A copy writes the same file again, and Modal refuses a command before it starts, so both are tried again with a
+    line each. A refusal after the start could follow the command's effects, so that command fails."""
+    monkeypatch.setattr(run_state, "RETRY_WAITS", (0, 0, 0))
+    modal = Modal(monkeypatch)
+    run = modal_run(tmp_path, monkeypatch)
+
+    async def main():
+        async with inspector_sandbox.sandbox(run, "probe") as box:
+            sandbox, = modal.created
+            # Harbor tries a copy twice itself.
+            sandbox.filesystem.copy_from_local = refusing(sandbox.filesystem.copy_from_local, 2)
+            await box.upload(b"data", "/tmp/copied")
+            sandbox.exec = refusing(sandbox.exec, 1)
+            await box.exec(["echo", "nudi-started"], runtime=None)
+            started = sum("nudi-started" in command for command in sandbox.commands)
+
+            async def output_refused(*argv, **kwargs):
+                ran.append(argv)
+                return SimpleNamespace(stdout=SimpleNamespace(read=refusing(Aio(value), 1)))
+
+            ran, sandbox.exec = [], Aio(output_refused)
+            with pytest.raises(modal_env.ModalFailure, match="exec failed: AuthError"):
+                await box.exec(["echo", "nudi-ran"], runtime=None)
+            return sandbox.copies, started, len(ran)
+
+    copied, started, ran = asyncio.run(main())
+    assert "/tmp/copied" in copied and (started, ran) == (1, 1)
+    lines = [json.loads(line)["text"].split(" ", 2)[2] for line in (run.config.output_dir / "events.jsonl").read_text().splitlines()
+             if json.loads(line)["kind"] == "retry"]
+    assert lines == ["Modal upload failed with AuthError; trying again in 0 s",
+                     "Modal exec failed to start with AuthError; trying again in 0 s"]
+
+
 def test_a_sandbox_killed_for_memory_keeps_its_exit_code():
     """Harbor reads exit 137 as out of memory; its text holds only the requested memory, so nudi names the cause and
     the exit code, not only the exception type."""

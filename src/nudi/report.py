@@ -20,7 +20,7 @@ from pathlib import Path
 
 from nudi.assessment import Evidence, Ungrounded, captured_object, classify_probe, conclusions, satisfied
 from nudi.attack import SESSION_FAILURES, AttackAttempt, AttackFinding, AttackResult, Problem
-from nudi.inspection import (HACK_CATEGORIES, InspectionResult, confirmed, correctness, evidenced, marked, measured_observations, replaced, support,
+from nudi.inspection import (HACK_CATEGORIES, InspectionResult, evidenced, marked, measured_observations, replaced,
                              scope as inspection_scope)
 from nudi.records import (CANCELLED, PROVIDER_REPORTED, Assessment, CallRecord, EpisodeResult, MetricBasis, Observation, RunRecord,
                           write_private)
@@ -62,7 +62,7 @@ FLAG_TEXT = {
 }
 LOCAL_LIMIT = (
     "Local over-credit and under-credit labels compare one native reward with one deserved score. "
-    "They are not binary FP/FN labels, and legitimate partial credit is not a false pass."
+    "They are not binary FP/FN labels, and legitimate credit for part of the work is not a false pass."
 )
 METRIC_LIMIT = (
     "F1, AUROC and the false discovery and false negative rates compare native decisions and scores with "
@@ -71,7 +71,7 @@ METRIC_LIMIT = (
     "the grader inspector's interpretation, not independently validated."
 )
 NON_BINARY = ("Non-binary rewards are currently not supported in grader agreement analysis. "
-              "Wrong partial scores were not searched; that search is not supported yet.")
+              "Wrong non-binary scores were not searched; that search is not supported yet.")
 UNKNOWN_REWARD = "Reward type could not be established; grader agreement analysis currently supports binary rewards only."
 AGREEMENT_LIMIT = (
     "Grader agreement covers binary rewards only. False discovery rate is FP / (TP + FP) and false negative rate is "
@@ -141,25 +141,23 @@ def build(run_dir: Path, secrets=(), selected=None, stop=None, running=False) ->
         warnings.append(f"{record.cancelled_calls} model calls were cancelled in flight, so their usage is unknown; the known cost excludes them")
 
     # Execution apart from evidence: a step that failed, stopped or never ran is unfinished; one that ran to its end with
-    # a status other than complete left evidence unresolved, which is its result and keeps the run complete. A partial step
+    # a status other than complete left evidence unresolved, which is its result and keeps the run complete. An unresolved step
     # with an attempt that failed to execute and that no later attempt of the same work recovered did not run to its end.
-    failed = {*record.failed_phases, *(name for name, result in loaded.items() if result.status == "partial" and unrecovered(result))}
+    failed = {*record.failed_phases, *(name for name, result in loaded.items() if result.status == "unresolved" and unrecovered(result))}
     unfinished = {name: status for name, status in analyses.items()
-                  if name in failed or not present[name] or status not in ("complete", "partial", "not run")}
+                  if name in failed or not present[name] or status not in ("complete", "unresolved", "not run")}
     results = {name: episode(run_dir, name) for name in record.episodes}
     # Each inspector finding by its candidate id, `hack-N` or `grader-N`.
     inspections = {f"{mode}_inspector": inspection(mode, loaded[mode], warnings) for mode in ("grader", "hack") if mode in loaded}
     now = {f"{mode}-{item['index']}" for mode in ("grader", "hack") if mode in loaded for item in current(inspections[f"{mode}_inspector"])}
     pool = record.simulation.episodes if record.simulation else []
-    # Each ordinary episode's readings, which decide its completion for its findings' words as for the metrics.
-    together = {name: ordinary_assessments(name, loaded["grader"].assessments) for name in pool} if "grader" in loaded else {}
     attacked = counted(loaded["attack"]) if "attack" in loaded else None
     shown = cases({name: item for mode in ("hack", "grader") if mode in loaded for index, item in enumerate(loaded[mode].assessments)
-                   if (name := f"{mode}-{index}") in now}, attacked, record, together)
+                   if (name := f"{mode}-{index}") in now}, attacked, record)
     report = {
         "schema_version": SCHEMA_VERSION,
-        "status": "stopped" if stop or record.stop_reason else "running" if running else ("partial" if failed else "time_limit") if record.time_limit_reached
-                  else "partial" if unfinished else "complete",
+        "status": "stopped" if stop or record.stop_reason else "running" if running else ("unfinished" if failed else "time_limit") if record.time_limit_reached
+                  else "unfinished" if unfinished else "complete",
         "unfinished": unfinished,
         "unresolved": [name for name, status in analyses.items() if status != "complete" and name not in unfinished],
         "elapsed": (datetime.fromisoformat(record.ended_at) - datetime.fromisoformat(record.started_at)).total_seconds()
@@ -196,7 +194,7 @@ def build(run_dir: Path, secrets=(), selected=None, stop=None, running=False) ->
             item["cause"] = judged.get(index)
     if "grader" in loaded:
         report["labels"] = labels(pool, loaded["grader"], warnings)
-        report["metrics"] = metrics(run_dir, pool, results, loaded["grader"], warnings, record.requirements)
+        report["metrics"] = metrics(run_dir, pool, results, loaded["grader"], warnings)
         notes += [LOCAL_LIMIT, METRIC_LIMIT, AGREEMENT_LIMIT]
     if report["ordinary"]:
         # After labels and metrics, which the flags cite.
@@ -347,7 +345,7 @@ def configuration_section(record: RunRecord, results: dict) -> dict:
             "unknown_reasons": unknown_reasons(record.calls), "cancelled_calls": record.cancelled_calls, "cost_by_job": cost_by_job(record),
             "refused_calls": record.refused_calls, "capacity": record.capacity.model_dump(mode="json"),
             "backend": record.backend, "modal_cost": modal_cost(record),
-            "cost_map": record.cost_map, "limitations": record.limitations, "approved_requirements": len(record.requirements or [])}
+            "cost_map": record.cost_map, "limitations": record.limitations}
 
 
 def wilson(count: int, total: int) -> list[float]:
@@ -639,7 +637,7 @@ def ordinary_assessments(name: str, assessments: list[Assessment]) -> list[Asses
 def reference(name: str, assessments: list[Assessment], run_dir: Path) -> tuple[str, list[str], list[str]]:
     """The episode's completion reference: complete, incomplete or unknown, with reasons and
     the cited requirements no check reads, each of which keeps completion unknown.
-    Reward never supplies it, and legitimate partial credit alone is neither label.
+    Reward never supplies it, and legitimate credit for part of the work alone is neither label.
     Only the episode's own checked assessments supply a basis or an observation; a basis
     without a check still keeps complete unknown until its task requirements are observed satisfied."""
     own = ordinary_assessments(name, assessments)
@@ -755,26 +753,17 @@ def native_value(result: EpisodeResult | None, key: str) -> tuple[float | None, 
     return value, []
 
 
-# Why an episode's completion is unknown when its readings of the approved requirements read otherwise.
-DISAGREE = "completeness is unknown: the readings of the approved requirements disagree with it"
-
-
-def metrics(run_dir: Path, pool: list[str], results: dict, result: InspectionResult, warnings: list[str],
-            requirements: list | None = None) -> dict:
+def metrics(run_dir: Path, pool: list[str], results: dict, result: InspectionResult, warnings: list[str]) -> dict:
     """Grader agreement per configuration and native decision rule under an established binary
     reward contract: TP/FP/FN/TN, false discovery and false negative rates and F1 over the same
     eligible episodes, each counted once, beside the rule's native pass rate with its 95% Wilson interval; plus AUROC and
     coverage of the ordinary pool. Local discrepancy labels never become matrix cells, and an episode whose completion is
-    unknown, also one with a presumed label, is in no cell. A completion counts only when the episode's own readings
-    of the approved `requirements` agree with it: each read supported for complete work, one read violated for incomplete."""
+    unknown, also one with a presumed label, is in no cell."""
     episodes, configs, rules, valid, auroc = {}, {}, {}, {}, {}
     for name in pool:
         own = ordinary_assessments(name, result.assessments)
         bases = [assessment.claim.basis for assessment in own if assessment.claim.basis is not None]
         completion, completion_reasons, unobserved = reference(name, result.assessments, run_dir)
-        read, why = correctness(own, requirements)
-        if completion != "unknown" and read != completion:
-            completion, completion_reasons = "unknown", completion_reasons + [why or DISAGREE]
         entry = episodes[name] = {"completion": completion, "completion_reasons": completion_reasons, "unobserved": unobserved,
                                   "decision": None, "score": None}
         config = json.dumps(configuration(results[name]), sort_keys=True) if results.get(name) else ""
@@ -1127,10 +1116,10 @@ VALID_WORK = {3: ", reproduced by an Attacker with full instructions", 4: ", rep
               5: ", reproduced by an Attacker with no extra information"}
 
 
-def ladder(level: int, valid_work: bool = False, strong: bool = True) -> dict:
-    """A case's level, 2 to 5, and its label. A case of work the grader fails keeps its level and is labelled "Correct
-    work failed" only when the approved list confirms the work correct, else "Work the grader failed"."""
-    label = ("Correct work failed" if strong else "Work the grader failed") + VALID_WORK.get(level, "") if valid_work else LADDER[level]
+def ladder(level: int, valid_work: bool = False) -> dict:
+    """A case's level, 2 to 5, and its label. A case of correct work the grader fails keeps its level and is labelled
+    "Correct work failed"."""
+    label = "Correct work failed" + VALID_WORK.get(level, "") if valid_work else LADDER[level]
     return {"level": level, "label": label}
 
 
@@ -1177,30 +1166,22 @@ def kind_of(outcome: str, source: str) -> str:
     return "false_negative" if outcome == "rejected_valid" else "false_positive" if source == "grader inspector" else "hack"
 
 
-def case(name: str, source: str, item: Assessment, record: RunRecord, others: list[Assessment] = ()) -> dict:
-    """The facts a reader acts on for one problem: its reading's outcome, scope, reward and check, its marks with the
-    values that check measured, the approved requirement it reads violated and what it leaves open. Its type, and its
-    strong words, only when the approved list confirms them, with the `others` readings of its episode; work the grader
-    failed without that says why completeness is unknown."""
-    strong = confirmed(item, record.requirements, others)
-    violated = support([item], {row.observation for row in record.requirements or []})
-    return {"id": name, "source": source, "type": kind_of(item.outcome, source) if strong else None, "mechanism": oneline(item.claim.mechanism),
+def case(name: str, source: str, item: Assessment) -> dict:
+    """The facts a reader acts on for one problem: its type, its reading's outcome, scope, reward and check, its marks
+    with the values that check measured and what it leaves open."""
+    return {"id": name, "source": source, "type": kind_of(item.outcome, source), "mechanism": oneline(item.claim.mechanism),
             "outcome": item.outcome, "scope": item.execution_scope, "reward": item.reward, "check": item.claim.check,
-            "marks": marked(item), "unresolved": item.claim.unresolved, "family": item.claim.family,
-            "reason": None if strong or item.outcome != "rejected_valid" else correctness([item, *others], record.requirements)[1],
-            "requirement": next((row.text for row in record.requirements or [] if "violated" in violated.get(row.observation, ())), None)}
+            "marks": marked(item), "unresolved": item.claim.unresolved, "family": item.claim.family}
 
 
-def cases(inspected: dict[str, Assessment], result: AttackResult | None, record: RunRecord,
-          together: dict[str, list[Assessment]] | None = None) -> list[dict]:
+def cases(inspected: dict[str, Assessment], result: AttackResult | None, record: RunRecord) -> list[dict]:
     """nudi's findings, each with its own level and counts and the stored problem that holds it, the record's internal id
     `causes` groups by. Each current evidenced inspector reading in `inspected`, by its finding id, is at the least help
     under which an Attacker given its help made an exploit, else at 2. Each no-hint exploit made into an Attacker problem,
     its cause new as its attack inspector read it, is a finding at 5; one read as a known problem's cause is `read`, at 5,
     in that problem. Any other Attacker exploit, of help no shown finding gave, of no read cause, or of the outcome its
     attempt did not seek, is a finding of its own at its help's level, in the problem whose finding gave that help.
-    `result` is read as `counted` reads it. `together` holds each ordinary episode's readings, with which an inspector
-    reading of it is confirmed, as the metrics decide that episode's completion."""
+    `result` is read as `counted` reads it."""
     judged = result.problems if result else []
 
     def held(problem: Problem | None, name: str) -> dict:
@@ -1217,9 +1198,7 @@ def cases(inspected: dict[str, Assessment], result: AttackResult | None, record:
         reproduced = [attempt for attempt in given({name}, result, record) if attempt.status == "evidenced_issue"
                       and exploit_of(result, attempt, (item.outcome,)) is not None] if result else []
         level = max((LEVELS[attempt.level] for attempt in reproduced), default=2)
-        others = (together or {}).get(item.claim.episode, [])
-        found.append(case(name, f"{name.split('-')[0]} inspector", item, record, others) | ladder(
-            level, item.outcome == "rejected_valid", confirmed(item, record.requirements, others)) | {
+        found.append(case(name, f"{name.split('-')[0]} inspector", item) | ladder(level, item.outcome == "rejected_valid") | {
             "help": None, "kind": None, "conditions": rows, "attempts": sum(row["attempts"] for row in rows) if result else None,
             "reproduced": len(reproduced) if result else None,
             "unrewarded": sum(row.get("unrewarded", 0) for row in rows) if result else None,
@@ -1237,7 +1216,7 @@ def cases(inspected: dict[str, Assessment], result: AttackResult | None, record:
             continue
         reading = result.assessments[position]
         level = 5 if attempt.level == "none" else LEVELS[attempt.level]
-        found.append(case(attempt.episode, "Attacker", reading, record) | ladder(level, reading.outcome == "rejected_valid") | {
+        found.append(case(attempt.episode, "Attacker", reading) | ladder(level, reading.outcome == "rejected_valid") | {
             "reward": reading.reward if reading.reward is not None else attempt.rewards.get("reward"),
             "help": helped(attempt.level, " and ".join(attempt.sources)),
             "kind": item.kind if item else None, "conditions": [], "attempts": None, "reproduced": None, "unrewarded": None,
@@ -1690,18 +1669,14 @@ def judged(item: dict) -> str:
 
 
 def case_line(item: dict) -> str:
-    """One finding: the approved requirement it names, the reward, the values its check measured for its marks, the
-    help its Attacker had, its label and why its work's completeness is unknown, and for an inspector's finding how many
-    assessed attempts with its help were exploits; one read as its cause's says so instead. What its agents left open is
-    in its Attack entry."""
-    parts = [f'requirement "{brief(oneline(item["requirement"]))}"'] if item["requirement"] else []
-    parts += [f"reward {number(item['reward'])}" if item["reward"] is not None else "no reward",
+    """One finding: the reward, the values its check measured for its marks, the help its Attacker had, its label, and
+    for an inspector's finding how many assessed attempts with its help were exploits; one read as its cause's says so
+    instead. What its agents left open is in its Attack entry."""
+    parts = [f"reward {number(item['reward'])}" if item["reward"] is not None else "no reward",
               f"{values(item['marks'])} measured by " + (f"check {item['check']}" if item["check"] else "its check")]
     if item["help"]:
         parts.append(f"with {item['help']}")
     parts.append(item["label"] + scoped(item))
-    if item["reason"]:
-        parts.append(item["reason"])
     if item["read_as"]:
         parts.append(judged(item))
     elif counts := tally(item):
@@ -1743,26 +1718,6 @@ def unproven(report: dict) -> list[dict]:
     return rows
 
 
-# After the count of measured findings, when the approved list confirms none of them, or no list was given.
-UNCONFIRMED = {True: "The approved requirement list confirms none of them, so nudi does not say which task rule each breaks.",
-               False: "No approved requirement list was given, so nudi does not say which task rule each breaks."}
-
-
-def measured(shown: list[dict], listed: bool, ran: bool) -> str:
-    """The headline over measured findings the approved list does not confirm: how many paid reward the checks show the
-    work did not earn, how many withheld it where the checks measured the marks shown, and how many an Attacker given
-    their help exploited or found, or that no Attacker ran; never that the work was correct."""
-    paid = sum(item["outcome"] != "rejected_valid" for item in shown)
-    withheld, attacked = len(shown) - paid, sum(item["outcome"] != "rejected_valid" and
-                                               (item["source"] == "Attacker" or bool(item["reproduced"])) for item in shown)
-    counts = [f"{count} {'finding' if count == 1 else 'findings'} below {text}" for count, text in (
-        (paid, "gave reward the checks show the work did not earn"), (withheld, "withheld reward where the checks measured the marks shown"))
-        if count]
-    exploited = (f"{attacked} {'was' if attacked == 1 else 'were'} exploited by an Attacker given {'its' if attacked == 1 else 'their'} "
-                 "help, or found by one") if ran else "no Attacker ran"
-    return f"{'; '.join(counts)}; {exploited}. {UNCONFIRMED[listed]}"
-
-
 # The headline over readings that claim an exploit or misjudged work without marks, when no finding has a level.
 UNMARKED = ("No cheat and no misjudged work was evidenced; the readings below claim one, but none names an observation of "
             "its check that shows it.")
@@ -1792,17 +1747,14 @@ def answer(report: dict) -> list[str]:
     Package evidence shows what a copy of the task package did, not that a task agent can cheat."""
     shown = [item for cause in report["causes"] for item in cause["findings"] if item["level"] is not None]
     cheats = [item for item in shown if item["type"] == "hack"]
-    misjudged = any(item["type"] in ("false_positive", "false_negative") for item in shown)
     verdict = ""
     if cheats:
         verdict = "The grader can be cheated" + ("" if any(item["scope"] == "native" or item["reproduced"] for item in cheats)
                                                  else " in a copy of the task package, not yet in a real episode")
-    if misjudged:
+    if any(item["type"] in ("false_positive", "false_negative") for item in shown):
         verdict = f"{verdict}, and it misjudges work" if verdict else "The grader misjudges work"
     unmarked = [cause for cause in report["causes"] if top(cause) is None]
-    ran = bool(report["other_episodes"]["attacker"])
-    verdict = (f"{verdict}." if verdict else measured(shown, bool(report["configuration"].get("approved_requirements")), ran) if shown else UNMARKED if unmarked
-               else "No cheat and no misjudged work was evidenced.")
+    verdict = (f"{verdict}." if verdict else UNMARKED if unmarked else "No cheat and no misjudged work was evidenced.")
     ranked = sorted((cause for cause in report["causes"] if top(cause) is not None),
                     key=lambda cause: (all(item["outcome"] == "rejected_valid" for item in cause["findings"]), -(cause["level"] or 0), -top(cause)))
     shared = [cause for cause in ranked if len(cause["findings"]) > 1 or cause["findings"][0]["read_as"]]
@@ -1901,12 +1853,12 @@ def headline(report: dict, record: RunRecord, stop=None) -> str:
     if record.started_at and record.ended_at:
         minutes = int((datetime.fromisoformat(record.ended_at) - datetime.fromisoformat(record.started_at)).total_seconds()) // 60
         took = f" after {minutes // 60}:{minutes % 60:02d}"
-    # A partial step that is no failed phase ran to its end, with an attempt that failed to run: its lost work says which.
+    # An unresolved step that is no failed phase ran to its end, with an attempt that failed to run: its lost work says which.
     work, gaps, why = lost(report), [], unjudged(report)
     for name, state in report["unfinished"].items():
-        partial = state == "partial"
-        gaps.append("; ".join(work.pop(name) + why.pop(name, [])) if partial and work.get(name) else f"{STEPS[name]} " + (
-            "did not run" if state == "not run" else "had an attempt that failed to run" if partial and name not in record.failed_phases
+        lost_work = state in ("unresolved", "unfinished")
+        gaps.append("; ".join(work.pop(name) + why.pop(name, [])) if lost_work and work.get(name) else f"{STEPS[name]} " + (
+            "did not run" if state == "not run" else "had an attempt that failed to run" if lost_work and name not in record.failed_phases
             else STOPPED.get(state, "failed")))
     also = "; ".join(phrase for phrases in work.values() for phrase in phrases)
     named = [STEPS[name] + "".join(f" ({clause})" for clause in why.get(name, [])) for name in report["unresolved"]]
@@ -1989,7 +1941,7 @@ def markdown(report: dict) -> str:
     if not config["provenance"]:
         lines.append("- Task digest and version pins: unavailable, no retained episode record")
     lines += ["", "## Analyses", ""] + [f"- {name}: {status}" + (": it ran to its end, but not every condition was settled; see Warnings"
-                                                                  if status == "partial" and name not in report["unfinished"] else "")
+                                                                  if status == "unresolved" and name not in report["unfinished"] else "")
                                          for name, status in report["analyses"].items()]
 
     lines += ["", "## Categories searched", ""]
@@ -2189,10 +2141,10 @@ def markdown(report: dict) -> str:
 BATCH = {"complete": "Finished. Every environment ran every step.", "time_limit": "Stopped at your time limit. Results below are what was found so far.",
          "cancelled": "Stopped by you. Results below are what was found so far.",
          "terminated": "Stopped by a termination signal. Results below are what was found so far.",
-         "partial": "Finished with gaps: not every environment ran every step. Results below are what was found.",
+         "unfinished": "Finished with gaps: not every environment ran every step. Results below are what was found.",
          "refused": "Could not start: no environment started."}
 NOT_STARTED = "Not started: the time limit or a stop came before its turn."
-ALONE = {"complete": 0, "time_limit": 1, "partial": 1, "stopped": 1, "refused": 2, "cancelled": 130, "terminated": 143, "not_started": None}
+ALONE = {"complete": 0, "time_limit": 1, "unfinished": 1, "stopped": 1, "refused": 2, "cancelled": 130, "terminated": 143, "not_started": None}
 
 
 def summary(rows: list[dict], totals: dict, stop: str | None = None) -> dict:
@@ -2211,7 +2163,7 @@ def summary(rows: list[dict], totals: dict, stop: str | None = None) -> dict:
                              "modal_cost": built["configuration"].get("modal_cost")})
     found = {row["status"] for row in environments}
     status = stop or ("cancelled" if "cancelled" in found else "complete" if found == {"complete"}
-                      else "time_limit" if found <= {"complete", "time_limit"} else "partial")
+                      else "time_limit" if found <= {"complete", "time_limit"} else "unfinished")
     started = found - {"refused", "not_started"}
     code = {"cancelled": 130, "terminated": 143, "complete": 0}.get(status, 1 if started else 2)
     return {"status": status, "exit_code": code, **totals, "environments": environments}
@@ -2223,7 +2175,7 @@ def summary_markdown(summary: dict) -> str:
         return "none" if value is None else f"{value:g}{unit}"
 
     lines = ["# nudi summary", "", "Each environment has its own run folder and report; nothing is combined across them.", "",
-             # A batch in which no environment started has exit code 2 and keeps its status, `partial`.
+             # A batch in which no environment started has exit code 2 and keeps its status, `unfinished`.
              f"- Outcome: {BATCH['refused' if summary['exit_code'] == 2 else summary['status']]}",
              f"- Backend {summary['backend']}: {summary['admitted']} of {len(summary['environments'])} environments admitted, "
              f"{summary['at_once']} at once in {summary['rounds']} rounds",

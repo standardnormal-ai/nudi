@@ -10,3 +10,9 @@ os.environ["MODAL_CONFIG_PATH"] = os.path.join(os.path.dirname(__file__), "no-mo
 def free_disk_minimum(monkeypatch):
     """A test run's records are small, so the free-space floor applies only where a test sets it."""
     monkeypatch.setattr("nudi.run_state.FREE_DISK_MINIMUM", 0)
+
+
+@pytest.fixture(autouse=True)
+def no_retry(monkeypatch):
+    """A scripted provider or Modal failure ends its call at once, unless a test sets the waits before each retry."""
+    monkeypatch.setattr("nudi.run_state.RETRY_WAITS", ())

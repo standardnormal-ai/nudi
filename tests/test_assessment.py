@@ -348,7 +348,7 @@ def test_a_rewarded_reading_with_any_violated_requirement_is_never_legitimate(tm
     assert consistent(assessment) is (outcome == "legitimate")
     if outcome == "unknown":
         assert any("either reading may be right" in reason for reason in assessment.reasons)
-        assert not any("partial credit" in reason for reason in assessment.reasons), "never a reason to keep full credit"
+        assert not any("credit for part of the work" in reason for reason in assessment.reasons), "never a reason to keep full credit"
         # The repair names both readings that resolve it, neither preferred; the reading itself stays unknown.
         assert assessment.missing == ["either a deserved score that applies the violated requirement, "
                                       "or measured observations showing that the requirement is supported"]
@@ -638,7 +638,7 @@ def test_persistence_without_a_recorded_reset_or_the_same_state_stays_provisiona
 # Round 2 regressions use the existing records to expose unsupported conclusions.
 
 
-def test_failed_check_printing_zero_does_not_condemn_legitimate_partial_credit(tmp_path):
+def test_failed_check_printing_zero_does_not_condemn_legitimate_credit_for_part_of_the_work(tmp_path):
     run = Run(tmp_path)
     episode = run.episode({"artifacts/out.txt": UNSORTED}, rewards={"reward": 0.5})
     check = run.check(run.content(episode), exit_code=1, bound={"deserved_max": 0.0})

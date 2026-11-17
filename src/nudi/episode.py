@@ -589,7 +589,7 @@ def record_slots(slots: list[RunSlot], output_dir: Path, run_dir: Path, result: 
         elif slot.traces:
             # Upstream persists only finished episodes; keep the live traces, model calls included.
             lines = [type_adapter(type(trace)).dump_json(trace, exclude_none=True) for trace in slot.traces]
-            write_private(output_dir / run_dir / "partial-traces.jsonl", b"\n".join(lines) + b"\n")
+            write_private(output_dir / run_dir / "unfinished-traces.jsonl", b"\n".join(lines) + b"\n")
         for trace in slot.traces:
             result.ids["trace_id"] = trace.id
             for name, reward in trace.rewards.items():
@@ -599,7 +599,7 @@ def record_slots(slots: list[RunSlot], output_dir: Path, run_dir: Path, result: 
             result.verifier_timeout |= trace.stop_condition == "scoring_timeout"
             errors += trace.errors
     result.errors = [ErrorRecord(type=e.type, message=e.message) for e in errors]
-    for name, relative in (("run", ""), ("traces", "traces.jsonl"), ("partial_traces", "partial-traces.jsonl")):
+    for name, relative in (("run", ""), ("traces", "traces.jsonl"), ("unfinished_traces", "unfinished-traces.jsonl")):
         if (output_dir / run_dir / relative).exists():
             result.artifacts[name] = str(run_dir / relative)
 

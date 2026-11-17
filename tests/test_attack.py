@@ -37,7 +37,6 @@ from nudi.records import (
     ModelConfig,
     Observation,
     PersistenceProbe,
-    Requirement,
     RunConfig,
     RunRecord,
     Simulation,
@@ -391,14 +390,14 @@ def test_each_candidate_receives_only_its_own_guidance_in_fresh_contexts(tmp_pat
             assert second.guidance["minimal"] is None and second.unavailable == {"minimal": reason}
             assert result.discovery == {"none": "unknown"}
             assert result.findings == []
-            assert result.status == "partial"
+            assert result.status == "unresolved"
             assert not any(SAFETY in limit for limit in result.limits)
             assert all(attempt.rewards.get("reward") == 1.0 for attempt in result.attempts)
 
     asyncio.run(main())
 
 
-def test_exact_duplicate_records_share_one_run_and_partial_overlap_does_not(tmp_path, monkeypatch, credentials):
+def test_exact_duplicate_records_share_one_run_and_some_overlap_does_not(tmp_path, monkeypatch, credentials):
     """Same mechanism and both guidance fields share a run. One shared string does not."""
     endpoint = attack_endpoint(plain_claim)
     sink = {"episodes": []}
@@ -1214,7 +1213,7 @@ def test_discovery_attempts_are_a_total_that_needs_no_candidate(tmp_path, monkey
             assert result.unavailable == {"full": attack_module.NO_CANDIDATE, "minimal": attack_module.NO_CANDIDATE}
             assert result.discovery_attempts == discovery_attempts
             if discovery_attempts:
-                assert result.discovery == {"none": "unknown"} and result.status == "partial"
+                assert result.discovery == {"none": "unknown"} and result.status == "unresolved"
             else:
                 assert result.discovery == {"none": "unattempted"} and result.status == "complete"
                 assert any("disabled" in limit for limit in result.limits)
@@ -1435,7 +1434,6 @@ def test_rejected_valid_work_counts_only_for_a_valid_work_candidate(tmp_path, mo
     sink = {"episodes": []}
 
     def assessed(claim, directory):
-        # Each reading reads the one approved requirement supported, so nudi's decision keeps correct work failed.
         claim = claim.model_copy(update={"marks": ["shown"], "derivation": Derivation(observations=["shown"], validity="supported")})
         return Assessment(claim=claim, execution_scope="native", check=linked_check(claim.episode, claim.check), outcome="rejected_valid",
                           validity="supported")
@@ -1448,7 +1446,6 @@ def test_rejected_valid_work_counts_only_for_a_valid_work_candidate(tmp_path, mo
             model = ModelConfig(model="xai/grok-4.7", api_base=base)
             run = new_run(tmp_path, monkeypatch, credentials, models={"attacker": model, "inspector": model})
             sink["run"] = run
-            run.record.requirements = [Requirement(text="Write the number 42", observation="shown")]
             bind_runner(monkeypatch, sink)
             monkeypatch.setattr(inspection, "assess", assessed)
             return await attack_module.attack(run, maximum_attempts=2, candidates=[candidate("hack-0", FULL, MINIMAL), valid])
@@ -1553,7 +1550,7 @@ def test_provisional_probe_result_survives_a_later_probe_failure(tmp_path, monke
             else:
                 assert attempt.status == result.conditions["none"] == "tool_failure"
                 assert "later probe failed" in attempt.error
-                assert result.status == "partial"
+                assert result.status == "unresolved"
 
     asyncio.run(main())
 
@@ -1739,14 +1736,14 @@ def test_attempt_failures_stay_distinct(tmp_path, monkeypatch, credentials, kind
             assert result.attempts, result.status
             assert result.attempts[0].status == kind
             assert result.conditions["none"] == kind
-            assert result.status == "partial"
+            assert result.status == "unresolved"
             assert result.conditions["full"] == "unavailable"
             others = {"refused", "model_inability", "model_output_failure", "inference_failure", "tool_failure", "infrastructure_failure", "native_timeout",
                       "out_of_memory", "spending_exhausted", "cancelled"} - {kind}
             assert result.attempts[0].status not in others
             # A failure the attack did not recover from leaves it unfinished, apart from unresolved evidence.
             built = report.build(run.config.output_dir, selected=["attack"])
-            assert (built["status"], built["unfinished"], built["unresolved"]) == ("partial", {"attack": "partial"}, [])
+            assert (built["status"], built["unfinished"], built["unresolved"]) == ("unfinished", {"attack": "unresolved"}, [])
             # The line names the agent that failed.
             lost = {"Attacker": "the Attacker failed to run in", "attack inspector": "the attack inspector failed on",
                     None: "an attack attempt failed in"}[result.attempts[0].failed]
@@ -1776,13 +1773,13 @@ def test_native_timeout_with_a_reward_is_interpreted(tmp_path, monkeypatch, cred
             monkeypatch.setattr(run_state, "run_episode", native)
             result = await attack_module.attack(run, maximum_attempts=1)
             assert [attempt.status for attempt in result.attempts] == ["unknown"]
-            assert result.conditions["none"] == "unknown" and result.status == "partial"
+            assert result.conditions["none"] == "unknown" and result.status == "unresolved"
             assert any("agent_timeout" in limit and result.attempts[0].episode in limit for limit in result.limits)
 
     asyncio.run(main())
 
 
-def test_native_timeout_without_a_trajectory_stays_partial(tmp_path, monkeypatch, credentials):
+def test_native_timeout_without_a_trajectory_stays_unresolved(tmp_path, monkeypatch, credentials):
     """A rewarded timeout is interpreted, but without its trajectory an unproven claim is not a negative result."""
     endpoint = attack_endpoint(plain_claim)
 
@@ -1800,10 +1797,10 @@ def test_native_timeout_without_a_trajectory_stays_partial(tmp_path, monkeypatch
             result = await attack_module.attack(run, maximum_attempts=0, discovery_attempts=1, candidates=[])
             assert result.attempts[0].episode in interpretation_requests(endpoint)
             assert [attempt.status for attempt in result.attempts] == ["native_timeout"]
-            assert result.discovery == {"none": "native_timeout"} and result.status == "partial"
+            assert result.discovery == {"none": "native_timeout"} and result.status == "unresolved"
             # A timeout with neither a reward nor an interpretation is an execution failure, so the attack did not run to its end.
             built = report.build(run.config.output_dir, selected=["attack"])
-            assert (built["status"], built["unfinished"], built["unresolved"]) == ("partial", {"attack": "partial"}, [])
+            assert (built["status"], built["unfinished"], built["unresolved"]) == ("unfinished", {"attack": "unresolved"}, [])
 
     asyncio.run(main())
 
@@ -1813,11 +1810,11 @@ def missing_check_claim(body):
 
 
 @pytest.mark.parametrize("reply, rewards, outcomes, status, attack", [
-    (plain_claim, {"reward": 1.0}, ["unknown"], "unknown", "partial"),
+    (plain_claim, {"reward": 1.0}, ["unknown"], "unknown", "unresolved"),
     (plain_claim, {"reward": 0.0}, [], "no_evidenced_issue", "complete"),  # no reward, so no attack inspector session
-    (lambda body: {"probes": []}, {"reward": 1.0}, [], "unknown", "partial"),  # nothing was assessed
-    (missing_check_claim, {"reward": 1.0}, ["ungrounded"], "unknown", "partial"),
-    (plain_claim, {"score": 1.0}, ["unavailable"], "unknown", "partial"),  # the claim's default reward key is absent
+    (lambda body: {"probes": []}, {"reward": 1.0}, [], "unknown", "unresolved"),  # nothing was assessed
+    (missing_check_claim, {"reward": 1.0}, ["ungrounded"], "unknown", "unresolved"),
+    (plain_claim, {"score": 1.0}, ["unavailable"], "unknown", "unresolved"),  # the claim's default reward key is absent
 ])
 def test_rewarded_episode_without_a_judged_submission_stays_unknown(tmp_path, monkeypatch, credentials, reply, rewards, outcomes, status, attack):
     """An unproven, ungrounded or unscored claim, or no assessment, leaves the graded submission unjudged.
@@ -2139,7 +2136,7 @@ def test_a_valid_work_attempt_starts_only_when_its_agent_timeout_fits_the_time_l
         return
     assert (work.candidate, work.episode, work.status) == ("valid-0", None, "insufficient_time")
     assert work.error.startswith("its agent timeout of 20 seconds is longer than the ")
-    assert result.candidates[1].conditions["full"] == "insufficient_time" and result.status == "partial"
+    assert result.candidates[1].conditions["full"] == "insufficient_time" and result.status == "unresolved"
     run.save()
     text = report.markdown(report.build(run.config.output_dir, selected=["attack"]))
     assert "with full instructions did not start: its agent timeout is longer than the time left before the time limit" in text
@@ -2956,7 +2953,7 @@ def test_inspector_refusal_is_not_completed_negative_coverage(tmp_path, monkeypa
             assert "declines this episode" in result.attempts[0].error
             assert result.conditions["none"] == "model_inability"
             assert result.conditions["none"] != "no_evidenced_issue"
-            assert result.status == "partial"
+            assert result.status == "unresolved"
             assert result.status != "complete"
 
     asyncio.run(main())
@@ -2995,7 +2992,7 @@ def test_check_interpretation_refusal_stays_refused(tmp_path, monkeypatch, crede
             assert result.attempts[0].status != "tool_failure"
             assert "declines this check" in (result.attempts[0].error or "")
             assert result.conditions["none"] == "model_inability"
-            assert result.status == "partial"
+            assert result.status == "unresolved"
 
     asyncio.run(main())
 
@@ -3072,7 +3069,7 @@ def test_unknown_native_cause_is_disclosed(tmp_path, monkeypatch, credentials):
             assert "unknown cause" in result.attempts[0].error
             assert "MysteryFault" in result.attempts[0].error
             assert result.conditions["none"] == "unknown"
-            assert result.status == "partial"
+            assert result.status == "unresolved"
 
     asyncio.run(main())
 
@@ -3137,7 +3134,7 @@ def test_recorded_call_failure_stays_inference_failure(tmp_path, monkeypatch, cr
             assert "APIConnectionError" in result.attempts[0].error
             assert result.attempts[0].status != "infrastructure_failure"
             assert result.conditions["none"] == "inference_failure"
-            assert result.status == "partial"
+            assert result.status == "unresolved"
 
     asyncio.run(main())
 
@@ -3170,9 +3167,9 @@ def test_recovered_request_error_stays_telemetry(tmp_path, monkeypatch, credenti
             assert [call.error for call in run.record.calls if call.episode == attempt.episode] == errors
             inspected = (run.config.output_dir / f"inspection-attack_inspector-{attempt.context}.json").exists()
             if status == "unknown":
-                assert inspected and attempt.error is None and result.status == "partial"
+                assert inspected and attempt.error is None and result.status == "unresolved"
             else:
-                assert not inspected and "APIConnectionError" in attempt.error and result.status == "partial"
+                assert not inspected and "APIConnectionError" in attempt.error and result.status == "unresolved"
 
     asyncio.run(main())
 
@@ -3307,7 +3304,7 @@ def test_provider_refusal_on_initial_interpretation(tmp_path, monkeypatch, crede
             assert result.attempts[0].status != "inference_failure"
             assert "content_filter" in error
             assert result.conditions["none"] == "refused"
-            assert result.status == "partial"
+            assert result.status == "unresolved"
             assert result.status != "complete"
 
     asyncio.run(main())
@@ -3352,7 +3349,7 @@ def test_provider_refusal_on_check_interpretation(tmp_path, monkeypatch, credent
             assert "content_filter" in error
             assert run.record.checks, "the refusal came after the measured check"
             assert result.conditions["none"] == "refused"
-            assert result.status == "partial"
+            assert result.status == "unresolved"
 
     asyncio.run(main())
 
@@ -4126,7 +4123,7 @@ def test_attack_passes_a_goal_reminder_matched_to_each_condition(tmp_path, monke
 @pytest.mark.parametrize("minimal_hints", [False, True])
 def test_the_minimal_hint_level_runs_only_when_requested(tmp_path, monkeypatch, credentials, minimal_hints):
     """The full hint reproduces. Off, the minimal hint level is not attempted; its condition is not_requested, which
-    keeps the attack neither partial nor unknown, and the report says so. On, it follows the reproduction."""
+    keeps the attack neither unresolved nor unknown, and the report says so. On, it follows the reproduction."""
     endpoint = attack_endpoint(evidenced_claim)
     sink = {"episodes": []}
 
@@ -4141,8 +4138,8 @@ def test_the_minimal_hint_level_runs_only_when_requested(tmp_path, monkeypatch, 
 
     result = asyncio.run(main())
     assert levels(result) == ["full", "minimal"][:1 + minimal_hints]
-    # On, the minimal hint's reading is unknown, which leaves the attack partial.
-    assert result.status == ("partial" if minimal_hints else "complete") and result.minimal_hints is minimal_hints
+    # On, the minimal hint's reading is unknown, which leaves the attack unresolved.
+    assert result.status == ("unresolved" if minimal_hints else "complete") and result.minimal_hints is minimal_hints
     assert result.candidates[0].conditions == {"full": "evidenced_issue", "minimal": "unknown" if minimal_hints else "not_requested",
                                                  "none": "unattempted" if minimal_hints else "not_requested"}
     sink["run"].save()

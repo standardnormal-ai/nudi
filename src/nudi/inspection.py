@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from functools import cache, reduce
 from pathlib import Path, PurePosixPath
 from types import UnionType
-from typing import Any, Literal, Union, get_args, get_origin
+from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
 from harbor.models.task.task import Task
 from harbor.models.task.verifier_mode import resolve_verifier_environment_definition
@@ -49,6 +49,7 @@ from nudi.records import (
     SandboxResult,
     StateCopy,
     Validity,
+    renamed,
     write_private,
 )
 
@@ -147,7 +148,7 @@ class InspectionResult(BaseModel):
     mode: str
     ordinary_inspection: str | None = None
     """Grader mode: `holistic_inspection`, or `inspector_swarm` with one grader inspector per ordinary episode."""
-    status: str = "running"
+    status: Annotated[str, renamed("unresolved")] = "running"
     categories: dict[str, str]
     applicability: dict[str, str]
     attempts: list[InspectionAttempt] = []
@@ -165,8 +166,8 @@ class InspectionResult(BaseModel):
     artifacts: dict[str, dict[str, str]] = {}
     """Run-relative retained transcripts, request messages, full tool outputs and workspace of each session."""
     limits: list[str] = []
-    hack_inspection: str | None = None
-    """Grader mode: `complete` or `partial`, the hack inspection whose findings its first request listed, `failed` when
+    hack_inspection: Annotated[str | None, renamed("unresolved")] = None
+    """Grader mode: `complete` or `unresolved`, the hack inspection whose findings its first request listed, `failed` when
     that hack phase raised after saving them, or `none`."""
     hack_findings: list[str] = []
     """Grader mode: the ids of the hack findings its first request listed."""
@@ -375,8 +376,7 @@ def task_context(run) -> dict:
         files[name] = text
         remaining -= file.stat().st_size
     task = Task(root)
-    approved = {"approved_requirements": [item.model_dump() for item in run.record.requirements]} if run.record.requirements else {}
-    return {"untrusted_task_files": files, "omitted_context_files": omitted, **approved,
+    return {"untrusted_task_files": files, "omitted_context_files": omitted,
             "native_tools": {"terminal": True, "network": str(task.config.agent.network_mode or task.config.environment.network_mode),
                              "agent_user": task.config.agent.user, "verifier_mode": task.config.verifier.environment_mode,
                              "cpus": task.config.environment.cpus, "memory_mb": task.config.environment.memory_mb},
@@ -439,50 +439,6 @@ def marked(assessment: Assessment) -> dict:
     """The value its check measured for each of the reading's marks; empty unless it has marks and the check measured each."""
     observations, marks = measured_observations(assessment), assessment.claim.marks
     return {name: observations[name] for name in marks} if marks and set(marks) <= observations.keys() else {}
-
-
-# Why the approved requirement list does not confirm a reading's strong words.
-NO_LIST = "completeness is unknown: no approved requirement list was given"
-NOT_ALL = "completeness is unknown: the readings of this episode do not read every approved requirement supported"
-
-
-def support(readings: list[Assessment], approved=()) -> dict[str, set[str]]:
-    """The validities `readings` give each observation their checks measured: the check's own requirement's validity for
-    the derivation's observations, and each further reading's accepted validity for its own. One validity read for the
-    observations of several `approved` requirements at once is read for none of them: it does not say which it is for."""
-    found = {}
-    for item in readings:
-        measured, derivation = measured_observations(item), item.claim.derivation
-        if derivation is None:
-            continue
-        pairs = [(derivation.observations, item.validity)]
-        pairs += [(reading.observations, conclusion.validity) for reading, conclusion in zip(derivation.requirements, item.conclusions)]
-        for names, validity in pairs:
-            if len(set(names) & set(approved)) > 1:
-                continue
-            for name in set(names) & measured.keys():
-                found.setdefault(name, set()).add(validity)
-    return found
-
-
-def correctness(readings: list[Assessment], requirements: list | None) -> tuple[str, str | None]:
-    """`complete` when `readings` read every approved requirement supported and none violated, `incomplete` when they read
-    one violated, otherwise `unknown` with why; an empty list is no list."""
-    if not requirements:
-        return "unknown", NO_LIST
-    found = support(readings, {item.observation for item in requirements})
-    if any("violated" in found.get(item.observation, ()) for item in requirements):
-        return "incomplete", None
-    if all(found.get(item.observation) == {"supported"} for item in requirements):
-        return "complete", None
-    return "unknown", NOT_ALL
-
-
-def confirmed(assessment: Assessment, requirements: list | None, others: list[Assessment] = ()) -> bool:
-    """True when the approved list confirms an evidenced reading's strong words: correct work failed needs the reading,
-    with the `others` of its episode, to read every approved requirement supported, invalid work accepted one read
-    violated. Only wording depends on it."""
-    return correctness([assessment, *others], requirements)[0] == ("complete" if assessment.outcome == "rejected_valid" else "incomplete")
 
 
 def unmarked(assessment: Assessment) -> str | None:
@@ -1673,7 +1629,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
         report.status = "environment_unavailable"
         raise
     except Exception:
-        report.status = "partial"
+        report.status = "unfinished"
         raise
     finally:
         # Sessions at once add their attempts as they start. The record keeps plan order, and each review its attempt.
@@ -1697,7 +1653,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
             if report.categories[category] == "pending":
                 report.categories[category] = "no_evidenced_issue" if settling and category in ended and category not in named else "unknown"
         if report.status == "running":
-            report.status = "complete" if all(value in ("evidenced_issue", "no_evidenced_issue", "restricted") for value in report.categories.values()) and not obligations() else "partial"
+            report.status = "complete" if all(value in ("evidenced_issue", "no_evidenced_issue", "restricted") for value in report.categories.values()) and not obligations() else "unresolved"
         if mode == "grader":
             reviewed = {review.episode for review in report.reviews}
             causes = "; ".join(f"{item.phase} attempt {item.number} {item.status}: {item.error or 'incomplete'}" for item in report.attempts

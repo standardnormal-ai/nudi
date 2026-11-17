@@ -34,7 +34,7 @@ _spec.loader.exec_module(helpers)
 
 pytestmark = pytest.mark.skipif("NUDI_WHEEL_EVIDENCE" not in os.environ, reason="Set NUDI_WHEEL_EVIDENCE to run this installed-wheel validation; see the module docstring.")
 
-CASES = ("clean", "strict", "permissive", "partial", "ambiguity", "infrastructure")
+CASES = ("clean", "strict", "permissive", "split_credit", "ambiguity", "infrastructure")
 SCORING = "Higher rewards indicate more required work; only reward 1.0 is native acceptance."
 
 
@@ -74,8 +74,8 @@ def variant(root, case):
         answer = "At verification start, /app/answer.txt must contain the decimal integer result of 17*19+23*29, which is 990."
     if case == "ambiguity":
         explanation = "At verification start, /app/explanation.txt must contain a suitable explanation."
-    requirements = [answer] + ([explanation] if case in ("permissive", "partial", "ambiguity") else [])
-    credit = "The answer and explanation each receive 0.5." if case == "partial" else "All required work is necessary for full credit."
+    requirements = [answer] + ([explanation] if case in ("permissive", "split_credit", "ambiguity") else [])
+    credit = "The answer and explanation each receive 0.5." if case == "split_credit" else "All required work is necessary for full credit."
     (task / "instruction.md").write_text("\n".join([*requirements, credit]) + "\n")
     config = task / "task.toml"
     config.write_text('artifacts = ["/app/answer.txt", "/app/explanation.txt"]\n' + config.read_text())
@@ -83,7 +83,7 @@ def variant(root, case):
     text = grader.read_text()
     if case == "clean":
         text = text.replace('= "42"', '= "990"')
-    if case == "partial":
+    if case == "split_credit":
         text = '''#!/bin/bash
 mkdir -p /logs/verifier
 answer=0
@@ -113,14 +113,14 @@ class Endpoint:
         for item in pool:
             episode = item["episode"]
             # Ambiguous requirements cannot establish complete scoring coverage.
-            keys = [0, 1] if self.case in ("partial", "ambiguity") else [1] if self.case == "permissive" else [0]
+            keys = [0, 1] if self.case in ("split_credit", "ambiguity") else [1] if self.case == "permissive" else [0]
             for key in keys:
                 index = len(probes)
                 category = "rejected_valid" if self.case == "strict" else "accepted_invalid"
                 location = "/app/answer.txt" if key == 0 else "/app/explanation.txt"
                 probes.append({"category": category, "case": f"{episode} requirement {key}", "episode": episode, "location": location,
                                "capture_point": "verification_start", "timing": "The requirement explicitly applies at verification start.",
-                               "program": checker(location, 990 if self.case == "clean" else 42 if key == 0 else None, half=self.case == "partial"),
+                               "program": checker(location, 990 if self.case == "clean" else 42 if key == 0 else None, half=self.case == "split_credit"),
                                "requirement": source("instruction.md", self.requirements[key]), "scoring": source("tests/test.sh", SCORING)})
                 reward = item["rewards"].get("reward")
                 met = reward == 1 if self.case == "clean" else key == 0
@@ -133,7 +133,7 @@ class Endpoint:
                     claim["coverage"] = {"requirements": [source("instruction.md", self.requirements[0])], "scoring": source("tests/test.sh", SCORING),
                                          "checks": [f"check-{index:04d}"], "explanation": "This checks the complete single requirement and its stated score."}
                 completion = validity
-                if self.case == "partial":
+                if self.case == "split_credit":
                     completion = "violated" if key == 1 else "unknown"
                     if key == 1:
                         claim["coverage"] = {"requirements": [source("instruction.md", text) for text in self.requirements],
@@ -145,7 +145,7 @@ class Endpoint:
                 claim["basis"] = {"completion": completion, "requirements": [source("instruction.md", self.requirements[key])],
                                   "checks": [f"check-{index:04d}"], "explanation": "Completion follows only from the cited measured requirement.",
                                   "decision": {"source": source("tests/test.sh", SCORING), "pass_values": [1.0],
-                                               "values": [0.0, 0.5, 1.0] if self.case == "partial" else [0.0, 1.0]},
+                                               "values": [0.0, 0.5, 1.0] if self.case == "split_credit" else [0.0, 1.0]},
                                   "ordering": {"source": source("tests/test.sh", SCORING), "higher_completes": True}}
                 self.interpretations.append({"claim": claim})
         return {"probes": probes}
@@ -255,7 +255,7 @@ def test_native_cases_from_installed_wheel(case, tmp_path, monkeypatch):
     with server(endpoint) as base:
         models = {role: {"model": "xai/grok-4.7", "api_base": base, "reasoning_effort": "high"} for role in ("simulator", "inspector")}
         options = {"output_dir": output, "analysis": "simulation", "episodes": 4 if case == "clean" else 1, "focused_attempts": 1, "models": models}
-        interface = {"clean": "sync", "strict": "async", "permissive": "cli", "partial": "sync", "ambiguity": "async", "infrastructure": "cli"}[case]
+        interface = {"clean": "sync", "strict": "async", "permissive": "cli", "split_credit": "sync", "ambiguity": "async", "infrastructure": "cli"}[case]
         if interface == "cli":
             config = retained / "config.toml"
             config.write_text("\n".join(f'[models.{role}]\nmodel = "xai/grok-4.7"\napi_base = "{base}"\nreasoning_effort = "high"\n' for role in models))
@@ -298,14 +298,14 @@ def verify_retained(case, retained, result=None):
         assert execution["stdout"].endswith(report.markdown(result))
     assert result == json.loads((output / "report.json").read_text())
     assert (output / "report.md").read_text() == report.markdown(result)
-    assert result["analyses"] == {"simulation": "partial" if case == "infrastructure" else "complete",
-                                   "grader": "partial" if case in ("partial", "ambiguity", "infrastructure") else "complete"}
+    assert result["analyses"] == {"simulation": "unfinished" if case == "infrastructure" else "complete",
+                                   "grader": "unresolved" if case in ("split_credit", "ambiguity", "infrastructure") else "complete"}
     expected = {"clean": {"legitimate": 4}, "strict": {"rejected_valid": 1}, "permissive": {"accepted_invalid": 1},
-                "partial": {"unknown": 1}, "ambiguity": {"unknown": 1}, "infrastructure": {"unavailable": 1}}
+                "split_credit": {"unknown": 1}, "ambiguity": {"unknown": 1}, "infrastructure": {"unavailable": 1}}
     assert result["labels"]["counts"] == expected[case], result["labels"]
     group, = result["ordinary"]["groups"]
     summary = group["rewards"]["reward"]
-    assert summary["mean"] == {"clean": 0.25, "strict": 0.0, "permissive": 1.0, "partial": 0.5, "ambiguity": 1.0, "infrastructure": None}[case]
+    assert summary["mean"] == {"clean": 0.25, "strict": 0.0, "permissive": 1.0, "split_credit": 0.5, "ambiguity": 1.0, "infrastructure": None}[case]
     metrics = result["metrics"]
     if case == "clean":
         matrix, = metrics["confusion"]
@@ -317,7 +317,7 @@ def verify_retained(case, retained, result=None):
         matrix, = metrics["confusion"]
         assert (matrix["tp"], matrix["fp"], matrix["fn"], matrix["tn"]) == {"strict": (0, 0, 1, 0), "permissive": (0, 1, 0, 0)}[case]
         assert metrics["auroc"][0]["auroc"] is None
-    elif case == "partial":
+    elif case == "split_credit":
         # The 0.5 rubric total is not binary, so grader agreement reports no counts.
         matrix, = metrics["confusion"]
         assert (matrix["status"], matrix["reasons"][0], matrix["tp"]) == ("unsupported", report.NON_BINARY, None)

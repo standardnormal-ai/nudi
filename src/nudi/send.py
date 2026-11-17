@@ -30,14 +30,14 @@ from pathlib import Path
 from typing import Literal
 
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field
 
 from nudi import copies, report
 from nudi.attack import FULL_UNAVAILABLE, MINIMAL_UNAVAILABLE, AttackResult, Candidate, Cause, Problem, attack
 from nudi.checks import finish_cleanup, redacted
 from nudi.inspection import InspectionResult, at_once, evidenced, finding_view, inspect_grader, inspect_hacks
 from nudi.episode import UnsupportedTask, check_backend, check_output, select_path, tree_digest
-from nudi.records import (DEFAULT_MODELS, Assessment, DiskFull, EnvironmentUnavailable, Requirement, RunConfig, RunRecord, SandboxResult,
+from nudi.records import (DEFAULT_MODELS, Assessment, DiskFull, EnvironmentUnavailable, RunConfig, RunRecord, SandboxResult,
                           private_dir, write_private)
 from nudi.run_state import (ORIGINAL_BEHAVIOR, BackendUnavailable, CapacityError, Slots, declared_requirements, elapsed, environment, event, events_lock,
                             simulate, start_run)
@@ -68,7 +68,7 @@ PHASES = {
     "attack": ("attack", "{attempts}, {found}", attacked),
 }
 # A step's status in the words of its line on stderr; its event keeps the status, and a complete step adds none.
-ENDED = {"partial": "some results unclear", "not run": "nothing to attack", "cancelled": "stopped",
+ENDED = {"unresolved": "some results unclear", "not run": "nothing to attack", "cancelled": "stopped",
          "spending_exhausted": "stopped at the spending cap"}
 
 
@@ -118,9 +118,6 @@ class AnalysisConfig(RunConfig):
     """Attempt each candidate whose full hint reproduced its exploit with the minimal hint too. On by default."""
     attack_from: Path | None = None
     """An earlier run of the same task, only read: this run copies its inspection records and runs only the attack."""
-    requirements: Path | None = None
-    """A TOML file of the task's requirements a person approved, each a `[[requirement]]` table with its `text` and the
-    `observation` of a check that measures it. Without it the report calls no work correct and no route a violation of the task."""
 
 
 def configure(task_dir, config, options: dict) -> AnalysisConfig:
@@ -130,18 +127,10 @@ def configure(task_dir, config, options: dict) -> AnalysisConfig:
     if config is not None:
         config = Path(config)
         values = tomllib.loads(config.read_text())
-        for key in ("output_dir", "credentials_file", "attack_from", "requirements"):
+        for key in ("output_dir", "credentials_file", "attack_from"):
             if isinstance(values.get(key), str):
                 values[key] = config.parent / values[key]
     return AnalysisConfig.model_validate({**values, **options, "task_dir": task_dir})
-
-
-def approved(path: Path) -> list[Requirement]:
-    """The approved requirement list in the TOML file at `path`: at least one requirement, each with its own observation."""
-    items = TypeAdapter(list[Requirement]).validate_python(tomllib.loads(path.read_text()).get("requirement"))
-    if not items or len({item.observation for item in items}) != len(items):
-        raise ValueError(f"{path} must list at least one requirement, each with its own observation")
-    return items
 
 
 WHERE_TO_LOOK = (
@@ -223,7 +212,7 @@ def hack_context(run, hack: InspectionResult | None) -> dict | None:
     found = guidance(hack)["candidates"]
     if not found:
         return None
-    return {"hack_inspection": status or ("complete" if hack.status == "complete" else "partial"), "hack_findings": [
+    return {"hack_inspection": status or ("complete" if hack.status == "complete" else "unresolved"), "hack_findings": [
         {"id": item.id, "category": item.category, "outcome": item.outcome, "mechanism": item.mechanism,
          "where_to_look": _supplied(assessment_of({"hack": hack}, item).claim.hint_location)} for item in found]}
 
@@ -372,32 +361,24 @@ async def send_nudis_async(task_dir, config=None, **options) -> dict:
     directory must be new or empty. The report is
     also written as `report.json` and `report.md` in the output directory, after
     cancellation too; until then each confirmation writes the report so far there, with status `running`.
-    With `time_limit` the run stops at that many minutes as a cancelled run does, and returns its report with status `time_limit`, or `partial` when a phase
+    With `time_limit` the run stops at that many minutes as a cancelled run does, and returns its report with status `time_limit`, or `unfinished` when a phase
     failed before. Every state copy of the run is deleted first, also after a failure.
     Each progress line, and then how the run ended, is appended to `events.jsonl` there as it happens. With `attack_from`
-    the run copies an earlier run's inspection records and runs only the attack on them, under that run's approved
-    requirement list; a different `requirements` is a ValueError."""
+    the run copies an earlier run's inspection records and runs only the attack on them."""
     settings = configure(task_dir, config, options)
     # Earlier records there would otherwise be reported as this run's results.
     if settings.output_dir.exists() and any(settings.output_dir.iterdir()):
         raise ValueError(f"output directory {settings.output_dir} is not empty; choose a new or empty directory")
     selected, roles, earlier, results = SELECTED[settings.analysis], ROLES[settings.analysis], None, {}
-    requirements = approved(settings.requirements) if settings.requirements else None
     if settings.attack_from:
         # Resolved once, before every check and the copy: `.` and a link such as `runs/latest` name the folder they point to.
         settings.attack_from = settings.attack_from.resolve()
         earlier, results = earlier_run(settings)
-        # Its readings were decided under its approved list, so the rerun keeps that list.
-        if requirements is not None and requirements != earlier.requirements:
-            raise ValueError(f"--requirements differs from the approved requirement list of the earlier run {settings.attack_from}, "
-                             "whose readings this run reuses; give the same list or none")
-        requirements = earlier.requirements
         # An earlier analysis that failed before its first save left no record; it stays selected, so the report names it.
         selected = tuple(name for name in SELECTED["full"]
                          if name in results or name in earlier.failed_phases or name == "attack")
         roles = ROLES["hacking"]
     run = start_run(settings, roles, ("attack",) if earlier else selected)  # The analyses that will run.
-    run.record.requirements = requirements
     # The log's last event says how the run ended, also when it was cancelled or stopped, or a rerun's copy failed.
     try:
         if earlier:
@@ -649,12 +630,12 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
         try:
             results[name] = await steps[name]()
             took, counts, status = elapsed(started), produced(results[name]), results[name].status
-            ended = "some episodes have no reward" if (name, status) == ("simulation", "partial") else ENDED.get(status, status)
+            ended = "some episodes have no reward" if (name, status) == ("simulation", "unfinished") else ENDED.get(status, status)
             event(run, "phase_end", f"{phase} done after {took}: {phase_words(name, counts)}" + f"; {ended}" * (status != "complete"),
                   phase=name, elapsed=took, status=status, **counts)
-            # An inspection or attack that returned ran to its end, also with evidence left unresolved (`partial`)
+            # An inspection or attack that returned ran to its end, also with evidence left unresolved (`unresolved`)
             # or nothing it could attack (`not run`); a stop such as the spending cap, or episodes without a reward, did not.
-            if status not in (("complete",) if name == "simulation" else ("complete", "partial", "not run")):
+            if status not in (("complete",) if name == "simulation" else ("complete", "unresolved", "not run")):
                 run.record.failed_phases.append(name)
         except DiskFull as error:
             run.record.warnings.append(f"{name} stopped: {error}")
@@ -874,8 +855,6 @@ async def send_environments_async(task_dirs, config=None, **options) -> dict:
         raise ValueError(f"output directory {batch} is not empty; choose a new or empty directory")
     if settings.attack_from and len(tasks) > 1:
         raise ValueError("--attack-from reruns the attack of one task; give one task")
-    if settings.requirements and len(tasks) > 1:
-        raise ValueError("--requirements lists the requirements of one task; give one task")
     for task in tasks:
         check_output(batch, task)
         if settings.credentials_file and settings.credentials_file.resolve().is_relative_to(task.resolve()):

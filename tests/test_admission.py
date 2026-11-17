@@ -206,7 +206,7 @@ def test_a_failed_collect_hook_is_a_run_warning_and_the_probe_still_grades(tmp_p
 
     async def exec(self, command, cwd=None, env=None, timeout_sec=None, user=None):
         if command == "nudi-main-hook":
-            return ExecResult(stdout="partial export", stderr="disk full", return_code=7)
+            return ExecResult(stdout="half-written export", stderr="disk full", return_code=7)
         return await SandboxEnvironment.exec(self, command, cwd, env, timeout_sec, user)
 
     monkeypatch.setattr(Services, "exec", exec)
@@ -214,7 +214,7 @@ def test_a_failed_collect_hook_is_a_run_warning_and_the_probe_still_grades(tmp_p
     name = asyncio.run(inspection.package_probe(run, "true\n"))
     assert sandbox_record(run, name)["rewards"] == {"reward": 1.0}
     assert [warning for warning in run.record.warnings if "Collect hook" in warning] == [
-        f"{name}: Collect hook in service 'main' exited with code 7: 'nudi-main-hook'. stdout: partial export stderr: disk full"]
+        f"{name}: Collect hook in service 'main' exited with code 7: 'nudi-main-hook'. stdout: half-written export stderr: disk full"]
 
 
 def test_separate_mode_collects_the_main_service_then_stops_it_before_helper_hooks(tmp_path, monkeypatch, credentials):

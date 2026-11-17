@@ -15,6 +15,7 @@ import shutil
 import stat
 import sys
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
@@ -38,7 +39,7 @@ from langsmith import tracing_context
 
 from nudi import checks, inspection, inspector_sandbox
 from nudi.records import ErrorRecord, InfrastructureAbort, write_private
-from nudi.run_state import SpendingCapReached, model_calls, notice
+from nudi.run_state import SpendingCapReached, account_refusal, again, current, model_calls, notice
 
 # The profile identity is private to nudi; LiteLLM still receives the configured route.
 register_harness_profile("nudi-inspector", HarnessProfile(
@@ -63,9 +64,22 @@ DRAIN_TIMEOUT = 10
 RECURSION_LIMIT = 9_999
 
 
+def brief(error: Exception) -> bool:
+    """Whether a failed model call can pass: a timeout, a rate limit, a lost connection or a server error, by its status,
+    never an account refusal. Any other client error fails at once."""
+    status = getattr(error, "status_code", None)
+    return isinstance(status, int) and (status in (408, 429) or status >= 500) and not account_refusal(error)
+
+
 class InspectorModel(ChatLiteLLM):
     def _get_ls_params(self, *args, **kwargs):
         return {**super()._get_ls_params(*args, **kwargs), "ls_provider": "nudi-inspector"}
+
+    async def acompletion_with_retry(self, run_manager=None, **kwargs):
+        """LiteLLM's call, tried again while it fails briefly. ChatLiteLLM's own retry is off at its default of one attempt
+        and never covers a 500, 502 or 503."""
+        run, _, name = current.get()
+        return await again(run, f"{name}: a model call failed", partial(self.client.acompletion, **kwargs), brief)
 
 
 def chat_model(config, key: str, callbacks=()) -> InspectorModel:
@@ -76,7 +90,7 @@ def chat_model(config, key: str, callbacks=()) -> InspectorModel:
     if config.model.startswith("xiaomi_mimo/") and config.reasoning_effort not in (None, "none"):
         kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
     return InspectorModel(model=config.model, api_base=config.api_base, api_key=key, model_kwargs=kwargs, streaming=False,
-                          max_retries=1, cache=False, callbacks=list(callbacks))
+                          cache=False, callbacks=list(callbacks))
 
 
 class HarborBackend(BaseSandbox):

@@ -489,7 +489,7 @@ def assert_artifacts_retained(output: Path, result: EpisodeResult) -> None:
 
 
 @pytest.mark.parametrize(("source", "path"), [(CONTRACT_TASK, "verifiers"), (DOCKERFILE_TASK, "harbor")])
-def test_cancellation_during_agent_keeps_partial_evidence(docker_env, tmp_path, source, path):
+def test_cancellation_during_agent_keeps_the_evidence_so_far(docker_env, tmp_path, source, path):
     task = long_agent_budget(tmp_path, source)
     first_seen: list[float] = []
 
@@ -511,7 +511,7 @@ def test_cancellation_during_agent_keeps_partial_evidence(docker_env, tmp_path, 
     else:
         # No episode exists yet; the run and the live trace do, with the model call observed.
         assert {"run_id", "trace_id"} <= set(result.ids) and "episode_id" not in result.ids
-        (line,) = (docker_env / result.artifacts["partial_traces"]).read_text().splitlines()
+        (line,) = (docker_env / result.artifacts["unfinished_traces"]).read_text().splitlines()
         trace = json.loads(line)
         assert trace["id"] == result.ids["trace_id"]
         assert [call["model"] for call in trace["calls"]] == [MODEL]

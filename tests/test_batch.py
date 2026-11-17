@@ -168,7 +168,7 @@ def test_the_time_limit_is_one_deadline_split_over_rounds(tmp_path, monkeypatch)
                               concurrency=8, time_limit=0.001)
     assert statuses(tmp_path / "late") == {**dict.fromkeys(names[:4], "complete"), "task-4": "not_started"}
     assert all(0 < limit <= 0.0005 for limit in runs.options("time_limit").values())
-    assert (built["status"], built["exit_code"]) == ("partial", 1)
+    assert (built["status"], built["exit_code"]) == ("unfinished", 1)
 
 
 @pytest.mark.parametrize("duration, started, waits", [(0, 2, [0, 30]), (61, 1, [0])])
@@ -203,7 +203,7 @@ def test_environments_that_cannot_start_before_the_deadline_add_no_waits(tmp_pat
     built = asyncio.run(batch())
     assert calls == names[:started]
     assert [row["status"] for row in built["environments"]] == ["complete"] * started + ["not_started"] * (5 - started)
-    assert (built["status"], built["exit_code"]) == ("partial", 1)
+    assert (built["status"], built["exit_code"]) == ("unfinished", 1)
     assert waited == waits
 
 
@@ -273,12 +273,12 @@ def test_every_environment_refused_exits_2(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("outcomes, code", [
-    ({}, 0), ({"task-b": "time_limit"}, 1), ({"task-b": "partial"}, 1), ({"task-a": "time_limit", "task-b": "time_limit"}, 1)])
+    ({}, 0), ({"task-b": "time_limit"}, 1), ({"task-b": "unfinished"}, 1), ({"task-a": "time_limit", "task-b": "time_limit"}, 1)])
 def test_the_command_exits_0_only_when_every_environment_would(tmp_path, monkeypatch, capsys, outcomes, code):
     Runs(monkeypatch, outcomes=outcomes)
     assert command(*tasks(tmp_path, "task-a", "task-b"), "--output", tmp_path / "batch") == code
     status = summary(tmp_path / "batch")["status"]
-    assert status == ("partial" if "partial" in outcomes.values() else "time_limit" if outcomes else "complete")
+    assert status == ("unfinished" if "unfinished" in outcomes.values() else "time_limit" if outcomes else "complete")
 
 
 def test_an_environment_not_started_makes_the_command_exit_1(tmp_path, monkeypatch):
@@ -320,7 +320,7 @@ def test_a_stop_writes_running_reports_marks_waiting_ones_and_prints_the_summary
 
 def test_the_summary_lists_each_answer_line_cost_and_folder_without_a_combined_verdict(tmp_path, monkeypatch):
     """Each row keeps its report's verdict and how it ran; this report, from before headlines, has them first and last."""
-    Runs(monkeypatch, outcomes={"task-b": "partial"})
+    Runs(monkeypatch, outcomes={"task-b": "unfinished"})
     batch = tmp_path / "batch"
     built = send_environments(tasks(tmp_path, "task-a", "task-b"), output_dir=batch, spending_cap=1)
     assert "answer" not in built and "verdict" not in json.dumps(built)

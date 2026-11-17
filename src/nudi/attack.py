@@ -6,6 +6,8 @@ import math
 import time
 
 from harbor.models.task.task import Task
+from typing import Annotated
+
 from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 from nudi import copies
@@ -25,7 +27,7 @@ from nudi.inspection import (
     unmarked,
 )
 from nudi.inspector_sandbox import START_FAILURES
-from nudi.records import Assessment, EnvironmentUnavailable, write_private
+from nudi.records import Assessment, EnvironmentUnavailable, renamed, write_private
 
 
 NO_CANDIDATE = "no candidate"
@@ -146,7 +148,7 @@ class Cause(BaseModel):
 
 
 class AttackResult(BaseModel):
-    status: str = "running"
+    status: Annotated[str, renamed("unresolved")] = "running"
     maximum_attempts: int = 2
     discovery_attempts: int = 1
     minimal_hints: bool = True
@@ -788,6 +790,6 @@ async def attack(run, *, maximum_attempts: int = 2, discovery_attempts: int = 1,
             result.status = "not run" if prevented else "complete"
             result.limits.append(UNGUIDED_LIMIT if prevented else DISABLED_LIMIT)
         if result.status == "running":
-            result.status = "complete" if settled() else "partial"
+            result.status = "complete" if settled() else "unresolved"
         save()
     return result

@@ -410,6 +410,26 @@ def event(run, kind: str, message: str, severity: int | None = logging.INFO, /, 
         publish()
 
 
+# Seconds before each further try of an operation that failed briefly. The client libraries' own retries span a
+# second or two, shorter than a gateway or Modal outage.
+RETRY_WAITS = (4, 8, 16)
+
+
+async def again(run, failed: str, call, brief):
+    """`call()`, tried again after each of `RETRY_WAITS` while `brief(error)` is true of its error, with a `retry` event
+    and its line on stderr before each try. `failed` begins the line. Only an operation that is safe to repeat comes here."""
+    for wait in RETRY_WAITS:
+        try:
+            return await call()
+        except Exception as error:
+            if not brief(error):
+                raise
+            name = type(error).__name__
+            event(run, "retry", f"{failed} with {name}; trying again in {wait} s", logging.WARNING, error=name, wait=wait)
+            await asyncio.sleep(wait)
+    return await call()
+
+
 def resolve_credentials(config: RunConfig, models, roles) -> tuple[dict[Role, str], dict[Role, str]]:
     """Each role's credential and its source: the credentials file first, then the environment."""
     if config.credentials_file and not config.credentials_file.is_file():
@@ -818,7 +838,7 @@ async def simulate(run: Run, episodes: int = 12, *, gate: contextlib.AbstractAsy
     an episode only while the spending cap allows; admitted episodes finish. With `gate`
     each episode holds one of its slots, which other work shares, from before admission to its end. Failed
     episodes stay recorded; one that ended without a reward and without a model call gets one fresh attempt in its
-    place. The pool is partial only when one has no usable reward. Each episode's state copies serve grader
+    place. The pool is unfinished only when one has no usable reward. Each episode's state copies serve grader
     inspection, which reuses this pool."""
     from nudi.checks import finish_cleanup, redacted
 
@@ -879,7 +899,7 @@ async def simulate(run: Run, episodes: int = 12, *, gate: contextlib.AbstractAsy
     try:
         await asyncio.gather(*workers)
         if simulation.status == "running":
-            simulation.status = "partial" if unusable or replaced else "complete"
+            simulation.status = "unfinished" if unusable or replaced else "complete"
     except asyncio.CancelledError:
         simulation.status = "cancelled"
         raise

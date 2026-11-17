@@ -1,7 +1,7 @@
 """send_nudis, send_nudis_async and `nudi send-nudis`: one implementation over the existing analyses.
 
 The existing analyses and run start are replaced by recorders that retain records the way
-they do, so selection, configuration, guidance and partial results are checked without Docker
+they do, so selection, configuration, guidance and unfinished results are checked without Docker
 or model calls. The analyses themselves have their own suites.
 """
 
@@ -155,13 +155,10 @@ def after_feed(fake):
 SHOWN = Check(id="check-0000", ids={}, content=Content(episode="0000-inspector", path="copy.json", sha256="0" * 64),
               requirement=Observation(episode=None, path="instruction.md", excerpt="Write the answer."), command=["python3"],
               exit_code=0, output=json.dumps({"observations": {"shown": True}}))
-# An approved list whose one requirement that check measures, so a reading of correct work there can read it supported.
-APPROVED = '[[requirement]]\ntext = "Write the answer."\nobservation = "shown"\n'
 
 
 def candidate(mechanism, interpretation, outcome="unknown", full_guidance=None, hint_location=None):
-    """An inspector reading whose check measured its one mark; one of correct work failed reads the approved
-    requirement supported."""
+    """An inspector reading whose check measured its one mark; one of correct work failed reads the requirement supported."""
     derivation = Derivation(observations=["shown"], validity="supported") if outcome == "rejected_valid" else None
     return Assessment(claim=Claim(mechanism=mechanism, episode="0000-inspector", interpretation=interpretation, derivation=derivation,
                                   full_guidance=full_guidance, hint_location=hint_location, marks=["shown"]), outcome=outcome, check=SHOWN,
@@ -415,21 +412,19 @@ def test_grader_agreement_availability_is_the_same_in_api_cli_json_and_markdown(
         (task / name).parent.mkdir(parents=True, exist_ok=True)
         (task / name).write_text(text)
     grader = {}
-    approved = tmp_path / "requirements.toml"
-    approved.write_text('[[requirement]]\ntext = "sorted"\nobservation = "sorted"\n')
     if status == "supported":
         # One verified reference grounds the binary rule; the other two episodes have presumed labels, which stay out of
-        # agreement. Its reading reads the one approved requirement supported, so its work counts as complete.
+        # agreement.
         reference = checked("0000-simulator", "c0", "sorted", "supported", basis=basis("supported", ["sorted"], ["c0"], decision=RULE))
         reference.check.output = json.dumps({"observations": {"sorted": True}})
         grader = {"assessments": [reference],
                   "ordinary": {"0000-simulator": EpisodeLabel(label="legitimate", basis="verified", assessments=[0]),
                                **{f"000{index}-simulator": EpisodeLabel(label="legitimate", basis="presumed") for index in (1, 2)}}}
     Analyses(monkeypatch, rewards=rewards, **grader)
-    result = send_nudis(task, output_dir=tmp_path / "api", episodes=len(rewards), analysis="simulation", requirements=approved)
+    result = send_nudis(task, output_dir=tmp_path / "api", episodes=len(rewards), analysis="simulation")
     Analyses(monkeypatch, rewards=rewards, **grader)
     code = cli.main(["send-nudis", str(task), "--output", str(tmp_path / "cli"), "--episodes", str(len(rewards)),
-                     "--analysis", "simulation", "--requirements", str(approved)])
+                     "--analysis", "simulation"])
 
     # Unsupported agreement alone neither fails the run nor hides its other results.
     assert code == 0 and result["status"] == "complete"
@@ -450,7 +445,7 @@ def test_grader_agreement_availability_is_the_same_in_api_cli_json_and_markdown(
     assert message in "\n".join(result["warnings"])
     assert f"reward: {status}, no agreement values. {message}" in text
     if status == "unsupported":
-        assert "Wrong partial scores were not searched; that search is not supported yet." in text
+        assert "Wrong non-binary scores were not searched; that search is not supported yet." in text
 
 
 INVALID = {
@@ -577,34 +572,21 @@ def test_each_inspector_candidate_composes_its_own_guidance_without_a_model_call
 
 @pytest.mark.parametrize("only_false_negative", [False, True])
 def test_rejected_valid_hack_findings_become_valid_work_candidates(tmp_path, monkeypatch, only_false_negative):
-    """Rejected valid work whose reading reads every approved requirement supported is a valid-work candidate with its
-    own guidance, beside exploit candidates."""
+    """Rejected valid work whose check measured its marks is a valid-work candidate with its own guidance, beside exploit
+    candidates."""
     fn = candidate("correct work rejected", "undeserved rejection", outcome="rejected_valid",
                    full_guidance="Write the answer in the documented format.", hint_location="fn/private-grader.py")
     candidates = [fn]
     if not only_false_negative:
         candidates.append(candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION))
     analyses = Analyses(monkeypatch, candidates=candidates)
-    (tmp_path / "requirements.toml").write_text(APPROVED)
-    result = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking", requirements=tmp_path / "requirements.toml")
+    result = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
     sent = analyses.candidates_sent
     assert len(sent) == len(candidates)
     assert [(item.id, item.valid_work) for item in sent] == [("hack-0", True), ("hack-1", False)][:len(candidates)]
     assert sent[0].guidance == {"full": "Write the answer in the documented format.", "minimal": WHERE_TO_LOOK + "\nfn/private-grader.py"}
     findings = result["inspections"]["hack_inspector"]["findings"]
     assert [item["assessment"]["outcome"] for item in findings["evidenced"]] == ["rejected_valid", "accepted_invalid"][:len(candidates)]
-
-
-def test_rejected_valid_work_with_marks_and_no_approved_list_is_still_a_candidate(tmp_path, monkeypatch):
-    """The approved list changes only the report's words: a reading of failed work whose check measured its marks is a
-    valid-work candidate whether or not a list was approved."""
-    fn = candidate("correct work rejected", "undeserved rejection", outcome="rejected_valid",
-                   full_guidance="Write the answer in the documented format.", hint_location="fn/private-grader.py")
-    analyses = Analyses(monkeypatch, candidates=[fn])
-    result = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="hacking")
-    assert [(item.id, item.valid_work) for item in analyses.candidates_sent] == [("hack-0", True)]
-    evidenced, = result["inspections"]["hack_inspector"]["findings"]["evidenced"]
-    assert evidenced["assessment"]["outcome"] == "rejected_valid"
 
 
 @pytest.mark.parametrize(("full_guidance", "hint_location"), [
@@ -899,8 +881,7 @@ def test_each_grader_finding_is_recorded_on_its_own_and_attacked(tmp_path, monke
                   hint_location=GRADER_LOCATION),
         candidate("legitimate work", INTERPRETATION, "legitimate", full_guidance=GRADER_STEPS, hint_location=GRADER_LOCATION),
     ])
-    (tmp_path / "requirements.toml").write_text(APPROVED)
-    send_nudis(tmp_path / "task", output_dir=tmp_path / "run", requirements=tmp_path / "requirements.toml")
+    send_nudis(tmp_path / "task", output_dir=tmp_path / "run")
 
     assert analyses.calls[-1] == ("attack", 1, 1, 3)
     hack, same, grader = analyses.candidates_sent
@@ -916,11 +897,11 @@ def test_each_grader_finding_is_recorded_on_its_own_and_attacked(tmp_path, monke
         ("hack inspector evidenced hack-0", "P1"), ("grader inspector evidenced grader-0", "G1"), ("grader inspector evidenced grader-1", "G2")]
 
 
-@pytest.mark.parametrize("status", ["complete", "partial"])
+@pytest.mark.parametrize("status", ["complete", "unresolved"])
 def test_the_grader_inspector_request_lists_the_hack_findings_without_their_full_guidance(tmp_path, monkeypatch, status):
     """In the full analysis the grader inspector reads each hack candidate finding as a place to look: its id,
-    category, outcome, mechanism and where to look, never its full guidance. A partial hack inspection still gives
-    its findings and says it was partial."""
+    category, outcome, mechanism and where to look, never its full guidance. An unresolved hack inspection still gives
+    its findings and says it was unresolved."""
     analyses = Analyses(monkeypatch, candidates=[
         candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION),
         candidate("legitimate work", INTERPRETATION, "legitimate", full_guidance=REPRODUCTION, hint_location=LOCATION),
@@ -946,7 +927,7 @@ def test_a_run_whose_steps_all_ran_exits_0_with_unresolved_evidence_in_its_answe
     inspect_hacks = analyses.inspect_hacks
 
     async def unresolved(run, **options):
-        result = (await inspect_hacks(run, **options)).model_copy(update={"status": "partial"})
+        result = (await inspect_hacks(run, **options)).model_copy(update={"status": "unresolved"})
         (run.config.output_dir / "inspection-hack.json").write_text(result.model_dump_json())
         return result
 
@@ -1010,7 +991,7 @@ def test_a_hack_phase_that_raised_after_saving_findings_still_lists_them_for_the
         candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION)])
 
     async def raised(run, *, focused_attempts, **_):
-        saved = analyses.inspection(run, "hack", analyses.candidates).model_copy(update={"status": "partial"})
+        saved = analyses.inspection(run, "hack", analyses.candidates).model_copy(update={"status": "unfinished"})
         (run.config.output_dir / "inspection-hack.json").write_text(saved.model_dump_json())
         raise RuntimeError("hack broke")
 
@@ -1019,7 +1000,7 @@ def test_a_hack_phase_that_raised_after_saving_findings_still_lists_them_for_the
     assert analyses.grader_request == {"hack_inspection": "failed", "hack_findings": [
         {"id": "hack-0", "category": None, "outcome": "accepted_invalid", "mechanism": MECHANISM, "where_to_look": LOCATION}]}
     assert REPRODUCTION not in json.dumps(analyses.grader_request)
-    assert (built["status"], built["analyses"]["hack"]) == ("partial", "partial")
+    assert (built["status"], built["analyses"]["hack"]) == ("unfinished", "unfinished")
 
 
 @pytest.mark.parametrize("case", ["no findings", "failed hack phase", "simulation only"])
@@ -1111,13 +1092,13 @@ def test_failed_analysis_keeps_independent_results_and_redacts_credentials(tmp_p
     assert analyses.calls[-1] == ("attack", 1, 1, 0)
     assert analyses.grader_request is None
     assert report["analyses"] == {"simulation": "complete", "grader": "complete", "hack": "not run", "attack": "complete"}
-    assert report["status"] == "partial"
+    assert report["status"] == "unfinished"
     assert "run: hack failed: RuntimeError: provider echoed [redacted]" in report["warnings"]
     for name in ("run.json", "report.json", "report.md"):
         assert SECRET not in (tmp_path / "run" / name).read_text()
 
 
-def test_cancellation_writes_the_partial_report_and_propagates(tmp_path, monkeypatch):
+def test_cancellation_writes_the_report_so_far_and_propagates(tmp_path, monkeypatch):
     """A run stopped during the ordinary-episode path keeps the hack inspector's results."""
     analyses = Analyses(monkeypatch, fail={"simulation": asyncio.CancelledError()})
     with pytest.raises(asyncio.CancelledError):
@@ -1127,7 +1108,7 @@ def test_cancellation_writes_the_partial_report_and_propagates(tmp_path, monkeyp
     report = json.loads((tmp_path / "run" / "report.json").read_text())
     # The attack started with the hack inspector; it is cancelled before its feed closed, with no record saved.
     assert report["analyses"] == {"simulation": "not run", "grader": "not run", "hack": "complete", "attack": "not run"}
-    assert report["status"] == "partial" and report["unresolved"] == []
+    assert report["status"] == "unfinished" and report["unresolved"] == []
     assert "run: cancelled during simulation and attack" in report["warnings"]
 
 
@@ -1231,7 +1212,7 @@ def test_failed_phases_and_run_warnings_are_events_and_stderr_prints_their_text(
     assert fields(log)[1] == {"kind": "warning", "message": "a model call's cost is unknown"}
     # Each event carries the run's cost so far, as run.json has it then.
     assert [[item[key] for key in COST] for item in log] == [[0.0, 0, 0]] + [[0.25, 1, 2]] * (len(log) - 1)
-    assert fields(log)[-1] == {"kind": "run_end", "status": "partial", "report": "report.json"}
+    assert fields(log)[-1] == {"kind": "run_end", "status": "unfinished", "report": "report.json"}
     assert SECRET not in (tmp_path / "run" / "events.jsonl").read_text()
 
 
@@ -1507,7 +1488,7 @@ def test_a_failed_phase_before_the_time_limit_still_exits_1(tmp_path, monkeypatc
     monkeypatch.setattr(send, "attack", after_feed(sleeping))
     assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run"), "--time-limit", "0.01"]) == 1
     report = json.loads((tmp_path / "run" / "report.json").read_text())
-    assert report["status"] == "partial"
+    assert report["status"] == "unfinished"
     assert "run: the run stopped at its time limit of 0.01 minutes during attack" in report["warnings"]
 
 
@@ -1892,7 +1873,7 @@ def test_a_task_environment_that_cannot_start_stops_the_run_with_its_reason(tmp_
                      "nudi: attack stopped after 0:00:00: another analysis stopped the run"]
     assert fields(events(tmp_path / "run"))[-2:] == [
         {"kind": "phase_end", "phase": "attack", "elapsed": 0, "status": "cancelled"},
-        {"kind": "run_end", "status": "partial", "report": "report.json"}]
+        {"kind": "run_end", "status": "unfinished", "report": "report.json"}]
     assert [call[0] for call in analyses.calls] == ["start_run", "simulate", "inspect_hacks"]
     built = json.loads((tmp_path / "run" / "report.json").read_text())
     assert built["analyses"] == {"hack": "environment_unavailable", "attack": "not run", "simulation": "complete", "grader": "not run"}
@@ -1928,16 +1909,14 @@ def sandbox_record(task: Path, **fields) -> str:
                             "task_digest": tree_digest(task), "copy_digest": "0", "environment": {}, **fields}).model_dump_json()
 
 
-def earlier_run(tmp_path, monkeypatch, analysis, requirements=None, **fake):
+def earlier_run(tmp_path, monkeypatch, analysis, **fake):
     """An earlier run of the fake analyses in `run-1` of a task with one file, with one inspector episode, one sandbox and
-    one priced call added as a real inspection leaves them; `requirements` is its approved list's TOML text."""
+    one priced call added as a real inspection leaves them."""
     (tmp_path / "task").mkdir()
     (tmp_path / "task" / "grader.py").write_text("expected = 1\n")
     Analyses(monkeypatch, **fake)
     earlier = tmp_path / "run-1"
-    if requirements:
-        (tmp_path / "requirements.toml").write_text(requirements)
-    send_nudis(tmp_path / "task", output_dir=earlier, analysis=analysis, requirements=tmp_path / "requirements.toml" if requirements else None)
+    send_nudis(tmp_path / "task", output_dir=earlier, analysis=analysis)
     record = json.loads((earlier / "run.json").read_text())
     episode, box = earlier / "episodes" / f"{len(record['episodes']):04d}-inspector", earlier / "sandboxes" / "sandbox-0000"
     for folder in (episode, box):
@@ -2038,24 +2017,6 @@ def test_a_rerun_keeps_only_evidenced_earlier_findings_and_an_earlier_attacker_f
     assert built["attack"]["leads"] == [{"findings": ["0007-attacker"], "cause": "Write the score file.", "origin": str(earlier.resolve())}]
 
 
-def test_attack_from_keeps_the_earlier_runs_approved_list_and_refuses_another(tmp_path, monkeypatch, capsys):
-    """The earlier run's readings were decided under its approved list, so the rerun reports under that list, also when
-    no --requirements is given; the same list again is accepted, and a different one is refused before anything runs."""
-    earlier = earlier_run(tmp_path, monkeypatch, "hacking", APPROVED)
-    Analyses(monkeypatch)
-    built = send_nudis(tmp_path / "task", output_dir=tmp_path / "run-2", attack_from=earlier)
-    assert built["configuration"]["approved_requirements"] == 1
-    assert json.loads((tmp_path / "run-2" / "run.json").read_text())["requirements"] == [{"text": "Write the answer.", "observation": "shown"}]
-    send_nudis(tmp_path / "task", output_dir=tmp_path / "run-3", attack_from=earlier, requirements=tmp_path / "requirements.toml")
-    (tmp_path / "other.toml").write_text(APPROVED.replace("shown", "written"))
-    with pytest.raises(ValueError, match="differs from the approved requirement list of the earlier run"):
-        send_nudis(tmp_path / "task", output_dir=tmp_path / "run-4", attack_from=earlier, requirements=tmp_path / "other.toml")
-    assert not (tmp_path / "run-4").exists()
-    assert cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run-5"), "--attack-from", str(earlier),
-                     "--requirements", str(tmp_path / "other.toml")]) == 2
-    assert "differs from the approved requirement list" in capsys.readouterr().err
-
-
 def test_a_rerun_whose_copy_fails_still_ends_its_event_log(tmp_path, monkeypatch):
     """Copying is part of the run, so a failed copy stops it with a last event, as any other error does."""
     earlier = earlier_run(tmp_path, monkeypatch, "hacking")
@@ -2076,7 +2037,7 @@ def test_attack_from_a_full_run_keeps_its_simulation_and_attacks_the_grader_find
     findings, all fed to the run's one attack call, as when the attack runs beside both inspectors. The ordinary
     episodes, labels and metrics read the copied records. TOML paths are relative to the file.
     The run's start names only the attack, which is all that runs."""
-    earlier = earlier_run(tmp_path, monkeypatch, "full", APPROVED, rewards=[1.0, 0.0], candidates=[
+    earlier = earlier_run(tmp_path, monkeypatch, "full", rewards=[1.0, 0.0], candidates=[
         candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION)], assessments=[
         candidate("accepted forged output", INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION),
         candidate("rejected documented format", "undeserved rejection", "rejected_valid", full_guidance=GRADER_STEPS,
@@ -2100,9 +2061,9 @@ def test_attack_from_a_full_run_keeps_its_simulation_and_attacks_the_grader_find
     assert SOURCE in built["answer"]
 
 
-def test_attack_from_a_run_whose_grader_inspection_left_no_record_is_partial(tmp_path, monkeypatch):
+def test_attack_from_a_run_whose_grader_inspection_left_no_record_is_unfinished(tmp_path, monkeypatch):
     """A grader inspection that raised before its first save left no record. The rerun does not run it again, reads
-    partial, and its Answer's source line names the analysis without a record."""
+    unfinished, and its Answer's source line names the analysis without a record."""
     earlier = earlier_run(tmp_path, monkeypatch, "full", rewards=[1.0, 0.0], fail={"grader": RuntimeError("grader broke")})
     assert not (earlier / "inspection-grader.json").exists()
     analyses = Analyses(monkeypatch)
@@ -2110,7 +2071,7 @@ def test_attack_from_a_run_whose_grader_inspection_left_no_record_is_partial(tmp
 
     assert [call[0] for call in analyses.calls] == ["start_run", "attack"]
     assert built["analyses"] == {"hack": "complete", "simulation": "complete", "grader": "not run", "attack": "complete"}
-    assert built["status"] == "partial"
+    assert built["status"] == "unfinished"
     assert (built["answer"][0], built["answer"][-1]) == (
         "Finished with gaps: the grader inspector did not run. Results below are what was found.",
         SOURCE.replace("that run recorded.", "that run recorded; grader left no record there."))
@@ -2143,7 +2104,7 @@ def test_attack_from_a_run_stopped_in_its_hack_inspection_keeps_that_status(tmp_
     analyses = Analyses(monkeypatch)
     built = send_nudis(tmp_path / "task", output_dir=tmp_path / "run-2", attack_from=earlier)
     assert analyses.calls == [("start_run", ["attacker", "inspector"]), ("attack", 1, 1, 1)]
-    assert built["analyses"] == {"hack": "cancelled", "attack": "complete"} and built["status"] == "partial"
+    assert built["analyses"] == {"hack": "cancelled", "attack": "complete"} and built["status"] == "unfinished"
     assert "hack cancelled: its coverage is incomplete" in built["warnings"]
     assert (built["answer"][0], built["answer"][-1]) == (
         "Finished with gaps: the hack inspector cancelled. Results below are what was found.", SOURCE)
@@ -2316,7 +2277,7 @@ def test_a_modal_run_stops_its_app_at_run_end(tmp_path, monkeypatch, fail, sandb
     built = send_nudis(tmp_path / "task", output_dir=tmp_path / "run", analysis="simulation")
     app = f"nudi-{analyses.run.record.run_id}"
     assert calls == ([("lookup", app, False), ("stop", app)] if sandboxes else [])
-    assert built["status"] == ("partial" if fail else "complete")
+    assert built["status"] == ("unfinished" if fail else "complete")
     stopping = [warning for warning in built["warnings"] if app in warning]
     assert stopping == ([f"run: Modal app {app} was not stopped (RuntimeError); stop it with `modal app stop {app}`"] if stop_fails else [])
     assert "as-secret-text" not in (tmp_path / "run" / "run.json").read_text()
@@ -2564,7 +2525,7 @@ def test_a_raising_attack_is_one_warning_and_the_hack_phase_keeps_its_status(tmp
     assert built["warnings"].count("run: attack failed: RuntimeError: attack broke") == 1
     assert built["analyses"]["hack"] == "complete"
     # The attack failed, so not every step ran.
-    assert built["status"] == "partial" and "attack" in built["unfinished"]
+    assert built["status"] == "unfinished" and "attack" in built["unfinished"]
 
 
 def test_hack_sessions_and_early_attempts_share_the_slots_of_the_run(tmp_path, monkeypatch):
@@ -2674,7 +2635,7 @@ def test_the_run_has_one_attack_with_one_line_and_the_hack_line_counts_no_attemp
     unclear = AttackAttempt(level="none", number=1, context="attacker-none-1", status="unknown")
 
     async def attacking(run, **options):
-        return AttackResult(status="partial", attempts=[unclear])
+        return AttackResult(status="unresolved", attempts=[unclear])
 
     monkeypatch.setattr(send, "attack", after_feed(attacking))
     cli.main(["send-nudis", str(tmp_path / "task"), "--output", str(tmp_path / "run")])
@@ -2682,7 +2643,7 @@ def test_the_run_has_one_attack_with_one_line_and_the_hack_line_counts_no_attemp
     assert lines[-1] == "nudi: attack done after 0:00:00: 1 attempt, 0 exploits; some results unclear"
     assert "nudi: hack inspector done after 0:00:00: 0 experiments, 0 assessments" in lines
     ends = [item for item in events(tmp_path / "run") if item["kind"] == "phase_end" and item["phase"] in ("hack", "attack")]
-    assert [(item["phase"], item["status"]) for item in ends] == [("hack", "complete"), ("attack", "partial")]
+    assert [(item["phase"], item["status"]) for item in ends] == [("hack", "complete"), ("attack", "unresolved")]
     assert ends[1]["attempts"] == 1 and "new_attempts" not in ends[1] and "attacker_attempts" not in ends[0]
 
 

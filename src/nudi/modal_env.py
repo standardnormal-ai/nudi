@@ -7,15 +7,18 @@ importing nudi or running on Docker never imports the Modal SDK, which reads the
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from functools import partial
 
 from harbor.environments import modal
 from harbor.environments.base import ExecResult
 from harbor.utils.optional_import import MissingExtraError
+from modal.exception import AuthError
+from modal.exception import ConnectionError as ModalConnectionError
 
 from nudi.inspector_sandbox import _now
 from nudi.records import OUT_OF_MEMORY, ModalSandbox, RunRecord
 from nudi.report import MODAL_LIFETIME
-from nudi.run_state import current, logger
+from nudi.run_state import again, current, logger
 
 # Bounds each Modal call of a stop: the termination, the wait for it and each removal check.
 REMOVAL_TIMEOUT = 60
@@ -94,6 +97,12 @@ def _bounded(call):
     return asyncio.wait_for(call, REMOVAL_TIMEOUT)
 
 
+def _brief(error: Exception) -> bool:
+    """Whether a Modal failure can pass: Modal refused the credential mid-run or lost the connection. A credential
+    refused at the start fails `start`, which is not repeated."""
+    return isinstance(error, (AuthError, ModalConnectionError))
+
+
 class ModalBox(modal.ModalEnvironment):
     """Harbor's Modal environment with every SDK failure translated into a `ModalFailure`.
 
@@ -105,7 +114,8 @@ class ModalBox(modal.ModalEnvironment):
     `nudi-<run id>`, so Modal's billing report has rows for that run alone. With `copy_image`,
     the snapshot of a state copy, the sandbox starts from it. A nudi sandbox, which names its run,
     reads command output that is not UTF-8 with replacement characters, as Harbor's Docker
-    environment does; a native trial's sandbox keeps Harbor's Modal exec."""
+    environment does; a native trial's sandbox keeps Harbor's Modal exec. A file copy, and the
+    start of a nudi sandbox's command, is tried again after a brief Modal failure."""
 
     def __init__(self, *args, run=None, copy_image=None, **kwargs):
         self.native = run is None
@@ -146,8 +156,11 @@ class ModalBox(modal.ModalEnvironment):
         if not self._sandbox:
             raise RuntimeError("Sandbox not found. Please start the environment first.")
         try:
-            process = await self._sandbox.exec.aio(shell, "-lc" if login else "-c", command, workdir=cwd, text=False,
-                                                   secrets=[modal._cached_env_secret(env)] if env else [], timeout=timeout_sec)
+            # Modal checks the credential before it starts the command, so only a refused start is tried again; any
+            # later failure can follow the command's effects.
+            start = partial(self._sandbox.exec.aio, shell, "-lc" if login else "-c", command, workdir=cwd, text=False,
+                            secrets=[modal._cached_env_secret(env)] if env else [], timeout=timeout_sec)
+            process = await again(self.run, "Modal exec failed to start", start, lambda error: isinstance(error, AuthError))
             stdout, stderr = await process.stdout.read.aio(), await process.stderr.read.aio()
             return_code = await process.wait.aio()
         except Exception as error:
@@ -155,17 +168,21 @@ class ModalBox(modal.ModalEnvironment):
             raise
         return ExecResult(stdout=stdout.decode(errors="replace"), stderr=stderr.decode(errors="replace"), return_code=return_code)
 
+    async def _again(self, operation: str, call):
+        """A copy, which writes the same files again when repeated, under `_guarded` and tried again while it fails briefly."""
+        await _guarded(operation, again(self.run, f"Modal {operation} failed", call, _brief))
+
     async def upload_file(self, source_path, target_path):
-        await _guarded("upload", super().upload_file(source_path, target_path))
+        await self._again("upload", partial(super().upload_file, source_path, target_path))
 
     async def upload_dir(self, source_dir, target_dir):
-        await _guarded("upload", super().upload_dir(source_dir, target_dir))
+        await self._again("upload", partial(super().upload_dir, source_dir, target_dir))
 
     async def download_file(self, source_path, target_path):
-        await _guarded("download", super().download_file(source_path, target_path))
+        await self._again("download", partial(super().download_file, source_path, target_path))
 
     async def download_dir(self, source_dir, target_dir):
-        await _guarded("download", super().download_dir(source_dir, target_dir))
+        await self._again("download", partial(super().download_dir, source_dir, target_dir))
 
     async def is_dir(self, path, user=None):
         return await _guarded("exec", super().is_dir(path, user))

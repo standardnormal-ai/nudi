@@ -28,7 +28,6 @@ from nudi.records import (
     Observation,
     Ordering,
     Reading,
-    Requirement,
     RunRecord,
     Simulation,
 )
@@ -64,9 +63,7 @@ class RunDir:
             models=dict(DEFAULT_MODELS), credential_sources={role: "environment" for role in DEFAULT_MODELS},
             spending_cap=5.0, capacity=Capacity(docker_cpus=8, docker_memory_mb=16384, episode_cpus=1,
                                                 episode_memory_mb=2048, concurrency=4),
-            cost_map={"source": "local"}, simulation=Simulation(requested=0, status="complete"),
-            # The approved requirement list: an episode's work is correct only when its readings read it supported.
-            requirements=[Requirement(text=text, observation=key) for key, text in REQUIREMENTS.items()])
+            cost_map={"source": "local"}, simulation=Simulation(requested=0, status="complete"))
         self.grader: InspectionResult | None = None
         self.hack: InspectionResult | None = None
         self.attack: AttackResult | None = None
@@ -128,7 +125,7 @@ def basis(completion: str, keys: list[str], checks: list[str], **fields) -> Metr
 
 
 def referenced(run: RunDir, completion: str, rewards: dict, *, model="xiaomi_mimo/mimo-v2.6-pro", errors=(), **fields) -> str:
-    """An ordinary episode whose one check settles its single-requirement completion; a second reads the other approved
+    """An ordinary episode whose one check settles its single-requirement completion; a second reads the other
     requirement the same way."""
     name = run.episode(rewards=rewards, model=model, errors=errors)
     check = f"check-{name}"
@@ -182,12 +179,12 @@ def test_reward_summary_groups_configurations_and_never_turns_missing_or_invalid
 def test_constant_and_mixed_rewards_are_descriptive_notes_not_warnings(tmp_path):
     run = RunDir(tmp_path)
     for _ in range(3):
-        run.episode(rewards={"reward": 1.0, "partial": 0.5})
-    run.episode(rewards={"reward": 0.0, "partial": 0.25})
+        run.episode(rewards={"reward": 1.0, "part": 0.5})
+    run.episode(rewards={"reward": 0.0, "part": 0.25})
 
     result = run.report()
     notes, warnings = "\n".join(result["notes"]), "\n".join(result["warnings"])
-    assert "reward: mixed" in notes and "partial: mixed" in notes
+    assert "reward: mixed" in notes and "part: mixed" in notes
     assert "difficulty" in notes and "sampling" in notes and "execution" in notes
     assert "mixed" not in warnings and "constant" not in warnings
 
@@ -408,10 +405,10 @@ def test_completion_references_and_native_decisions_count_each_ordinary_episode_
               checked(violated_pass, "c2", "summary", "violated", outcome="accepted_invalid",
                       basis=basis("violated", ["summary"], ["c2", "c3"], decision=RULE)),
               checked(violated_pass, "c3", "sorted", "unknown"))
-    # Legitimate partial credit without a completion basis supplies neither label. Its fractional
+    # Legitimate credit for part of the work without a completion basis supplies neither label. Its fractional
     # reward would contradict the binary rule, so it runs under another model configuration.
-    partial = run.episode(rewards={"reward": 0.4}, model="openai/gpt-6")
-    run.label(partial, "legitimate", checked(partial, "c4", "sorted", "supported", outcome="legitimate"))
+    part_credit = run.episode(rewards={"reward": 0.4}, model="openai/gpt-6")
+    run.label(part_credit, "legitimate", checked(part_credit, "c4", "sorted", "supported", outcome="legitimate"))
     complete_fail = run.episode(rewards={"reward": 0.0})
     run.label(complete_fail, "rejected_valid", checked(complete_fail, "c5", "sorted", "supported", outcome="rejected_valid"),
               checked(complete_fail, "c6", "summary", "supported", basis=basis("supported", both, ["c5", "c6"], decision=RULE)))
@@ -434,10 +431,10 @@ def test_completion_references_and_native_decisions_count_each_ordinary_episode_
 
     result = run.report()
     episodes = result["metrics"]["episodes"]
-    names = [complete_pass, violated_pass, partial, complete_fail, unresolved, violated_fail, uncovered, no_reward]
+    names = [complete_pass, violated_pass, part_credit, complete_fail, unresolved, violated_fail, uncovered, no_reward]
     assert [episodes[name]["completion"] for name in names] == [
         "complete", "incomplete", "unknown", "complete", "unknown", "incomplete", "unknown", "complete"]
-    assert any("no metric basis" in reason for reason in episodes[partial]["completion_reasons"])
+    assert any("no metric basis" in reason for reason in episodes[part_credit]["completion_reasons"])
     assert any("whether the summary is required" in reason for reason in episodes[unresolved]["completion_reasons"])
     assert any(REQUIREMENTS["summary"] in reason for reason in episodes[uncovered]["completion_reasons"])
     assert episodes[no_reward]["decision"] is None
@@ -858,7 +855,7 @@ RUBRIC = RULE.model_copy(update={"values": [0.0, 0.5, 1.0]})
     (RULE, ENCODED, (RULE, RUBRIC), "unsupported", True),
     (RULE, ENCODED, (RULE, ENCODED.model_copy(update={"pass_values": [0.0]})), "unavailable", True),
 ], ids=["different_rules", "value_order", "omitted_values", "non_binary_declaration", "opposite_direction", "single_values",
-        "partial_declaration", "hidden_non_binary", "hidden_opposite_direction"])
+        "incomplete_declaration", "hidden_non_binary", "hidden_opposite_direction"])
 def test_one_reward_contract_per_configuration_keeps_each_decision_rule_group(tmp_path, first, second, hidden, status, split):
     run = RunDir(tmp_path)
     names = [referenced(run, completion, {"reward": value}, decision=rule)
@@ -1105,8 +1102,8 @@ def test_conflicting_requirement_conclusions_keep_completion_unknown(tmp_path):
 COMPLETE = "# Only a reward of 1.0 means the whole task is complete."
 
 
-def test_requested_basis_is_retained_and_partial_credit_can_have_a_noncompletion_reference(tmp_path, monkeypatch, credentials):
-    """Legitimate partial credit: the explanation earns 0.5 and the answer is omitted.
+def test_requested_basis_is_retained_and_credit_for_part_of_the_work_can_have_a_noncompletion_reference(tmp_path, monkeypatch, credentials):
+    """Legitimate credit for part of the work: the explanation earns 0.5 and the answer is omitted.
     The Inspector separately establishes noncompletion; finding a defect is unnecessary."""
     task = task_with_artifacts(tmp_path, '["/app/explanation.txt", "/app/answer.txt"]')
     with (task / "tests" / "test.sh").open("a") as file:
@@ -1137,8 +1134,6 @@ def test_requested_basis_is_retained_and_partial_credit_can_have_a_noncompletion
         async with serve(script) as base:
             run = new_run(tmp_path, monkeypatch, credentials, task_dir=task,
                           models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
-            run.record.requirements = [Requirement(text="the explanation", observation="exists"),
-                                       Requirement(text="the answer", observation="correct")]
             simulation = await run_state.simulate(run, 1)
             inspection = await inspection_module.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"], focused_attempts=0)
             return run, inspection
@@ -1147,7 +1142,7 @@ def test_requested_basis_is_retained_and_partial_credit_can_have_a_noncompletion
     assert "`basis`" in script.requests[0]["messages"][0]["content"]
     # Each half lives in its own file, so no check has the whole deserved score and the label stays unknown (a recorded limit).
     assert inspection.ordinary["0000-simulator"].label == "unknown"
-    assert inspection.status == "partial", "an unresolved ordinary review keeps the grader inspection partial"
+    assert inspection.status == "unresolved", "an unresolved ordinary review keeps the grader inspection unresolved"
     retained = InspectionResult.model_validate_json((run.config.output_dir / "inspection-grader.json").read_text())
     assert retained.assessments[1].claim.basis.completion == "violated"
     assert retained.assessments[1].claim.basis.decision.values == [0.0, 0.5, 1.0]
@@ -1169,8 +1164,8 @@ def test_auroc_needs_a_binary_contract_grounded_ordering_and_both_classes_and_co
     lower = ORDER.model_copy(update={"reward": "loss", "higher_completes": False})
     low_loss = referenced(run, "supported", {"loss": 0.1}, ordering=lower)
     referenced(run, "violated", {"loss": 0.3}, ordering=lower)
-    one_class = ORDER.model_copy(update={"reward": "partial"})
-    referenced(run, "supported", {"partial": 0.2}, ordering=one_class)
+    one_class = ORDER.model_copy(update={"reward": "part"})
+    referenced(run, "supported", {"part": 0.2}, ordering=one_class)
     # A configuration without an established binary reward contract reports no AUROC value.
     for completion, value in (("supported", 1.0), ("violated", 0.5)):
         referenced(run, completion, {"reward": value}, model="openai/gpt-6", ordering=ORDER)
@@ -1183,8 +1178,8 @@ def test_auroc_needs_a_binary_contract_grounded_ordering_and_both_classes_and_co
     loss = groups["xiaomi_mimo/mimo-v2.6-pro", "loss"]
     assert loss["higher_completes"] is False and loss["auroc"] == 1.0
     assert metrics["episodes"][low_loss]["score"] == 0.1
-    partial = groups["xiaomi_mimo/mimo-v2.6-pro", "partial"]
-    assert partial["auroc"] is None and "both classes" in partial["unavailable"]
+    part = groups["xiaomi_mimo/mimo-v2.6-pro", "part"]
+    assert part["auroc"] is None and "both classes" in part["unavailable"]
     assert metrics["episodes"][unordered]["score"] is None
     assert any("no source-grounded score ordering" in reason for reason in metrics["episodes"][unordered]["ordering_reasons"])
     unknown = groups["openai/gpt-6", "reward"]
@@ -1228,32 +1223,15 @@ def test_a_flag_states_its_quartiles_fence_minimum_and_what_its_episodes_recorde
     assert (identical["quartiles"], identical["fence"]) == (None, None)
 
 
-def test_one_reading_for_several_approved_requirements_supports_none_of_them(tmp_path):
-    """A reading of one check's requirement that names the observations of two approved requirements does not say which
-    it read supported, so neither is: the work the grader failed is not confirmed correct, and the metrics count no FN."""
-    run = RunDir(tmp_path)
-    both = ["sorted", "summary"]
-    name = run.episode(rewards={"reward": 0.0})
-    reading = checked(name, "c1", "sorted", "supported", outcome="rejected_valid", basis=basis("supported", both, ["c1"], decision=RULE))
-    reading.claim.derivation.observations = reading.claim.marks = both
-    reading.check.output = json.dumps({"observations": {"sorted": True, "summary": False}})
-    run.label(name, "rejected_valid", reading)
-    built = run.report()
-    assert [(item["type"], item["label"], item["reason"]) for cause in built["causes"] for item in cause["findings"]] == [
-        (None, "Work the grader failed", inspection_module.NOT_ALL)]
-    assert built["metrics"]["episodes"][name]["completion"] == "unknown"
-    assert [group["fn"] for group in built["metrics"]["confusion"]] in ([], [0])
-
-
 def test_findings_and_metrics_read_an_episodes_completion_from_the_same_readings(tmp_path):
-    """Two checks each read one approved requirement supported. The metrics count the episode as correct work failed, so
-    its rejected-valid finding says so too."""
+    """Two checks each read one requirement supported. The metrics count the episode as correct work failed, so its
+    rejected-valid finding says so too."""
     run = RunDir(tmp_path)
     name = run.episode(rewards={"reward": 0.0})
     run.label(name, "rejected_valid", checked(name, "c1", "sorted", "supported", outcome="rejected_valid"),
               checked(name, "c2", "summary", "supported", basis=basis("supported", ["sorted", "summary"], ["c1", "c2"], decision=RULE)))
     built = run.report()
     assert [group["fn"] for group in built["metrics"]["confusion"]] == [1]
-    assert [(item["type"], item["label"], item["reason"]) for cause in built["causes"] for item in cause["findings"]] == [
-        ("false_negative", "Correct work failed", None)]
+    assert [(item["type"], item["label"]) for cause in built["causes"] for item in cause["findings"]] == [
+        ("false_negative", "Correct work failed")]
     assert built["answer"][1] == "The grader misjudges work."

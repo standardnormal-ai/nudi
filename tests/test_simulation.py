@@ -32,7 +32,7 @@ from harbor.trial.trial import Trial
 import nudi.inspection as inspection_module
 from nudi import attack, checks, copies, episode, inspector_sandbox, persistence, report, run_state
 from nudi.records import (Assessment, Check, Claim, Content, Coverage, DiskFull, EpisodeResult, ErrorRecord, ModelConfig,
-                          Observation, Requirement, RunRecord)
+                          Observation, RunRecord)
 from test_attack import GO_DIR, GO_FILE, GO_LINK, stat_header
 from test_inspection import CHECKER, Images, InspectorScript, Sandboxes, sandbox_record
 from test_limits import credentials, new_run, session_messages  # noqa: F401  (pytest fixture)
@@ -251,7 +251,7 @@ def test_failure_and_spending_cap_keep_every_attempt_without_retry(tmp_path, mon
     assert stored(run).simulation == simulation
 
 
-def test_cancellation_records_the_partial_pool(tmp_path, monkeypatch, credentials):
+def test_cancellation_records_the_pool_so_far(tmp_path, monkeypatch, credentials):
     Native(monkeypatch, delay=5)
 
     async def main():
@@ -416,9 +416,9 @@ def test_a_worker_whose_cancellation_harbor_consumes_starts_no_episode_after_ctr
     assert stored(run).simulation.status == "cancelled"
 
 
-@pytest.mark.parametrize("reward, status", [(0.0, "complete"), (None, "partial")])
+@pytest.mark.parametrize("reward, status", [(0.0, "complete"), (None, "unfinished")])
 def test_returned_native_failure_counts_without_a_raise(tmp_path, monkeypatch, credentials, reward, status):
-    """Harbor returns exception_info and still grades. The failure stays recorded; the pool is partial only
+    """Harbor returns exception_info and still grades. The failure stays recorded; the pool is unfinished only
     when the episode has no usable reward. Its agent made a model call, so it is not attempted again."""
     native = Native(monkeypatch, rewards={"0001-simulator": reward})
     native.agents["0001-simulator"] = terminus
@@ -440,7 +440,7 @@ def test_returned_native_failure_counts_without_a_raise(tmp_path, monkeypatch, c
 
 def test_an_episode_that_never_started_gets_one_fresh_attempt_and_keeps_its_records(tmp_path, monkeypatch, credentials):
     """An episode with no reward and no model call, as when its agent setup failed, is replaced once; the fresh attempt
-    is not replaced again, so the pool stays partial when it fails too."""
+    is not replaced again, so the pool stays unfinished when it fails too."""
     native = Native(monkeypatch, rewards={"0001-simulator": None, "0002-simulator": None})
     native.returned = {"0001-simulator": "RuntimeError", "0002-simulator": "RuntimeError"}
 
@@ -454,7 +454,7 @@ def test_an_episode_that_never_started_gets_one_fresh_attempt_and_keeps_its_reco
     assert simulation.episodes == ["0000-simulator", "0002-simulator"]
     assert simulation.retries == {"0002-simulator": "0001-simulator"}
     assert list(simulation.failures) == ["0001-simulator", "0002-simulator"]
-    assert simulation.status == "partial"
+    assert simulation.status == "unfinished"
     assert stored(run).simulation == simulation
 
 
@@ -659,7 +659,7 @@ print(json.dumps({{"observations": {{"{name}": met}}, "results": {{}}}}))
 ''' for name, test in (("exists", 'read("/app/explanation.txt") is not None'), ("correct", '(read("/app/answer.txt") or b"").strip() == b"42"'))}
 
 
-def test_separate_checks_of_separate_files_leave_partial_credit_unknown(tmp_path, monkeypatch, credentials):
+def test_separate_checks_of_separate_files_leave_credit_for_part_of_the_work_unknown(tmp_path, monkeypatch, credentials):
     """Each requirement earns 0.5 and lives in its own file. No single check sees both, so none has a deserved
     score and combined coverage cannot justify the reward: a recorded limit of the single deserved score.
     Unresolved or failed cited evidence keeps the same combination unknown for its own reason too."""
@@ -760,21 +760,13 @@ def both(checks: list[str]) -> dict:
             "explanation": "The cited facts settle both scored requirements and so the actual reward."}
 
 
-def approved(run):
-    """`run` given an approved list of both requirements, which the answer check measures as `number` and `newline`."""
-    run.record.requirements = [Requirement(text="Write the number 42 to /app/answer.txt.", observation="number"),
-                               Requirement(text=NEWLINE, observation="newline")]
-    run.save()
-    return run
-
-
 def metric_basis(value: str, keys: list[str], checks: list[str]) -> dict:
     return {"completion": value, "requirements": [FACTS[key] for key in keys], "checks": checks, "explanation": f"completion {value}"}
 
 
 def test_measured_facts_and_requirement_conclusions_reach_labels_and_reports(tmp_path, monkeypatch, credentials):
     """Measured absence with an unknown score, a failed copy, one check supporting the number while the
-    newline is violated (rewarded partial credit, which stays unknown), complete and partial coverage, and conflicting readings."""
+    newline is violated (rewarded credit for part of the work, which stays unknown), complete and incomplete coverage, and conflicting readings."""
     task = answer_task(tmp_path)
     pool = [f"{index:04d}-simulator" for index in range(6)]
     done = {"/app/answer.txt": b"42\n"}
@@ -817,10 +809,8 @@ def test_measured_facts_and_requirement_conclusions_reach_labels_and_reports(tmp
 
     built = report.build(run.config.output_dir)
     episodes = built["metrics"]["episodes"]
-    # No check of pool[4] reads the newline requirement: it is listed as unobserved and keeps completion unknown. The run
-    # has no approved list, so no reference counts: pool[0]'s and pool[2]'s incomplete and pool[3]'s complete one stay unknown.
-    assert [episodes[name]["completion"] for name in pool] == ["unknown"] * 6
-    assert all(inspection_module.NO_LIST in episodes[name]["completion_reasons"] for name in (pool[0], pool[2], pool[3]))
+    # No check of pool[4] reads the newline requirement: it is listed as unobserved and keeps completion unknown.
+    assert [episodes[name]["completion"] for name in pool] == ["incomplete", "unknown", "incomplete", "complete", "unknown", "unknown"]
     assert episodes[pool[4]]["unobserved"] == [f"instruction.md: {NEWLINE!r}"] and episodes[pool[3]]["unobserved"] == []
     assert any("conflicting" in reason for reason in episodes[pool[5]]["completion_reasons"])
     assert built["labels"]["review"]["unresolved"] == [pool[0], pool[1], pool[2], pool[4], pool[5]]
@@ -828,8 +818,8 @@ def test_measured_facts_and_requirement_conclusions_reach_labels_and_reports(tmp
     findings = built["inspections"]["grader_inspector"]["findings"]
     absent = next(item for item in findings["inconclusive"] if item["claim"]["episode"] == pool[0])
     assert (absent["assessment"]["validity"], absent["assessment"]["discrepancy"]) == ("violated", "unknown")
-    partial = next(item for item in findings["inconclusive"] if item["claim"]["episode"] == pool[2])
-    assert partial["assessment"]["conclusions"] == [{"requirement": FACTS["newline"], "validity": "violated", "reasons": []}]
+    half = next(item for item in findings["inconclusive"] if item["claim"]["episode"] == pool[2])
+    assert half["assessment"]["conclusions"] == [{"requirement": FACTS["newline"], "validity": "violated", "reasons": []}]
     markdown = report.markdown(built).splitlines()
     assert "attempted but unresolved 5" in next(line for line in markdown if line.startswith("Review attempted"))
     line = next(line for line in markdown if line.startswith("- grader_inspector inconclusive:") and pool[0] in line)
@@ -904,9 +894,8 @@ def test_secondary_conclusions_survive_unknown_primary_validity_in_labels_and_re
     built = report.build(run.config.output_dir)
     episode = built["metrics"]["episodes"][name]
     assert inspection.ordinary[name].label == "unknown", "requirement evidence alone cannot justify the scoring outcome"
-    # The run has no approved list, so even an uncontested incomplete reference does not count.
-    assert episode["completion"] == "unknown"
-    assert (inspection_module.NO_LIST in episode["completion_reasons"]) is (case == "uncontested")
+    expected = "incomplete" if case == "uncontested" else "unknown"
+    assert episode["completion"] == expected
     if case == "conflicting":
         for reasons in (episode["completion_reasons"], inspection.ordinary[name].reasons):
             assert any("conflicting" in reason and NEWLINE in reason for reason in reasons)
@@ -914,7 +903,7 @@ def test_secondary_conclusions_survive_unknown_primary_validity_in_labels_and_re
     if case == "unresolved":
         assert first.claim.unresolved == ["whether the newline requirement applies"]
     markdown = report.markdown(built).splitlines()
-    assert any(line.startswith(f"- {name}: completion unknown;") for line in markdown)
+    assert any(line.startswith(f"- {name}: completion {expected};") for line in markdown)
     assert any(line.startswith("- grader_inspector inconclusive:") and f"requirement {NEWLINE!r} violated" in line for line in markdown)
 
 
@@ -936,7 +925,7 @@ def test_corrected_interpretation_uses_the_next_existing_attempt_without_rerunni
 
     async def main():
         async with serve(script) as base:
-            run = approved(new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base)))
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
             simulation = await run_state.simulate(run, 1)
             return run, await inspection_module.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"],
                                                                focused_attempts=0 if case == "exhausted" else 1)
@@ -1003,7 +992,7 @@ def test_invalid_reinterpretation_preserves_other_repairs_and_ordinary_probes(tm
 
     async def main():
         async with serve(script) as base:
-            run = approved(new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base)))
+            run = new_run(tmp_path, monkeypatch, credentials, task_dir=task, models=inspector(base))
             simulation = await run_state.simulate(run, 2)
             return run, await inspection_module.inspect_grader(run, simulation.episodes, categories=["accepted_invalid"], focused_attempts=1)
 
@@ -1015,7 +1004,7 @@ def test_invalid_reinterpretation_preserves_other_repairs_and_ordinary_probes(tm
     assert built["inspections"]["grader_inspector"]["attempts"][1]["status"] == "no_evidenced_issue"
     assert reply in json.dumps(session_messages(run.config.output_dir, "grader-accepted_invalid"))
     # Without a usable repair the first episode stays unknown, so only a corrected unknown reference completes.
-    assert inspection.status == ("partial" if invalid == "list" else "complete")
+    assert inspection.status == ("unresolved" if invalid == "list" else "complete")
     assert inspection.unreviewed == {} and inspection.ordinary[second].label == "legitimate"
     assert built["metrics"]["episodes"][second]["completion"] == "complete"
     if invalid == "list":
@@ -1051,7 +1040,7 @@ def test_unsupported_runtime_keeps_the_check_failed_and_the_label_unknown(tmp_pa
     assert [(entry["argv"][0], entry["exit_code"]) for entry in probes] == [("python3", 127), ("python", 0)]
     assert probes[1]["output"].strip() == "2"
     assert inspector_sandbox.CHECK_PROGRAM not in sandboxes.environments["sandbox-0000"].uploads
-    assert report.assessments == [] and (report.attempts[0].status, report.status) == ("tool_failure", "partial")
+    assert report.assessments == [] and (report.attempts[0].status, report.status) == ("tool_failure", "unresolved")
     assert "python3" in report.attempts[0].error and report.ordinary["0000-simulator"].label == "unknown"
     assert script.requests == [], "no unsupported agent inference starts"
 
@@ -1143,7 +1132,7 @@ def test_a_sole_named_reward_labels_like_reward_and_several_keys_stay_unavailabl
         assert "no native reward 'reward'" in several["0001-simulator"][2][0]
 
 
-def test_labels_keep_partial_credit_unknowns_and_unavailable_rewards_apart_from_probes(tmp_path, monkeypatch, credentials):
+def test_labels_keep_part_credit_unknowns_and_unavailable_rewards_apart_from_probes(tmp_path, monkeypatch, credentials):
     from test_inspection import mock_experiments
     Sandboxes(monkeypatch)
 

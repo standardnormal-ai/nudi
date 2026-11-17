@@ -8,9 +8,9 @@ the credentials file or the host environment only when a call is sent. Paths in
 import errno
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field
 
 NativeBehavior = Literal["shared_grading", "host_harness", "atif"]
 ExecutionPath = Literal["verifiers", "harbor"]
@@ -20,6 +20,11 @@ Backend = Literal["docker", "modal"]
 ExecutionScope = Literal["native", "package"]
 """`native`: the original task harness of a native episode. `package`: an Inspector
 sandbox running a copy of the task package; it never establishes native accessibility."""
+
+
+def renamed(status: str) -> BeforeValidator:
+    """Loads an older record's status as `status`: `unfinished` for a run or simulation, `unresolved` for an analysis."""
+    return BeforeValidator(lambda value: status if value == "partial" else value)  # older records named both partial
 
 
 def private_dir(path: Path) -> None:
@@ -32,14 +37,14 @@ def write_private(path: Path, data: str | bytes) -> None:
     """Write `path`, created owner-only with its missing parents. The data goes to a hidden sibling
     first and replaces `path` whole, so a failed write leaves the earlier version for the report.
     No space left on the device stops the run (`DiskFull`)."""
-    partial = path.with_name(f".{path.name}.partial")
+    staged = path.with_name(f".{path.name}.tmp")
     try:
         private_dir(path.parent)
-        with open(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as file:
+        with open(os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as file:
             file.write(data.encode() if isinstance(data, str) else data)
-        os.replace(partial, path)
+        os.replace(staged, path)
     except OSError as error:
-        partial.unlink(missing_ok=True)
+        staged.unlink(missing_ok=True)
         if error.errno == errno.ENOSPC:
             raise DiskFull(f"no space left on the records host to write {path}") from error
         raise
@@ -254,10 +259,10 @@ class Simulation(BaseModel):
     fresh attempt is not attempted again."""
     failures: dict[str, list[ErrorRecord]] = {}
     """Episodes whose runner raised or whose native result reported errors; their
-    records keep any partial evidence, including a reward Harbor still graded."""
+    records keep the evidence they gathered, including a reward Harbor still graded."""
     refusals: dict[str, list[str]] = {}
     """Episodes with explicit model refusal signals in their calls, failed or not."""
-    status: Literal["running", "complete", "partial", "spending_exhausted", "cancelled"] = "running"
+    status: Annotated[Literal["running", "complete", "unfinished", "spending_exhausted", "cancelled"], renamed("unfinished")] = "running"
 
 
 class Check(BaseModel):
@@ -481,14 +486,6 @@ class ModalSandbox(BaseModel):
     """Modal reported the sandbox ended after stop, or after one more terminate."""
 
 
-class Requirement(BaseModel):
-    """One requirement of an approved requirement list: its text and the name of the check observation that measures it."""
-
-    model_config = ConfigDict(extra="forbid")
-    text: str = Field(min_length=1)
-    observation: str = Field(min_length=1)
-
-
 class RunRecord(BaseModel):
     task_dir: str
     path: ExecutionPath
@@ -518,7 +515,7 @@ class RunRecord(BaseModel):
     failed_phases: list[str] = []
     """Phases that raised an error or did not run to their end, as at the spending cap; Ctrl-C and the time limit are no
     failure. An inspection or attack that returned with evidence unresolved ran to its end; the report also counts one that
-    returned partial with an attempt that failed to execute as failed."""
+    returned `unresolved` with an attempt that failed to execute as failed."""
     events: list[EpisodeEvent] = []
     """Episode lifecycle in the order nudi observed it."""
     checks: list[Check] = []
@@ -535,8 +532,6 @@ class RunRecord(BaseModel):
     modal: list[ModalSandbox] = []
     attack_from: str | None = None
     """The earlier run's resolved directory, whose inspection records this run copied to run only the attack again."""
-    requirements: list[Requirement] | None = Field(None, min_length=1)
-    """The approved requirement list the run was given, never empty; None without one and in older records."""
     started_at: str | None = None
     """When the run started, in UTC ISO 8601; None in older records."""
     ended_at: str | None = None
@@ -548,7 +543,7 @@ class Coverage(BaseModel):
 
     It cites the requirement and scoring sources, the checks of that episode that
     observed them, and explains why they justify its actual reward. A positive reward
-    with any violated requirement is not legitimate, even as correct partial credit.
+    with any violated requirement is not legitimate, even as correct credit for part of the work.
     nudi verifies only the references, not semantic completeness."""
 
     requirements: list[Observation]
@@ -585,7 +580,7 @@ class Ordering(BaseModel):
 class MetricBasis(BaseModel):
     """Grader inspector interpretation of one ordinary episode's whole-task completion.
 
-    Local validity, legitimate partial credit and complete-scoring coverage are not
+    Local validity, legitimate credit for part of the work and complete-scoring coverage are not
     completion. `supported` needs every cited completion requirement to be observed
     satisfied by a cited check; a cited requirement no check reads keeps completion
     unknown, and nudi lists it. `violated` needs one observed

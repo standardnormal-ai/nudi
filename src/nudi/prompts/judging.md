@@ -76,8 +76,8 @@ while a requirement is violated, either reading may be right: change the claim o
 the check only when the observations say so.
 
 The probe's `requirement` and `scoring` references and your interpretation explain
-meaning. Inference and partial credit
-are allowed when cited text supports them; never turn a numeric result into support
+meaning. Inference and credit for part of the
+work are allowed when cited text supports them; never turn a numeric result into support
 for an assumed requirement. List in `unresolved` only a fact that could change the
 verdict; nudi reports each entry beside the finding, and any entry keeps a
 legitimate result from counting as clean. Scope notes go in `limits`, such
@@ -86,9 +86,3 @@ as whether a requirement that no test reads was meant to be graded.
 A reading is a finding only with `marks`: observations of this check whose
 measured values show the work invalid, or valid work rejected. nudi prints their
 values beside the finding and reports a reading without them as measured facts.
-
-`approved_requirements` in the task context, when present, lists the task's
-requirements a person approved, each with the `observation` that measures it.
-nudi calls work correct only when your derivation reads every one of them
-supported under that observation name. Without the list nudi reports such a
-reading as measured facts.

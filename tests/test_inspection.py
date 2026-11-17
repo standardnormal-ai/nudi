@@ -279,16 +279,16 @@ def test_an_experiment_that_cannot_fit_beside_its_own_workspace_says_so_in_its_r
 def test_the_grader_inspector_reads_listed_hack_findings_and_its_record_names_them(tmp_path, monkeypatch, credentials, unit_sandboxes):
     """Hack findings join the first grader inspector request only. The record names which were given, and from what
     hack inspection; without any, the request is as before and the record says none."""
-    listed = {"hack_inspection": "partial", "hack_findings": [{"id": "hack-3", "category": "grader_tampering", "outcome": "accepted_invalid",
+    listed = {"hack_inspection": "unresolved", "hack_findings": [{"id": "hack-3", "category": "grader_tampering", "outcome": "accepted_invalid",
                                                               "mechanism": "Replace the grader.", "where_to_look": "tests/test.sh"}]}
     requests = inspector_responses(monkeypatch, [{"probes": []}] * 2)
     run = new_run(tmp_path, monkeypatch, credentials)
     result = asyncio.run(inspection_module.inspect_grader(run, [], categories=["accepted_invalid"], focused_attempts=0, request=listed))
     broad = json.loads(requests[0]["messages"][-1]["content"])
     assert {key: broad[key] for key in listed} == listed
-    assert (result.hack_inspection, result.hack_findings) == ("partial", ["hack-3"])
+    assert (result.hack_inspection, result.hack_findings) == ("unresolved", ["hack-3"])
     saved = json.loads((run.config.output_dir / "inspection-grader.json").read_text())
-    assert (saved["hack_inspection"], saved["hack_findings"]) == ("partial", ["hack-3"])
+    assert (saved["hack_inspection"], saved["hack_findings"]) == ("unresolved", ["hack-3"])
 
     plain = new_run(tmp_path, monkeypatch, credentials, name="plain")
     result = asyncio.run(inspection_module.inspect_grader(plain, [], categories=["accepted_invalid"], focused_attempts=0))
@@ -322,7 +322,7 @@ def test_two_focused_attempts_by_default_each_start_one_fresh_session_per_catego
             run = new_run(tmp_path, monkeypatch, credentials, concurrency=2,
                           models={"inspector": ModelConfig(model="xai/grok-4.7", api_base=base)})
             result = await inspection_module.inspect_hacks(run, categories=["package_oracles", "fabricated_answers"])
-            assert result.status == "partial", "nothing was measured, so no category settles"
+            assert result.status == "unresolved", "nothing was measured, so no category settles"
             assert [attempt.phase for attempt in result.attempts] == ["focused"] * 3
             assert [attempt.category for attempt in result.attempts] == ["package_oracles", "fabricated_answers", "other"]
             # Each session starts its own conversation: the system prompt and its first request.
@@ -357,7 +357,7 @@ def test_each_focused_grader_inspector_category_forks_the_final_broad_conversati
         assert len(messages[-1]["content"]) < 2000
     asked = [message for message in session_messages(tmp_path / "run", "grader-rejected_valid") if message["role"] == "human"]
     assert json.loads(asked[-1]["content"])["categories"] == ["rejected_valid"]
-    assert result.status == "partial", "nothing was measured, so no category settles"
+    assert result.status == "unresolved", "nothing was measured, so no category settles"
 
 
 @pytest.mark.parametrize("mode", ["hack", "grader"])
@@ -382,7 +382,7 @@ def test_a_focused_fork_restores_its_checkpoint_without_unregistered_types(tmp_p
         unregister()
     # Nothing was measured, so no category settles. Hack inspector sessions start fresh and restore no fork.
     assert [attempt.phase for attempt in result.attempts] == ["broad"] * (mode == "grader") + ["focused"] * (2 if mode == "grader" else 3)
-    assert result.status == "partial"
+    assert result.status == "unresolved"
     assert events == [], {(event["module"], event["name"], event["kind"]) for event in events}
 
 
@@ -560,15 +560,15 @@ def test_broad_retention_failure_keeps_a_fresh_focused_conversation(tmp_path, mo
     """Broad replied, but its files were not retained in full: a fork would reference missing paths."""
     retain = inspector.Investigation.retain
 
-    async def partial(session):
+    async def interrupted(session):
         if session.name == "grader-broad":
             target = session.box.directory / "workspace" / "nudi/workspace/notes.txt"
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("partial")
+            target.write_text("unresolved")
             raise RuntimeError("retention interrupted")
         await retain(session)
 
-    monkeypatch.setattr(inspector.Investigation, "retain", partial)
+    monkeypatch.setattr(inspector.Investigation, "retain", interrupted)
     requests = inspector_responses(monkeypatch, [{"probes": []}, {"probes": []}])
     run = new_run(tmp_path, monkeypatch, credentials)
     asyncio.run(inspection_module.inspect_grader(run, [], categories=["accepted_invalid"], focused_attempts=1))
@@ -1018,7 +1018,7 @@ def test_refusal_is_distinct_from_finished_investigation(tmp_path, monkeypatch, 
     asyncio.run(main())
 
 
-def test_cap_and_cancellation_preserve_partial_inspection(tmp_path, monkeypatch, credentials, unit_sandboxes):
+def test_cap_and_cancellation_preserve_the_inspection_so_far(tmp_path, monkeypatch, credentials, unit_sandboxes):
     import nudi.inspection as inspection_module
 
     async def main():
@@ -1092,18 +1092,18 @@ def test_inference_and_tool_failures_remain_distinct(tmp_path, monkeypatch, cred
                 raise RuntimeError("native tool failed")
             mock_experiments(monkeypatch, broken_tool)
             report = await inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0)
-            assert report.status == "partial"
+            assert report.status == "unresolved"
             assert report.attempts[0].status == "tool_failure"
             async def broken_inference(*args, **kwargs):
                 raise inspection_module.InferenceFailure("local endpoint failed")
             monkeypatch.setattr(inspector.Investigation, "ask", broken_inference)
             report = await inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0)
             assert report.attempts[0].status == "inference_failure"
-            assert report.status == "partial" and len(report.attempts) == 1
+            assert report.status == "unresolved" and len(report.attempts) == 1
             assert report.categories == {"package_oracles": "unknown"}
             # The failed inspection did not run to its end, apart from any evidence it left unresolved.
             built = report_module.build(run.config.output_dir, selected=["hack"])
-            assert (built["status"], built["unfinished"], built["unresolved"]) == ("partial", {"hack": "partial"}, [])
+            assert (built["status"], built["unfinished"], built["unresolved"]) == ("unfinished", {"hack": "unresolved"}, [])
             # It ran, so its line says what failed rather than that the hack inspector failed.
             assert built["answer"][0] == ("Finished with gaps: one hack inspector broad search stopped early because a model call failed. "
                                           "Results below are what was found.")
@@ -1422,6 +1422,43 @@ def test_inspector_failure_does_not_retain_credentials(tmp_path, monkeypatch, cr
     report = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
     assert report.attempts[0].status == "inference_failure"
     assert secret not in (run.config.output_dir / "inspection-hack.json").read_text()
+
+
+@pytest.mark.parametrize("failure", ["bad request", "account refusal"])
+def test_a_brief_model_failure_is_tried_again_with_a_line_and_a_client_error_is_not(tmp_path, monkeypatch, credentials, failure):
+    """A gateway's 502 and a rate limit are tried again after a short wait, each try with one stderr line; a client
+    error and an account refusal, also one a rate limit wraps, fail at once."""
+    monkeypatch.setattr(run_state, "RETRY_WAITS", (0, 0, 0))
+    run = new_run(tmp_path, monkeypatch, credentials)
+    litellm = inspector.litellm
+    final = {"bad request": litellm.BadRequestError(message="no", model="m", llm_provider="openai"),
+             "account refusal": litellm.RateLimitError(message="quota", model="m", llm_provider="openai",
+                                                       body={"code": "insufficient_quota"})}[failure]
+    failures = [litellm.BadGatewayError(message="bad gateway", model="m", llm_provider="openai"),
+                litellm.RateLimitError(message="slow down", model="m", llm_provider="openai"), None, final]
+    calls = []
+
+    async def completion(**request):
+        calls.append(request)
+        if error := failures.pop(0):
+            raise error
+        return litellm.ModelResponse(choices=[{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}])
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    model = inspector.chat_model(run.record.models["inspector"], run.keys["inspector"])
+
+    async def ask():
+        with run_state.model_calls(run, "inspector", "hack-broad"):
+            return await model.ainvoke("hi")
+
+    assert asyncio.run(ask()).content == "ok" and len(calls) == 3
+    with pytest.raises(type(final)):
+        asyncio.run(ask())
+    assert len(calls) == 4
+    events = [json.loads(line) for line in (run.config.output_dir / "events.jsonl").read_text().splitlines()]
+    assert [item["text"].split(" ", 2)[2] for item in events if item["kind"] == "retry"] == [
+        "hack-broad: a model call failed with BadGatewayError; trying again in 0 s",
+        "hack-broad: a model call failed with RateLimitError; trying again in 0 s"]
 
 
 def test_targeted_probe_dispatch_keeps_privilege_out_of_later_ordinary_episode(tmp_path, monkeypatch, credentials):
@@ -2032,7 +2069,7 @@ def test_attacker_interpretation_keeps_model_inability_separate(tmp_path, monkey
     run = new_run(tmp_path, monkeypatch, credentials)
     result = asyncio.run(attack.attack(run, maximum_attempts=1))
     assert result.attempts[0].status == result.conditions["none"] == expected
-    assert result.status == "partial"
+    assert result.status == "unresolved"
     assert [item.reasons for item in result.assessments] == ([] if expected == "model_inability" else [[inspection_module.UNFINISHED]])
 
 
@@ -2284,7 +2321,7 @@ def test_inspection_status_and_the_result_list_the_same_open_obligations(tmp_pat
     assert (entry["id"], entry["category"]) == ("experiment-0000", "package_oracles") and UNRESOLVED_ITEM in entry["reason"]
     assert entry["next"]
     assert interpreted["open"] == result.open
-    assert result.categories == {"package_oracles": "unknown"} and result.status == "partial"
+    assert result.categories == {"package_oracles": "unknown"} and result.status == "unresolved"
 
 
 @pytest.mark.parametrize("replaced", [False, True])
@@ -2660,7 +2697,7 @@ def test_a_failed_focused_request_leaves_its_category_to_the_next_attempt(tmp_pa
     assert any(sandbox_record(run, name)["purpose"] == "probe" for name in run.record.sandboxes) == executed
     assert run.record.episodes == []
     # The failure stays in attempts[0]; a later attempt in the category that ends cleanly recovers from it.
-    assert result.status == ("complete" if category == "evidenced_issue" else "partial")
+    assert result.status == ("complete" if category == "evidenced_issue" else "unresolved")
 
 
 def test_guidance_names_only_steps_an_attacker_can_follow(tmp_path, monkeypatch, credentials):
@@ -2870,6 +2907,9 @@ def test_each_job_reads_the_core_and_only_its_own_part():
         assert "## References" in prompt and "`path` is relative to the task directory" in prompt
         # Reasoning does not return to the model, so its plan survives only as visible text.
         text = " ".join(prompt.split())
+        further = ("add one `derivation.requirements` item per further requirement, citing its text in one of the check's inputs "
+                   "and the exact `observations` keys it rests on.")
+        assert (further in text) is (job == "grader")
         assert "Before each tool call, write one or two visible sentences naming your current hypothesis and your next experiment" in text
         # Code reads a focused summary as the end of that category's search.
         assert ("returning InspectionSummary declares the focused category searched" in text) is (job != "attack")
@@ -2897,7 +2937,7 @@ def test_every_inspector_prompt_requires_the_deserved_score_the_repairs_demand(t
         assert "A measured case is not rerun unless its reading ended unknown or a `contract` reply asks for it" in text
         assert ("the check of this episode that measured them all" in text) is (job == "grader")
         # Nothing beside the full-credit rule may keep a deserved score while a requirement is violated.
-        assert "keep a correct deserved score" not in text and "even as correct partial credit;" not in text
+        assert "keep a correct deserved score" not in text and "even as correct credit for part of the work;" not in text
         assert "The scoring reference sets the points per stated requirement and never replaces the requirement." in text
         assert text.count("A reply that starts with `contract`") == 1 and text.count("starts with `repair`") == 1
         assert "a retry needs a new case" not in text, "a repair runs the same case again"
@@ -3013,7 +3053,7 @@ def test_explicit_provider_policy_exception_keeps_refusal_and_redacted_cause(tmp
     result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0)
                          if surface == "inspection" else attack.attack(run, maximum_attempts=1))
     attempt, = result.attempts
-    assert attempt.status == "refused" and result.status == "partial"
+    assert attempt.status == "refused" and result.status == "unresolved"
     assert "explicit policy block" in attempt.error and secret not in attempt.error
     assert secret not in json.dumps(result.model_dump())
 
@@ -3031,7 +3071,7 @@ def test_unchanged_unavailable_measurements_do_not_execute_again_or_become_negat
     result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=3))
     assert result.attempts.pop().category == "other"
     assert len([name for name in run.record.sandboxes if sandbox_record(run, name)["purpose"] == "probe"]) == (0 if unavailable == "runtime" else 1)
-    assert result.status == "partial" and result.categories == {"package_oracles": "unknown"}
+    assert result.status == "unresolved" and result.categories == {"package_oracles": "unknown"}
     assert len(result.assessments) == (0 if unavailable == "runtime" else 1)
     assert all(item.outcome in ("unknown", "unavailable") for item in result.assessments)
     assert all(attempt.status == ("tool_failure" if unavailable == "runtime" else "unobservable") for attempt in result.attempts)
@@ -3103,7 +3143,7 @@ def test_a_failed_check_keeps_only_its_own_category_open(tmp_path, monkeypatch, 
 
     episode_tools(monkeypatch, behave)
     result = asyncio.run(inspection_module.inspect_hacks(run, categories=order, focused_attempts=1))
-    assert result.categories == {"package_oracles": "no_evidenced_issue", "fabricated_answers": "unknown"} and result.status == "partial"
+    assert result.categories == {"package_oracles": "no_evidenced_issue", "fabricated_answers": "unknown"} and result.status == "unresolved"
     (entry,) = result.open
     assert entry["category"] == "fabricated_answers" and "check failed" in entry["reason"]
     assert {attempt.category: attempt.status for attempt in result.attempts} == {
@@ -3147,7 +3187,7 @@ def test_another_failure_in_the_session_does_not_hide_a_failed_check(tmp_path, m
         ("other", "no_evidenced_issue")]
     assert sorted(check.exit_code for check in run.record.checks) == [0, 0, 3] + [3] * (other == "unscoped_failure")
     assert result.categories == {"fabricated_answers": "unknown", "package_oracles": "no_evidenced_issue"}
-    assert result.status == "partial"
+    assert result.status == "unresolved"
     assert ("grep timed out" in result.attempts[1].error) == (other == "tool_error")
     # The retry of package_oracles ended without a failure, so the inspection ran to its end; fabricated_answers left its
     # evidence unresolved, and the failed attempt stays a warning and lost work.
@@ -3212,7 +3252,7 @@ def test_an_older_attempt_failing_last_keeps_the_newer_failure(tmp_path, monkeyp
     result = asyncio.run(inspection_module.inspect_hacks(run, categories=[x, y, z], focused_attempts=2))
     assert events == [("failed", 2), ("completed", 0), ("completed", 3), ("failed", 4), ("failed", 1)]
     # Session 3 measured a consistent case, so only failure 4 keeps fabricated_answers unknown.
-    assert result.categories[x] == "unknown" and result.status == "partial"
+    assert result.categories[x] == "unknown" and result.status == "unresolved"
 
 
 def test_an_invalid_probe_then_a_valid_one_settles_the_category_normally(tmp_path, monkeypatch, credentials, unit_sandboxes):
@@ -3231,9 +3271,9 @@ def test_an_invalid_probe_then_a_valid_one_settles_the_category_normally(tmp_pat
 
 @pytest.mark.parametrize("focused_attempts, settled, status", [
     (2, "no_evidenced_issue", "complete"),
-    (1, "unknown", "partial"),
+    (1, "unknown", "unresolved"),
 ])
-def test_recovered_focused_failure_keeps_its_error_without_forcing_partial(tmp_path, monkeypatch, credentials, plan_order, focused_attempts,
+def test_recovered_focused_failure_keeps_its_error_without_forcing_unresolved(tmp_path, monkeypatch, credentials, plan_order, focused_attempts,
                                                                            settled, status, unit_sandboxes):
     """A failed attempt that a later attempt in the same category recovers from stays in the attempts and warnings only.
     The recovering attempt measures one consistent case, so only the failure decides whether the category settles."""
@@ -3292,10 +3332,10 @@ def test_a_category_settles_on_its_readings_whatever_the_summary_lists(tmp_path,
 
 @pytest.mark.parametrize("first, repaired, settled, status", [
     ("invalid", True, "evidenced_issue", "complete"),
-    ("invalid", False, "unknown", "partial"),
+    ("invalid", False, "unknown", "unresolved"),
     # A claim naming an unmeasured observation is refused at once, so the receipt stays open until it is repaired.
     ("inconclusive", True, "evidenced_issue", "complete"),
-    ("inconclusive", False, "unknown", "partial"),
+    ("inconclusive", False, "unknown", "unresolved"),
 ])
 def test_pending_interpretation_mark_follows_the_receipt(tmp_path, monkeypatch, credentials, first, repaired, settled, status,
                                                          unit_sandboxes):
@@ -3625,7 +3665,7 @@ def test_retained_native_submission_is_checked_in_a_fresh_sandbox_with_hashed_in
     assert tampered.outcome == "ungrounded" and "sandbox-0000" in tampered.reasons[0]
 
 
-def test_sandbox_failure_and_cancellation_stop_it_and_keep_partial_records(tmp_path, monkeypatch, credentials):
+def test_sandbox_failure_and_cancellation_stop_it_and_keep_the_records_so_far(tmp_path, monkeypatch, credentials):
     task = explained_task(tmp_path)
     sandboxes = Sandboxes(monkeypatch)
     no_native_actor(monkeypatch)
@@ -3687,7 +3727,7 @@ def test_missing_python3_skips_dynamic_setup_and_preserves_evidence_and_native_r
 
     monkeypatch.setattr(inspector.Investigation, "ask", static_inspection)
     inspection = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
-    assert inspection.status == "partial" and inspection.attempts[0].status == "tool_failure"
+    assert inspection.status == "unresolved" and inspection.attempts[0].status == "tool_failure"
     assert inspection.categories == {"package_oracles": "unknown"} and inspection.assessments == []
     assert "python3" in inspection.attempts[0].error
     name, = run.record.sandboxes
@@ -3989,7 +4029,7 @@ def test_grader_review_is_optional_triage_and_omissions_stay_unreviewed_unknown(
     run = new_run(tmp_path, monkeypatch, credentials)
     pool = ordinary_pool(run)
     result = asyncio.run(inspection_module.inspect_grader(run, pool, categories=["accepted_invalid"], focused_attempts=0))
-    assert result.status == "partial", "an omitted ordinary episode prevents complete review"
+    assert result.status == "unresolved", "an omitted ordinary episode prevents complete review"
     broad = json.loads(requests[0]["messages"][-1]["content"])
     assert [entry["id"] for entry in broad["open"] if entry["category"] is None] == pool
     assert "each unreviewed ordinary episode" not in broad["instruction"] and "leads" in broad["instruction"]
@@ -3998,7 +4038,7 @@ def test_grader_review_is_optional_triage_and_omissions_stay_unreviewed_unknown(
     assert result.ordinary["0001-simulator"].label == "unknown"
     assert [(review.episode, review.status, review.assessment) for review in result.reviews] == [("0000-simulator", "assessed", 0)]
     assert list(result.unreviewed) == ["0001-simulator"] and "No experiment reviewed" in result.unreviewed["0001-simulator"]
-    assert result.categories["accepted_invalid"] == "unknown" and result.status == "partial"
+    assert result.categories["accepted_invalid"] == "unknown" and result.status == "unresolved"
     assert "unreviewed: No experiment reviewed" in " ".join(result.ordinary["0001-simulator"].reasons)
     warnings = []
     labels = report.labels(pool, result, warnings)
@@ -4057,7 +4097,7 @@ def test_named_normal_episode_with_an_unresolved_or_failed_review_stays_unknown(
     assert result.categories == {"accepted_invalid": "evidenced_issue"}
     assert (result.ordinary[pool[0]].label, result.ordinary[pool[0]].basis) == ("unknown", None)
     assert (result.ordinary[pool[1]].label, result.ordinary[pool[1]].basis) == ("accepted_invalid", "verified")
-    assert result.status == "partial"
+    assert result.status == "unresolved"
     if doubt == "failed_review":
         assert "checker sandbox failed" in " ".join(result.ordinary[pool[0]].reasons)
     assert report.labels(pool, result, [])["review"]["unresolved"] == [pool[0]]
@@ -4300,9 +4340,9 @@ def test_review_interpreted_by_its_check_id_is_assessed_and_an_uninterpreted_one
 
 
 @pytest.mark.parametrize("then, episode, settled, status", [
-    (None, "no_evidenced_issue", "no_evidenced_issue", "partial"),
+    (None, "no_evidenced_issue", "no_evidenced_issue", "unresolved"),
     # A later claim naming an unmeasured observation goes back to the model and leaves its consistent reading in place.
-    ("invalid", "no_evidenced_issue", "no_evidenced_issue", "partial"),
+    ("invalid", "no_evidenced_issue", "no_evidenced_issue", "unresolved"),
     # A spending cap in the episode session does not undo the category work the focused session completed.
     ("cap", "spending_exhausted", "no_evidenced_issue", "spending_exhausted"),
 ])
@@ -4532,7 +4572,7 @@ def test_episode_evidence_settles_its_category_and_an_inconclusive_one_keeps_it_
         "evidenced_issue" if settled == "evidenced_issue" else "no_evidenced_issue"] * 2
     assert [assessment.outcome for assessment in result.assessments] == ["legitimate"] + [outcome] * 2
     assert {name: result.ordinary[name].label for name in pool} == dict.fromkeys(pool, label)
-    assert result.status == ("complete" if label == "accepted_invalid" else "partial")
+    assert result.status == ("complete" if label == "accepted_invalid" else "unresolved")
 
 
 def test_inspector_swarm_forks_one_isolated_inspector_per_episode_and_warns(tmp_path, monkeypatch, credentials, unit_sandboxes):
@@ -4945,7 +4985,7 @@ def test_ordinary_finding_outside_the_focused_category_settles_it_without_discar
         ("broad", None, "no_evidenced_issue"), ("focused", "accepted_invalid", "no_evidenced_issue"),
         ("focused", "accepted_invalid", "no_evidenced_issue")]
     assert [review.episode for review in result.reviews] == pool and result.unreviewed == {}
-    assert result.status == "partial"
+    assert result.status == "unresolved"
 
 
 def test_the_claim_nudi_records_for_a_failed_experiment_is_marked_as_nudis(tmp_path, monkeypatch, credentials, unit_sandboxes):
@@ -4994,7 +5034,7 @@ def test_unusable_interpretation_keeps_its_successful_check_and_later_ordinary_r
     assert (first.episode, first.status, first.checks, first.assessment) == (pool[0], "incomplete", {"check-0000": 0}, None)
     assert "breaks nudi's check output contract" in first.error
     assert (second.episode, second.status, second.checks, second.assessment) == (pool[1], "assessed", {"check-0001": 0}, 0)
-    assert result.unreviewed == {} and result.status == "partial"
+    assert result.unreviewed == {} and result.status == "unresolved"
     assert "review incomplete after check-0000 exit 0" in " ".join(result.ordinary[pool[0]].reasons)
     shown = json.dumps(session_messages(run.config.output_dir, "grader-broad"))
     assert "Error invoking tool 'interpret_experiment'" in shown
@@ -5060,7 +5100,7 @@ def test_nonfatal_targeted_failure_keeps_later_ordinary_reviews(tmp_path, monkey
     assert investigated == ["true\n", "false\n", None, None], "later tool requests stay independent of a failed setup"
     assert len(requests) == 1 and result.unreviewed == {}
     assert (result.attempts[0].status, result.attempts[0].error) == ("tool_failure", "RuntimeError: sandbox failed")
-    assert result.status == "partial"
+    assert result.status == "unresolved"
 
 
 @pytest.mark.parametrize("interruption, status", [("spending", "spending_exhausted"), ("cancelled", "cancelled"),
@@ -5832,7 +5872,7 @@ def test_public_tool_duplicates_and_provider_failure_keep_three_focused_attempts
 
     run, result = asyncio.run(main())
     assert len(result.attempts) == 4 and [item.number for item in result.attempts] == [0, 1, 2, 3]
-    assert result.status == "partial" and result.categories["rejected_valid"] == "unknown"
+    assert result.status == "unresolved" and result.categories["rejected_valid"] == "unknown"
     assert result.attempts[2].status == "refused"
     assert len([name for name in run.record.sandboxes if sandbox_record(run, name)["purpose"] == "probe"]) == 1
     assert "duplicate_case" in json.dumps(script.tool_results())
@@ -5858,7 +5898,7 @@ def test_public_inspector_capacity_one_returns_raw_incomplete_feedback(tmp_path,
             return run, result
 
     run, result = asyncio.run(main())
-    assert result.status == "partial" and result.categories["rejected_valid"] == "unknown"
+    assert result.status == "unresolved" and result.categories["rejected_valid"] == "unknown"
     assert "CapacityUnavailable" in json.dumps(script.tool_results())
     assert len(run.record.sandboxes) == 1 and sandbox_record(run, run.record.sandboxes[0])["cleanup"]["removed"]
 
@@ -5906,7 +5946,7 @@ def test_truncated_setup_output_never_closes_public_coverage(tmp_path, monkeypat
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
     result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=0))
     # A nonzero setup exit the session continued past, with a valid check, is a limit only.
-    assert (result.status, result.attempts[0].status) == (("partial", "unobservable") if setup_failure == "truncated" else ("complete", "evidenced_issue"))
+    assert (result.status, result.attempts[0].status) == (("unresolved", "unobservable") if setup_failure == "truncated" else ("complete", "evidenced_issue"))
     if setup_failure == "truncated":
         assert result.attempts[0].error == "experiment-0000: setup output was truncated; uncaptured bytes are unavailable."
     assert result.assessments[0].outcome == "accepted_invalid", "independent measured evidence is still retained"
@@ -5962,7 +6002,7 @@ def test_real_sdk_tool_infrastructure_abort_stops_before_focused_retry(tmp_path,
     run = asyncio.run(main())
     result = inspection_module.InspectionResult.model_validate_json((run.config.output_dir / "inspection-hack.json").read_text())
     assert len(result.attempts) == len(script.requests) == 1
-    assert result.attempts[-1].status == "tool_failure" and result.status == "partial"
+    assert result.attempts[-1].status == "tool_failure" and result.status == "unfinished"
     assert all(sandbox_record(run, name)["cleanup"]["removed"] for name in run.record.sandboxes)
 
 
@@ -6459,11 +6499,11 @@ def test_tool_error_the_session_recovers_from_is_a_limit(tmp_path, monkeypatch, 
     attempt, = result.attempts
     if outcome == "open":
         assert attempt.status == "no_evidenced_issue" and any("grep timed out" in limit for limit in result.limits)
-        assert result.categories == {"package_oracles": "unknown"} and result.status == "partial"
+        assert result.categories == {"package_oracles": "unknown"} and result.status == "unresolved"
         assert [entry["id"] for entry in result.open] == ["package_oracles"], "nothing was measured, not the timeout"
     else:
         assert (attempt.status, attempt.error) == ("model_inability", "cannot finish this inspection")
-        assert result.categories == {"package_oracles": "unknown"} and result.status == "partial"
+        assert result.categories == {"package_oracles": "unknown"} and result.status == "unresolved"
         from nudi import report
         warnings = []
         public = report.inspection("hack", result, warnings)
@@ -6480,7 +6520,7 @@ def test_truncated_checker_output_stays_unobservable(tmp_path, monkeypatch, cred
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
     result = asyncio.run(inspection_module.inspect_grader(run, [], categories=["accepted_invalid"], focused_attempts=0))
     assert [check.exit_code for check in run.record.checks] == [125, 0][:1 + repeated]
-    assert (result.status, result.attempts[0].status) == ("complete" if repeated else "partial", "unobservable")
+    assert (result.status, result.attempts[0].status) == ("complete" if repeated else "unresolved", "unobservable")
     assert result.attempts[0].error == "experiment-0000: check output was truncated"
     assert result.categories["accepted_invalid"] == ("evidenced_issue" if repeated else "unknown")
     assert any("experiment-0000" in limit and "truncated" in limit for limit in result.limits)
@@ -7672,7 +7712,7 @@ def test_a_failed_other_session_stays_open_until_a_later_attempt_recovers_it(tmp
     result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=focused_attempts))
     assert asked.count("hack-other") == focused_attempts and result.categories == {"package_oracles": "no_evidenced_issue"}
     assert [entry["id"] for entry in result.open] == ["other"] * (focused_attempts == 1)
-    assert result.status == ("partial" if focused_attempts == 1 else "complete")
+    assert result.status == ("unresolved" if focused_attempts == 1 else "complete")
 
 
 def test_an_other_reading_proposes_its_family_and_a_listed_one_does_not(tmp_path, monkeypatch, credentials, unit_sandboxes):
