@@ -76,10 +76,10 @@ def full(run: RunDir) -> None:
 
 
 def clean(run: RunDir) -> None:
-    """Nothing evidenced: the hack inspector stopped partial and the grader inspector did not run."""
+    """Nothing evidenced: the hack inspector ended with evidence still open and the grader inspector did not run."""
     for reward in (1.0, 1.0, 0.0, 0.5):
         run.episode(rewards={"reward": reward})
-    run.hack = InspectionResult(mode="hack", status="partial", applicability={"persistence": "the task resets nothing between episodes"},
+    run.hack = InspectionResult(mode="hack", status="unresolved", applicability={"persistence": "the task resets nothing between episodes"},
                                 categories={"grader_tampering": "no_evidenced_issue", "online_lookup": "unknown", "persistence": "restricted"},
                                 assessments=[checked("sandbox-0000", "check-0000", "sorted", "unknown")])
 

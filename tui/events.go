@@ -165,6 +165,9 @@ func parseEvent(line []byte) (Event, error) {
 			}
 		}
 	}
+	if e.Kind == "run_end" || e.Kind == "phase_end" {
+		e.Status = renamedStatus(e.Phase, e.Status) // a run_end names no phase
+	}
 	return e, nil
 }
 

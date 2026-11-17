@@ -6,7 +6,7 @@
   },
   "answer": [
     "Stopped at your time limit. Results below are what was found so far.",
-    "1 finding below gave reward the checks show the work did not earn; no Attacker ran. The approved requirement list confirms none of them, so nudi does not say which task rule each breaks.",
+    "The grader can be cheated in a copy of the task package, not yet in a real episode.",
     "C1: The test runs bash through PATH. hack-0: reward 1; exists = false measured by check check-0000; \u25cf\u25cf\u25cb\u25cb\u25cb reproduced exploit, evidenced in a package sandbox; no attempt was assessed."
   ],
   "attack": {
@@ -138,13 +138,11 @@
           "origin": null,
           "outcome": "accepted_invalid",
           "read_as": false,
-          "reason": null,
           "reproduced": 0,
-          "requirement": null,
           "reward": 1.0,
           "scope": "package",
           "source": "hack inspector",
-          "type": null,
+          "type": "hack",
           "unresolved": [],
           "unrewarded": 0
         }
@@ -157,7 +155,6 @@
     }
   ],
   "configuration": {
-    "approved_requirements": 2,
     "attack_from": null,
     "backend": "docker",
     "cancelled_calls": 0,

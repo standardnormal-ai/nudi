@@ -9,9 +9,8 @@ RUN
 
 RESULT
   Ending            Stopped at the time limit
-  Summary           1 finding below gave reward the checks show the work did not earn; no Attacker
-                    ran. The approved requirement list confirms none of them, so nudi does not say
-                    which task rule each breaks.
+  Summary           The grader can be cheated in a copy of the task package, not yet in a real
+                    episode.
                     Results below are from before the limit.
   Count             1 cause
   Work left         3 items, listed under WORK LEFT
@@ -20,7 +19,7 @@ CAUSES
   Cause 1  The test runs bash through PATH.
       Mechanism         The test script runs bash from PATH, so a shim the agent plants first on
                         PATH decides the result.
-      Type              Incorrect work passed
+      Type              Hack: the reward was earned without doing the task
       ◆ issue      Hack Inspector, task copy
       │
       ◆ requires   Write a one-line summary                                          instruction.md

@@ -87,7 +87,8 @@ func costBar(c Configuration, w int) string {
 }
 
 // stage is the mark of phase i on its tab: a check once it finished, a word when it did not, and off when the run left it out.
-// A phase that ran to its end with questions left open finished; Work left lists the questions.
+// A phase that ran to its end with questions left open finished; Work left lists the questions. One whose report does
+// not say whether it ran to its end reads unresolved.
 func (r Report) stage(i int) (mark string, off bool) {
 	a := phases[i].Analysis
 	status, ok := r.Analyses[a]
@@ -96,12 +97,14 @@ func (r Report) stage(i int) (mark string, off bool) {
 		return "", true
 	case r.PhaseErrors[a] != "":
 		return redStyle.Render("Error"), false
-	case status == "complete", status == "partial" && r.Unfinished[a] == "" && slices.Contains(r.Unresolved, a):
+	case status == "complete", status == "unresolved" && r.Unfinished[a] == "" && slices.Contains(r.Unresolved, a):
 		return greenStyle.Render("✓"), false
 	case status == "not run":
 		return dim("-"), false
-	case status == "partial":
-		return yellowStyle.Render("partly"), false
+	case status == "unfinished", status == "unresolved" && r.Unfinished[a] != "":
+		return yellowStyle.Render("unfinished"), false
+	case status == "unresolved":
+		return yellowStyle.Render("unresolved"), false
 	case status == "cancelled", status == "time_limit", status == "spending_exhausted":
 		return yellowStyle.Render("stopped"), false
 	}
@@ -230,11 +233,13 @@ func costPanel(r Report, w int) string {
 func helpPanel(w int, live bool) string {
 	row := func(a, b string) string { return cols(w, " ", []int{20}, a, dim(b)) }
 	// The live screen has no Work left, no row cursor and no Enter; its rows say so in their own words.
-	untested, unfinished, toggle := "Not tested. Work left on Results says why.", "A phase that did not finish. Work left on Results says what is left.",
-		"A collapsed or expanded section or row. Press the key shown beside it, or Enter."
+	untested, toggle := "Not tested. Work left on Results says why.", "A collapsed or expanded section or row. Press the key shown beside it, or Enter."
+	unfinished := "A phase in which a step failed or stopped. Work left on Results says what is left."
+	unresolved := "A phase that ran to its end with evidence still open. Work left on Results says which."
 	if live {
 		untested, toggle = "Not tested yet.", "A collapsed or expanded section. Press the key shown beside it."
-		unfinished = "partly: the phase ended with some results unresolved or some work not finished; the report says which. stopped: it ended before its work was done."
+		unfinished = "unfinished: a step of the phase failed or stopped. stopped: the phase ended before its work was done."
+		unresolved = "The phase ended with evidence still open, or with some attempts not run; the report says which."
 	}
 	out := []string{spread(" "+fg(teal, bold("Help")), keyText("?")+" "+dim("or")+" "+keyText("Esc")+" "+dim("close"), w), "", heading("Symbols", ""),
 		row(greenStyle.Render("✓")+" "+redStyle.Render("✓"), "Yes. Green beside a phase that finished; red for a demonstrated cause."),
@@ -242,7 +247,8 @@ func helpPanel(w int, live bool) string {
 		row(dim("-"), untested),
 		row(yellowStyle.Render("?"), "Unresolved. The evidence did not decide it."),
 		row(redStyle.Render("Error"), "The step failed to run. The reason is on the same screen."),
-		row(yellowStyle.Render("partly")+" "+yellowStyle.Render("stopped"), unfinished),
+		row(yellowStyle.Render("unfinished")+" "+yellowStyle.Render("stopped"), unfinished),
+		row(yellowStyle.Render("unresolved"), unresolved),
 		row(dim("▸ ▾"), toggle),
 	}
 	if !live {
@@ -258,7 +264,7 @@ func helpPanel(w int, live bool) string {
 	out = append(out, "", heading("Colours", ""),
 		row(redStyle.Render("red"), "A demonstrated cause, or a wrong grader decision."),
 		row(greenStyle.Render("green"), "A finished phase, or a correct grader decision."),
-		row(yellowStyle.Render("amber"), "Work that needs attention: stopped, partly finished, not tested."),
+		row(yellowStyle.Render("amber"), "Work that needs attention: stopped, unfinished, unresolved, not tested."),
 		row(dim("grey"), "Background information."),
 		"", heading("Words", ""),
 		row("Real episode", "A normal run of the task by an agent, scored by the task's own grader."),

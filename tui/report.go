@@ -502,6 +502,12 @@ func load(dir string) (Report, error) {
 			}
 		}
 	}
+	r.Status = renamedStatus("", r.Status)
+	for _, m := range []map[string]string{r.Analyses, r.Unfinished} {
+		for a, status := range m {
+			m[a] = renamedStatus(a, status)
+		}
+	}
 	// Older reports keep generated category verdicts in their warnings and safety prose in their answer.
 	var warnings []string
 	for _, warning := range r.Warnings {
@@ -510,6 +516,9 @@ func load(dir string) (Report, error) {
 				continue
 			}
 			warning = match[1] + " search limitation (" + match[2] + "): " + match[3]
+		}
+		if a, rest, ok := strings.Cut(warning, " "+oldStatus+": "); ok && !strings.Contains(a, " ") {
+			warning = a + " " + renamedStatus(a, oldStatus) + ": " + rest
 		}
 		warnings = append(warnings, warning)
 	}
@@ -734,6 +743,22 @@ func clean(v any) any {
 		return out
 	}
 	return v
+}
+
+// oldStatus is the one status older reports and events gave both to a run or simulation in which a step failed or
+// stopped and to an inspection or attack that ran to its end with evidence left open.
+const oldStatus = "partial"
+
+// renamedStatus is the status of analysis, or of the run when analysis is "", in today's words: unfinished for a run
+// or simulation in which a step failed or stopped, unresolved for an inspection or attack with evidence left open.
+func renamedStatus(analysis, status string) string {
+	switch {
+	case status != oldStatus:
+		return status
+	case analysis == "" || analysis == "simulation":
+		return "unfinished"
+	}
+	return "unresolved"
 }
 
 func (r Report) task() string { return r.Configuration.TaskDir }

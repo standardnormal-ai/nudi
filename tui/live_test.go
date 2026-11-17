@@ -71,7 +71,7 @@ func screenLines(t *testing.T, l *Live, now time.Time) string {
 var attackLog = ev("00:00", "run_start", `, "backend": "modal", "spending_cap": 4, "concurrency": 8, "concurrency_setting": 8, "known_cost": 0`) +
 	ev("00:00", "phase_start", `, "phase": "hack"`) +
 	ev("00:30", "evidenced", `, "inspector": "hack", "outcome": "accepted_invalid", "category": "grader_tampering", "id": "check-0001", "index": 0`) +
-	ev("02:00", "phase_end", `, "phase": "hack", "status": "partial"`) +
+	ev("02:00", "phase_end", `, "phase": "hack", "status": "unresolved"`) +
 	ev("02:00", "phase_start", `, "phase": "attack"`) +
 	ev("02:01", "attempt_start", `, "episode": "0000-attacker", "candidate": "hack-0", "level": "full", "number": 1`) +
 	ev("02:01", "attempt_start", `, "episode": "0001-attacker", "candidate": null, "level": "none", "number": 1`) +
@@ -93,7 +93,7 @@ func TestLiveScreen(t *testing.T) {
 	s := screenLines(t, liveFrom(t, attackLog), at9("04:00"))
 	for _, want := range []string{
 		"nudi  runs/x   following live", "Modal     Elapsed 4:00     Concurrency 8", "Model cost $0.62 of $4.00",
-		"Simulation waiting", "Find Hacks partly", "Attack  ⣾",
+		"Simulation waiting", "Find Hacks unresolved", "Attack  ⣾",
 		"Agents  2 running", "Attacker", "No information", "Looking for any hack", "Try 1",
 		"Attack Inspector", "Checks try 1, full",
 		"Findings So Far (0)", "None yet.",
@@ -282,7 +282,7 @@ func TestFollowScreenGivesWayToTheViewer(t *testing.T) {
 	}
 	m, _ = m.Update(liveTick{})
 	v, ok := m.(model)
-	if !ok || !strings.Contains(v.View().Content, "gave reward the checks show the work did not earn") {
+	if !ok || !strings.Contains(v.View().Content, "The grader can be cheated, and it misjudges work.") {
 		t.Fatalf("%T does not show the viewer", m)
 	}
 }
@@ -371,10 +371,10 @@ func TestLiveWordsOnly(t *testing.T) {
 	}
 }
 
-// The live Help lists only what works while the run goes on, says what partly means and what the references are.
+// The live Help lists only what works while the run goes on, says what unfinished and unresolved mean and what the references are.
 func TestLiveHelp(t *testing.T) {
 	s := plainText(helpPanel(wideAt, true))
-	for _, want := range []string{"partly", "unresolved", "References", "Findings So Far"} {
+	for _, want := range []string{"unfinished", "unresolved", "References", "Findings So Far"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("live help lacks %q:\n%s", want, s)
 		}

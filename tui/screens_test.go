@@ -76,17 +76,17 @@ func TestHelpScreen(t *testing.T) {
 // Each way a run can end has its own Results banner.
 func TestEndings(t *testing.T) {
 	for body, want := range map[string]string{
-		`"status": "complete", "answer": ["Finished", "No hack found."]`:                                         "✓ Finished",
-		`"status": "partial", "answer": ["Finished", "x"], "elapsed": 300`:                                       "Finished  after 5:00",
-		`"answer": ["Stopped", "x"], "stop": {"kind": "cancelled"}`:                                              "Stopped by you",
-		`"answer": ["Stopped", "x"], "stop": {"kind": "terminated"}`:                                             "Stopped by a termination signal",
-		`"answer": ["Stopped", "x"], "stop": {"kind": "time_limit", "minutes": 5}, "elapsed": 300`:               "Stopped at the time limit  5:00 of 5:00",
-		`"answer": ["Stopped", "x"], "stop": {"kind": "spending_cap"}`:                                           "Stopped at the spending cap",
-		`"answer": ["Stopped", "x"], "stop": {"kind": "stopped", "reason": "no run_end event"}`:                  "Run not finished",
-		`"answer": ["Stopped", "x"], "stop": {"kind": "provider_refused", "reason": "the provider refused it"}`:  "Stopped by the model provider",
-		`"answer": ["Stopped", "x"], "stop": {"kind": "provider_refused", "reason": "the provider refused it."}`: "The provider refused it.\n",
-		`"answer": ["Could not start: no task.toml"]`:                                                            "no task.toml",
-		`"answer": ["Finished", "x"], "analyses": {"hack": "partial"}, "phase_errors": {"hack": "boom\nmore"}`:   "Find Hacks failed",
+		`"status": "complete", "answer": ["Finished", "No hack found."]`:                                          "✓ Finished",
+		`"status": "unfinished", "answer": ["Finished", "x"], "elapsed": 300`:                                     "Finished  after 5:00",
+		`"answer": ["Stopped", "x"], "stop": {"kind": "cancelled"}`:                                               "Stopped by you",
+		`"answer": ["Stopped", "x"], "stop": {"kind": "terminated"}`:                                              "Stopped by a termination signal",
+		`"answer": ["Stopped", "x"], "stop": {"kind": "time_limit", "minutes": 5}, "elapsed": 300`:                "Stopped at the time limit  5:00 of 5:00",
+		`"answer": ["Stopped", "x"], "stop": {"kind": "spending_cap"}`:                                            "Stopped at the spending cap",
+		`"answer": ["Stopped", "x"], "stop": {"kind": "stopped", "reason": "no run_end event"}`:                   "Run not finished",
+		`"answer": ["Stopped", "x"], "stop": {"kind": "provider_refused", "reason": "the provider refused it"}`:   "Stopped by the model provider",
+		`"answer": ["Stopped", "x"], "stop": {"kind": "provider_refused", "reason": "the provider refused it."}`:  "The provider refused it.\n",
+		`"answer": ["Could not start: no task.toml"]`:                                                             "no task.toml",
+		`"answer": ["Finished", "x"], "analyses": {"hack": "unresolved"}, "phase_errors": {"hack": "boom\nmore"}`: "Find Hacks failed",
 	} {
 		r, err := load(writeReport(t, "{"+body+"}"))
 		if err != nil {
@@ -176,7 +176,7 @@ func TestWidthSweep(t *testing.T) {
 // A run stopped after a phase failed headlines the stop, with its reason, and keeps the phase's error as a note,
 // on Results and in the plain output.
 func TestStopAfterAPhaseErrorHeadlinesTheStop(t *testing.T) {
-	r, err := load(writeReport(t, `{"answer": ["Stopped", "x"], "analyses": {"hack": "partial"}, "phase_errors": {"hack": "boom\nmore"},
+	r, err := load(writeReport(t, `{"answer": ["Stopped", "x"], "analyses": {"hack": "unresolved"}, "phase_errors": {"hack": "boom\nmore"},
 		"stop": {"kind": "provider_refused", "reason": "the provider refused it"}}`))
 	if err != nil {
 		t.Fatal(err)

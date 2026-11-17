@@ -202,8 +202,10 @@ func (l *Live) stage(i int, sp string) (string, bool) {
 		return redStyle.Render("Error"), false
 	case p.Status == "complete":
 		return greenStyle.Render("✓"), false
-	case p.Status == "partial": // the events do not say whether every attempt ran, so partial is never done
-		return amber("partly"), false
+	case p.Status == "unfinished":
+		return amber("unfinished"), false
+	case p.Status == "unresolved": // the events do not say whether every attempt ran, so it is never done
+		return amber("unresolved"), false
 	}
 	return amber("stopped"), false
 }
@@ -736,7 +738,7 @@ func (l *Live) logWords(e Event) string {
 var jobKeys = map[string]string{"grader": "grader_inspector", "hack": "hack_inspector", "attack": "attack"}
 
 // phaseEndWords say how a phase ended, by its phase_end status.
-var phaseEndWords = map[string]string{"complete": "complete", "partial": "partly", "failed": "failed", "stopped": "stopped",
+var phaseEndWords = map[string]string{"complete": "complete", "unfinished": "a step failed or stopped", "unresolved": "evidence still open", "failed": "failed", "stopped": "stopped",
 	"cancelled": "stopped", "time_limit": "stopped at the time limit", "spending_exhausted": "stopped at the spending cap"}
 
 // sessionWords say how an inspector session ended, by its session_end status.

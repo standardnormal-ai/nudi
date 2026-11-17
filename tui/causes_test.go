@@ -28,7 +28,7 @@ func causeIDs(r Report) []string {
 // of the findings whose tries count.
 func TestCausesLoad(t *testing.T) {
 	r := fixture(t, "causes")
-	want := []string{"C6: A1", "C1: hack-1 hack-3 A2", "C3: hack-4", "C4: grader-12", "C7: A3", "C2: hack-2", "C5: grader-13"}
+	want := []string{"C1: hack-1 hack-3 A2", "C3: hack-4", "C4: grader-12", "C6: A1", "C7: A3", "C2: hack-2", "C5: grader-13"}
 	if got := causeIDs(r); !slices.Equal(got, want) {
 		t.Fatalf("causes %v, want %v", got, want)
 	}
@@ -40,7 +40,7 @@ func TestCausesLoad(t *testing.T) {
 	if slices.ContainsFunc(r.Attack.Problems, Problem.judged) || len(r.Attack.Problems) != 7 || r.Causes[4].Level != 0 {
 		t.Errorf("findings whose tries count: %d", len(r.Attack.Problems))
 	}
-	if f := r.Causes[1].Findings[2]; !f.ReadAs || f.Finding != "0016-attacker" || f.CauseID != "C1" {
+	if f := r.Causes[0].Findings[2]; !f.ReadAs || f.Finding != "0016-attacker" || f.CauseID != "C1" {
 		t.Errorf("read as: %+v", f)
 	}
 }
@@ -81,10 +81,10 @@ func TestOldReportsBecomeCauses(t *testing.T) {
 func TestCauseRows(t *testing.T) {
 	r := fixture(t, "causes")
 	s := plainTab(r, results, "none")
-	c2 := oneLine(rowsAfter(s, "2  The grader trusts whatever", 3))
-	if !strings.Contains(oneLine(row(s, "Incorrect Work Passed (5)")), "e expand Hint Full") || !strings.Contains(oneLine(row(s, "Correct Work Failed (2)")), "Hint Full") ||
+	c1 := oneLine(rowsAfter(s, "1  The grader trusts whatever", 3))
+	if !strings.Contains(oneLine(row(s, "Hacks (3)")), "e expand Hint Full") || !strings.Contains(oneLine(row(s, "Correct Work Rejected (2)")), "Hint Full") ||
 		strings.Contains(s, "Causes (") || strings.Contains(s[:strings.Index(s, "Abandoned")], "Type") || strings.Contains(s[:strings.Index(s, "Abandoned")], "work passed") ||
-		!strings.Contains(c2, "●●●●○") || !strings.Contains(c2, "3 findings, 1 not attacked on its own") || strings.Contains(s, "No info") {
+		!strings.Contains(c1, "●●●●○") || !strings.Contains(c1, "3 findings, 1 not attacked on its own") || strings.Contains(s, "No info") {
 		t.Errorf("rows:\n%s", s)
 	}
 	for _, id := range []string{"C1", "C6", "hack-", "A1"} {
@@ -92,7 +92,7 @@ func TestCauseRows(t *testing.T) {
 			t.Errorf("a cause row shows the code %s:\n%s", id, s)
 		}
 	}
-	if strings.Index(s, "5  A stale marker") > strings.Index(s, "Correct Work Failed") || strings.Index(s, "6  Answers") < strings.Index(s, "Correct Work Failed") {
+	if strings.Index(s, "5  A stale marker") > strings.Index(s, "Correct Work Rejected") || strings.Index(s, "6  Answers") < strings.Index(s, "Correct Work Rejected") {
 		t.Errorf("groups:\n%s", s)
 	}
 	if strings.Contains(oneLine(rowsAfter(s, "6  ", 1)), "findings") || strings.Contains(s, "Inspector  ") {
@@ -100,7 +100,7 @@ func TestCauseRows(t *testing.T) {
 	}
 	m := newModel(r, 0, false)
 	m.page()
-	c3 := slices.IndexFunc(m.items, func(it item) bool { return it.n > 0 }) + 2 // after causes 1 and 2
+	c3 := 2 // causes 1 and 2 have one row each before it
 	if m.items[c3].key != "" || evidenceOf(m.found, r.Causes[2].Findings[0]) != m.items[c3].n {
 		t.Errorf("a cause of one finding opens it: %+v", m.items)
 	}
@@ -118,7 +118,7 @@ func TestCauseRows(t *testing.T) {
 	if h3 := oneLine(rowsAfter(second(rows, "Edits grader or tests"), "Edits grader or tests", 2)); h3 != "Edits grader or tests - - ●●○○○ not attacked on its own" {
 		t.Errorf("not attacked on its own %q:\n%s", h3, open)
 	}
-	if a2 := oneLine(rowsAfter(rows, "A wrapper script", 2)); a2 != "A wrapper script returns 0. ●●●●● associated to this cause" || strings.Contains(rows, "Attacker,") {
+	if a2 := oneLine(rowsAfter(rows, "A wrapper script", 2)); a2 != "A wrapper script returns 0. ●●●●● associated to this cause, Incorrect work passed" || strings.Contains(rows, "Attacker,") {
 		t.Errorf("read as %q:\n%s", a2, open)
 	}
 	if strings.Contains(rows, "hack-") || strings.Contains(rows, "A2") {
@@ -143,16 +143,14 @@ func TestCauseRowsWithoutTries(t *testing.T) {
 	}
 }
 
-// A finding row names its type only when it differs from its cause's.
+// A finding row names its type only when it differs from its cause's, and a finding read as the cause does not set
+// the cause's type.
 func TestCauseFindingType(t *testing.T) {
-	_, r := edited(t, "causes", func(raw map[string]any) { findingIn(raw, "hack-3")["outcome"] = "rejected_valid" })
-	open := plainTab(r, results, "cause C1")
-	if h3 := oneLine(rowsAfter(second(open, "Edits grader or tests"), "Edits grader or tests", 2)); !strings.Contains(h3, "not attacked on its own, Correct work failed") ||
-		strings.Contains(oneLine(rowsAfter(open, "Edits grader or tests", 2)), "passed") {
+	open := plainTab(fixture(t, "causes"), results, "cause C1")
+	rows := open[:strings.Index(open, "Abandoned")]
+	if a2 := oneLine(rowsAfter(rows, "A wrapper script", 2)); !strings.HasSuffix(a2, "associated to this cause, Incorrect work passed") ||
+		strings.Contains(oneLine(rowsAfter(rows, "Edits grader or tests", 2)), "Hack") || !strings.Contains(rows, "Hacks (3)") {
 		t.Errorf("type:\n%s", open)
-	}
-	if !strings.Contains(open, "Incorrect Work Passed (5)") {
-		t.Errorf("a finding read as the cause sets its type:\n%s", open)
 	}
 }
 
@@ -175,13 +173,13 @@ func TestCauseArgument(t *testing.T) {
 	if _, _, err := findingNumber(r, found, "C9"); err == nil || err.Error() != "run has no cause or finding C9" {
 		t.Errorf("C9: %v", err)
 	}
-	for _, words := range [][]string{{"cause", "2"}, {"Cause", "2"}, {"cause2"}, {"CAUSE 2"}} {
+	for _, words := range [][]string{{"cause", "1"}, {"Cause", "1"}, {"cause1"}, {"CAUSE 1"}} {
 		if id, err := causeNumber(r, words); id != "C1" || err != nil {
 			t.Errorf("%v: %q %v", words, id, err)
 		}
 	}
 	// A plain number is a cause's number too, as Results shows it; rows show no finding numbers.
-	if id, err := causeNumber(r, []string{"2"}); id != "C1" || err != nil {
+	if id, err := causeNumber(r, []string{"2"}); id != "C3" || err != nil {
 		t.Errorf("a plain number is a cause number: %q %v", id, err)
 	}
 	if id, err := causeNumber(fixture(t, "clean"), []string{"1"}); id != "1" || err != nil {
@@ -194,16 +192,16 @@ func TestCauseArgument(t *testing.T) {
 		t.Error("two words that are not cause N")
 	}
 	_, out, _ := run("testdata/causes", "C1")
-	if !strings.HasPrefix(out, "  Cause 2  The grader trusts") || !strings.Contains(oneLine(out), "A wrapper script returns 0.") || strings.Contains(out, "CAUSES") || strings.Contains(out, "hack-1") {
+	if !strings.HasPrefix(out, "  Cause 1  The grader trusts") || !strings.Contains(oneLine(out), "A wrapper script returns 0.") || strings.Contains(out, "CAUSES") || strings.Contains(out, "hack-1") {
 		t.Errorf("piped C1:\n%s", out)
 	}
-	for _, words := range [][]string{{"cause", "2"}, {"2"}} {
+	for _, words := range [][]string{{"cause", "1"}, {"1"}} {
 		if _, by, _ := run(append([]string{"testdata/causes"}, words...)...); by != out {
 			t.Errorf("piped %v:\n%s", words, by)
 		}
 	}
-	if _, one, _ := run("testdata/causes", "1"); !strings.Contains(one, "Results › Cause 1 ›") {
-		t.Errorf("piped 1, a cause of one finding, opens that finding:\n%s", one)
+	if _, one, _ := run("testdata/causes", "2"); !strings.Contains(one, "Results › Cause 2 ›") {
+		t.Errorf("piped 2, a cause of one finding, opens that finding:\n%s", one)
 	}
 	if _, id, _ := run("testdata/causes", "hack-1"); !strings.Contains(id, "REFERENCES") {
 		t.Errorf("piped hack-1 opens that finding:\n%s", id)
@@ -220,7 +218,7 @@ func TestCauseArgument(t *testing.T) {
 // Piped cause output gives each finding the timeline of its screen, one step per fact that exists, in order: who found
 // it, what it breaks, its reward, nudi's check, its cause, the Attacker's result at each help it was given, its level.
 func TestCauseTimeline(t *testing.T) {
-	_, out, _ := run("testdata/causes", "cause", "2")
+	_, out, _ := run("testdata/causes", "cause", "1")
 	first := out[strings.Index(out, "Edits grader or tests"):strings.Index(out, "level")]
 	var steps []string
 	for _, l := range strings.Split(first, "\n") {
@@ -231,8 +229,8 @@ func TestCauseTimeline(t *testing.T) {
 	if !slices.Equal(steps, []string{"issue", "requires", "reward", "nudi", "cause", "hint", "full"}) {
 		t.Errorf("steps %v:\n%s", steps, out)
 	}
-	for _, want := range []string{"◆ issue Hack Inspector, task copy", "◆ cause associated to cause 2", "◆ hint Attacker demonstrated it, reward 1 Try 14",
-		"◆ full Attacker demonstrated it, reward 1 Try 7", "◆ level 4 of 5", "◆ attacker not attacked on its own", "◆ cause associated to cause 2",
+	for _, want := range []string{"◆ issue Hack Inspector, task copy", "◆ cause associated to cause 1", "◆ hint Attacker demonstrated it, reward 1 Try 14",
+		"◆ full Attacker demonstrated it, reward 1 Try 7", "◆ level 4 of 5", "◆ attacker not attacked on its own", "◆ cause associated to cause 1",
 		"◆ no info Attacker demonstrated it, reward 1 Try 16"} {
 		if !strings.Contains(oneLine(out), want) {
 			t.Errorf("no %q:\n%s", want, out)
@@ -253,17 +251,17 @@ func TestCauseTimeline(t *testing.T) {
 func TestAttackByCause(t *testing.T) {
 	r := fixture(t, "causes")
 	s := plainTab(r, 3, "none")
-	if strings.Contains(oneLine(row(s, "Cause ")), "Ref") || !strings.Contains(oneLine(rowsAfter(s, "2  The grader trusts whatever", 1)), "▸ 2 The grader trusts whatever") || strings.Contains(s, "C1") {
+	if strings.Contains(oneLine(row(s, "Cause ")), "Ref") || !strings.Contains(oneLine(rowsAfter(s, "1  The grader trusts whatever", 1)), "▸ 1 The grader trusts whatever") || strings.Contains(s, "C1") {
 		t.Errorf("rows:\n%s", s)
 	}
-	if !strings.Contains(oneLine(rowsAfter(s, "16 ", 1)), "✓ ✗ Cause 2") {
-		t.Errorf("no-hint try read as cause 2:\n%s", s)
+	if !strings.Contains(oneLine(rowsAfter(s, "16 ", 1)), "✓ ✗ Cause 1") {
+		t.Errorf("no-hint try read as cause 1:\n%s", s)
 	}
-	open := plainTab(r, 3, "tries C1 "+r.Causes[1].Cause)
-	tries := rowsAfter(open, "2  The grader trusts whatever", 4)
+	open := plainTab(r, 3, "tries C1 "+r.Causes[0].Cause)
+	tries := rowsAfter(open, "1  The grader trusts whatever", 4)
 	if !strings.Contains(oneLine(tries), "Try Help") || !strings.Contains(oneLine(tries), "7 Full ✓ Finished 1") || !strings.Contains(oneLine(tries), "14 Hint ✓") ||
 		strings.Contains(open, "-attacker") || strings.Contains(tries, "16 ") {
-		t.Errorf("cause 2's tries:\n%s", open)
+		t.Errorf("cause 1's tries:\n%s", open)
 	}
 }
 
@@ -271,9 +269,9 @@ func TestAttackByCause(t *testing.T) {
 // older report's problems are numbered the same way.
 func TestPlainCauses(t *testing.T) {
 	s := plainReport(fixture(t, "causes"), plainW)
-	if !strings.Contains(s, "CAUSES\n  An agent grouped the findings into causes; it can make mistakes.\n\n  Cause 1") || !strings.Contains(s, "\n  Cause 1  The agent writes") ||
+	if !strings.Contains(s, "CAUSES\n  An agent grouped the findings into causes; it can make mistakes.\n\n  Cause 1") || !strings.Contains(s, "\n  Cause 1  The grader trusts whatever") ||
 		!strings.Contains(s, "\n      Edits grader or tests\n          Mechanism         The grader runs the task's copy") || !strings.Contains(s, "not attacked on its own") ||
-		!strings.Contains(s, "◆ cause      associated to cause 2") || strings.Contains(s, "\nPROBLEMS") || !strings.Contains(s, "  Cause 6  Answers are compared as raw strings.\n      Mechanism ") ||
+		!strings.Contains(s, "◆ cause      associated to cause 1") || strings.Contains(s, "\nPROBLEMS") || !strings.Contains(s, "  Cause 6  Answers are compared as raw strings.\n      Mechanism ") ||
 		strings.Contains(s[:strings.Index(s, "EVIDENCE")], "hack-") {
 		t.Errorf("plain:\n%s", s)
 	}
@@ -391,7 +389,7 @@ func TestFoldedCauseSentenceIsOneLine(t *testing.T) {
 			open string
 		}{{results, "cause C1"}, {3, "tries C1 " + long}} {
 			shut := plainText(drawTab(r, tab.s, w, "none"))
-			line := row(shut, "▸ 2  The grader trusts whatever")
+			line := row(shut, "▸ 1  The grader trusts whatever")
 			i := strings.Index(shut, line)
 			next := strings.TrimSpace(strings.SplitN(shut[i+len(line)+1:], "\n", 2)[0])
 			if !strings.Contains(line, "…") || strings.Contains(line, "pytest reads it.") || strings.HasPrefix(next, "conda") || strings.HasPrefix(next, "environment") {
@@ -495,10 +493,10 @@ func TestAbandonedNames(t *testing.T) {
 func TestFindingTimeline(t *testing.T) {
 	r := fixture(t, "causes")
 	found := r.findings()
-	n := evidenceOf(found, r.Causes[1].Findings[0])
+	n := evidenceOf(found, r.Causes[0].Findings[0])
 	s := plainShow(r, found, n, 100)
 	evidence := s[strings.Index(s, "EVIDENCE"):strings.Index(s, "LIMITATIONS")]
-	for _, want := range []string{"◆ issue Hack Inspector, task copy", "◆ cause associated to cause 2", "◆ hint Attacker demonstrated it, reward 1 Try 14", "◆ level 4 of 5"} {
+	for _, want := range []string{"◆ issue Hack Inspector, task copy", "◆ cause associated to cause 1", "◆ hint Attacker demonstrated it, reward 1 Try 14", "◆ level 4 of 5"} {
 		if !strings.Contains(oneLine(evidence), want) {
 			t.Errorf("no %q:\n%s", want, s)
 		}
@@ -509,7 +507,7 @@ func TestFindingTimeline(t *testing.T) {
 			t.Errorf("the head repeats %q:\n%s", gone, head)
 		}
 	}
-	if !strings.Contains(head, "Results › Cause 2 › The grader trusts whatever runs first on PATH.") {
+	if !strings.Contains(head, "Results › Cause 1 › The grader trusts whatever runs first on PATH.") {
 		t.Errorf("crumb:\n%s", head)
 	}
 	_, help, _ := run("--help")

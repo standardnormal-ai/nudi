@@ -22,8 +22,8 @@ const plainW = 100
 
 func main() { os.Exit(view(os.Args[1:], os.Stdout, os.Stderr)) }
 
-// view runs one command line and returns its exit code: Python's for the run, 0 when it is complete
-// or reached its time limit and 1 when it is partial, or 2 when the folder or the arguments are wrong.
+// view runs one command line and returns its exit code: 0 when the run is complete, 1 for any other run, such as one
+// in which a step failed or stopped or one that reached its time limit, or 2 when the folder or the arguments are wrong.
 func view(args []string, stdout, stderr io.Writer) int {
 	code := 0
 	noIntro, follow := false, false

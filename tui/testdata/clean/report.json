@@ -1,6 +1,6 @@
 {
   "analyses": {
-    "hack": "partial",
+    "hack": "unresolved",
     "simulation": "complete"
   },
   "answer": [
@@ -10,7 +10,6 @@
   "attack": null,
   "causes": [],
   "configuration": {
-    "approved_requirements": 2,
     "attack_from": null,
     "backend": "docker",
     "cancelled_calls": 0,
@@ -183,7 +182,7 @@
       },
       "limits": [],
       "open": [],
-      "status": "partial",
+      "status": "unresolved",
       "suspected": []
     }
   },
@@ -287,6 +286,6 @@
     "hack"
   ],
   "warnings": [
-    "hack partial: its coverage is incomplete"
+    "hack unresolved: its coverage is incomplete"
   ]
 }

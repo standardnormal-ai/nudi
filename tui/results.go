@@ -166,7 +166,7 @@ func ending(r Report, found []Finding, w int) []string {
 	head, notes := endingParts(r)
 	right := tally(r, found)
 	out := []string{spread(" "+head, right, w)}
-	// A finished run whose work was partly lost warns of it beside the count, or on a line of its own when that does
+	// A finished run that lost some of its work warns of it beside the count, or on a line of its own when that does
 	// not fit; Work Left says what was lost.
 	if lost := lostWork(r); lost != "" {
 		warn := yellowStyle.Render("! " + lost)
@@ -245,13 +245,13 @@ func endingParts(r Report) (string, []string) {
 	return head, slices.DeleteFunc(notes, func(s string) bool { return s == "" })
 }
 
-// lostWork says what failed, and where, in a finished run whose Answer says work was lost or in a partial run, whose
+// lostWork says what failed, and where, in a finished run whose Answer says work was lost or in an unfinished run, whose
 // work ended with some of it lost, as "Find Hacks: 1 search failed"; "" for any other run. It counts the failures the Answer's first line names: an inspector session that failed with
 // its experiment's error is that experiment's search, and an evidence copy belongs to no phase.
 func lostWork(r Report) string {
 	failed := slices.ContainsFunc(slices.Collect(maps.Values(r.PhaseErrors)), func(e string) bool { return e != "" })
 	if r.Stop != nil || failed || strings.HasPrefix(r.Answer[0], "Could not start") ||
-		r.Status != "partial" && !(r.Status == "complete" && strings.HasPrefix(r.Answer[0], "Finished, but ")) {
+		r.Status != "unfinished" && !(r.Status == "complete" && strings.HasPrefix(r.Answer[0], "Finished, but ")) {
 		return ""
 	}
 	var out []string
@@ -1298,7 +1298,7 @@ func warningRows(r Report, rows [][3]string) [][3]string {
 			continue // untriedLevels and the search rows say these
 		case coverage, strings.HasSuffix(w, "was selected but not run"), strings.HasPrefix(w, "attempted "):
 			// The open questions name what stayed unresolved; without one the reason is not recorded.
-			if !has(where, "") && status == "partial" {
+			if !has(where, "") && status == "unresolved" {
 				out = append(out, [3]string{where, "Some results", "Unresolved: Reason not recorded"})
 			} else if !has(where, "") {
 				out = append(out, [3]string{where, "Coverage", "Incomplete: " + word(statusWords, status)})

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"flag"
 	"fmt"
 	"os"
@@ -516,13 +517,21 @@ func TestLiveAttackerProblemFromAGuidedTry(t *testing.T) {
 	}
 }
 
-// A phase that ended partial may have left an attempt that failed to run, so its tab says partly, not done.
-func TestLivePartialPhaseIsPartly(t *testing.T) {
-	l := liveFrom(t, ev("00:00", "run_start", `, "backend": "docker"`)+
-		ev("00:00", "phase_start", `, "phase": "hack"`)+
-		ev("01:00", "phase_end", `, "phase": "hack", "status": "partial", "elapsed": 60`))
-	if s := screenLines(t, l, at9("01:00")); !strings.Contains(s, "Find Hacks  partly") || strings.Contains(s, "✓") {
-		t.Errorf("partial phase:\n%s", s)
+// A phase whose step failed or stopped reads unfinished, and one that ended with evidence open reads unresolved, never
+// done, since it may have left an attempt that failed to run. Older events gave both one status, mapped by phase.
+func TestLiveUnfinishedAndUnresolvedPhases(t *testing.T) {
+	for _, status := range []string{"", oldStatus} {
+		sim, hack := cmp.Or(status, "unfinished"), cmp.Or(status, "unresolved")
+		l := liveFrom(t, ev("00:00", "run_start", `, "backend": "docker"`)+
+			ev("00:00", "phase_start", `, "phase": "simulation"`)+
+			ev("00:30", "phase_end", `, "phase": "simulation", "status": "`+sim+`", "elapsed": 30`)+
+			ev("00:30", "phase_start", `, "phase": "hack"`)+
+			ev("01:00", "phase_end", `, "phase": "hack", "status": "`+hack+`", "elapsed": 30`))
+		s := screenLines(t, l, at9("01:00"))
+		if !strings.Contains(s, "Simulation unfinished") || !strings.Contains(s, "Find Hacks  unresolved") || strings.Contains(s, "✓") ||
+			strings.Contains(strings.ToLower(s), oldStatus) {
+			t.Errorf("phases ended %q:\n%s", status, s)
+		}
 	}
 }
 

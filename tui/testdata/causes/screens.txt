@@ -6,21 +6,20 @@
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
  ✓ Finished                                                                                7 causes
- 4 findings below gave reward the checks show the work did not earn; 2 findings below withheld
- reward where the checks measured the marks shown; 1 was exploited by an Attacker given its help, or
- found by one. The approved requirement list confirms none of them, so nudi does not say which task
- rule each breaks.
+ The grader can be cheated, and it misjudges work.
 
- Incorrect Work Passed (5)  e expand                                            Hint  Full
- ›   1  The agent writes the reward file itself.                                 -     -    ●●●●●
-   ▸ 2  The grader trusts whatever runs first on PATH.                           ✓     ✓    ●●●●○
+ Hacks (3)  e expand                                                            Hint  Full
+ › ▸ 1  The grader trusts whatever runs first on PATH.                           ✓     ✓    ●●●●○
         3 findings, 1 not attacked on its own
-     3  The grader trusts a timing file the agent can write.                     -     -    ●●○○○
-     4  The grader pays for an output file that only exists, without checking…   -     -    ●●○○○
+     2  The grader trusts a timing file the agent can write.                     -     -    ●●○○○
+     3  The grader pays for an output file that only exists, without checking…   -     -    ●●○○○
+
+ Incorrect Work Passed (2)                                                      Hint  Full
+     4  The agent writes the reward file itself.                                 -     -    ●●●●●
      5  A stale marker file is read as a pass.                                   -     -
         No level of its own, only findings associated to it
 
- Correct Work Failed (2)                                                        Hint  Full
+ Correct Work Rejected (2)                                                      Hint  Full
      6  Answers are compared as raw strings.                                     -     ✓    ●●●○○
      7  The grader rejects a correct answer written with leading zeros, which…   -     -    ●●○○○
 
@@ -39,8 +38,8 @@
 
  Work Left (7)
  Where              What                                  Why
- Attack             Cause 3, Rigs timing                  Not tested: no Attacker attempt recorded
- Attack             Cause 4, The grader pays for an       Not tested: no Attacker attempt recorded
+ Attack             Cause 2, Rigs timing                  Not tested: no Attacker attempt recorded
+ Attack             Cause 3, The grader pays for an       Not tested: no Attacker attempt recorded
                     output file that only exists,
                     without checking the answer in it.
  Attack             Cause 7, The grader rejects a         Not tested: no Attacker attempt recorded
@@ -143,21 +142,24 @@
  Simulation ✓ ── Grade Simulations ✓ ── Find Hacks ✓ ──  Attack  ✓                  │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- Incorrect Work Passed (5)                                                                 e expand
+ Hacks (3)                                                                                 e expand
         Cause                                       Hint  Full
- › ▸ 1  The agent writes the reward file itself.     -     -
-   ▸ 2  The grader trusts whatever runs first on…    ✓     ✓
-   ▸ 3  The grader trusts a timing file the agent…   -     -
-   ▸ 4  The grader pays for an output file that…     -     -
+ › ▸ 1  The grader trusts whatever runs first on…    ✓     ✓
+   ▸ 2  The grader trusts a timing file the agent…   -     -
+   ▸ 3  The grader pays for an output file that…     -     -
+
+ Incorrect Work Passed (2)
+        Cause                                       Hint  Full
+   ▸ 4  The agent writes the reward file itself.     -     -
    ▸ 5  A stale marker file is read as a pass.       -     -
 
- Correct Work Failed (2)
+ Correct Work Rejected (2)
         Cause                                       Hint  Full
    ▸ 6  Answers are compared as raw strings.         -     ✓
    ▸ 7  The grader rejects a correct answer…         -     -
 
  Can an Attacker Succeed Without Any Information?
    Try   Hack demonstrated?   New finding?   Same cause as
-   16            ✓                 ✗         Cause 2
+   16            ✓                 ✗         Cause 1
    17            ✓                 ✓
    18            ✓                 ✗         Cause 5

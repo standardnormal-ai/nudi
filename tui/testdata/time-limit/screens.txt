@@ -6,11 +6,10 @@
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
  Stopped at the time limit                                                                  1 cause
- 1 finding below gave reward the checks show the work did not earn; no Attacker ran. The approved
- requirement list confirms none of them, so nudi does not say which task rule each breaks.
+ The grader can be cheated in a copy of the task package, not yet in a real episode.
  Results below are from before the limit.
 
- Incorrect Work Passed (1)  e expand                                            Hint  Full
+ Hacks (1)  e expand                                                            Hint  Full
  ›   1  The test runs bash through PATH.                                         -     -    ●●○○○
 
  ▸ What the References Mean                                                                i expand
@@ -64,7 +63,7 @@
  Simulation ✓ ── Grade Simulations ── Find Hacks ✓ ──  Attack  stopped              │   [ Results ]
  ──────────────────────────────────────────────────────────────────────────────────────────────────
 
- Incorrect Work Passed (1)                                                                 e expand
+ Hacks (1)                                                                                 e expand
         Cause                                       Hint  Full
  › ▸ 1  The test runs bash through PATH.             -     -
 

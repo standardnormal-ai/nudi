@@ -81,7 +81,7 @@
  │
  ◆ cause      associated to cause 5
  │
- ◆ level      Work the grader failed
+ ◆ level      Correct work failed
 
  Interpretation
  The Grader Inspector wrote: "summary is supported"

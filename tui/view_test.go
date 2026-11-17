@@ -19,24 +19,55 @@ import (
 // is wider than the window.
 func renderAll(t *testing.T, r Report) {
 	t.Helper()
-	found := r.findings()
 	for _, w := range []int{80, 120} {
-		screens := []string{plainReport(r, w), modelsPanel(r, w), costPanel(r, w), helpPanel(w, false), helpPanel(w, true), drawTab(r, 0, w, "episodes")}
-		for s := 0; s <= results; s++ {
-			screens = append(screens, drawTab(r, s, w))
-		}
-		for n := range found {
-			for tab := range 3 {
-				screens = append(screens, renderShow(r, found, n+1, tab, "Results", w))
-			}
-		}
-		for _, s := range screens {
+		for _, s := range allScreens(r, w) {
 			for _, line := range splitLines(s) {
 				if width(line) > w {
 					t.Errorf("%d columns at width %d: %q", width(line), w, ansi.Strip(line))
 				}
 			}
 		}
+	}
+}
+
+// allScreens is every screen of r at width w, with every row and section expanded.
+func allScreens(r Report, w int) []string {
+	found := r.findings()
+	screens := []string{plainReport(r, w), modelsPanel(r, w), costPanel(r, w), helpPanel(w, false), helpPanel(w, true), drawTab(r, 0, w, "episodes")}
+	for s := 0; s <= results; s++ {
+		screens = append(screens, drawTab(r, s, w))
+	}
+	for n := range found {
+		for tab := range 3 {
+			screens = append(screens, renderShow(r, found, n+1, tab, "Results", w))
+		}
+	}
+	return screens
+}
+
+// Reports written before the status rename gave one status to a run in which a step failed or stopped and to an
+// inspection that ended with evidence open; clean-before-levels is one, clean holds today's words. The screens use the
+// new word for each, and never the old one.
+func TestOldStatusNeverShows(t *testing.T) {
+	for _, name := range []string{"clean", "clean-before-levels"} {
+		r := fixture(t, name)
+		if r.Analyses["hack"] != "unresolved" || name == "clean-before-levels" && (r.Status != "unfinished" || r.Warnings[0] != "hack unresolved: its coverage is incomplete") {
+			t.Errorf("%s: status %q, analyses %v, warnings %q", name, r.Status, r.Analyses, r.Warnings)
+		}
+		for _, s := range allScreens(r, 120) {
+			if strings.Contains(strings.ToLower(plainText(s)), oldStatus) {
+				t.Errorf("%s shows the old status:\n%s", name, plainText(s))
+			}
+		}
+	}
+	r, err := load(writeReport(t, `{"answer": ["x"], "status": "`+oldStatus+`", "analyses": {"simulation": "`+oldStatus+`", "attack": "`+oldStatus+`"},
+		"unfinished": {"simulation": "`+oldStatus+`", "attack": "`+oldStatus+`"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Status != "unfinished" || r.Analyses["simulation"] != "unfinished" || r.Analyses["attack"] != "unresolved" || r.Unfinished["simulation"] != "unfinished" ||
+		r.Unfinished["attack"] != "unresolved" {
+		t.Errorf("mapped: status %q, analyses %v, unfinished %v", r.Status, r.Analyses, r.Unfinished)
 	}
 }
 
@@ -269,7 +300,7 @@ func TestPipe(t *testing.T) {
 		}
 	}
 	if code, _, _ := run("testdata/clean-before-levels"); code != 1 {
-		t.Errorf("partial run exits %d", code)
+		t.Errorf("run with evidence still open exits %d", code)
 	}
 	// Evidence left unresolved is a result: the run still ran every step.
 	if code, _, _ := run("testdata/clean"); code != 0 {
@@ -322,7 +353,7 @@ func TestKeys(t *testing.T) {
 	if m = press(m, "x"); m.intro != nil {
 		t.Fatal("a key does not skip the intro")
 	}
-	if m.screen != results || !strings.Contains(m.View().Content, "gave reward the checks show the work did not earn") {
+	if m.screen != results || !strings.Contains(m.View().Content, "The grader can be cheated, and it misjudges work.") {
 		t.Fatal("the viewer does not open on Results")
 	}
 	// Enter expands the first problem, P1; Down and Enter open its first evidence record, hack-1.
@@ -760,7 +791,7 @@ func TestProblemTypeIsTheReports(t *testing.T) {
 
 // A phase that failed after keeping results shows them, and says it failed before finishing rather than that it has none.
 func TestFailedPhaseKeepsItsResults(t *testing.T) {
-	r, err := load(writeReport(t, `{"answer": ["x"], "status": "partial", "analyses": {"hack": "partial"}, "phase_errors": {"hack": "hack failed: RuntimeError: boom"},
+	r, err := load(writeReport(t, `{"answer": ["x"], "status": "unfinished", "analyses": {"hack": "unresolved"}, "phase_errors": {"hack": "hack failed: RuntimeError: boom"},
 		"inspections": {"hack_inspector": {"findings": {"evidenced": [{"index": 0, "assessment": {"outcome": "accepted_invalid"}, "claim": {"mechanism": "kept finding"}}]}}}}`))
 	if err != nil {
 		t.Fatal(err)
@@ -1022,7 +1053,7 @@ func TestOlderExploitElsewhereKeepsItsLevel(t *testing.T) {
 // A suspected exploit, a measured check whose reading ended unknown, is a counted state among the findings not counted
 // as problems, on Results and in the plain output, named by its category with its check as the reference.
 func TestSuspectedExploitIsNotCountedAsAProblem(t *testing.T) {
-	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"hack": "partial", "grader": "complete"}, "inspections": {
+	r, err := load(writeReport(t, `{"answer": ["x"], "analyses": {"hack": "unresolved", "grader": "complete"}, "inspections": {
 		"hack_inspector": {"suspected": [{"category": "package_oracles", "check": "check-0"}], "findings": {}},
 		"grader_inspector": {"suspected": [{"category": null, "check": "check-1"}], "findings": {}}}}`))
 	if err != nil {
@@ -1142,7 +1173,7 @@ func TestLegendsFoldedUntilE(t *testing.T) {
 			t.Errorf("tab %d: pressing e does not open the legend", s)
 		}
 	}
-	if s := plainTab(r, results, "cause C1"); !strings.Contains(row(s, "Incorrect Work Passed (3)"), "e expand") || strings.Contains(row(s, "Correct Work Failed"), "e expand") || strings.Contains(s, "Who demonstrated it") {
+	if s := plainTab(r, results, "cause C1"); !strings.Contains(row(s, "Hacks (3)"), "e expand") || strings.Contains(row(s, "Correct Work Rejected"), "e expand") || strings.Contains(s, "Who demonstrated it") {
 		t.Errorf("Results header:\n%s", s)
 	}
 }
@@ -1351,7 +1382,7 @@ func TestEmptyGroupsAreHidden(t *testing.T) {
 			}
 		}
 	}
-	if s := plainTab(r, 3, "e"); !strings.HasSuffix(oneLine(row(s, "Incorrect Work Passed (3)")), "e collapse") || !strings.Contains(s, "✓ yes") {
+	if s := plainTab(r, 3, "e"); !strings.HasSuffix(oneLine(row(s, "Hacks (3)")), "e collapse") || !strings.Contains(s, "✓ yes") {
 		t.Errorf("the first group shown lost the legend:\n%s", s)
 	}
 	none, err := load(writeReport(t, `{"schema_version": 2, "answer": ["x"], "analyses": {"attack": "complete"}, "attack": {"problems": []}}`))
@@ -1429,7 +1460,7 @@ func TestPlainAbandonedProblemsWrap(t *testing.T) {
 // At 80 columns a tab strip that needs two lines keeps Results beside a tab, never alone on a line.
 func TestTabStripWrapsWholeTabs(t *testing.T) {
 	r := fixture(t, "full")
-	r.Analyses["simulation"] = "partial"
+	r.Analyses["simulation"] = "unfinished"
 	m := newModel(r, 0, false)
 	m.w = 80
 	for _, line := range strings.Split(plainText(m.top()), "\n") {
@@ -1454,7 +1485,7 @@ func TestPlainFoldsAndKeyHints(t *testing.T) {
 			t.Errorf("Results lacks %q:\n%s", want, res)
 		}
 	}
-	for s, head := range map[int]string{results: "Incorrect Work Passed (3)", 2: "Findings (4)", 3: "Incorrect Work Passed (3)", 1: "Metrics"} {
+	for s, head := range map[int]string{results: "Hacks (3)", 2: "Findings (4)", 3: "Hacks (3)", 1: "Metrics"} {
 		if got := oneLine(row(plainTab(r, s, "none"), head)); !strings.Contains(got, " e expand") || strings.Contains(got, "Legend") {
 			t.Errorf("tab %d header %q", s, got)
 		}
@@ -1543,7 +1574,7 @@ func TestOnlyTitlesAreBold(t *testing.T) {
 					t.Errorf("%s tab %d: %q is bold but not a Title Case title", name, s, run)
 				}
 			}
-			if s == results && name == "full" && !slices.Contains(runs, "Incorrect Work Passed") {
+			if s == results && name == "full" && !slices.Contains(runs, "Hacks") {
 				t.Errorf("Results title not bold: %q", runs)
 			}
 		}
@@ -1667,6 +1698,11 @@ func TestNoTypeWithoutTypedProblems(t *testing.T) {
 // incorrect work passed.
 func TestProblemResultType(t *testing.T) {
 	_, r := edited(t, "full", func(raw map[string]any) {
+		for _, c := range raw["causes"].([]any) {
+			for _, f := range c.(map[string]any)["findings"].([]any) {
+				f.(map[string]any)["type"] = nil
+			}
+		}
 		findingIn(raw, "hack-4")["type"] = "hack"
 		raw["causes"] = append(raw["causes"].([]any), map[string]any{"id": "C6", "cause": "an unaided exploit", "level": 5, "findings": []any{
 			map[string]any{"id": "0016-attacker", "source": "Attacker", "mechanism": "an unaided exploit", "level": 5, "attacked": true}}})
@@ -1700,7 +1736,7 @@ func TestEpisodeWithoutRewardSaysWhen(t *testing.T) {
 	x := g.Rewards["reward"]
 	x.Usable = x.Attempted - 1
 	g.Rewards["reward"] = x
-	r.Unfinished = map[string]string{"simulation": "partial"}
+	r.Unfinished = map[string]string{"simulation": "unfinished"}
 	s := plainTab(r, results)
 	if !strings.Contains(oneLine(s), "simulator ended during agent work: ModalFailure: the sandbox ran out of memory") || strings.Contains(s, "12 of 12 episodes") {
 		t.Errorf("work left:\n%s", s)
@@ -1802,10 +1838,10 @@ func TestFinishedWithLostWork(t *testing.T) {
 	if s := plainText(drawTab(r, results, 80, "none")); !strings.Contains(splitLines(s)[0], "! Some work was lost") {
 		t.Errorf("lost work no record shows:\n%s", s)
 	}
-	// A partial run, whose work ended with some of it lost, reads Finished and warns the same way: a session that failed with its experiment's
+	// An unfinished run, whose work ended with some of it lost, reads Finished and warns the same way: a session that failed with its experiment's
 	// error is that one search, a failed try counts under Attack, and a failed evidence copy belongs to no phase.
 	_, r = edited(t, "full", func(raw map[string]any) {
-		raw["status"] = "partial"
+		raw["status"] = "unfinished"
 		raw["answer"] = append([]any{"Finished with gaps: the Attacker failed to run in 0020-attacker; work was also lost: one hack inspector search (grader tampering) stopped early because a sandbox command failed. Results below are what was found."}, raw["answer"].([]any)[1:]...)
 		hack := raw["inspections"].(map[string]any)["hack_inspector"].(map[string]any)
 		hack["attempts"] = []any{map[string]any{"status": "tool_failure", "category": "grader_tampering", "error": "AuthError"}, map[string]any{"status": "unobservable"}}
@@ -1817,9 +1853,9 @@ func TestFinishedWithLostWork(t *testing.T) {
 	want := "! Find Hacks: 1 search failed; Attack: 1 try failed; 1 evidence copy failed"
 	for _, w := range []int{60, 80, 120} {
 		s := plainText(drawTab(r, results, w, "none"))
-		if lines := splitLines(s); !strings.HasPrefix(lines[0], " Finished") || strings.Contains(s, "Partly") || !strings.Contains(oneLine(strings.Join(lines[:3], "\n")), want) ||
+		if lines := splitLines(s); !strings.HasPrefix(lines[0], " Finished") || !strings.Contains(oneLine(strings.Join(lines[:3], "\n")), want) ||
 			strings.Contains(s, "Work left says what did not finish") {
-			t.Errorf("partial ending at %d:\n%s", w, s)
+			t.Errorf("unfinished ending at %d:\n%s", w, s)
 		}
 	}
 }

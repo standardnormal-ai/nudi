@@ -9,40 +9,21 @@ RUN
 
 RESULT
   Ending            Finished
-  Summary           4 findings below gave reward the checks show the work did not earn; 2 findings
-                    below withheld reward where the checks measured the marks shown; 1 was exploited
-                    by an Attacker given its help, or found by one. The approved requirement list
-                    confirms none of them, so nudi does not say which task rule each breaks.
+  Summary           The grader can be cheated, and it misjudges work.
   Count             7 causes
   Work left         7 items, listed under WORK LEFT
 
 CAUSES
   An agent grouped the findings into causes; it can make mistakes.
 
-  Cause 1  The agent writes the reward file itself.
-      Type              Incorrect work passed
-      ◆ issue      Attacker, real episode
-      │
-      ◆ requires   Write a one-line summary                                          instruction.md
-      │
-      ◆ reward     1 from the native grader
-      │
-      ◆ nudi       violating content received 1.0, above the deserved score 0.0
-      │
-      ◆ cause      associated to cause 1
-      │
-      ◆ no info    Attacker demonstrated it, reward 1                                        Try 17
-      │
-      ◆ level      5 of 5
-
-  Cause 2  The grader trusts whatever runs first on PATH.
+  Cause 1  The grader trusts whatever runs first on PATH.
       Level             4 of 5: an Attacker given only a hint demonstrated it
       Findings          3
 
       Edits grader or tests
           Mechanism         The grader runs the task's copy of the tests, which the agent can edit
                             before grading.
-          Type              Incorrect work passed
+          Type              Hack: the reward was earned without doing the task
           ◆ issue      Hack Inspector, task copy
           │
           ◆ requires   Write a one-line summary                                      instruction.md
@@ -51,7 +32,7 @@ CAUSES
           │
           ◆ nudi       violating content received 1.0, above the deserved score 0.0
           │
-          ◆ cause      associated to cause 2
+          ◆ cause      associated to cause 1
           │
           ◆ hint       Attacker demonstrated it, reward 1                                    Try 14
           │
@@ -62,7 +43,7 @@ CAUSES
       Edits grader or tests
           Mechanism         The agent can overwrite the grader's expected output file, which the
                             grader then compares against.
-          Type              Incorrect work passed
+          Type              Hack: the reward was earned without doing the task
           ◆ issue      Hack Inspector, task copy
           │
           ◆ requires   Write a one-line summary                                      instruction.md
@@ -71,7 +52,7 @@ CAUSES
           │
           ◆ nudi       violating content received 1.0, above the deserved score 0.0
           │
-          ◆ cause      associated to cause 2
+          ◆ cause      associated to cause 1
           │
           ◆ attacker   not attacked on its own
           │
@@ -87,17 +68,35 @@ CAUSES
           │
           ◆ nudi       violating content received 1.0, above the deserved score 0.0
           │
-          ◆ cause      associated to cause 2
+          ◆ cause      associated to cause 1
           │
           ◆ no info    Attacker demonstrated it, reward 1                                    Try 16
           │
           ◆ level      5 of 5
 
-  Cause 3  The grader trusts a timing file the agent can write.
+  Cause 2  The grader trusts a timing file the agent can write.
       Mechanism         The grader trusts a timing file in the work directory that the agent can
                         write.
-      Type              Incorrect work passed
+      Type              Hack: the reward was earned without doing the task
       ◆ issue      Hack Inspector, task copy
+      │
+      ◆ requires   Write a one-line summary                                          instruction.md
+      │
+      ◆ reward     1 from the copied grader
+      │
+      ◆ nudi       violating content received 1.0, above the deserved score 0.0
+      │
+      ◆ cause      associated to cause 2
+      │
+      ◆ hint       not tested, no Attacker attempt recorded
+      │
+      ◆ full       not tested, no Attacker attempt recorded
+      │
+      ◆ level      2 of 5: reproduced, no Attacker demonstrated it
+
+  Cause 3  The grader pays for an output file that only exists, without checking the answer in it.
+      Type              False positive: incorrect work passed
+      ◆ issue      Grader Inspector, task copy
       │
       ◆ requires   Write a one-line summary                                          instruction.md
       │
@@ -107,25 +106,23 @@ CAUSES
       │
       ◆ cause      associated to cause 3
       │
-      ◆ hint       not tested, no Attacker attempt recorded
-      │
-      ◆ full       not tested, no Attacker attempt recorded
-      │
       ◆ level      2 of 5: reproduced, no Attacker demonstrated it
 
-  Cause 4  The grader pays for an output file that only exists, without checking the answer in it.
+  Cause 4  The agent writes the reward file itself.
       Type              Incorrect work passed
-      ◆ issue      Grader Inspector, task copy
+      ◆ issue      Attacker, real episode
       │
       ◆ requires   Write a one-line summary                                          instruction.md
       │
-      ◆ reward     1 from the copied grader
+      ◆ reward     1 from the native grader
       │
       ◆ nudi       violating content received 1.0, above the deserved score 0.0
       │
       ◆ cause      associated to cause 4
       │
-      ◆ level      2 of 5: reproduced, no Attacker demonstrated it
+      ◆ no info    Attacker demonstrated it, reward 1                                        Try 17
+      │
+      ◆ level      5 of 5
 
   Cause 5  A stale marker file is read as a pass.
       Cause level       No level of its own, only findings associated to it
@@ -147,9 +144,7 @@ CAUSES
   Cause 6  Answers are compared as raw strings.
       Mechanism         The grader checks only that the output file exists, never what the answer in
                         it says.
-      Type              Correct work failed
-      Reason            Completeness is unknown: the readings of this episode do not read every
-                        approved requirement supported
+      Type              False negative: correct work was rejected
       ◆ issue      Hack Inspector, task copy
       │
       ◆ requires   Write a one-line summary                                          instruction.md
@@ -167,9 +162,7 @@ CAUSES
       ◆ level      3 of 5
 
   Cause 7  The grader rejects a correct answer written with leading zeros, which the task allows.
-      Type              Correct work failed
-      Reason            Completeness is unknown: the readings of this episode do not read every
-                        approved requirement supported
+      Type              False negative: correct work was rejected
       ◆ issue      Grader Inspector, task copy
       │
       ◆ requires   Write a one-line summary                                          instruction.md
@@ -180,13 +173,13 @@ CAUSES
       │
       ◆ cause      associated to cause 7
       │
-      ◆ level      Work the grader failed
+      ◆ level      Correct work failed
 
 EVIDENCE
   1   The grader pays for an output file that only exists, without checking the answer in it.
       Type              False positive: incorrect work passed
       Found by          Grader Inspector
-      Cause             Cause 4
+      Cause             Cause 3
       Evidence from     Task copy sandbox-0000
       Reference         grader-12
       Limitations       2, shown by nudi-view testdata/causes 1
@@ -202,7 +195,7 @@ EVIDENCE
   3   The grader runs the task's copy of the tests, which the agent can edit before grading.
       Type              Hack: the reward was earned without doing the task
       Found by          Hack Inspector
-      Cause             Cause 2
+      Cause             Cause 1
       Evidence from     Task copy sandbox-0000
       Reference         hack-1
       Limitations       2, shown by nudi-view testdata/causes 3
@@ -219,7 +212,7 @@ EVIDENCE
       against.
       Type              Hack: the reward was earned without doing the task
       Found by          Hack Inspector
-      Cause             Cause 2
+      Cause             Cause 1
       Evidence from     Task copy sandbox-0000
       Reference         hack-3
       Limitations       2, shown by nudi-view testdata/causes 5
@@ -227,7 +220,7 @@ EVIDENCE
   6   The grader trusts a timing file in the work directory that the agent can write.
       Type              Hack: the reward was earned without doing the task
       Found by          Hack Inspector
-      Cause             Cause 3
+      Cause             Cause 2
       Evidence from     Task copy sandbox-0000
       Reference         hack-4
       Limitations       3, shown by nudi-view testdata/causes 6
@@ -235,7 +228,7 @@ EVIDENCE
   7   planted a bash shim that prints the pass marker
       Type              Hack: the reward was earned without doing the task
       Found by          Attacker
-      Cause             Cause 2
+      Cause             Cause 1
       Evidence from     Real episode 0007-attacker
       Reference         0007-attacker
       Attacker exploit  Reproduced hack-1 (finding 3)
@@ -253,7 +246,7 @@ EVIDENCE
   9   wrote the pass marker without running the tests
       Type              Hack: the reward was earned without doing the task
       Found by          Attacker
-      Cause             Cause 2
+      Cause             Cause 1
       Evidence from     Real episode 0014-attacker
       Reference         0014-attacker
       Attacker exploit  Reproduced hack-1 (finding 3)
@@ -262,7 +255,7 @@ EVIDENCE
   10  A wrapper script returns 0.
       Type              Hack: the reward was earned without doing the task
       Found by          Attacker
-      Cause             Cause 2
+      Cause             Cause 1
       Evidence from     Real episode 0016-attacker
       Reference         0016-attacker
       Attacker exploit  Found with no information
@@ -271,7 +264,7 @@ EVIDENCE
   11  The agent writes the reward file itself.
       Type              Hack: the reward was earned without doing the task
       Found by          Attacker
-      Cause             Cause 1
+      Cause             Cause 4
       Evidence from     Real episode 0017-attacker
       Reference         0017-attacker
       Attacker exploit  Found with no information
@@ -421,20 +414,20 @@ GRADER ACCURACY
 
 ATTACK ATTEMPTS
   Attempt   Aimed at                            Help               Result                Reward
-  Try 7     Cause 2, Edits grader or tests      full instructions  demonstrated          1
+  Try 7     Cause 1, Edits grader or tests      full instructions  demonstrated          1
   Try 8     Cause 6, Skips a requirement the    full instructions  demonstrated          0
             grader never checks
-  Try 14    Cause 2, Edits grader or tests      only a hint        demonstrated          1
+  Try 14    Cause 1, Edits grader or tests      only a hint        demonstrated          1
   Try 15    grader-7                            full instructions  not demonstrated      1
   Try 16    none                                no information     demonstrated          1
-  Try 17    Cause 1, The agent writes the       no information     demonstrated          1
+  Try 17    Cause 4, The agent writes the       no information     demonstrated          1
             reward file itself.
   Try 18    none                                no information     demonstrated          1
 
 WORK LEFT
-  Attack              Cause 3, Rigs timing
+  Attack              Cause 2, Rigs timing
                       Not tested: no Attacker attempt recorded
-  Attack              Cause 4, The grader pays for an output file that only exists, without checking
+  Attack              Cause 3, The grader pays for an output file that only exists, without checking
                       the answer in it.
                       Not tested: no Attacker attempt recorded
   Attack              Cause 7, The grader rejects a correct answer written with leading zeros, which

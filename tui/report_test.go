@@ -208,8 +208,8 @@ func TestLoadReadsTheFactsTheScreensTabulate(t *testing.T) {
 		t.Fatalf("causes: %+v", c)
 	}
 	ps := []Problem{c[0].Findings[0], c[3].Findings[0]}
-	if ps[0].ID != "hack-1" || ps[0].Finding != "hack-1" || ps[0].Outcome != "accepted_invalid" || ps[0].Type != nil || !*ps[0].Attacked ||
-		ps[1].ID != "hack-2" || ps[1].Outcome != "rejected_valid" || ps[1].Reason == nil || ps[0].Conditions[0].Attempts != 1 || ps[0].Conditions[0].Status == "" {
+	if ps[0].ID != "hack-1" || ps[0].Finding != "hack-1" || ps[0].Outcome != "accepted_invalid" || deref(ps[0].Type) != "hack" || !*ps[0].Attacked ||
+		ps[1].ID != "hack-2" || ps[1].Outcome != "rejected_valid" || ps[0].Conditions[0].Attempts != 1 || ps[0].Conditions[0].Status == "" {
 		t.Fatalf("findings: %+v", ps)
 	}
 	if at := r.Attack.Attempts; at[0].Status != "evidenced_issue" || *at[0].Assessment != 0 || at[3].Status != "no_evidenced_issue" {

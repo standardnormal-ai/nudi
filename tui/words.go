@@ -50,7 +50,8 @@ var stopWords = map[string][2]string{
 
 // unfinishedWords say why a step did not run to its end, by its status.
 var unfinishedWords = map[string]string{
-	"partial":            "Not finished",
+	"unfinished":         "A step failed or stopped",
+	"unresolved":         "Some work did not finish; evidence still open",
 	"cancelled":          "Stopped",
 	"time_limit":         "Stopped at the time limit",
 	"spending_exhausted": "Stopped at the spending cap",
@@ -73,11 +74,12 @@ var statusWords = map[string]string{
 	"stopped":            "stopped",
 	"failed":             "failed",
 	"complete":           "done",
-	"partial":            "some results unclear",
+	"unfinished":         "a step failed or stopped",
+	"unresolved":         "evidence still open",
 	"time_limit":         "time limit reached",
 	"cancelled":          "stopped",
 	"spending_exhausted": "stopped by the spending cap",
-	"running":            "unfinished",
+	"running":            "still running",
 	"unknown":            "result unclear",
 	"not run":            "selected but not run",
 }
