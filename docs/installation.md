@@ -25,9 +25,24 @@ nudi measures Docker's free space only for a daemon on the same host that it rea
 
 A full Docker disk fails each build, start or copy, and three failed starts in a row of the task's environment stop the run. The hack inspector may test whether a task can exhaust disk space by filling its sandbox's disk. On Docker this fills the disk where Docker stores data until the sandbox is removed, and nudi does not limit it.
 
-## Install v0.5.1
+## Install
 
-nudi has no GitHub Releases. Each version is a git tag, and the current one is `v0.5.1`. Install that tag in a virtual environment:
+nudi is on PyPI. Install it as a command-line tool with uv or pipx, which put it in its own environment:
+
+```sh
+uv tool install --python 3.12 "nudi[modal]"
+# or
+pipx install --python python3.12 "nudi[modal]"
+nudi --version
+```
+
+`nudi --version` prints the installed version from the package metadata. The `[modal]` extra adds the Modal backend; drop it if you only use Docker. To upgrade, run `uv tool upgrade nudi` or `pipx upgrade nudi`.
+
+Without Python 3.12, install it first, for example with `uv python install 3.12`, `brew install python@3.12` or from python.org.
+
+### Install from a git tag
+
+To install a version straight from its git tag, for example `v0.5.1`, use a virtual environment:
 
 ```sh
 python3.12 -m venv .venv
@@ -36,9 +51,7 @@ python -m pip install "nudi[modal] @ git+https://github.com/standardnormal-ai/nu
 nudi --version
 ```
 
-`nudi --version` prints the installed version from the package metadata. The `[modal]` extra adds the Modal backend; drop it if you only use Docker. With uv, `uv venv --python 3.12` followed by `uv pip install` with the same package spec does the same.
-
-Without `python3.12`, install Python 3.12 first, for example with `uv python install 3.12`, `brew install python@3.12` or from python.org.
+With uv, `uv venv --python 3.12` followed by `uv pip install` with the same package spec does the same.
 
 Only the direct dependencies are pinned, in [pyproject.toml](../pyproject.toml). Their own dependencies resolve at install time, so two installs can differ in those.
 
