@@ -7,6 +7,7 @@ No model provider is called.
 import asyncio
 import contextlib
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -556,6 +557,27 @@ def test_a_second_ctrl_c_records_the_episode_cancelled(tmp_path, monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         asyncio.run(run_episode(config))
     assert stored(tmp_path / "episode").cancelled
+
+
+def test_an_episode_without_nudi_package_metadata_records_its_version_unknown(tmp_path, monkeypatch):
+    """Run from a checkout without installed nudi-cli metadata, an episode records that version as unknown instead of
+    crashing."""
+    installed = importlib.metadata.version
+
+    def version(name):
+        if name == "nudi-cli":
+            raise importlib.metadata.PackageNotFoundError(name)
+        return installed(name)
+
+    async def finished(*args):
+        pass
+
+    monkeypatch.setattr(importlib.metadata, "version", version)
+    monkeypatch.setattr("nudi.episode.run_verifiers", finished)
+    config = EpisodeConfig(task_dir=CONTRACT_TASK, output_dir=tmp_path / "episode", model=MODEL, api_key_var="XAI_API_KEY")
+    result = asyncio.run(run_episode(config))
+    assert result.versions["nudi-cli"] == "unknown" and result.versions["harbor"] == installed("harbor")
+    assert stored(tmp_path / "episode") == result
 
 
 @pytest.mark.parametrize("alias", [False, True])

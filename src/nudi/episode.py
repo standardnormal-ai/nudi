@@ -864,6 +864,14 @@ def check_output(output_dir: Path, task_dir: Path) -> None:
         raise ValueError(f"output_dir {output_dir} overlaps the task {task_dir}")
 
 
+def installed_version(name: str) -> str:
+    """The installed package's version, or `unknown` when it has no metadata, as when nudi runs from a checkout."""
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
 def framed_instruction(frame: str, task: str, reminder: str) -> str:
     """Wrap an attack frame around the task's own instruction.
 
@@ -894,7 +902,7 @@ async def run_episode(config: EpisodeConfig, queue: TrialQueue | None = None, *,
         task_digest=tree_digest(config.task_dir),
         model=config.model,
         reasoning_effort=config.reasoning_effort,
-        versions={name: importlib.metadata.version(name) for name in VERSIONED},
+        versions={name: installed_version(name) for name in VERSIONED},
     )
     private_dir(config.output_dir)
     config.output_dir.chmod(0o700)

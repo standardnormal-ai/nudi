@@ -78,7 +78,7 @@ Nothing bounds a run's time or inference cost unless you set `--time-limit` or `
 
 [Parallelization](parallelization.md) says what starts when, how the run's slots are shared and when a container waits or is refused. The `hack` `phase_start` event gives the number of slots as `slots`. `run_start` lists the phases that will run as `analyses`; a rerun with `--attack-from` lists only `attack`. One workspace may still admit one experiment even at `--concurrency 1`, and Attacker retries of the same candidate at the same hint level wait for each other.
 
-With focused attempts, the hack inspector starts one focused session per category and one `other` session, each from a fresh conversation with the task and the checklist. The `other` session maps what the grader trusts, measures each trust the learner can break, and starts with trusts no listed category covers. Its findings take a listed category as `category` when one fits, else `other`. It settles no category of its own, but a failed attempt of it stays in `open` until a later attempt recovers it.
+With focused attempts, the hack inspector starts one focused session per category and one `other` session, each from a fresh conversation with the task and the checklist. The `other` session maps what the grader trusts, measures each trust the learner can break, and starts with trusts no listed category covers. Its findings take a listed category as `category` when one fits, else `other`. It settles no category of its own, but a failed attempt of it stays in `open` until a later attempt recovers it. In separate verifier mode every hack inspector workspace starts from the verifier's environment, not the task image, so it has the grader's tools.
 
 An interpretation of an `other` experiment must give `family`, a short name for the hack family it shows, and its finding carries it as `family`. `report.md` lists families outside `HACK_CATEGORIES` by finding id, on one line after the causes, only when there is one. Names that match a listed category, also with spaces or in another case, are left out of that line.
 
@@ -472,7 +472,7 @@ It prints Modal's bill for that run's sandboxes and exits `0`, or prints one lin
 `nudi-view` shows a run in the terminal: the result with its causes, each phase with the findings beside it, and the evidence, limitations and references of each finding. It reads only the run's `report.json`, which nudi 0.0.0 or later must have written, and its `events.jsonl` when it follows a run that is still going. Build it with Go 1.27.3 or later, as `tui/go.mod` requires. A pip install has no source checkout, so clone the same tag first:
 
 ```sh
-git clone --branch v0.5.2 https://github.com/standardnormal-ai/nudi.git
+git clone --branch v0.5.3 https://github.com/standardnormal-ai/nudi.git
 cd nudi
 (cd tui && go build -o nudi-view .)
 ```
