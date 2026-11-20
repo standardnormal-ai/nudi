@@ -13,13 +13,13 @@ nudi starts each piece of work as soon as what it reads exists, so analyses over
 | Attack inspector | its Attacker episode ends rewarded, or with valid work | the episode and its copies; with a hint, its target finding; with no hint, the causes known then |
 | `report.json`, `report.md` | each confirmation, and the end | records saved so far |
 
-Each focused hack inspector session starts its own conversation. With `--focused-attempts 0`, one broad hack inspector session measures every category instead. The native persistence readback of a location runs once, after the session that named it releases its workspace, in that session's slot. The grader inspector misses hack findings saved after it starts.
+The hack inspector runs three identical sessions, each in its own conversation, with the same request for every category. The native persistence readback of a location runs once, after the session that named it releases its workspace, in that session's slot. The grader inspector misses hack findings saved after it starts.
 
 ## Slots
 
 Each Simulator episode, inspector session and Attacker attempt holds one of `--concurrency // 2` slots, at least one. A Simulator episode uses one container of its slot, and an Attacker attempt keeps its slot through its attack inspector. On Docker there is one slot when a workspace needs more memory than an episode.
 
-Work takes free slots in the order it asked for them, except that an Attacker attempt on a finding takes the next free slot ahead of work that has not started. Running work is never interrupted. The Simulator asks first, and asks for a slot only while one of its episodes is left. Among the hack inspector's focused sessions, the two slowest, `resource_exhaustion` and `other`, ask first. A grader inspector focused session whose category already has an evidenced issue takes no slot, and neither does the judge's call.
+Work takes free slots in the order it asked for them, except that an Attacker attempt on a finding takes the next free slot ahead of work that has not started. Running work is never interrupted. The Simulator asks first, and asks for a slot only while one of its episodes is left. A grader inspector focused session whose category already has an evidenced issue takes no slot, and neither does the judge's call.
 
 A container that does not fit waits for another to end. Only a container that cannot fit beside a lone held workspace is refused, and the experiment's reply then says so. `--concurrency` counts sandboxes, so a task's helper containers can exceed it.
 

@@ -699,7 +699,7 @@ def test_an_account_refusal_keeps_its_reason_without_keys_and_stops_new_work_at_
 
     async def main():
         async with serve(endpoint) as base_url:
-            with model_calls(run, "inspector", "hack-broad"):
+            with model_calls(run, "inspector", "hack-session-1"):
                 with pytest.raises(Exception, match="spend limit"):
                     await call(base_url)
                 with pytest.raises(asyncio.CancelledError):
@@ -713,11 +713,11 @@ def test_an_account_refusal_keeps_its_reason_without_keys_and_stops_new_work_at_
     record = stored_run(run)
     error = record.calls[-1].error
     assert "API key spend limit exceeded" in error and FILE_KEY not in error and "sk-live0123456789abcdef" not in error
-    assert record.stop_reason.startswith("the model provider refused a call of the hack inspector (hack-broad): ")
+    assert record.stop_reason.startswith("the model provider refused a call of the hack inspector (hack-session-1): ")
     assert "API key spend limit exceeded" in record.stop_reason and FILE_KEY not in record.stop_reason
     logged = [json.loads(line) for line in (run.config.output_dir / "events.jsonl").read_text().splitlines()]
     refused = [item for item in logged if item["kind"] == "provider_refused"]
-    assert len(refused) == 1 and refused[0]["agent"] == "hack inspector (hack-broad)" and record.stop_reason in refused[0]["text"]
+    assert len(refused) == 1 and refused[0]["agent"] == "hack inspector (hack-session-1)" and record.stop_reason in refused[0]["text"]
 
 
 @pytest.mark.parametrize("status,message", [(429, "Rate limit reached, retry in 1 s"), (403, "API key spend limit exceeded")])
@@ -758,14 +758,14 @@ def test_an_account_status_chained_inside_a_rate_limit_stops_the_run(tmp_path, m
         chained = error
 
     async def main():
-        with model_calls(run, "inspector", "hack-broad"):
+        with model_calls(run, "inspector", "hack-session-1"):
             with pytest.raises(litellm.RateLimitError):
                 await litellm.acompletion(model="nlp_cloud/m", messages=[{"role": "user", "content": "hi"}], mock_response=chained)
 
     asyncio.run(main())
     record = stored_run(run)
     assert stops_seen == ([True] if stops else [])
-    assert (record.stop_reason or "").startswith("the model provider refused a call of the hack inspector (hack-broad): ") == stops
+    assert (record.stop_reason or "").startswith("the model provider refused a call of the hack inspector (hack-session-1): ") == stops
     assert "payment required" in record.calls[-1].error
 
 
@@ -952,7 +952,7 @@ def test_investigation_calls_keep_the_run_credential_route_effort_and_cost(tmp_p
     async def main():
         async with serve(script) as base_url:
             run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": inspector_model(base_url, priced)})
-            async with inspector.investigation(run, "hack-broad", "Inspect the copied package.", {}) as session:
+            async with inspector.investigation(run, "hack-session-1", "Inspect the copied package.", {}) as session:
                 return run, await session.ask("Investigate.", Finding)
 
     run, result = asyncio.run(main())
@@ -962,7 +962,7 @@ def test_investigation_calls_keep_the_run_credential_route_effort_and_cost(tmp_p
     assert [body["model"] for body in bodies] == ["grok-4.7" if priced else "nudi-unpriced-model"] * 2
     assert [body.get("reasoning_effort") for body in bodies] == ["xhigh" if priced else None] * 2
     record = stored_run(run)
-    assert [(c.role, c.episode) for c in record.calls] == [("inspector", "hack-broad")] * 2
+    assert [(c.role, c.episode) for c in record.calls] == [("inspector", "hack-session-1")] * 2
     if priced:
         expected = sum(litellm.cost_per_token(model="xai/grok-4.7", prompt_tokens=11, completion_tokens=7))
         assert (record.known_cost, record.unknown_cost_calls) == (pytest.approx(2 * expected), 0)
@@ -991,7 +991,7 @@ def test_compaction_summary_is_refused_once_known_cost_reaches_the_cap(tmp_path,
     async def main():
         async with serve(script) as base_url:
             runs.append(new_run(tmp_path, monkeypatch, credentials, models={"inspector": inspector_model(base_url)}, spending_cap=1.0))
-            async with inspector.investigation(runs[0], "hack-broad", "Inspect the copied package.", {}) as session:
+            async with inspector.investigation(runs[0], "hack-session-1", "Inspect the copied package.", {}) as session:
                 with pytest.raises(SpendingCapReached):
                     await session.ask("Investigate.", Finding)
             return runs[0], session
@@ -999,7 +999,7 @@ def test_compaction_summary_is_refused_once_known_cost_reaches_the_cap(tmp_path,
     run, session = asyncio.run(main())
     assert len(script.requests) == 5 and all(body.get("tools") for _, body in script.requests)
     # LangChain tries summary generation three times; each try is refused before it is sent.
-    assert stored_run(run).refused_calls == {"hack-broad": 3}
+    assert stored_run(run).refused_calls == {"hack-session-1": 3}
     assert sandbox_record(run, session.box.record.name)["cleanup"]["removed"] is True
     assert sum(entry["type"] == "tool" for entry in transcript(session)) == 4
 
@@ -1019,16 +1019,15 @@ def test_public_compaction_preserves_records_when_summary_spending_is_exhausted(
 
     async def main():
         async with serve(script) as base:
-            # One session at a time: the `other` session starts first and the stop prevents the next.
             run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": inspector_model(base)}, spending_cap=1.0, concurrency=2)
             runs.append(run)
             return run, await inspection.inspect_hacks(run, categories=["package_oracles"])
 
     run, result = asyncio.run(main())
     assert result.status == "spending_exhausted" and result.categories == {"package_oracles": "unknown"}
-    assert len(result.attempts) == 1 and stored_run(run).refused_calls == {"hack-other": 3}
+    assert len(result.attempts) == 1 and stored_run(run).refused_calls == {"hack-session-1": 3}
     assert len(script.requests) == 5 and all(body.get("tools") for _, body in script.requests)
-    artifact = run.config.output_dir / result.artifacts["hack-other"]["transcript"]
+    artifact = run.config.output_dir / result.artifacts["hack-session-1"]["transcript"]
     entries = [json.loads(line) for line in artifact.read_text().splitlines()]
     assert sum(entry["type"] == "tool" for entry in entries) == 4
     assert all(sandbox_record(run, name)["cleanup"]["removed"] for name in run.record.sandboxes)
@@ -1056,7 +1055,6 @@ def test_public_cancelled_inference_retains_accounting_and_artifact_references(t
 
         script = Blocked(*[("inspection_status", {}) for _ in range(4)], "overflow") if phase == "summary" else Blocked(("inspection_status", {}))
         async with serve(script) as base:
-            # One session at a time: the `other` session starts first and the cancellation prevents the next.
             run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": inspector_model(base)}, concurrency=2)
             running = asyncio.create_task(inspection.inspect_hacks(run, categories=["package_oracles"]))
             await asyncio.wait_for(blocked.wait(), 20)
@@ -1073,7 +1071,7 @@ def test_public_cancelled_inference_retains_accounting_and_artifact_references(t
     assert result.status == "cancelled" and result.categories == {"package_oracles": "unknown"}
     assert len(stored_run(run).calls) == len(script.requests)
     assert stored_run(run).calls[-1].error == "CancelledError" and stored_run(run).calls[-1].cost is None
-    assert (run.config.output_dir / result.artifacts["hack-other"]["transcript"]).is_file()
+    assert (run.config.output_dir / result.artifacts["hack-session-1"]["transcript"]).is_file()
     assert all(sandbox_record(run, name)["cleanup"]["removed"] for name in run.record.sandboxes)
 
 
@@ -1090,7 +1088,7 @@ def test_refused_or_failed_inference_stops_the_turn_keeps_records_and_removes_th
     async def main():
         async with serve(script) as base_url:
             run = new_run(tmp_path, monkeypatch, credentials, models={"inspector": inspector_model(base_url)})
-            async with inspector.investigation(run, "hack-broad", "Inspect the copied package.", {}) as session:
+            async with inspector.investigation(run, "hack-session-1", "Inspect the copied package.", {}) as session:
                 with pytest.raises(inspection.ProviderRefusal if outcome != "error" else inspection.InferenceFailure) as raised:
                     await session.ask("Investigate.", Finding)
             return run, session, raised.value

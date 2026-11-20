@@ -6,8 +6,7 @@ Complete sources are at /nudi/package.
 
 Measure each new case with run_experiment once you have it; workspace files are
 never experiment inputs, and a workspace rehearsal measures nothing. Never exhaust
-disk, memory or processes, and never run the grader, in the workspace; measure it in
-an experiment. A case is a
+disk, memory or processes in the workspace. A case is a
 probe's `episode` or `setup_program`, `location`, `capture_point`, `requirement` and
 `scoring`; its `case` name and `program` are not part of it. Read its raw setup, grader, copy and check output, errors included.
 run_experiment returns a draft reading of its receipt. Complete it with

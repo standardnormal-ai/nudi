@@ -107,8 +107,8 @@ class Analyses:
         (run.config.output_dir / "inspection-grader.json").write_text(result.model_dump_json())
         return result
 
-    async def inspect_hacks(self, run, *, focused_attempts, on_evidence=None, gate=None, causes=()):
-        self.calls.append(("inspect_hacks", focused_attempts))
+    async def inspect_hacks(self, run, *, on_evidence=None, gate=None, causes=()):
+        self.calls.append(("inspect_hacks",))
         self.gates["inspect_hacks"] = gate
         self.raise_if("hack")
         result = self.inspection(run, "hack")
@@ -212,12 +212,11 @@ def test_default_is_full_analysis_with_default_counts(tmp_path, monkeypatch, cap
     """Twelve ordinary episodes and two focused attempts per category by default, one try and one retry."""
     assert send.AnalysisConfig.model_fields["focused_attempts"].default == 2
     assert send.AnalysisConfig.model_fields["episodes"].default == inspect.signature(run_state.simulate).parameters["episodes"].default == 12
-    assert {inspect.signature(function).parameters["focused_attempts"].default
-            for function in (inspection.inspect_grader, inspection.inspect_hacks)} == {2}
+    assert inspect.signature(inspection.inspect_grader).parameters["focused_attempts"].default == 2
     with pytest.raises(SystemExit):
         cli.main(["send-nudis", "--help"])
     help = " ".join(capsys.readouterr().out.split())
-    assert "total focused attempts per grader inspector or hack inspector category, default 2" in help
+    assert "total focused attempts per grader inspector category, default 2" in help
     assert "ordinary Simulator episodes, default 12" in help
     assert ("runs one grader inspector session per ordinary episode (inspector_swarm), several at a time within the run's "
             "concurrency; default off (holistic_inspection)") in help and "3 to 7 minutes" not in help
@@ -226,7 +225,7 @@ def test_default_is_full_analysis_with_default_counts(tmp_path, monkeypatch, cap
 
     # The Simulator, the hack inspector and the attack start together; the grader inspector when the simulation ends; the
     # attack's call ends after both inspections. One try, one no-hint attempt, and the minimal hint after a reproduction.
-    assert analyses.calls == [("start_run", ALL_ROLES), ("simulate", 12), ("inspect_hacks", 2), ("inspect_grader", [], 2, False),
+    assert analyses.calls == [("start_run", ALL_ROLES), ("simulate", 12), ("inspect_hacks",), ("inspect_grader", [], 2, False),
                               ("attack", 1, 1, 0)]
     assert analyses.minimal_hints is True
     assert analyses.analyses == ("simulation", "hack", "grader", "attack")
@@ -360,7 +359,7 @@ def test_python_async_and_cli_share_configuration_and_report(tmp_path, monkeypat
     assert code == 0
     assert capsys.readouterr().out == (tmp_path / "cli" / "report.md").read_text()
     assert reports[0] == reports[1] == reports[2]
-    assert calls[0] == calls[1] == calls[2] == [("start_run", ALL_ROLES), ("simulate", 7), ("inspect_hacks", 1),
+    assert calls[0] == calls[1] == calls[2] == [("start_run", ALL_ROLES), ("simulate", 7), ("inspect_hacks",),
                                                 ("inspect_grader", [], 1, False), ("attack", 4, 3, 0)]
     assert configs[0]["discovery_attempts"] == 3
     analyses = Analyses(monkeypatch)
@@ -493,7 +492,7 @@ def test_isolated_inspections_switch_parses_from_cli_api_and_file(tmp_path, monk
         analyses = Analyses(monkeypatch)
         start(tmp_path / name)
         found[name] = [call for call in analyses.calls if call[0] in ("inspect_grader", "inspect_hacks")]
-    assert found == {name: [("inspect_hacks", 2), ("inspect_grader", [], 2, name.endswith("on"))] for name in runs}
+    assert found == {name: [("inspect_hacks",), ("inspect_grader", [], 2, name.endswith("on"))] for name in runs}
     with pytest.raises(ValidationError):
         send_nudis(task, output_dir=tmp_path / "invalid", isolated_inspections="yes")
     with pytest.raises(SystemExit) as error:
@@ -813,7 +812,7 @@ def test_a_legitimate_reading_and_a_control_make_no_problem(tmp_path, monkeypatc
     requests = judge_replies(monkeypatch, [])
     Analyses(monkeypatch)
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, **_):
+    async def inspect_hacks(run, *, on_evidence, gate, **_):
         report = hack_findings(("legitimate", "grader_tampering", REPRODUCTION), ("accepted_invalid", "grader_tampering", REPRODUCTION))
         report.experiments[1]["control"] = True
         for index in range(2):
@@ -831,7 +830,7 @@ def test_a_reading_again_of_a_check_joins_its_problem(tmp_path, monkeypatch):
     the problem of the check's earlier reading with no second case."""
     analyses = Analyses(monkeypatch)
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, **_):
+    async def inspect_hacks(run, *, on_evidence, gate, **_):
         report = hack_findings(("accepted_invalid", "grader_tampering", None))
         await on_evidence(report, 0)
         report.assessments.append(report.assessments[0].model_copy(update={"claim": report.assessments[0].claim.model_copy(
@@ -853,7 +852,7 @@ def test_a_fed_finding_a_later_reading_of_its_check_withdrew_is_no_longer_curren
     hack-0's check withdrew it, and a later evidenced one without guidance, hack-2, replaced it; hack-1 stands."""
     analyses = Analyses(monkeypatch)
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, **_):
+    async def inspect_hacks(run, *, on_evidence, gate, **_):
         report = hack_findings(("accepted_invalid", "grader_tampering", REPRODUCTION), ("accepted_invalid", "grader_tampering", REPRODUCTION))
         await evidence_each(report, on_evidence, [0, 1])
         first = report.assessments[0]
@@ -908,8 +907,8 @@ def test_the_grader_inspector_request_lists_the_hack_findings_without_their_full
         candidate("reward file", "the verifier trusts the reward file", "unknown", full_guidance=REPRODUCTION)])
     inspect_hacks = analyses.inspect_hacks
 
-    async def finished(run, *, focused_attempts, **_):
-        result = (await inspect_hacks(run, focused_attempts=focused_attempts)).model_copy(update={"status": status})
+    async def finished(run, **_):
+        result = (await inspect_hacks(run)).model_copy(update={"status": status})
         (run.config.output_dir / "inspection-hack.json").write_text(result.model_dump_json())
         return result
 
@@ -964,14 +963,14 @@ def test_a_quiet_stretch_prints_one_line_naming_the_running_agent_jobs(tmp_path,
 
     async def quiet(run, **options):
         run.jobs = Jobs()
-        run_state.event(run, "session_start", "hack inspector hack-broad started", inspector="hack", session="hack-broad")
+        run_state.event(run, "session_start", "hack inspector hack-session-1 started", inspector="hack", session="hack-session-1")
         for number, name in enumerate(["hack-2", "hack-1", "hack-2"]):
             run_state.event(run, "attempt_start", "Attacker started", episode=f"000{number}-attacker", candidate=name, problem="P1")
         run_state.event(run, "attempt_end", "Attacker finished", episode="0002-attacker", candidate="hack-2", problem="P1")
         run_state.event(run, "session_start", "attack inspector started", inspector="attack", session="attack-2", candidate="hack-2", problem="P1")
         while not any(item["kind"] == "heartbeat" for item in events(tmp_path / "run")):
             await asyncio.sleep(0.01)
-        run_state.event(run, "session_end", "hack inspector hack-broad ended", inspector="hack", session="hack-broad")
+        run_state.event(run, "session_end", "hack inspector hack-session-1 ended", inspector="hack", session="hack-session-1")
         return await inspect_hacks(run, **options)
 
     monkeypatch.setattr(send, "inspect_hacks", quiet)
@@ -990,7 +989,7 @@ def test_a_hack_phase_that_raised_after_saving_findings_still_lists_them_for_the
     analyses = Analyses(monkeypatch, candidates=[
         candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION)])
 
-    async def raised(run, *, focused_attempts, **_):
+    async def raised(run, **_):
         saved = analyses.inspection(run, "hack", analyses.candidates).model_copy(update={"status": "unfinished"})
         (run.config.output_dir / "inspection-hack.json").write_text(saved.model_dump_json())
         raise RuntimeError("hack broke")
@@ -1452,11 +1451,11 @@ def test_an_account_refusal_stops_every_analysis_and_names_its_agent_and_reason(
     fail within minutes. stderr, events.jsonl and the report's first line say why and whose call it was; what finished stays."""
     monkeypatch.setattr(send, "elapsed", lambda started: "0:00:00")
     analyses = Analyses(monkeypatch)
-    said = "the model provider refused a call of the hack inspector (hack-broad): API key spend limit exceeded."
+    said = "the model provider refused a call of the hack inspector (hack-session-1): API key spend limit exceeded."
 
-    async def refusing(run, *, focused_attempts, **_):
+    async def refusing(run, **_):
         (run.config.output_dir / "inspection-hack.json").write_text(analyses.inspection(run, "hack").model_dump_json())
-        run.refused("hack inspector (hack-broad)", "API key spend limit exceeded.")
+        run.refused("hack inspector (hack-session-1)", "API key spend limit exceeded.")
         await asyncio.sleep(30)
 
     monkeypatch.setattr(send, "inspect_hacks", refusing)
@@ -1480,7 +1479,7 @@ def test_a_failed_phase_before_the_time_limit_still_exits_1(tmp_path, monkeypatc
     stop such as the spending cap."""
     analyses = Analyses(monkeypatch, fail={"hack": RuntimeError("hack broke")} if shape == "raised" else {})
     if shape == "returned":
-        async def incomplete(run, *, focused_attempts, **_):
+        async def incomplete(run, **_):
             result = analyses.inspection(run, "hack").model_copy(update={"status": "spending_exhausted"})
             (run.config.output_dir / "inspection-hack.json").write_text(result.model_dump_json())
             return result
@@ -1810,7 +1809,7 @@ def test_a_phase_that_fails_on_a_full_disk_still_prints_why(tmp_path, monkeypatc
     with its causes, stops the run."""
     analyses = Analyses(monkeypatch)
 
-    async def failing(run, *, focused_attempts, **_):
+    async def failing(run, **_):
         no_space_under(monkeypatch, run.config.output_dir)
         raise RuntimeError("hack broke")
 
@@ -1858,8 +1857,8 @@ def test_a_task_environment_that_cannot_start_stops_the_run_with_its_reason(tmp_
     reason = ("the task's verifier environment failed to start 3 times in a row, last with ModalFailure: Modal start failed: "
               "ImageBuildError; no later sandbox or episode can use it, so the run stops")
 
-    async def inspect_hacks(run, *, focused_attempts, **_):
-        analyses.calls.append(("inspect_hacks", focused_attempts))
+    async def inspect_hacks(run, **_):
+        analyses.calls.append(("inspect_hacks",))
         result = InspectionResult(mode="hack", status="environment_unavailable", categories={}, applicability={})
         (run.config.output_dir / "inspection-hack.json").write_text(result.model_dump_json())
         raise EnvironmentUnavailable(reason)
@@ -2081,7 +2080,7 @@ def test_attack_from_a_run_stopped_in_its_hack_inspection_keeps_that_status(tmp_
     """A stopped inspection keeps the findings it recorded, so the attack runs on them and the report keeps its status."""
     analyses = Analyses(monkeypatch)
 
-    async def stopped(run, *, focused_attempts, **_):
+    async def stopped(run, **_):
         result = analyses.inspection(run, "hack", [
             candidate(MECHANISM, INTERPRETATION, "accepted_invalid", full_guidance=REPRODUCTION, hint_location=LOCATION)])
         box = run.config.output_dir / "sandboxes" / "sandbox-0000"
@@ -2415,7 +2414,7 @@ def test_a_later_reading_that_withdraws_a_finding_leaves_it_a_lead(tmp_path, mon
 
     real_early_attack(monkeypatch, judge)
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, **_):
+    async def inspect_hacks(run, *, on_evidence, gate, **_):
         report = hack_findings(("accepted_invalid", "grader_tampering", REPRODUCTION))
         await evidence_each(report, on_evidence, [0])
         later = hack_findings(("legitimate", "grader_tampering", REPRODUCTION))
@@ -2447,7 +2446,7 @@ def test_a_time_limit_during_the_hack_inspection_keeps_the_early_reproduction(tm
 
     real_early_attack(monkeypatch, judge)
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, **_):
+    async def inspect_hacks(run, *, on_evidence, gate, **_):
         report = hack_findings(("accepted_invalid", "grader_tampering", REPRODUCTION), ("accepted_invalid", "package_oracles", REPRODUCTION))
         (run.config.output_dir / "inspection-hack.json").write_text(report.model_dump_json())
         await evidence_each(report, on_evidence, range(2))
@@ -2480,7 +2479,7 @@ def test_a_time_limit_after_the_hack_inspection_returned_cancels_the_early_attem
 
     real_early_attack(monkeypatch, judge)
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, **_):
+    async def inspect_hacks(run, *, on_evidence, gate, **_):
         report = hack_findings(("accepted_invalid", "grader_tampering", REPRODUCTION), ("accepted_invalid", "package_oracles", REPRODUCTION))
         (run.config.output_dir / "inspection-hack.json").write_text(report.model_dump_json())
         await evidence_each(report, on_evidence, range(2))
@@ -2504,7 +2503,7 @@ def test_a_run_with_a_time_limit_lets_its_agents_be_told_how_much_of_it_is_left(
 
     analyses, seen = Analyses(monkeypatch), []
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, **_):
+    async def inspect_hacks(run, *, on_evidence, gate, **_):
         seen.append((run.time_limit[0] - asyncio.get_running_loop().time(), run.time_limit[1]))
         return hack_findings()
 
@@ -2551,7 +2550,7 @@ def test_hack_sessions_and_early_attempts_share_the_slots_of_the_run(tmp_path, m
 
     real_early_attack(monkeypatch, judge)
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, **_):
+    async def inspect_hacks(run, *, on_evidence, gate, **_):
         report = hack_findings(("accepted_invalid", "grader_tampering", REPRODUCTION))
         (run.config.output_dir / "inspection-hack.json").write_text(report.model_dump_json())
         async with gate:
@@ -2700,7 +2699,7 @@ def test_a_finding_judged_after_the_attack_returned_is_still_saved(tmp_path, mon
         returned.set()
         return result
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, **_):
+    async def inspect_hacks(run, *, on_evidence, gate, **_):
         report = hack_findings(("accepted_invalid", "grader_tampering", REPRODUCTION))
         (run.config.output_dir / "inspection-hack.json").write_text(report.model_dump_json())
         await returned.wait()
@@ -2734,7 +2733,7 @@ def test_a_sibling_stop_keeps_the_exploit_an_attack_inspector_interpreted_before
         interpreted.set()
         await asyncio.sleep(30)
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, **_):
+    async def inspect_hacks(run, *, on_evidence, gate, **_):
         await interpreted.wait()
         raise EnvironmentUnavailable("the task's image failed to start")
 
@@ -2770,7 +2769,7 @@ def test_a_finding_the_judge_reads_as_a_known_cause_is_listed_under_it_and_no_at
 
     real_early_attack(monkeypatch, judge)
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, **_):
+    async def inspect_hacks(run, *, on_evidence, gate, **_):
         report = caused_findings(first, second)
         await evidence_each(report, on_evidence, [0, 1])
         (run.config.output_dir / "inspection-hack.json").write_text(report.model_dump_json())
@@ -2814,7 +2813,7 @@ def test_each_finding_is_judged_as_it_is_evidenced_and_a_new_cause_is_attacked_w
 
     real_early_attack(monkeypatch, judge)
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, **_):
+    async def inspect_hacks(run, *, on_evidence, gate, **_):
         report = caused_findings("The grader trusts the answer file.", "The grader trusts the exit code.")
         for index in (0, 1):
             await evidence_each(report, on_evidence, [index])
@@ -2843,7 +2842,7 @@ def test_a_failed_or_unclear_judge_call_or_a_finding_without_a_cause_sentence_ma
 
     real_early_attack(monkeypatch, judge)
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, **_):
+    async def inspect_hacks(run, *, on_evidence, gate, **_):
         report = caused_findings(None, "The grader trusts the answer file.", "The grader trusts the exit code.",
                                 "The grader trusts the log.", None)
         await evidence_each(report, on_evidence, range(5))
@@ -2878,7 +2877,7 @@ def test_a_valid_work_finding_is_never_compared_with_a_cause_and_the_hack_inspec
 
     real_early_attack(monkeypatch, judge)
 
-    async def inspect_hacks(run, *, focused_attempts, on_evidence, gate, causes=(), **_):
+    async def inspect_hacks(run, *, on_evidence, gate, causes=(), **_):
         report = hack_findings(*[("accepted_invalid", "grader_tampering", REPRODUCTION)] * 4)
         report.assessments[2] = candidate("way 2", INTERPRETATION, "rejected_valid", full_guidance=REPRODUCTION, hint_location=LOCATION)
         report.assessments[2].claim.check = "check-2"

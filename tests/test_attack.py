@@ -2677,7 +2677,7 @@ def test_inspector_persistence_request_is_not_an_attack(tmp_path, monkeypatch, c
             report = await inspection.inspect_hacks(run, categories=["persistence", "grader_tampering"])
             assert seen == ["/app/nudi-persistence.bin"]
             assert report.categories["persistence"] == "restricted"
-            assert [attempt.category for attempt in report.attempts] == ["grader_tampering", "other"]
+            assert [(attempt.phase, attempt.category) for attempt in report.attempts] == [("broad", None)]
             assert report.assessments[0].persistence == "not_observed"
             assert report.categories["persistence"] != "evidenced_issue"
             assert "reset" in report.applicability["persistence"].lower()

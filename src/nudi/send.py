@@ -105,8 +105,7 @@ class AnalysisConfig(RunConfig):
     episodes: int = Field(12, ge=1, strict=True)
     """Ordinary Simulator episodes."""
     focused_attempts: int = Field(2, ge=0, strict=True)
-    """Total focused attempts of the grader inspector, after its broad session, and of the hack inspector for each category;
-    with none, the hack inspector's one broad session measures every category."""
+    """Total focused attempts of the grader inspector for each category, after its broad session."""
     isolated_inspections: bool = Field(False, strict=True)
     """Grader inspector: off, `holistic_inspection`, presumes labels for episodes it names normal;
     on, `inspector_swarm`, verifies each ordinary episode in its own grader inspector forked from broad."""
@@ -614,7 +613,7 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
         "grader": lambda: inspect_grader(run, run.record.simulation.episodes if run.record.simulation else [],
                                          focused_attempts=settings.focused_attempts, isolated_inspections=settings.isolated_inspections,
                                          request=hack_context(run, results.get("hack")), gate=gate, on_evidence=found("grader")),
-        "hack": lambda: inspect_hacks(run, focused_attempts=settings.focused_attempts, on_evidence=found("hack"), gate=gate, causes=sentenced),
+        "hack": lambda: inspect_hacks(run, on_evidence=found("hack"), gate=gate, causes=sentenced),
         "attack": attacking,
     }
     begun = {}  # Each started analysis's start on the monotonic clock.
