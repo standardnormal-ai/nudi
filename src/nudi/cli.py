@@ -160,7 +160,7 @@ class Lines(logging.Formatter):
 
 def version() -> str:
     try:
-        return importlib.metadata.version("nudi")
+        return importlib.metadata.version("nudi-cli")
     except importlib.metadata.PackageNotFoundError:
         return "unknown: run from a checkout that is not installed"
 

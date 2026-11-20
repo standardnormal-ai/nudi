@@ -128,7 +128,7 @@ STORAGE = (
     "{} = {} is recorded but not enforced; Harbor's Docker environment "
     "sets no storage quota, so disk fit is not established"
 )
-VERSIONED = ("nudi", "verifiers", "harbor", "litellm")
+VERSIONED = ("nudi-cli", "verifiers", "harbor", "litellm")
 DOCKERFILE = "Dockerfile-only environment: the Verifiers adapter does not build Dockerfiles"
 # Demonstrated adapter differences, with what requesting the native behavior is called.
 DIFFERENCES = {

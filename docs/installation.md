@@ -27,27 +27,27 @@ A full Docker disk fails each build, start or copy, and three failed starts in a
 
 ## Install
 
-nudi is on PyPI. Install it as a command-line tool with uv or pipx, which put it in its own environment:
+nudi is on PyPI as `nudi-cli`; the command it installs is still `nudi`. Install it as a command-line tool with uv or pipx, which put it in its own environment:
 
 ```sh
-uv tool install --python 3.12 "nudi[modal]"
+uv tool install --python 3.12 "nudi-cli[modal]"
 # or
-pipx install --python python3.12 "nudi[modal]"
+pipx install --python python3.12 "nudi-cli[modal]"
 nudi --version
 ```
 
-`nudi --version` prints the installed version from the package metadata. The `[modal]` extra adds the Modal backend; drop it if you only use Docker. To upgrade, run `uv tool upgrade nudi` or `pipx upgrade nudi`.
+`nudi --version` prints the installed version from the package metadata. The `[modal]` extra adds the Modal backend; drop it if you only use Docker. To upgrade, run `uv tool upgrade nudi-cli` or `pipx upgrade nudi-cli`.
 
 Without Python 3.12, install it first, for example with `uv python install 3.12`, `brew install python@3.12` or from python.org.
 
 ### Install from a git tag
 
-To install a version straight from its git tag, for example `v0.5.1`, use a virtual environment:
+To install a version straight from its git tag, for example `v0.5.2`, use a virtual environment:
 
 ```sh
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install "nudi[modal] @ git+https://github.com/standardnormal-ai/nudi.git@v0.5.1"
+python -m pip install "nudi-cli[modal] @ git+https://github.com/standardnormal-ai/nudi.git@v0.5.2"
 nudi --version
 ```
 
