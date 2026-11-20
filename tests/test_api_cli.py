@@ -190,7 +190,7 @@ def test_help_and_argument_errors_load_no_run_module(argv):
 def test_version_is_the_installed_package_version(capsys):
     with pytest.raises(SystemExit) as done:
         cli.main(["--version"])
-    assert done.value.code == 0 and capsys.readouterr().out == f"nudi {importlib.metadata.version('nudi')}\n"
+    assert done.value.code == 0 and capsys.readouterr().out == f"nudi {importlib.metadata.version('nudi-cli')}\n"
 
 
 def test_help_points_to_the_viewer(capsys):
@@ -201,7 +201,7 @@ def test_help_points_to_the_viewer(capsys):
 
 def test_python_dash_m_nudi_runs_the_command():
     done = subprocess.run([sys.executable, "-m", "nudi", "--version"], capture_output=True, text=True, check=False)
-    assert (done.returncode, done.stdout) == (0, f"nudi {importlib.metadata.version('nudi')}\n")
+    assert (done.returncode, done.stdout) == (0, f"nudi {importlib.metadata.version('nudi-cli')}\n")
 
 
 def test_the_analysis_choices_are_send_analysis():

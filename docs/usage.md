@@ -472,7 +472,7 @@ It prints Modal's bill for that run's sandboxes and exits `0`, or prints one lin
 `nudi-view` shows a run in the terminal: the result with its causes, each phase with the findings beside it, and the evidence, limitations and references of each finding. It reads only the run's `report.json`, which nudi 0.0.0 or later must have written, and its `events.jsonl` when it follows a run that is still going. Build it with Go 1.27.3 or later, as `tui/go.mod` requires. A pip install has no source checkout, so clone the same tag first:
 
 ```sh
-git clone --branch v0.5.1 https://github.com/standardnormal-ai/nudi.git
+git clone --branch v0.5.2 https://github.com/standardnormal-ai/nudi.git
 cd nudi
 (cd tui && go build -o nudi-view .)
 ```

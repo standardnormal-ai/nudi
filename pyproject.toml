@@ -1,6 +1,6 @@
 [project]
-name = "nudi"
-version = "0.5.1"
+name = "nudi-cli"
+version = "0.5.2"
 description = "Pre-hack and simulate Harbor RL environments"
 readme = "readme.md"
 license = "MIT"
@@ -45,3 +45,6 @@ testpaths = ["tests"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src", "LICENSE", "readme.md"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nudi"]
