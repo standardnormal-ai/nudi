@@ -30,11 +30,13 @@ A full Docker disk fails each build, start or copy, and three failed starts in a
 nudi is on PyPI as `nudi-cli`; the command it installs is still `nudi`. Install it as a command-line tool with uv or pipx, which put it in its own environment:
 
 ```sh
-uv tool install --python 3.12 "nudi-cli[modal]"
+uv tool install --python 3.12 --prerelease=allow "nudi-cli[modal]"
 # or
-pipx install --python python3.12 "nudi-cli[modal]"
+pipx install --python python3.12 --pip-args="--pre" "nudi-cli[modal]"
 nudi --version
 ```
+
+nudi pins `verifiers[harbor]==0.4.1.dev12`, a pre-release, because the newest stable verifiers, 0.4.1, lacks the evaluation runner nudi calls. uv and pipx refuse a pre-release dependency unless you allow it, hence the flags. `pip` needs none, because the pre-release is pinned exactly: `python -m pip install "nudi-cli[modal]"` works in a virtual environment.
 
 `nudi --version` prints the installed version from the package metadata. The `[modal]` extra adds the Modal backend; drop it if you only use Docker. To upgrade, run `uv tool upgrade nudi-cli` or `pipx upgrade nudi-cli`.
 
@@ -51,7 +53,7 @@ python -m pip install "nudi-cli[modal] @ git+https://github.com/standardnormal-a
 nudi --version
 ```
 
-With uv, `uv venv --python 3.12` followed by `uv pip install` with the same package spec does the same.
+With uv, `uv venv --python 3.12` followed by `uv pip install --prerelease=allow` with the same package spec does the same.
 
 Only the direct dependencies are pinned, in [pyproject.toml](../pyproject.toml). Their own dependencies resolve at install time, so two installs can differ in those.
 
