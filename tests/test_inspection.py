@@ -223,6 +223,35 @@ def mock_experiments(monkeypatch, callback):
     monkeypatch.setattr(inspection_module, "assess", assess)
 
 
+@pytest.mark.parametrize("mode", ["hack", "grader"])
+def test_only_hack_inspector_workspaces_start_from_the_verifier_environment(tmp_path, monkeypatch, credentials, mode, unit_sandboxes):
+    """In separate verifier mode the hack inspector's workspace starts from the task's verifier environment, which has the
+    grader's tools; a grader inspector workspace keeps the task image."""
+    started = []
+    opened = inspector_sandbox.sandbox
+
+    def sandbox(run, purpose, **options):
+        started.append((purpose, options.get("definition", False)))
+        return opened(run, purpose, **options)
+
+    monkeypatch.setattr(inspector_sandbox, "sandbox", sandbox)
+    inspector_responses(monkeypatch, [{"probes": []}] * 2)
+    run = new_run(tmp_path, monkeypatch, credentials)
+    if mode == "hack":
+        # The family's session and the `other` session.
+        asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"], focused_attempts=1))
+        assert started == [("workspace", True)] * 2
+    else:
+        asyncio.run(inspection_module.inspect_grader(run, [], categories=["accepted_invalid"], focused_attempts=0))
+        assert started == [("workspace", False)]
+
+
+def test_only_the_hack_inspector_prompt_says_its_workspace_starts_from_the_verifier_environment():
+    sentence = "In separate verifier mode the workspace starts from the verifier's environment, not the task image."
+    prompts = {job: " ".join(inspection_module.inspector_prompt(job).split()) for job in ("hack", "grader", "attack")}
+    assert {job: sentence in prompt for job, prompt in prompts.items()} == {"hack": True, "grader": False, "attack": False}
+
+
 def test_hack_inspector_receives_the_static_checklist(tmp_path, monkeypatch, credentials, unit_sandboxes):
     requests = inspector_responses(monkeypatch, [{"probes": []}] * 2)
     run = new_run(tmp_path, monkeypatch, credentials)

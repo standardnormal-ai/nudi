@@ -889,7 +889,8 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
                   gate: asyncio.Semaphore | None = None, causes=()) -> InspectionResult:
     """The grader inspector: one broad SDK investigation, then one focused fork of its final conversation per category, with
     fresh experiments. The hack inspector: one focused session per category, each from a fresh conversation, or with no
-    focused attempts one broad session of every category. `isolated` grader inspection then forks broad once per ordinary episode. Focused sessions, and then those forks,
+    focused attempts one broad session of every category; in separate verifier mode its workspaces start from the
+    verifier's environment. `isolated` grader inspection then forks broad once per ordinary episode. Focused sessions, and then those forks,
     run `at_once` at a time, each with its own workspace and its own experiments, which take turns within it.
 
     Mode `attack` is instead one attack inspector session `title` bound to the Attacker episode in
@@ -1475,7 +1476,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
             event(run, "session_start", f"{mode} inspector {name} started", inspector=mode, session=name, category=category, episode=episode,
                   **({"candidate": target["id"]} if mode == "attack" and target.get("id") else {}),
                   **({"problem": target["problem"]} if mode == "attack" and target.get("problem") else {}))
-            async with investigation(run, name, prompt, selected, fork, workspace) as session:
+            async with investigation(run, name, prompt, selected, fork, workspace, definition=mode == "hack") as session:
                 session.open = lambda: leads(state, category)
                 report.artifacts[name] = {key: str((session.box.directory / value).relative_to(run.config.output_dir))
                                           for key, value in session.box.record.artifacts.items()}

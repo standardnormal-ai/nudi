@@ -12,6 +12,9 @@ finding outside the requested categories or outside every family is welcome: giv
 its probe its family as `category`, or `other` when none fits. A reading of an
 `other` experiment also gives `family`, a short name for the hack family it shows.
 
+In separate verifier mode the workspace starts from the verifier's environment, not
+the task image.
+
 Put the substantive requirement and scoring text directly in the probe's
 `requirement` and `scoring` references, never artifact metadata alone: the reading
 rests on them alone.
