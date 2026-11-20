@@ -6,6 +6,12 @@ readme = "readme.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.13"
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Testing",
+]
 dependencies = [
     "verifiers[harbor]==0.4.1.dev12",
     "harbor==0.24.0",
@@ -16,6 +22,11 @@ dependencies = [
     "langchain-core==1.7.1",
     "langgraph==1.2.18",
 ]
+
+[project.urls]
+Homepage = "https://github.com/standardnormal-ai/nudi"
+Documentation = "https://github.com/standardnormal-ai/nudi/tree/main/docs"
+Issues = "https://github.com/standardnormal-ai/nudi/issues"
 
 [project.scripts]
 nudi = "nudi.cli:main"
@@ -31,3 +42,6 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "LICENSE", "readme.md"]
