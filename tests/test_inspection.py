@@ -2249,8 +2249,8 @@ def test_a_session_end_keeps_category_status_out_of_its_text(tmp_path, monkeypat
 
 
 def test_a_session_end_names_only_the_category_after_a_repeated_case(tmp_path, monkeypatch, credentials, unit_sandboxes):
-    """A repeated case leaves the attempt duplicate_case, which did not end the session, so its end line does not name it;
-    its later finding still shows in the category's status."""
+    """A repeated case did not end the session, so its end line does not name it; the later finding makes the attempt
+    evidenced and shows in the category's status."""
     no_native_actor(monkeypatch)
     repeated = {"category": "package_oracles", "case": "one", "setup_program": "first case"}
     inspector_responses(monkeypatch, [{"probes": [repeated, repeated, {**repeated, "case": "two", "setup_program": "second case"}]}])
@@ -2263,7 +2263,7 @@ def test_a_session_end_names_only_the_category_after_a_repeated_case(tmp_path, m
     run = new_run(tmp_path, monkeypatch, credentials)
     result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"]))
     assert session_ends(run) == [("hack inspector hack-session-1 ended after T; searched package_oracles",
-                                  {"status": "duplicate_case", "category": "package_oracles", "category_status": "evidenced_issue"})]
+                                  {"status": "evidenced_issue", "category": "package_oracles", "category_status": "evidenced_issue"})]
     assert result.categories == {"package_oracles": "evidenced_issue"}
 
 
@@ -2412,6 +2412,26 @@ def test_a_repeated_case_leaves_its_category_settled(tmp_path, monkeypatch, cred
     result = inspect()
     assert replies[0]["status"] == "duplicate_case" and replies[1]["open"] == []
     assert result.categories == {"package_oracles": "no_evidenced_issue"} and result.status == "complete"
+
+
+@pytest.mark.parametrize("then", ["truncated", "evidenced"])
+def test_an_attempt_that_repeated_a_case_takes_a_later_truncation_or_finding(tmp_path, monkeypatch, credentials, unit_sandboxes, then):
+    """A repeated case marks its attempt `duplicate_case`; truncated check output after it still leaves the attempt
+    unobservable with its reason, and a finding after it still makes it evidenced."""
+    async def later(tools):
+        if then == "truncated":
+            return await tools["run_experiment"].ainvoke({"probe": setup_probe(
+                location="/app/other.txt", program=f"print('x' * {inspector_sandbox.OUTPUT_LIMIT + 1})\n")})
+        receipt = await tools["run_experiment"].ainvoke({"probe": setup_probe()})
+        return await tools["interpret_experiment"].ainvoke({"experiment": receipt["id"], **VIOLATED})
+
+    run, replies, inspect = consistent_session(tmp_path, monkeypatch, credentials,
+                                               lambda tools: tools["run_experiment"].ainvoke({"probe": deserved_probe()}),
+                                               later)
+    attempt = inspect().attempts[0]
+    assert replies[0]["status"] == "duplicate_case"
+    assert (attempt.status, attempt.error) == (
+        ("unobservable", "experiment-0001: check output was truncated") if then == "truncated" else ("evidenced_issue", None))
 
 
 def test_a_tool_error_the_session_continued_past_does_not_keep_completed_work_unknown(tmp_path, monkeypatch, credentials, unit_sandboxes):

@@ -490,11 +490,11 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
                   finding=attempt.episode, problem=name, new=False, cause_id=cause.id)
         return name
 
-    async def evidence(inspector: str, inspection: InspectionResult, item) -> Problem:
-        """The problem of an evidenced candidate finding: the problem holding a case of its check, as for a second reading
-        of one experiment, or a new one, of the known cause the judge reads its cause as, else of a new cause. The finding
-        joins it. Only invalid work accepted is judged, or opens a cause a later finding is compared with. One finding is
-        judged at a time, so each is compared with every such cause opened before it."""
+    async def evidence(inspector: str, inspection: InspectionResult, item) -> None:
+        """Add an evidenced candidate finding to its problem: the problem holding a case of its check, as for a second reading
+        of one experiment, or a new one, of the known cause the judge reads its cause as, else of a new cause. Only invalid
+        work accepted is judged, or opens a cause a later finding is compared with. One finding is judged at a time, so each
+        is compared with every such cause opened before it."""
         async with judging:
             problem = next((problem for problem in problems if item.check and any(case.get("check") == item.check for case in problem.cases)), None)
             if problem is None:
@@ -516,7 +516,6 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
         if problem.evidence != "evidenced":  # Also an earlier run's problem it did not reproduce.
             problem.evidence = "evidenced"
             event(run, "reproduced", f"{SOURCES[inspector][1]} evidenced {item.id}", problem=problem.id, result="evidenced")
-        return problem
 
     live = {}  # Each inspection's record as it grows, from its evidence hook.
 

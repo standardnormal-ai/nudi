@@ -171,7 +171,7 @@ Neither the probe nor the claim schema admits a field it does not declare, at an
 
 A probe that answers an earlier experiment's open interpretation, as that entry's next step asks, names it in `replaces`. Once the probe has an interpretation, the earlier entry leaves `open`. Another interpretation of the same category does not resolve it.
 
-A check that exits 0 on an experiment whose grading wrote no reward did not fail. Its reward is unavailable, "its grading wrote no reward" is that experiment's limit and keeps it in `open`, and the same case is not run again. The session's other measurements and findings stand; only a repeat of that case makes the session `unobservable`. A session that ends with its draft open leaves that experiment `unfinished`: its interpretation is unknown with that reason, and an inspector can still complete it by its experiment id.
+A check that exits 0 on an experiment whose grading wrote no reward did not fail. Its reward is unavailable, "its grading wrote no reward" is that experiment's limit and keeps it in `open`, and the same case is not run again. The session's other measurements and findings stand; only a repeat of that case makes the session `unobservable`, and only while it has found nothing. Truncated check output does the same; a finding after it still makes the session evidenced. A session that ends with its draft open leaves that experiment `unfinished`: its interpretation is unknown with that reason, and an inspector can still complete it by its experiment id.
 
 ### The open list
 

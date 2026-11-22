@@ -1443,6 +1443,45 @@ def test_a_grouped_finding_an_attacker_proved_raises_its_cause_above_its_first_f
     assert (cause["level"], cause["label"], cause["attempts"], cause["reproduced"], cause["unrewarded"]) == (3, report.LADDER[3], 1, 1, 1)
 
 
+def test_a_full_guidance_reproduction_of_a_grouped_finding_raises_its_cause(tmp_path):
+    """The judge grouped grader-1 under C1, whose first finding hack-0 no Attacker exploited. No grader reading is shown,
+    so the full-guidance Attacker that reproduced grader-1 is a finding of its own, which raises C1 to its level."""
+    run = RunDir(tmp_path)
+    inspected(run, 1)
+    unpaid, paid = run.episode("attacker", {"reward": 0.0}), run.episode("attacker", {"reward": 1.0})
+    run.attack = AttackResult(
+        status="complete", discovery={"none": "no_evidenced_issue"},
+        problems=[Problem(id="P1", source="hack inspector", cause="Forge.", findings=["hack-0"], evidence="evidenced"),
+                  Problem(id="G1", source="grader inspector", cause="Skip.", findings=["grader-1"], evidence="evidenced")],
+        causes=[Cause(id="C1", cause="The grader trusts the digest.", problems=["P1", "G1"])],
+        candidates=[Candidate(id=name, mechanism=name, outcome="accepted_invalid", guidance={"full": "steps", "minimal": None},
+                              conditions={"full": status, "minimal": "unavailable"})
+                    for name, status in (("hack-0", "no_evidenced_issue"), ("grader-1", "evidenced_issue"))],
+        attempts=[AttackAttempt(level="full", number=1, context="attacker-hack-0-full-1", candidate="hack-0", sources=["hack-0"],
+                                episode=unpaid, status="no_evidenced_issue", rewards={"reward": 0.0}),
+                  AttackAttempt(level="full", number=1, context="attacker-grader-1-full-1", candidate="grader-1", sources=["grader-1"],
+                                episode=paid, status="evidenced_issue", assessment=0, rewards={"reward": 1.0})],
+        findings=[AttackFinding(kind="reproduction", candidate="grader-1", sources=["grader-1"], attempt=1, assessment=0)],
+        assessments=[evidenced(paid, "check-0100")])
+    (cause,) = run.report(selected=["hack", "attack"])["causes"]
+    assert [(item["id"], item["level"], item["read_as"]) for item in cause["findings"]] == [(paid, 3, True), ("hack-0", 2, False)]
+    assert (cause["level"], cause["label"]) == (3, report.LADDER[3])
+
+
+def test_a_control_reading_without_marks_stays_out_of_the_answer(tmp_path):
+    """A control's reading that claims an exploit without marks checks the measurement, so its inspection keeps it and the
+    Answer names no such claim."""
+    run = RunDir(tmp_path)
+    graded = run.episode(rewards={"reward": 1.0})
+    bare = evidenced(graded, "check-0000")
+    bare.claim.marks = []
+    run.hack = InspectionResult(mode="hack", status="complete", categories={"grader_tampering": "unknown"}, applicability={},
+                                assessments=[bare], experiments=[{**experiment(0, "grader_tampering", "check-0000"), "control": True}])
+    built = run.report(selected=["hack"])
+    assert [item["index"] for group in built["inspections"]["hack_inspector"]["findings"].values() for item in group] == [0]
+    assert built["causes"] == [] and report.NO_MARKS not in " ".join(built["answer"])
+
+
 def test_a_no_hint_exploit_judged_to_use_the_cause_of_a_lead_stays_with_no_level_given_to_the_cause(tmp_path):
     """The attack inspector judged a no-hint exploit to use the cause of a stored problem that is now a lead: the cause
     lists the exploit at its own 5 with the lead's member beside it, so the measured exploit stays in the Answer, and the

@@ -1666,7 +1666,7 @@ def tally(item: dict) -> str | None:
 
 def judged(item: dict) -> bool:
     """A no-hint exploit judged to use its cause, which its line says."""
-    return item["read_as"] and item["source"] == "Attacker"
+    return item["read_as"] and item["source"] == "Attacker" and item["kind"] == "discovery"
 
 
 def case_line(item: dict) -> str:
@@ -1703,8 +1703,10 @@ def unproven(report: dict) -> list[dict]:
     measured and what that check measured, and its `reason` why nudi makes no claim from it."""
     rows = []
     for key, section in (*report["inspections"].items(), ("attack", report["attack"])):
+        # A control's reading checks the measurement, so it is no finding.
+        controls = {row.get("check") for row in (section or {}).get("experiments", []) if row.get("control")}
         for item in (item for group in ("legitimate", "inconclusive") for item in (section or {}).get("findings", {}).get(group, [])
-                     if item["superseded_by"] is None):
+                     if item["superseded_by"] is None and check_id(item) not in controls):
             assessment = item["assessment"]
             if assessment["outcome"] not in ("accepted_invalid", "rejected_valid"):
                 continue

@@ -1052,7 +1052,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
     def unobservable(reason: str) -> None:
         # Only an attempt that found nothing yet observed nothing. The first cause stays, so the report says why.
         current = inspection_session.get().attempt
-        if current.status == "no_evidenced_issue":
+        if current.status in ("no_evidenced_issue", "duplicate_case"):
             current.status = "unobservable"
             current.error = current.error or redacted(run, reason)
 
@@ -1344,7 +1344,7 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
             if target in categories and evidenced(assessment) and (mode != "hack" or assessment.outcome == "accepted_invalid"):
                 report.categories[target] = "evidenced_issue"
                 completed[target] = state.index
-                if (target in requested or current.episode) and current.status in ("no_evidenced_issue", "unobservable"):
+                if (target in requested or current.episode) and current.status in ("no_evidenced_issue", "duplicate_case", "unobservable"):
                     current.status = "evidenced_issue"
             # A finding this reading withdraws or corrects is announced once saved, so the report so far shows the correction.
             if mode != "attack" and before is not None and evidenced(before):
