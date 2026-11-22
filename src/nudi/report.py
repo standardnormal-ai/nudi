@@ -1233,8 +1233,8 @@ def causes(result: AttackResult | None, record: RunRecord, shown: list[dict]) ->
     each finding when it was evidenced; else, in older records, each stored problem; else a finding no problem holds,
     with its mechanism as its sentence. A cause's first problem's findings have `read_as` false; a finding of a later
     one, which the judge read as that cause, has it true, as does a no-hint exploit judged to use it. Each cause has its
-    sentence; its level and label, its `read_as` false findings' best; the counts of the distinct attempts given their
-    help, null when none was; and its findings, best first. A finding's `also` keeps only the names its problem holds
+    sentence; its level and label, its findings' best except a no-hint exploit judged to use it; the counts of the
+    distinct attempts given those findings' help, null when none was; and its findings, best first. A finding's `also` keeps only the names its problem holds
     that are no finding shown here. A cause without a shown finding is left out."""
     stored = {cause.id: cause for cause in (result.causes if result else [])}
     cause_of = {name: cause.id for cause in stored.values() for name in cause.problems}
@@ -1254,7 +1254,7 @@ def causes(result: AttackResult | None, record: RunRecord, shown: list[dict]) ->
         owner |= dict.fromkeys(names, cid)
         findings = sorted((item | {"read_as": item["read_as"] or item["problem"] not in (None, *names[:1])} for item in findings),
                           key=lambda item: -(item["level"] or 0))
-        own = [item for item in findings if not item["read_as"]]
+        own = [item for item in findings if not judged(item)]
         best = max((item for item in own if item["level"] is not None), key=lambda item: item["level"], default=None)
         started = given({item["id"] for item in own}, result, record) if result else []
         _, unrewarded, assessed = split(started)

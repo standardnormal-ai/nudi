@@ -45,8 +45,8 @@ Each entry of `causes`:
 | --- | --- | --- |
 | `id` | string | `C1`, `C2` and so on, numbered as the run found causes. A cause an older record lacks takes the next number |
 | `cause` | string | One sentence on what the grader trusts: the first finding's cause sentence, else its mechanism |
-| `level`, `label` | integer or null, string or null | The best level among its findings with `read_as` false, and that level's words. A finding judged to use the cause never raises it. Null for a cause whose one finding is an interpretation without marks, and for a cause whose every finding has `read_as` true, as when a later interpretation withdrew the finding that opened it. `report.md` then says "no level of its own, only findings judged to use it" |
-| `attempts`, `reproduced`, `unrewarded` | integer or null | Counted over its findings with `read_as` false, each attempt once even when it had the help of two of them: assessed attempts given their help, how many reproduced the finding, and how many more got reward 0 and were not inspected. Null when no attempt was given the help of any of them |
+| `level`, `label` | integer or null, string or null | The best level among its findings, except no-hint exploits judged to use the cause, and that level's words. Such an exploit never raises it. Null for a cause whose one finding is an interpretation without marks, and for a cause whose every finding is such an exploit. `report.md` then says "no level of its own, only findings judged to use it" |
+| `attempts`, `reproduced`, `unrewarded` | integer or null | Counted over its findings except no-hint exploits judged to use the cause, each attempt once even when it had the help of two of them: assessed attempts given their help, how many reproduced the finding, and how many more got reward 0 and were not inspected. Null when no attempt was given the help of any of them |
 | `findings` | list | Each finding of the cause, best level first, described below |
 
 Each entry of `causes[].findings`:
@@ -57,7 +57,7 @@ Each entry of `causes[].findings`:
 | `source` | string | Who found it: `hack inspector`, `grader inspector` or `Attacker` |
 | `outcome` | string | The measured outcome: `accepted_invalid` (incorrect work passed) or `rejected_valid` (correct work failed) |
 | `attacked` | boolean | True when an Attacker attempt was given its help, assessed or not, and always for an Attacker's own finding |
-| `read_as` | boolean | True for a finding that is under this cause because an agent judged it so. That is an inspector finding the judge matched to this known cause, or a no-hint Attacker exploit the attack inspector judged to use it, at its own level 5, whose line ends "judged to use this cause". It keeps its own level and sets neither the cause's level nor its counts. False for the findings of the cause's first finding group, and for a no-hint exploit of a new cause, which is a cause of its own |
+| `read_as` | boolean | True for a finding that is under this cause because an agent judged it so. That is an inspector finding the judge matched to this known cause, or a no-hint Attacker exploit the attack inspector judged to use it, at its own level 5, whose line ends "judged to use this cause". Such an exploit keeps its own level and sets neither the cause's level nor its counts. False for the findings of the cause's first finding group, and for a no-hint exploit of a new cause, which is a cause of its own |
 | `mechanism` | string | What its interpretation says the work did, on one line |
 | `text` | string | Only for an interpretation without marks: what its check measured |
 | `type` | string or null | `hack`, `false_positive` (invalid work the grader inspector saw accepted in the simulations) or `false_negative` (correct work failed). Null for an interpretation without marks |

@@ -1276,7 +1276,7 @@ def grouped(run: RunDir, problems: list[Problem], causes: list[Cause] = ()) -> d
 def test_each_finding_has_its_own_level_and_a_cause_lists_its_findings_at_their_best(tmp_path):
     """A finding's level is the least help under which an Attacker given its help made an exploit, and a no-hint exploit
     of a new cause is at 5. A stored problem none of whose evidence stands is a lead. The judge's causes group findings:
-    each cause is at its first problem's findings' best level, counts the attempts given their help and lists its findings
+    each cause is at its findings' best level, counts the attempts given their help and lists its findings
     beneath it, best first, each keeping its own level and counts. Beneath each finding each help level its help was given
     at shows its attempts."""
     problems = [Problem(id="P1", source="hack inspector", cause="Forge the digest.", findings=["hack-0"], evidence="evidenced"),
@@ -1290,7 +1290,7 @@ def test_each_finding_has_its_own_level_and_a_cause_lists_its_findings_at_their_
     built = grouped(RunDir(tmp_path / "a"), problems, causes)
     assert [(cause["id"], cause["level"], cause["attempts"], cause["reproduced"],
              [(item["id"], item["level"], item["reproduced"]) for item in cause["findings"]]) for cause in built["causes"]] == [
-        ("C1", 4, 2, 2, [("hack-1", 4, 2), ("hack-0", 2, 0)]), ("C2", 3, 2, 1, [("hack-2", 3, 1)]), ("C3", 5, None, None, [("0000-attacker", 5, None)])]
+        ("C1", 4, 3, 2, [("hack-1", 4, 2), ("hack-0", 2, 0)]), ("C2", 3, 2, 1, [("hack-2", 3, 1)]), ("C3", 5, None, None, [("0000-attacker", 5, None)])]
     assert built["attack"]["leads"] == [{"findings": ["experiment-0009"], "cause": "Read the key.", "origin": None}]
     answer = built["answer"]
     at = answer.index(report.SHARED)
@@ -1353,7 +1353,7 @@ def test_a_no_hint_exploit_judged_to_use_a_known_cause_is_listed_there_and_never
     episode = run.attack.attempts[0].episode
     assert [(cause["id"], cause["level"], cause["attempts"], [(item["id"], item["level"], item["read_as"]) for item in cause["findings"]])
             for cause in built["causes"]] == [
-        ("C1", 4, 2, [(episode, 5, True), ("hack-1", 4, False), ("hack-0", 2, True)]), ("C2", 3, 2, [("hack-2", 3, False)])]
+        ("C1", 4, 3, [(episode, 5, True), ("hack-1", 4, False), ("hack-0", 2, True)]), ("C2", 3, 2, [("hack-2", 3, False)])]
     assert built["attack"]["attempts"][0]["cause"] == "C1"
     answer = built["answer"]
     at = answer.index(f"C1: The grader trusts the digest; {report.LADDER[4]}.")
@@ -1416,6 +1416,31 @@ def test_a_finding_of_a_known_cause_is_listed_under_it_and_a_cause_of_one_findin
     alone = built("b", [Cause(id=f"C{index}", cause="The grader trusts the digest.", problems=[f"P{index}"]) for index in (1, 2, 3)])
     assert [line.split(". ")[1].split(":")[0] for line in alone["answer"][2:]] == ["hack-0", "hack-1", "hack-2"]
     assert alone["answer"][2].startswith("C1: The grader trusts the digest. hack-0: ") and report.SHARED not in alone["answer"]
+
+
+def test_a_grouped_finding_an_attacker_proved_raises_its_cause_above_its_first_finding(tmp_path):
+    """The Attacker given C1's first finding hack-0 got reward 0. The judge grouped hack-1 under C1, and the Attacker given
+    hack-1's full guidance made an exploit, so C1 is at hack-1's proven level."""
+    run = RunDir(tmp_path)
+    inspected(run, 2)
+    unpaid, paid = run.episode("attacker", {"reward": 0.0}), run.episode("attacker", {"reward": 1.0})
+    run.attack = AttackResult(
+        status="complete", discovery={"none": "no_evidenced_issue"},
+        problems=[Problem(id=f"P{index + 1}", source="hack inspector", cause=f"Forge {index}.", findings=[f"hack-{index}"],
+                          evidence="evidenced") for index in range(2)],
+        causes=[Cause(id="C1", cause="The grader trusts the digest.", problems=["P1", "P2"])],
+        candidates=[Candidate(id=name, mechanism=name, outcome="accepted_invalid", guidance={"full": "steps", "minimal": None},
+                              conditions={"full": status, "minimal": "unavailable"})
+                    for name, status in (("hack-0", "no_evidenced_issue"), ("hack-1", "evidenced_issue"))],
+        attempts=[AttackAttempt(level="full", number=1, context="attacker-hack-0-full-1", candidate="hack-0", sources=["hack-0"],
+                                episode=unpaid, status="no_evidenced_issue", rewards={"reward": 0.0}),
+                  AttackAttempt(level="full", number=1, context="attacker-hack-1-full-1", candidate="hack-1", sources=["hack-1"],
+                                episode=paid, status="evidenced_issue", assessment=0, rewards={"reward": 1.0})],
+        findings=[AttackFinding(kind="reproduction", candidate="hack-1", sources=["hack-1"], attempt=1, assessment=0)],
+        assessments=[evidenced(paid, "check-0100")])
+    (cause,) = run.report(selected=["hack", "attack"])["causes"]
+    assert [(item["id"], item["level"], item["read_as"]) for item in cause["findings"]] == [("hack-1", 3, True), ("hack-0", 2, False)]
+    assert (cause["level"], cause["label"], cause["attempts"], cause["reproduced"], cause["unrewarded"]) == (3, report.LADDER[3], 1, 1, 1)
 
 
 def test_a_no_hint_exploit_judged_to_use_the_cause_of_a_lead_stays_with_no_level_given_to_the_cause(tmp_path):
