@@ -45,6 +45,19 @@ func TestCausesLoad(t *testing.T) {
 	}
 }
 
+// A reproduction made with a grouped finding's help is read as its cause but was not judged to use it; only a no-hint
+// exploit was.
+func TestOnlyANoHintExploitIsJudgedToUseItsCause(t *testing.T) {
+	f := fixture(t, "causes").Causes[0].Findings[2]
+	if !f.judged() {
+		t.Fatalf("no-hint exploit: %+v", f)
+	}
+	f.Kind = "reproduction"
+	if f.judged() {
+		t.Errorf("a reproduction read as its cause is judged: %+v", f)
+	}
+}
+
 // Older reports convert in one place: each problem is a cause of its own under its id, and a schema 3 cause row groups
 // its problems, with its no-hint readings as findings read as it and its unattacked problems marked.
 func TestOldReportsBecomeCauses(t *testing.T) {
