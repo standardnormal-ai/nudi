@@ -1571,7 +1571,7 @@ def cause_lines(report: dict) -> list[str]:
                     + "".join(f"; {key.replace('_', ' ')} {item[key]}" for key in ("check", "location", "capture_point")
                               if item.get(key) and not (key == "check" and item["id"] in sources))
                     + f"; with {', '.join(item['also'])}" * bool(item["also"])
-                    + f"; {judged(item)}" * item["read_as"])
+                    + "; judged to use this cause" * judged(item))
             lines.append(f"{head}; {text}." if alone else f"  - {text}")
             indent = "  " if alone else "    "
             lines += [indent + line.removeprefix("  ") for line in opened(item)]
@@ -1664,23 +1664,22 @@ def tally(item: dict) -> str | None:
     return text + (f", and {unrewarded} {'attempt' if unrewarded == 1 else 'attempts'} got reward 0" if unrewarded else "")
 
 
-def judged(item: dict) -> str:
-    """What a finding read as its cause's says: a no-hint exploit was judged to use it, an inspector's finding was not
-    attacked on its own."""
-    return "judged to use this cause" if item["source"] == "Attacker" else "not attacked on its own"
+def judged(item: dict) -> bool:
+    """A no-hint exploit judged to use its cause, which its line says."""
+    return item["read_as"] and item["source"] == "Attacker"
 
 
 def case_line(item: dict) -> str:
     """One finding: the reward, the values its check measured for its marks, the help its Attacker had, its label, and
-    for an inspector's finding how many assessed attempts with its help were exploits; one read as its cause's says so
-    instead. What its agents left open is in its Attack entry."""
+    for an inspector's finding how many assessed attempts with its help were exploits; a no-hint exploit judged to use its
+    cause says so. What its agents left open is in its Attack entry."""
     parts = [f"reward {number(item['reward'])}" if item["reward"] is not None else "no reward",
               f"{values(item['marks'])} measured by " + (f"check {item['check']}" if item["check"] else "its check")]
     if item["help"]:
         parts.append(f"with {item['help']}")
     parts.append(item["label"] + scoped(item))
-    if item["read_as"]:
-        parts.append(judged(item))
+    if judged(item):
+        parts.append("judged to use this cause")
     elif counts := tally(item):
         parts.append(counts)
     return f"{item['id']}: {'; '.join(parts)}."

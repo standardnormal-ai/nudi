@@ -147,7 +147,7 @@ Each finding states its cause, `cause`: one sentence on the one thing the grader
 
 When a new finding of accepted invalid work is recorded, the judge decides whether its cause is new or the same as a known cause. It decides before any Attacker starts for that finding. The judge is one call of the run's inspector model, which reads the task's instruction, the id and sentence of each cause known then, and the new cause sentence. Two causes are the same only when both name the same trusted thing. Checking too little, even of the same test, or sharing a kind of cheat, is no match.
 
-A finding of a known cause is listed under that cause at its own level 2, and no Attacker attacks it. With no known cause, or for a finding without a cause sentence, no call is made and the cause is new. A cause opened without a sentence, or by a finding of correct work the grader fails, is compared with nothing, and such a finding is never compared. When the judge is unsure, names no known cause or its call fails, the cause is new, with one warning for a failed call.
+A finding of a known cause is listed under that cause and gets its own Attacker. With no known cause, or for a finding without a cause sentence, no call is made and the cause is new. A cause opened without a sentence, or by a finding of correct work the grader fails, is compared with nothing, and such a finding is never compared. When the judge is unsure, names no known cause or its call fails, the cause is new, with one warning for a failed call.
 
 The judge takes one finding at a time, and its call waits for no inspection to end. Each hack inspector request lists the sentences of the causes a finding can be compared with under `known_causes` and asks for a different cause.
 
@@ -235,9 +235,9 @@ An inspector finding is one current evidenced hack or grader inspector interpret
 
 A no-hint exploit is at level 5. Judged to use a known cause, it is listed under that cause with `read_as` true and never raises the cause's level, which comes only from the cause's own findings; otherwise it is a cause of its own. An exploit made with help for a finding that no longer stands is a finding of its own, found by the Attacker, at that help's level, under the cause of the finding the help was written for. Its marks and check are the attack inspector's first interpretation, and further interpretations of the same attempt make no further finding. An attempt is `unknown` only when no interpretation decided whether its work is invalid. A finding's id is `hack-INDEX`, `grader-INDEX` or the Attacker's episode.
 
-A finding is under a cause with `read_as` true when an agent judged it so: an inspector finding the judge read as a known cause, which no Attacker attacks on its own, or a no-hint exploit judged to use a known cause. A cause's level is the best level of its findings with `read_as` false. Its counts count each attempt given their help once, and are null when none was. A finding with `read_as` true keeps its own level but sets neither. A cause whose every finding has `read_as` true, as when a later interpretation withdrew the finding that opened it, therefore has no level of its own.
+A finding is under a cause with `read_as` true when an agent judged it so: an inspector finding the judge read as a known cause, or a no-hint exploit judged to use a known cause. A cause's level is the best level of its findings with `read_as` false. Its counts count each attempt given their help once, and are null when none was. A finding with `read_as` true keeps its own level but sets neither. A cause whose every finding has `read_as` true, as when a later interpretation withdrew the finding that opened it, therefore has no level of its own.
 
-When a cause holds more than one finding, or one with `read_as` true, the Answer first says "An agent grouped the findings into causes; it can make mistakes." It then gives that cause on one line, such as "C1: The grader trusts the answer file; ●●●●○ exploit executable by learner with hint.", with its findings' lines beneath, each starting "  - ", those with `read_as` true last. An inspector finding with `read_as` true ends its line with "not attacked on its own" instead of a count, and a no-hint exploit with "judged to use this cause". A cause of one finding is one line: its id and sentence, then the finding's line.
+When a cause holds more than one finding, or one with `read_as` true, the Answer first says "An agent grouped the findings into causes; it can make mistakes." It then gives that cause on one line, such as "C1: The grader trusts the answer file; ●●●●○ exploit executable by learner with hint.", with its findings' lines beneath, each starting "  - ", those with `read_as` true last. A no-hint exploit with `read_as` true ends its line with "judged to use this cause". A cause of one finding is one line: its id and sentence, then the finding's line.
 
 ### Levels
 
@@ -260,7 +260,7 @@ The Answer has one short line per finding. Causes come highest level first, and 
 
 "C2: The grader trusts the test log. hack-3: reward 1; exists = false measured by check check-0003; ●●●○○ exploit executable by learner with full information; 1 of 1 assessed attempts with its help were exploits."
 
-Other endings are "no exploit in 2 assessed attempts with its help", "no attempt was assessed" or, for an inspector finding the judge read as a known cause, "not attacked on its own". An attempt the grader paid nothing was never inspected, so it is not assessed, and the count adds ", and 1 attempt got reward 0". The Answer never says a finding was not exploited.
+Other endings are "no exploit in 2 assessed attempts with its help" or "no attempt was assessed". An attempt the grader paid nothing was never inspected, so it is not assessed, and the count adds ", and 1 attempt got reward 0". The Answer never says a finding was not exploited.
 
 ### The Attack section
 

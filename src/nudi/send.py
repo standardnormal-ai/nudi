@@ -457,7 +457,7 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
     run.publish = publish
     problems = []
     # Each cause as the judge placed each finding when it was evidenced, and those opened by a cause sentence, the only
-    # ones a later finding is compared with. A problem after a cause's first is not attacked.
+    # ones a later finding is compared with.
     causes, sentenced, judging = [], [], asyncio.Lock()
     # One set of slots for the run: each Simulator episode, inspector session and Attacker attempt holds one.
     gate = Slots(at_once(run))
@@ -468,9 +468,6 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
         causes.append(Cause(id=f"C{len(causes) + 1}", cause=problem.cause, problems=[problem.id]))
         if sentence:
             sentenced.append(causes[-1])
-
-    def joined(problem: Problem) -> bool:
-        return any(problem.id in cause.problems[1:] for cause in causes)
 
     def judged(inspector: str, problem: Problem, same: Cause | None = None) -> None:
         """The `judged` event of a finding that makes a new problem, by its cause: a new one, or the known one the judge
@@ -513,7 +510,7 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
                     opened(problem, bool(sentence))
                 judged(inspector, problem, same)
                 if same:
-                    event(run, "cause", f"the judge read {item.id}'s cause as {same.id}, so no Attacker attacks {item.id} on its own",
+                    event(run, "cause", f"the judge read {item.id}'s cause as {same.id}",
                           finding=item.id, problem=problem.id, cause=same.id)
         problem.findings.append(item.id)
         if problem.evidence != "evidenced":  # Also an earlier run's problem it did not reproduce.
@@ -548,8 +545,8 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
             # A control's reading is no candidate, so it makes no problem.
             item = next((item for item in guidance(**{inspector: report})["candidates"] if item.id == f"{inspector}-{index}"), None)
             if item:
-                if not joined(await evidence(inspector, report, item)):
-                    attack_on(item)
+                await evidence(inspector, report, item)
+                attack_on(item)
                 if "attack" in results:  # The attack has returned, as at the spending cap: its record keeps the problem, not attacked.
                     write_private(run.config.output_dir / "attack.json",
                                   results["attack"].model_copy(update={"problems": problems}).model_dump_json(indent=2))
@@ -584,7 +581,7 @@ async def run_analyses(run, settings: AnalysisConfig, selected, results: dict) -
                 await evidence(inspector, results.get(inspector), item)
         by_id = {item.id: item for item in candidates}
         for problem in problems:
-            if problem.evidence == "evidenced" and not joined(problem):
+            if problem.evidence == "evidenced":
                 for name in problem.findings:
                     if name in by_id:
                         attack_on(by_id[name])

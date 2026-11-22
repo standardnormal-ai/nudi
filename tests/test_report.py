@@ -1277,8 +1277,8 @@ def test_each_finding_has_its_own_level_and_a_cause_lists_its_findings_at_their_
     """A finding's level is the least help under which an Attacker given its help made an exploit, and a no-hint exploit
     of a new cause is at 5. A stored problem none of whose evidence stands is a lead. The judge's causes group findings:
     each cause is at its first problem's findings' best level, counts the attempts given their help and lists its findings
-    beneath it, best first, each keeping its own level and counts; one the judge read as the cause was not attacked on its
-    own. Beneath each finding each help level its help was given at shows its attempts."""
+    beneath it, best first, each keeping its own level and counts. Beneath each finding each help level its help was given
+    at shows its attempts."""
     problems = [Problem(id="P1", source="hack inspector", cause="Forge the digest.", findings=["hack-0"], evidence="evidenced"),
                 Problem(id="P2", source="hack inspector", cause="Forge it again.", findings=["hack-1"], evidence="evidenced"),
                 Problem(id="P3", source="hack inspector", cause="Skip the test.", findings=["hack-2"], evidence="evidenced"),
@@ -1297,7 +1297,8 @@ def test_each_finding_has_its_own_level_and_a_cause_lists_its_findings_at_their_
     assert answer[at + 1].startswith("C3: The grader trusts the score file. 0000-attacker: ")
     assert answer[at + 2] == f"C1: The grader trusts the digest; {report.LADDER[4]}."
     assert [line.split(":")[0] for line in answer[at + 3:at + 5]] == ["  - hack-1", "  - hack-0"]
-    assert answer[at + 4].endswith("; not attacked on its own.") and answer[at + 5].startswith("C2: The grader trusts the test. hack-2: ")
+    assert answer[at + 4].endswith("; no exploit in 1 assessed attempt with its help.")
+    assert answer[at + 5].startswith("C2: The grader trusts the test. hack-2: ")
     model = "openai/deepseek/deepseek-v4.1-flash-1017"
     section = report.markdown(built).split("\n## Attack\n")[1].split("\n## ")[0].splitlines()
     c1 = section.index(f"- C1, {report.LADDER[4]}: The grader trusts the digest.")
@@ -1305,7 +1306,7 @@ def test_each_finding_has_its_own_level_and_a_cause_lists_its_findings_at_their_
         "  - hack-1 (grader_tampering, check-0001) from the hack inspector: unchecked requirement",
         f"    - With full instructions: 1 of 1 attempts were exploits, {model}, evidenced_issue."]
     hack0 = section.index(f"  - hack-0 (grader_tampering, check-0000) from the hack inspector, {report.LADDER[2]}, evidenced in a package sandbox: "
-                          "unchecked requirement; not attacked on its own")
+                          "unchecked requirement")
     assert section[hack0 + 1:hack0 + 3] == [f"    - With full instructions: 0 of 1 attempts were exploits, {model}, no_evidenced_issue.",
                                             "    - With only a hint: Not run, no exploit was made with more help."]
     assert f"- C3, {report.LADDER[5]}: The grader trusts the score file; 0000-attacker from an Attacker: unchecked requirement; check check-100." in section
@@ -1357,7 +1358,7 @@ def test_a_no_hint_exploit_judged_to_use_a_known_cause_is_listed_there_and_never
     answer = built["answer"]
     at = answer.index(f"C1: The grader trusts the digest; {report.LADDER[4]}.")
     assert answer[at + 1].startswith("  - hack-1: ") and answer[at + 2].startswith(f"  - {episode}: ")
-    assert answer[at + 2].endswith("; judged to use this cause.") and answer[at + 3].endswith("; not attacked on its own.")
+    assert answer[at + 2].endswith("; judged to use this cause.") and answer[at + 3].endswith("; no exploit in 1 assessed attempt with its help.")
     assert report.SHARED in answer
     lines = report.markdown(built).splitlines()
     assert f"- C1, {report.LADDER[4]}: The grader trusts the digest." in lines
@@ -1381,10 +1382,10 @@ def test_a_no_hint_attempt_names_the_cause_its_exploit_was_judged_to_use_not_the
     assert (attack["attempts"][0]["cause"], attack["attempts"][-1]["cause"]) == ("C2", None)
 
 
-def test_a_finding_of_a_known_cause_is_not_attacked_separately_and_a_cause_of_one_finding_is_one_line(tmp_path):
-    """The judge read hack-1's cause as C1 when it was evidenced, so no Attacker attacked hack-1: it stays at level 2, and
-    its line says it was not attacked on its own rather than that no attempt was assessed. C2 holds one finding, which no
-    Attacker ran on either, and is one line. With only such causes there is no sentence on shared causes."""
+def test_a_finding_of_a_known_cause_is_listed_under_it_and_a_cause_of_one_finding_is_one_line(tmp_path):
+    """The judge read hack-1's cause as C1 when it was evidenced, so hack-1 is listed under C1; no Attacker ran on it, so
+    it stays at level 2. C2 holds one finding, which no Attacker ran on either, and is one line. With only such causes
+    there is no sentence on shared causes."""
     problems = [Problem(id=f"P{index + 1}", source="hack inspector", cause=f"Forge {index}.", findings=[f"hack-{index}"], evidence="evidenced")
                 for index in range(3)]
 
@@ -1410,8 +1411,8 @@ def test_a_finding_of_a_known_cause_is_not_attacked_separately_and_a_cause_of_on
     answer = report_of["answer"]
     at = answer.index(report.SHARED)
     assert [line.split(":")[0] for line in answer[at + 1:at + 4]] == ["C1", "  - hack-0", "  - hack-1"]
-    assert answer[at + 3].endswith("; not attacked on its own.") and "assessed" not in answer[at + 3]
-    assert answer[at + 4].startswith("C2: The grader trusts the log. hack-2: ") and "not attacked on its own" not in answer[at + 4]
+    assert answer[at + 3].endswith("; no attempt was assessed.")
+    assert answer[at + 4].startswith("C2: The grader trusts the log. hack-2: ")
     alone = built("b", [Cause(id=f"C{index}", cause="The grader trusts the digest.", problems=[f"P{index}"]) for index in (1, 2, 3)])
     assert [line.split(". ")[1].split(":")[0] for line in alone["answer"][2:]] == ["hack-0", "hack-1", "hack-2"]
     assert alone["answer"][2].startswith("C1: The grader trusts the digest. hack-0: ") and report.SHARED not in alone["answer"]
