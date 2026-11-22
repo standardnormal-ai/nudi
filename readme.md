@@ -10,8 +10,9 @@
   <a href="docs/installation.md#optional-modal-backend"><img src="https://img.shields.io/badge/Integration-Modal-09AF58?style=flat" alt="Integration: Modal"></a>
 </p>
 
-`nudi` is an open source CLI tool for red-teaming and simulating RL environments before training. It uses agent swarms to find flaws in grading. And answers how likely they are.
-Currently works with non-rubric tasks.
+`nudi` is an open source tool for red-teaming and simulating RL environments before training. It uses agent swarms to find flaws in grading. And answers how likely they are.
+It reports in CLI to your coding agents, so they can patch the proven loopholes.
+Currently works with programmatic graders (rubric-graded environments supported soon).
 
 This readme is written by humans, for humans.
 The boring stuff for your coding agents is here:  
@@ -24,13 +25,13 @@ The boring stuff for your coding agents is here:
 
 ## How agents prevent agents reward hacking
 
-We try to answer two questions about a selected (harbor format) environment.
+We try to answer two questions about a selected environment.
 
-1. **Pre-Hacking** "What are ways the grader can be fooled?"
-	1. Agents with admin access to the raw task (dockerfile plus grader), hunt for ways how the grader could grant false responses full rewards (`hack_inspectors`).
+1. **Pre-Hacking** "How can the grader be fooled?"
+	1. Agents with admin access to the full environment, hunt for ways how the grader could grant false responses rewards.
 	2. Found flaws are then tried to be reproduced by agents inside the task harness, with varied amounts of information about the flaws (full info, hint, no info).
 
-2. **Simulations** "What are expectable agent submissions, and how well does the grader judge them?"
+2. **Simulations** "What submissions can be expected in training, and how well does the grader judge them?"
 	1. Agents complete the training tasks (without any extra hack instruction) in isolated sandboxes. The submissions of those "simulations" are inspected by an agent. Such that we can...
 		- ... compute error rates: how often grader would make flawed decisions in practice?
 		- ... find new overseen flaws: coming from natural behavior, instead of directed exploit hunting.
@@ -40,7 +41,7 @@ We try to answer two questions about a selected (harbor format) environment.
 - Agent-first CLI & Python Library
 - TUI for humans, with live progress
 - Harbor Environments: Ran through native Harbor
-- Modal Sandboxes: Built for cloud sandboxes.
+- Modal Sandboxes: Built for auto dispatch of cloud sandboxes
 - Parallelization: Parallel sandboxes, automatically scheduled and (if ran locally) constrained by available CPU/RAM. (i.e. inspector on flaw B would run in parallel with attackers of flaw A.)
 - Reports with rewards, traces, and evidence for each finding (optimized for coding agents)
 - Bring your own model... inference through any OpenAI-compatible API
@@ -48,36 +49,25 @@ We try to answer two questions about a selected (harbor format) environment.
 	- What to run (full analysis vs. only pre-hacking, vs. only simulations.)
 	- Intensity of search: number of simulations, tries per flaw, etc.
 	- Spending cap & Time limit
+- Concurrent inspection of multiple environments
 
 ### Soon to be released
 
-- Concurrent inspection of multiple environments.
-- Outer loop for autonomous patching: Find flaws, patch them, test again. Terminate with a patch report, when no new flaws found.
+- Rubric graded tasks 
+- Indexing submissions of simulator agents by similarity (to detect and understand outliers)
+- For teams building fully synthetic envs with zero human oversight: `nudi` covers the outer loop for autonomous patching. Find flaws, patch them, test again, until no flaws detectable.
 - More environment framework integrations: [verifiers](https://github.com/PrimeIntellect-ai/verifiers), [verl](https://github.com/XiaomiMiMo/verl), [hud](https://github.com/hud-evals/hud-python)
-
 ## How does it compare to human-led flaw finding?
 
 It's not easy to evaluate the autonomous swarm on finding loopholes in frontier environments. There simply are no independent benchmarks yet. 
+
 However, Terminal Bench 4.0.0 has been extensively investigated by Epoch AI (common issues sourced by community) and Preference Model (human-led investigations). We use the joint list of unique flaws - found by either human researchers or community - as target for nudi. 
 
 Over 4 randomly sampled tasks, nudi has shown to detect 80% of the flaws. Moreover, it found a variety of issues that have been unreported thus far... nearly doubling the amount of unique flaws. 
 
 ![Evaluation on Terminal Bench 4.0.0](docs/nudi-vs-published.png)
 
-## "Agentic Uno Reverse Card" inspired by real-life Pokemon
-
-**Nudibranchs** are sea slugs that evolution has formed into some of the most aesthetically appealing water creatures. But most importantly, they evolved into *weapon theft (kleptocnidy)*.
-
-So, they share their habitat with some jellyfish species. Those species prey approaching fish by stinging them with nematocysts; which are poison capsules, that explode inside the enemies body.
-
-Nudibranchs like *Glaucus atlanticus* eat (parts of) the jellyfish. They are able to swallow unexploded nematocysts, and repurpose the arsenal as their own shield.
-
-![Glaucus atlanticus](docs/assets/glaucus.jpg)
-
-
-
-
-## Conceptual Details behind nudi
+## Conceptual details behind `nudi`
 ### Pre-Hacking
 
 <img src="docs/diagrams/hacks.svg" alt="Hack inspection and attacker disclosure levels" width="516">
@@ -143,6 +133,16 @@ The labels are then used to compute FDR and FNR.
 | **False negative rate** [FN/(TP+FN)]  | Of valid runs, how many were rejected?                           | Correct submissions are not reward ($\Rightarrow$ indirectly inviting reward hacking, when agent gets fed up with impossible task) |
 
 (For now, it's only compatible with pass/fail graders. Rubric based environments are not covered by this analysis yet.)
+
+## "Agentic Uno Reverse Card" inspired by real-life Pokemon
+
+**Nudibranchs** are sea slugs that evolution has formed into some of the most aesthetically appealing water creatures. But most importantly, they evolved into *weapon theft (kleptocnidy)*.
+
+So, they share their habitat with some jellyfish species. Those species prey approaching fish by stinging them with nematocysts; which are poison capsules, that explode inside the enemies body.
+
+Nudibranchs like *Glaucus atlanticus* eat (parts of) the jellyfish. They are able to swallow unexploded nematocysts, and repurpose the arsenal as their own shield.
+
+![Glaucus atlanticus](docs/assets/glaucus.jpg)
 
 ## Citation
 
