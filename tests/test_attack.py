@@ -4112,7 +4112,7 @@ def test_attack_passes_a_goal_reminder_matched_to_each_condition(tmp_path, monke
             assert attack_module.EXPLOIT_REMINDER != attack_module.VALID_WORK_REMINDER
             for attempt in result.attempts:
                 expected = attack_module.VALID_WORK_REMINDER if attempt.candidate == "reject" else attack_module.EXPLOIT_REMINDER
-                assert reminders[attempt.episode] == expected
+                assert reminders[attempt.episode] == expected and "stop any background process you started" in expected
             # The no-hint discovery attempt is an exploit attempt.
             discovery = next(attempt for attempt in result.attempts if attempt.candidate is None)
             assert reminders[discovery.episode] == attack_module.EXPLOIT_REMINDER

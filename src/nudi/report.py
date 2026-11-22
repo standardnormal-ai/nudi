@@ -152,8 +152,10 @@ def build(run_dir: Path, secrets=(), selected=None, stop=None, running=False) ->
     now = {f"{mode}-{item['index']}" for mode in ("grader", "hack") if mode in loaded for item in current(inspections[f"{mode}_inspector"])}
     pool = record.simulation.episodes if record.simulation else []
     attacked = counted(loaded["attack"]) if "attack" in loaded else None
+    # A control's reading checks the measurement, so it is no finding.
+    controls = {mode: {row["check"] for row in loaded[mode].experiments if row.get("control") and row.get("check")} for mode in ("hack", "grader") if mode in loaded}
     shown = cases({name: item for mode in ("hack", "grader") if mode in loaded for index, item in enumerate(loaded[mode].assessments)
-                   if (name := f"{mode}-{index}") in now}, attacked, record)
+                   if (name := f"{mode}-{index}") in now and item.claim.check not in controls[mode]}, attacked, record)
     report = {
         "schema_version": SCHEMA_VERSION,
         "status": "stopped" if stop or record.stop_reason else "running" if running else ("unfinished" if failed else "time_limit") if record.time_limit_reached

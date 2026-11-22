@@ -5841,8 +5841,9 @@ def test_truncated_setup_output_never_closes_public_coverage(tmp_path, monkeypat
     requests = inspector_responses(monkeypatch, [{"probes": [setup_probe()]}, VIOLATED])
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
     result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"]))
-    # A nonzero setup exit the session continued past, with a valid check, is a limit only.
-    assert (result.status, result.attempts[0].status) == (("unresolved", "unobservable") if setup_failure == "truncated" else ("complete", "evidenced_issue"))
+    # A nonzero setup exit the session continued past, with a valid check, is a limit only. Truncated setup output keeps
+    # its experiment open, and the evidence the session found keeps its attempt evidenced.
+    assert (result.status, result.attempts[0].status) == ("unresolved" if setup_failure == "truncated" else "complete", "evidenced_issue")
     if setup_failure == "truncated":
         assert result.attempts[0].error == "experiment-0000: setup output was truncated; uncaptured bytes are unavailable."
     assert result.assessments[0].outcome == "accepted_invalid", "independent measured evidence is still retained"
@@ -6406,20 +6407,27 @@ def test_tool_error_the_session_recovers_from_is_a_limit(tmp_path, monkeypatch, 
         assert any("grep timed out" in text for text in public["limits"] + warnings)
 
 
-@pytest.mark.parametrize("repeated", [True, False])
-def test_truncated_checker_output_stays_unobservable(tmp_path, monkeypatch, credentials, unit_sandboxes, repeated):
-    """Truncated checker output leaves its attempt unobservable and a limit. It measured nothing, so a repeat that
-    evidences the issue settles the category; without one the category stays unknown."""
+@pytest.mark.parametrize("evidence", [None, "after", "before"])
+def test_truncated_checker_output_leaves_only_an_attempt_that_found_nothing_unobservable(tmp_path, monkeypatch, credentials, unit_sandboxes, evidence):
+    """Truncated checker output is a limit and measured nothing, so it leaves its attempt unobservable only while that
+    attempt found nothing: evidence before or after it settles the category and the attempt; without any the category
+    stays unknown."""
     no_native_actor(monkeypatch)
-    truncating = setup_probe(category="accepted_invalid", program=f"print('x' * {inspector_sandbox.OUTPUT_LIMIT + 1})\n")
-    inspector_responses(monkeypatch, [{"probes": [truncating] + [setup_probe(category="accepted_invalid")] * repeated}] + [VIOLATED] * repeated)
+    # An evidenced category takes no more probes, so truncation after evidence is measured in the other category.
+    other = "rejected_valid" if evidence == "before" else "accepted_invalid"
+    truncating = setup_probe(category=other, location="/app/other.txt", program=f"print('x' * {inspector_sandbox.OUTPUT_LIMIT + 1})\n")
+    evidencing = setup_probe(category="accepted_invalid")
+    probes = {None: [truncating], "after": [truncating, evidencing], "before": [evidencing, truncating]}[evidence]
+    inspector_responses(monkeypatch, [{"probes": probes}] + [VIOLATED] * bool(evidence))
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
-    result = asyncio.run(inspection_module.inspect_grader(run, [], categories=["accepted_invalid"], focused_attempts=0))
-    assert [check.exit_code for check in run.record.checks] == [125, 0][:1 + repeated]
-    assert (result.status, result.attempts[0].status) == ("complete" if repeated else "unresolved", "unobservable")
-    assert result.attempts[0].error == "experiment-0000: check output was truncated"
-    assert result.categories["accepted_invalid"] == ("evidenced_issue" if repeated else "unknown")
-    assert any("experiment-0000" in limit and "truncated" in limit for limit in result.limits)
+    result = asyncio.run(inspection_module.inspect_grader(run, [], categories=list(dict.fromkeys(["accepted_invalid", other])), focused_attempts=0))
+    assert [check.exit_code for check in run.record.checks] == {None: [125], "after": [125, 0], "before": [0, 125]}[evidence]
+    assert result.attempts[0].status == ("evidenced_issue" if evidence else "unobservable")
+    if evidence is None:
+        assert result.attempts[0].error == "experiment-0000: check output was truncated"
+    assert result.categories["accepted_invalid"] == ("evidenced_issue" if evidence else "unknown")
+    assert result.status == ("complete" if evidence == "after" else "unresolved")
+    assert any("truncated" in limit for limit in result.limits)
 
 
 def test_failed_then_repeated_experiment_settles_on_its_evidence(tmp_path, monkeypatch, credentials, unit_sandboxes):

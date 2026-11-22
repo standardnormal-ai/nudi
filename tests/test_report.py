@@ -1606,6 +1606,18 @@ def test_an_older_no_hint_attempt_aimed_at_a_finding_is_a_no_hint_exploit_of_its
     assert not any("rerun" in line or "aimed at it" in line or "possibly the same as" in line for line in section)
 
 
+def test_an_evidenced_control_reading_stays_in_its_inspection_and_is_no_finding_of_the_report(tmp_path):
+    """A control's reading checks the measurement, so its inspection lists it and the report's findings leave it out."""
+    run = RunDir(tmp_path)
+    run.grader = InspectionResult(mode="grader", status="complete", categories={}, applicability={},
+                                  assessments=[evidenced("sandbox-0000", "check-0"), evidenced("sandbox-0000", "check-1")],
+                                  experiments=[{**experiment(0, "accepted_invalid", "check-0"), "control": True},
+                                               experiment(1, "accepted_invalid", "check-1")])
+    built = run.report(selected=["grader"])
+    assert [item["id"] for item in shown(built)] == ["grader-1"]
+    assert [item["index"] for item in built["inspections"]["grader_inspector"]["findings"]["evidenced"]] == [0, 1]
+
+
 def test_a_case_without_an_attack_candidate_says_no_attempt_was_assessed(tmp_path):
     """The hacking analysis attacks only during the hack phase, which takes no finding without guidance, so such a
     case has no attack candidate, and neither has a guided finding after a stop: no attempt was assessed."""
