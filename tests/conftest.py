@@ -16,3 +16,9 @@ def free_disk_minimum(monkeypatch):
 def no_retry(monkeypatch):
     """A scripted provider or Modal failure ends its call at once, unless a test sets the waits before each retry."""
     monkeypatch.setattr("nudi.run_state.RETRY_WAITS", ())
+
+
+@pytest.fixture(autouse=True)
+def one_hack_session(monkeypatch):
+    """A scripted model plays one hack inspector session, unless a test sets the number of sessions."""
+    monkeypatch.setattr("nudi.inspection.HACK_SESSIONS", 1)

@@ -39,7 +39,7 @@ Nothing bounds a run's time or inference cost unless you set `--time-limit` or `
 - `--analysis`. No mode is a quick check. `simulation` runs whole Simulator episodes, and its grader inspector starts only after the last episode ends, then runs a broad session and focused sessions on its two categories.
 - `--episodes` (default 12). Each Simulator episode is a full agent run of the task. Episodes share the run's `--concurrency // 2` slots with inspector sessions and Attacker attempts; on Docker, fewer run when the task's declared resources do not fit. See [Parallelization](parallelization.md#slots).
 - The task's own timeouts. Each Simulator and Attacker episode runs under the task's agent timeout (`[agent] timeout_sec` in `task.toml`) and its grading under the verifier timeout, as in Harbor. A task with a long agent timeout makes every episode long.
-- Inspector sessions. They have no time limit of their own: a session ends when the inspector returns or uses all its model turns, about 4,999 per request. The hack inspector runs one focused session for each of its ten categories plus `other`, each up to `--focused-attempts` times (default 2). `--isolated-inspections` adds one grader inspector session per Simulator episode.
+- Inspector sessions. They have no time limit of their own: a session ends when the inspector returns or uses all its model turns, about 4,999 per request. The hack inspector runs three identical sessions, each once. `--isolated-inspections` adds one grader inspector session per Simulator episode.
 - The attack. Each finding of a new cause can get a full-hint, a single-hint and a no-hint attempt, as [Attack steps](#attack-steps) explains. `--attacker-tries` (default 1) caps the attempts per finding and hint level, `--discovery-attempts` (default 1) sets the independent no-hint attempts, and `--no-minimal-hints` skips the single-hint step and the no-hint step after it.
 - `--concurrency` (default 16), the number of sandboxes at once. A higher value shortens the run but makes no fewer model calls or sandboxes.
 - `--backend modal`. Modal bills sandbox time on top of inference; see [Modal cost](#modal-cost).
@@ -57,7 +57,7 @@ Nothing bounds a run's time or inference cost unless you set `--time-limit` or `
 | --- | --- | --- |
 | `--analysis` | `full` | `full`, `hacking` or `simulation` |
 | `--episodes` | `12` | Ordinary Simulator episodes |
-| `--focused-attempts` | `2` | Focused attempts per grader inspector or hack inspector category |
+| `--focused-attempts` | `2` | Focused attempts per grader inspector category |
 | `--attacker-tries` | `1` | Maximum Attacker attempts per candidate and hint level |
 | `--discovery-attempts` | `1` | Attacker attempts without hints, which start with the hack inspector |
 | `--minimal-hints`, `--no-minimal-hints` | On | Also attempt each candidate the full hint exploited with the single (minimal) hint |
@@ -78,11 +78,11 @@ Nothing bounds a run's time or inference cost unless you set `--time-limit` or `
 
 [Parallelization](parallelization.md) says what starts when, how the run's slots are shared and when a container waits or is refused. The `hack` `phase_start` event gives the number of slots as `slots`. `run_start` lists the phases that will run as `analyses`; a rerun with `--attack-from` lists only `attack`. One workspace may still admit one experiment even at `--concurrency 1`, and Attacker retries of the same candidate at the same hint level wait for each other.
 
-With focused attempts, the hack inspector starts one focused session per category and one `other` session, each from a fresh conversation with the task and the checklist. The `other` session maps what the grader trusts, measures each trust the learner can break, and starts with trusts no listed category covers. Its findings take a listed category as `category` when one fits, else `other`. It settles no category of its own, but a failed attempt of it stays in `open` until a later attempt recovers it. In separate verifier mode every hack inspector workspace starts from the verifier's environment, not the task image, so it has the grader's tools.
+The hack inspector starts three identical sessions, each from a fresh conversation with the task and the checklist and the same request: find every way invalid work gets undeserved reward and every case of valid work the grader rejects, mapping what the grader trusts. A session ends when it returns, and is not asked again. Its findings take a listed category as `category` when one fits, else `other`. A hack inspector session may run the copied grader in its workspace as a rehearsal, which is never evidence. In separate verifier mode its workspace starts from the verifier's environment, not the task image, so it has the grader's tools.
 
 An interpretation of an `other` experiment must give `family`, a short name for the hack family it shows, and its finding carries it as `family`. `report.md` lists families outside `HACK_CATEGORIES` by finding id, on one line after the causes, only when there is one. Names that match a listed category, also with spaces or in another case, are left out of that line.
 
-A persistence probe goes to the native persistence readback, which runs once per location after the session that named it releases its workspace. With `--focused-attempts 0`, one broad session measures every category. A hack inspector category stays open after a finding: its focused session is asked again, up to its attempts, while `open` names a failed attempt of that category that no later attempt recovered, unless the measurement was unavailable. A grader inspector category stops at its first evidenced issue.
+A persistence probe goes to the native persistence readback, which runs once per location after the session that named it releases its workspace. A hack inspector category stays open after a finding, and the hack inspector's categories only guide its search. A grader inspector category stops at its first evidenced issue.
 
 ### Spending cap
 
@@ -181,11 +181,11 @@ Every run_experiment, interpret_experiment and inspection_status reply starts wi
 - an experiment whose latest interpretation is unknown, with its reasons and repair, or agrees with the reward but leaves an item unresolved;
 - a failed check, or a check that broke the output contract, until a later check of its episode keeps the contract;
 - a case whose measurement was unavailable, as when its grading wrote no reward or its experiment failed, until a different case names it in `replaces`;
-- a failed attempt that no later attempt of its category recovered, which a later focused attempt retries;
-- a requested category with no interpretation that agrees with its reward;
+- a failed attempt that no later attempt of its category recovered, which a later grader inspector focused attempt retries; a failed hack inspector session keeps every category open in the report only;
+- for the grader inspector, a requested category with no interpretation that agrees with its reward;
 - for the grader inspector, an ordinary episode whose label is unknown.
 
-A session sees its own experiments, those it inherited from the grader inspector's broad conversation, and what names its categories or its episode. `replaces` must name an experiment that `open` lists, of the probe's own category and scope: the same episode for a probe of an episode, or a package experiment for a package probe. Any other is refused and nothing runs. Once the replacing experiment has an interpretation, the replaced one is read through it everywhere: in `open`, in an attack attempt's result, and in the report's findings and suspected exploits. The exception is a replaced experiment whose own interpretation is evidenced; no replacement withdraws that.
+A grader inspector session sees its own experiments, those it inherited from broad's conversation, and what names its categories or its episode. A hack inspector session sees only its own experiments. `replaces` must name an experiment that `open` lists, of the probe's own category and scope: the same episode for a probe of an episode, or a package experiment for a package probe. Any other is refused and nothing runs. Once the replacing experiment has an interpretation, the replaced one is read through it everywhere: in `open`, in an attack attempt's result, and in the report's findings and suspected exploits. The exception is a replaced experiment whose own interpretation is evidenced; no replacement withdraws that.
 
 A category settles `no_evidenced_issue` once its sessions ended and no entry names it, and an inspection is `complete` only when `open` is empty. Tool errors, duplicate cases and refused out-of-scope probes are history: they appear in limits and attempts but keep nothing open. An interpretation of a retained check outside an experiment is in `open` like an experiment's. An ordinary episode without a native reward cannot be labeled; it is listed in limits and keeps nothing open.
 
@@ -197,7 +197,7 @@ When Modal reports that an inspector session's workspace or experiment sandbox r
 
 A Simulator episode that ended without a reward is named in the Answer's first line with when it ended and its first failure, such as "0000-simulator (during agent work; ModalFailure: Modal exec failed: sandbox killed, out of memory (exit 137))". It ended during grading once nudi had copied its environment for grading, else during agent work.
 
-A failed experiment fails only itself: its measurement is unavailable and keeps its category open, not failed. A focused session whose workspace ran out of memory makes no later attempt in it, and its category's `open` entry says to run the inspection again.
+A failed experiment fails only itself: its measurement is unavailable and keeps its category open, not failed. A grader inspector focused session whose workspace ran out of memory makes no later attempt in it, and its category's `open` entry says to run the inspection again.
 
 An Attacker episode that runs out of memory, or an attack attempt that fails outside its attack inspector session, keeps its usual failure status, such as `tool_failure`. An Attacker episode that ended with an unclassified error, no reward and no model call, such as an agent setup that failed, has the status `episode_failure`: it failed to run. One that made model calls and whose grader wrote no reward has the status `no_reward`: nothing to judge, and no failure to run. An attack attempt's `failed` names the agent whose failure ended it, `Attacker` or `attack inspector`; an attempt whose attack inspector failed keeps the Attacker's reward.
 
@@ -343,7 +343,7 @@ The Answer's first line, also `outcome` in `report.json`, says the same in plain
 - "Stopped by a termination signal after 0:42. Results below are what was found so far." after SIGTERM.
 - "Stopped at your time limit after 1:30. Results below are what was found so far."
 - "Could not start: ..." with the first reason, when no step ran.
-- "Stopped after 0:42: the model provider refused a call of the hack inspector (hack-package_oracles): REASON. Results below are what was found so far." when the provider refused a call for the account. See [Provider refusals](#provider-refusals).
+- "Stopped after 0:42: the model provider refused a call of the hack inspector (hack-session-1): REASON. Results below are what was found so far." when the provider refused a call for the account. See [Provider refusals](#provider-refusals).
 - "Stopped: the nudi process ended without closing out the run. Results below are what was found so far." from `nudi report` after the process ended with no chance to save, as after `kill -9`.
 - "Still running. Results below are what was found so far; the final report replaces this one." in the report so far.
 
@@ -472,7 +472,7 @@ It prints Modal's bill for that run's sandboxes and exits `0`, or prints one lin
 `nudi-view` shows a run in the terminal: the result with its causes, each phase with the findings beside it, and the evidence, limitations and references of each finding. It reads only the run's `report.json`, which nudi 0.0.0 or later must have written, and its `events.jsonl` when it follows a run that is still going. Build it with Go 1.27.3 or later, as `tui/go.mod` requires. A pip install has no source checkout, so clone the same tag first:
 
 ```sh
-git clone --branch v0.5.3 https://github.com/standardnormal-ai/nudi.git
+git clone --branch v0.6.0 https://github.com/standardnormal-ai/nudi.git
 cd nudi
 (cd tui && go build -o nudi-view .)
 ```

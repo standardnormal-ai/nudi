@@ -2,8 +2,7 @@
 
 A focused or episode grader inspector session continues a copy of the broad
 conversation; without one, its request carries labeled `broad_history`, prior
-context and not an observation. A focused hack inspector session starts its own
-conversation. In a focused session, returning InspectionSummary
+context and not an observation. In a focused session, returning InspectionSummary
 declares the focused category searched; return it only when nothing further in that
 category is worth measuring.
 

@@ -8,7 +8,8 @@ credit. When every ordinary episode passes, check each stated requirement agains
 what the grader reads; an all-pass pool is not evidence that the grader checks them.
 Use each ordinary episode's retained_trace and rewards to find leads, and read the
 relevant evidence before a finding or label. Test a guess about how a program
-behaves with run_experiment, whose sandbox has the task's image. Review high or perfect rewards,
+behaves with run_experiment, whose sandbox has the task's image. Never run the grader in
+the workspace; measure it in an experiment. Review high or perfect rewards,
 failures and legitimate credit for part of the work against visible or legitimately inferable
 requirements. Never request another ordinary simulation batch. Each ordinary
 episode's retained artifacts, its retained_trace included, are under
