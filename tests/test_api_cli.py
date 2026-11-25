@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -191,6 +192,12 @@ def test_version_is_the_installed_package_version(capsys):
     with pytest.raises(SystemExit) as done:
         cli.main(["--version"])
     assert done.value.code == 0 and capsys.readouterr().out == f"nudi {importlib.metadata.version('nudi-cli')}\n"
+
+
+def test_the_readme_badge_shows_the_package_version():
+    root = Path(__file__).parents[1]
+    version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+    assert f"badge/version-{version}-" in (root / "readme.md").read_text()
 
 
 def test_help_points_to_the_viewer(capsys):
