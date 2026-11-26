@@ -1466,6 +1466,7 @@ def test_a_full_guidance_reproduction_of_a_grouped_finding_raises_its_cause(tmp_
     (cause,) = run.report(selected=["hack", "attack"])["causes"]
     assert [(item["id"], item["level"], item["read_as"]) for item in cause["findings"]] == [(paid, 3, True), ("hack-0", 2, False)]
     assert (cause["level"], cause["label"]) == (3, report.LADDER[3])
+    assert (cause["attempts"], cause["reproduced"], cause["unrewarded"]) == (1, 1, 1)
 
 
 def test_a_control_reading_without_marks_stays_out_of_the_answer(tmp_path):

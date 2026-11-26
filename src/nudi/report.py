@@ -1256,7 +1256,10 @@ def causes(result: AttackResult | None, record: RunRecord, shown: list[dict]) ->
                           key=lambda item: -(item["level"] or 0))
         own = [item for item in findings if not judged(item)]
         best = max((item for item in own if item["level"] is not None), key=lambda item: item["level"], default=None)
-        started = given({item["id"] for item in own}, result, record) if result else []
+        # An Attacker finding is named by its episode, so the findings whose help its attempt was given name its help.
+        helped = [result.attempts[item["attempt"]] for item in own if "attempt" in item] if result else []
+        started = given({item["id"] for item in own} | {name for attempt in helped for name in attempt.sources or [attempt.candidate]},
+                        result, record) if result else []
         _, unrewarded, assessed = split(started)
         rows.append({"id": cid, "cause": cause and cause.cause or findings[0]["mechanism"], "level": best and best["level"],
                      "label": best and best["label"], "attempts": len(assessed) if started else None,
