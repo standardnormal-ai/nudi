@@ -1084,7 +1084,8 @@ def test_no_candidate_leaves_guidance_unavailable_and_still_attacks(tmp_path, mo
 def test_inspector_prompt_requests_reproduction_steps_and_a_location_only():
     from nudi import inspection
     prompt = " ".join(inspection.inspector_prompt("hack").split())
-    assert "`full_guidance`" in prompt and "concrete steps that reproduce it" in prompt
+    assert "`full_guidance`" in prompt
+    assert inspection.claim_model("hack").model_fields["full_guidance"].description.startswith("Steps sent verbatim to the Attacker.")
     assert "`hint_location`" in prompt and "file, interface, or component" in prompt
     assert "must not contain a solution or a reproduction recipe" in prompt
     assert "A finding without either field gives the Attacker nothing to run." in prompt

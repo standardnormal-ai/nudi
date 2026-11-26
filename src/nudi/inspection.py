@@ -270,6 +270,9 @@ def claim_model(job: str) -> type[BaseModel]:
     if job == "hack":
         fields["family"] = (str | None, Field(None, description="A short name for the hack family this reading shows; "
                                                                 "required only when the experiment's category is `other`."))
+        fields["full_guidance"] = (str | None, Field(None, description=(
+            "Steps sent verbatim to the Attacker. Use only its normal task tools and files: no reference solution, grader tests "
+            "or nudi copy. Explain how to produce any required setup without those files.")))
     if job == "grader":
         fields |= {"coverage": (Coverage | None, None), "basis": (MetricBasis | None, None), "citations": (list[Observation], [])}
     return create_model("Claim", reward=(str | None, None), **fields)
