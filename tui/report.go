@@ -391,6 +391,7 @@ type Problem struct {
 	Attacked  *bool  `json:"attacked"`  // false when no Attacker attempt got this finding's help
 	ReadAs    bool   `json:"read_as"`   // placed under its cause by an agent's reading, not first found as it
 	Mechanism string `json:"mechanism"` // the finding's own mechanism
+	Kind      string `json:"kind"`      // an Attacker finding's: discovery for a no-hint exploit
 	CauseID   string `json:"-"`         // the cause load placed it under
 }
 
@@ -648,7 +649,7 @@ func groupCauses(r *Report) {
 				}
 			}
 			for _, episode := range c.Readings {
-				read := Problem{ID: episode, Finding: episode, Source: "Attacker", Level: 5, Label: c.Label, ReadAs: true, CauseID: c.ID}
+				read := Problem{ID: episode, Finding: episode, Source: "Attacker", Kind: "discovery", Level: 5, Label: c.Label, ReadAs: true, CauseID: c.ID}
 				if i := slices.IndexFunc(found, func(f Finding) bool { return f.Source == "attack" && f.Claim.Episode == episode }); i >= 0 {
 					read.Cause, read.Mechanism, read.Assessment = found[i].Claim.Mechanism, found[i].Claim.Mechanism, found[i].Index
 				}
@@ -710,7 +711,7 @@ func (r Report) causeOf(f Problem) Cause {
 }
 
 // judged says whether p is a no-hint exploit the attack inspector judged to use its cause.
-func (p Problem) judged() bool { return p.ReadAs && p.Source == "Attacker" }
+func (p Problem) judged() bool { return p.ReadAs && p.Source == "Attacker" && p.Kind == "discovery" }
 
 // notAttackedAlone says whether p is an inspector finding read as its cause that no Attacker was given the help of.
 func (p Problem) notAttackedAlone() bool {

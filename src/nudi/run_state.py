@@ -674,6 +674,25 @@ def provider_reason(run: Run, error: BaseException) -> str:
     return f"{type(error).__name__}: {text[:300]}"
 
 
+def settle(call_id: str, response=None, exception: Exception | None = None, unknown: str | None = None) -> None:
+    """Record the call `call_id` admitted in this context once: its response, with its usage and cost unknown for the
+    reason `unknown` when given, or `exception` when it failed."""
+    if (scope := current.get()) is None or (pending := pending_calls.get()) is None or (admitted := pending.pop(call_id, None)) is None:
+        return
+    if unknown is not None:
+        record_call(*scope, admitted, unknown=unknown, refusals=refusal_signals(response), started=admitted["started"])
+        return
+    if exception is None:
+        record_call(*scope, admitted, response=response, refusals=refusal_signals(response), started=admitted["started"])
+        return
+    refusals = [type(exception).__name__] if isinstance(exception, litellm.ContentPolicyViolationError) else []
+    reason = provider_reason(scope[0], exception)
+    record_call(*scope, admitted, error=reason, refusals=refusals, started=admitted["started"])
+    if account_refusal(exception):
+        from nudi.report import job
+        scope[0].refused(f"{job(scope[0].record.calls[-1], scope[0].record)} ({scope[2]})", reason.split(": ", 1)[1])
+
+
 class RunCalls(CustomLogger):
     """Process-wide LiteLLM callback that acts only within `model_calls`."""
 
@@ -691,22 +710,12 @@ class RunCalls(CustomLogger):
             pending[kwargs["litellm_call_id"]] = {"model": kwargs["model"], "started": datetime.now(timezone.utc).isoformat()}
         return {**kwargs, "api_key": run.keys[role]}
 
+    # LiteLLM skips this hook for a streamed call, whose caller settles it.
     async def async_post_call_success_deployment_hook(self, request_data, response, call_type):
-        if ((scope := current.get()) is not None
-                and (pending := pending_calls.get()) is not None
-                and (admitted := pending.pop(request_data["litellm_call_id"], None)) is not None):
-            record_call(*scope, request_data, response=response, refusals=refusal_signals(response), started=admitted["started"])
+        settle(request_data["litellm_call_id"], response)
 
     async def async_post_call_failure_deployment_hook(self, request_data, exception, call_type, fallback_depth=None):
-        if ((scope := current.get()) is not None
-                and (pending := pending_calls.get()) is not None
-                and (admitted := pending.pop(request_data["litellm_call_id"], None)) is not None):
-            refusals = [type(exception).__name__] if isinstance(exception, litellm.ContentPolicyViolationError) else []
-            reason = provider_reason(scope[0], exception)
-            record_call(*scope, request_data, error=reason, refusals=refusals, started=admitted["started"])
-            if account_refusal(exception):
-                from nudi.report import job
-                scope[0].refused(f"{job(scope[0].record.calls[-1], scope[0].record)} ({scope[2]})", reason.split(": ", 1)[1])
+        settle(request_data["litellm_call_id"], exception=exception)
 
 
 async def run_role_episode(run: Run, role: Role, *, instruction: str | None = None, agent=None,

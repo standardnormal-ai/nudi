@@ -37,6 +37,7 @@ from nudi.records import (DEFAULT_MODELS, Assessment, Capacity, Check, Claim, Co
                           Derivation, SandboxResult, Simulation, StateCopy)
 from nudi.run_state import Run
 from test_metrics import RULE, TASK, basis, checked
+from test_runner import streamed
 
 SECRET = "sk-live-api-0123456789"
 # Each progress line begins with the clock time.
@@ -728,8 +729,8 @@ def judge_replies(monkeypatch, replies, order=None):
         if isinstance(reply, BaseException):
             raise reply
         call = {"id": "call_0", "type": "function", "function": {"name": "SameCause", "arguments": json.dumps(reply)}}
-        return litellm.ModelResponse(choices=[{"index": 0, "finish_reason": "tool_calls",
-                                               "message": {"role": "assistant", "content": None, "tool_calls": [call]}}])
+        return streamed(litellm.ModelResponse(choices=[{"index": 0, "finish_reason": "tool_calls",
+                                                        "message": {"role": "assistant", "content": None, "tool_calls": [call]}}]))
 
     monkeypatch.setattr(litellm, "acompletion", completion)
     return requests
@@ -1084,7 +1085,8 @@ def test_no_candidate_leaves_guidance_unavailable_and_still_attacks(tmp_path, mo
 def test_inspector_prompt_requests_reproduction_steps_and_a_location_only():
     from nudi import inspection
     prompt = " ".join(inspection.inspector_prompt("hack").split())
-    assert "`full_guidance`" in prompt and "concrete steps that reproduce it" in prompt
+    assert "`full_guidance`" in prompt
+    assert inspection.claim_model("hack").model_fields["full_guidance"].description.startswith("Steps sent verbatim to the Attacker.")
     assert "`hint_location`" in prompt and "file, interface, or component" in prompt
     assert "must not contain a solution or a reproduction recipe" in prompt
     assert "A finding without either field gives the Attacker nothing to run." in prompt
@@ -2760,9 +2762,9 @@ def caused_findings(*causes) -> InspectionResult:
     return report
 
 
-def test_a_finding_the_judge_reads_as_a_known_cause_is_listed_under_it_and_no_attacker_attacks_it(tmp_path, monkeypatch):
+def test_a_finding_the_judge_reads_as_a_known_cause_is_listed_under_it_and_still_gets_its_own_attacker(tmp_path, monkeypatch):
     """When hack-1 is evidenced, one judge call compares its cause sentence with the known cause C1 and the task. Read as
-    C1, hack-1 is listed under that cause: no Attacker attacks it, it stays at level 2 and its line says so."""
+    C1, hack-1 is listed under that cause, and an Attacker given its full guidance still attacks it."""
     from test_runner import CONTRACT_TASK
 
     first, second = "The grader trusts the answer file.", "The grader trusts what the answer file says."
@@ -2785,8 +2787,8 @@ def test_a_finding_the_judge_reads_as_a_known_cause_is_listed_under_it_and_no_at
     monkeypatch.setattr(send, "inspect_hacks", inspect_hacks)
     built = send_nudis(CONTRACT_TASK, output_dir=tmp_path / "run", analysis="hacking", discovery_attempts=0, minimal_hints=False)
     saved = AttackResult.model_validate_json((tmp_path / "run" / "attack.json").read_text())
-    assert "hack-0" in targets and "hack-1" not in targets
-    assert not any("hack-1" in (item.sources or [item.candidate]) for item in saved.attempts)
+    assert targets == ["hack-0", "hack-1"]
+    assert any("hack-1" in (item.sources or [item.candidate]) for item in saved.attempts)
     assert [(item.id, item.findings) for item in saved.problems] == [("P1", ["hack-0"]), ("P2", ["hack-1"])]
     assert [(item.id, item.cause, item.problems) for item in saved.causes] == [("C1", first, ["P1", "P2"])]
     (request,) = requests
@@ -2794,12 +2796,12 @@ def test_a_finding_the_judge_reads_as_a_known_cause_is_listed_under_it_and_no_at
     assert asked["known_causes"] == [{"id": "C1", "cause": first}] and asked["new_cause"] == second and asked["task"]
     assert all(words in request["messages"][0]["content"] for words in ("same trusted thing", "When unsure"))
     (cause,) = built["causes"]
-    assert [(item["id"], item["level"], item["attacked"]) for item in cause["findings"]][1:] == [("hack-1", 2, False)]
+    assert [(item["id"], item["level"], item["attacked"]) for item in cause["findings"]][1:] == [("hack-1", 3, True)]
     line = next(line for line in built["answer"] if line.startswith("  - hack-1:"))
-    assert line.endswith("; not attacked on its own.") and "assessed" not in line
+    assert line.endswith("; 1 of 1 assessed attempts with its help were exploits.")
     texts = [item["text"].split(" ", 2)[2] for item in events(tmp_path / "run") if item["kind"] in ("judged", "cause")]
     assert texts == ["hack inspector finding hack-0 has a new cause C1", "hack inspector finding hack-1 has the known cause C1",
-                     "the judge read hack-1's cause as C1, so no Attacker attacks hack-1 on its own"]
+                     "the judge read hack-1's cause as C1"]
 
 
 def test_each_finding_is_judged_as_it_is_evidenced_and_a_new_cause_is_attacked_while_the_hack_inspection_runs(tmp_path, monkeypatch):

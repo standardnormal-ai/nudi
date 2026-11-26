@@ -152,8 +152,10 @@ def build(run_dir: Path, secrets=(), selected=None, stop=None, running=False) ->
     now = {f"{mode}-{item['index']}" for mode in ("grader", "hack") if mode in loaded for item in current(inspections[f"{mode}_inspector"])}
     pool = record.simulation.episodes if record.simulation else []
     attacked = counted(loaded["attack"]) if "attack" in loaded else None
+    # A control's reading checks the measurement, so it is no finding.
+    controls = {mode: {row["check"] for row in loaded[mode].experiments if row.get("control") and row.get("check")} for mode in ("hack", "grader") if mode in loaded}
     shown = cases({name: item for mode in ("hack", "grader") if mode in loaded for index, item in enumerate(loaded[mode].assessments)
-                   if (name := f"{mode}-{index}") in now}, attacked, record)
+                   if (name := f"{mode}-{index}") in now and item.claim.check not in controls[mode]}, attacked, record)
     report = {
         "schema_version": SCHEMA_VERSION,
         "status": "stopped" if stop or record.stop_reason else "running" if running else ("unfinished" if failed else "time_limit") if record.time_limit_reached
@@ -1231,8 +1233,8 @@ def causes(result: AttackResult | None, record: RunRecord, shown: list[dict]) ->
     each finding when it was evidenced; else, in older records, each stored problem; else a finding no problem holds,
     with its mechanism as its sentence. A cause's first problem's findings have `read_as` false; a finding of a later
     one, which the judge read as that cause, has it true, as does a no-hint exploit judged to use it. Each cause has its
-    sentence; its level and label, its `read_as` false findings' best; the counts of the distinct attempts given their
-    help, null when none was; and its findings, best first. A finding's `also` keeps only the names its problem holds
+    sentence; its level and label, its findings' best except a no-hint exploit judged to use it; the counts of the
+    distinct attempts given those findings' help, null when none was; and its findings, best first. A finding's `also` keeps only the names its problem holds
     that are no finding shown here. A cause without a shown finding is left out."""
     stored = {cause.id: cause for cause in (result.causes if result else [])}
     cause_of = {name: cause.id for cause in stored.values() for name in cause.problems}
@@ -1252,9 +1254,12 @@ def causes(result: AttackResult | None, record: RunRecord, shown: list[dict]) ->
         owner |= dict.fromkeys(names, cid)
         findings = sorted((item | {"read_as": item["read_as"] or item["problem"] not in (None, *names[:1])} for item in findings),
                           key=lambda item: -(item["level"] or 0))
-        own = [item for item in findings if not item["read_as"]]
+        own = [item for item in findings if not judged(item)]
         best = max((item for item in own if item["level"] is not None), key=lambda item: item["level"], default=None)
-        started = given({item["id"] for item in own}, result, record) if result else []
+        # An Attacker finding is named by its episode, so the findings whose help its attempt was given name its help.
+        helped = [result.attempts[item["attempt"]] for item in own if "attempt" in item] if result else []
+        started = given({item["id"] for item in own} | {name for attempt in helped for name in attempt.sources or [attempt.candidate]},
+                        result, record) if result else []
         _, unrewarded, assessed = split(started)
         rows.append({"id": cid, "cause": cause and cause.cause or findings[0]["mechanism"], "level": best and best["level"],
                      "label": best and best["label"], "attempts": len(assessed) if started else None,
@@ -1569,7 +1574,7 @@ def cause_lines(report: dict) -> list[str]:
                     + "".join(f"; {key.replace('_', ' ')} {item[key]}" for key in ("check", "location", "capture_point")
                               if item.get(key) and not (key == "check" and item["id"] in sources))
                     + f"; with {', '.join(item['also'])}" * bool(item["also"])
-                    + f"; {judged(item)}" * item["read_as"])
+                    + "; judged to use this cause" * judged(item))
             lines.append(f"{head}; {text}." if alone else f"  - {text}")
             indent = "  " if alone else "    "
             lines += [indent + line.removeprefix("  ") for line in opened(item)]
@@ -1662,23 +1667,22 @@ def tally(item: dict) -> str | None:
     return text + (f", and {unrewarded} {'attempt' if unrewarded == 1 else 'attempts'} got reward 0" if unrewarded else "")
 
 
-def judged(item: dict) -> str:
-    """What a finding read as its cause's says: a no-hint exploit was judged to use it, an inspector's finding was not
-    attacked on its own."""
-    return "judged to use this cause" if item["source"] == "Attacker" else "not attacked on its own"
+def judged(item: dict) -> bool:
+    """A no-hint exploit judged to use its cause, which its line says."""
+    return item["read_as"] and item["source"] == "Attacker" and item["kind"] == "discovery"
 
 
 def case_line(item: dict) -> str:
     """One finding: the reward, the values its check measured for its marks, the help its Attacker had, its label, and
-    for an inspector's finding how many assessed attempts with its help were exploits; one read as its cause's says so
-    instead. What its agents left open is in its Attack entry."""
+    for an inspector's finding how many assessed attempts with its help were exploits; a no-hint exploit judged to use its
+    cause says so. What its agents left open is in its Attack entry."""
     parts = [f"reward {number(item['reward'])}" if item["reward"] is not None else "no reward",
               f"{values(item['marks'])} measured by " + (f"check {item['check']}" if item["check"] else "its check")]
     if item["help"]:
         parts.append(f"with {item['help']}")
     parts.append(item["label"] + scoped(item))
-    if item["read_as"]:
-        parts.append(judged(item))
+    if judged(item):
+        parts.append("judged to use this cause")
     elif counts := tally(item):
         parts.append(counts)
     return f"{item['id']}: {'; '.join(parts)}."
@@ -1702,8 +1706,10 @@ def unproven(report: dict) -> list[dict]:
     measured and what that check measured, and its `reason` why nudi makes no claim from it."""
     rows = []
     for key, section in (*report["inspections"].items(), ("attack", report["attack"])):
+        # A control's reading checks the measurement, so it is no finding.
+        controls = {row.get("check") for row in (section or {}).get("experiments", []) if row.get("control")}
         for item in (item for group in ("legitimate", "inconclusive") for item in (section or {}).get("findings", {}).get(group, [])
-                     if item["superseded_by"] is None):
+                     if item["superseded_by"] is None and check_id(item) not in controls):
             assessment = item["assessment"]
             if assessment["outcome"] not in ("accepted_invalid", "rejected_valid"):
                 continue

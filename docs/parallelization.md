@@ -9,7 +9,7 @@ nudi starts each piece of work as soon as what it reads exists, so analyses over
 | No-hint Attacker attempts | the run starts | the task |
 | Grader inspector | the simulation ends | Simulator episodes and copies, hack findings so far |
 | The judge's call on a finding's cause | a new finding with a cause sentence is recorded while a known cause has one; one finding at a time | the task's instruction, each known cause's id and sentence, the new cause sentence |
-| Full-hint Attacker attempt on a finding | its check's first evidenced finding with full guidance is recorded, of a new cause | the task, that hint |
+| Full-hint Attacker attempt on a finding | its check's first evidenced finding with full guidance is recorded | the task, that hint |
 | Attack inspector | its Attacker episode ends rewarded, or with valid work | the episode and its copies; with a hint, its target finding; with no hint, the causes known then |
 | `report.json`, `report.md` | each confirmation, and the end | records saved so far |
 

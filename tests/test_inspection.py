@@ -38,7 +38,7 @@ import nudi.inspection as inspection_module
 from nudi import attack, checks, copies, episode, inspector, inspector_sandbox, persistence, run_state
 from nudi.assessment import assess
 from nudi.checks import host_command as trusted_host_command
-from nudi.records import Assessment, Check, Claim, Content, Derivation, ModelConfig, Observation, RunConfig
+from nudi.records import PROVIDER_REPORTED, Assessment, Check, Claim, Content, Derivation, ModelConfig, Observation, RunConfig
 from test_attack import GO_DIR, GO_FILE, SCRIPTED_PROBE, SCRIPTED_READING, scripted, stat_header
 from test_limits import credentials, new_run, session_messages
 from test_runner import (  # noqa: F401
@@ -52,6 +52,7 @@ from test_runner import (  # noqa: F401
     files_with_secret,
     masked,
     serve,
+    streamed,
     tree_digest,
 )
 
@@ -163,7 +164,7 @@ def inspector_responses(monkeypatch, responses):
     async def completion(**request):
         body = json.loads(json.dumps(request))
         message = script.message(body)
-        return inspector.litellm.ModelResponse(choices=[{"index": 0, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop", "message": message}])
+        return streamed(inspector.litellm.ModelResponse(choices=[{"index": 0, "finish_reason": "tool_calls" if message.get("tool_calls") else "stop", "message": message}]))
 
     monkeypatch.setattr(inspector.litellm, "acompletion", completion)
     return script.requests
@@ -1437,7 +1438,7 @@ def test_a_brief_model_failure_is_tried_again_with_a_line_and_a_client_error_is_
         calls.append(request)
         if error := failures.pop(0):
             raise error
-        return litellm.ModelResponse(choices=[{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}])
+        return streamed(litellm.ModelResponse(choices=[{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}]))
 
     monkeypatch.setattr(litellm, "acompletion", completion)
     model = inspector.chat_model(run.record.models["inspector"], run.keys["inspector"])
@@ -1454,6 +1455,254 @@ def test_a_brief_model_failure_is_tried_again_with_a_line_and_a_client_error_is_
     assert [item["text"].split(" ", 2)[2] for item in events if item["kind"] == "retry"] == [
         "hack-session-1: a model call failed with BadGatewayError; trying again in 0 s",
         "hack-session-1: a model call failed with RateLimitError; trying again in 0 s"]
+
+
+# One answer's usage as the model gateway reports it, its cost in the final chunk.
+STREAM_USAGE = {"prompt_tokens": 1200, "completion_tokens": 85, "total_tokens": 1285, "cost": 0.0031}
+
+
+class StreamedAnswers:
+    """The model gateway's chat completions: an answer and its reasoning text streamed in pieces with two tool calls, then
+    its usage in the final chunk; a request that does not stream gets the same usage at once. Each of `troubles` spoils
+    one try first: "stall" goes silent after the first chunk, "error frame" sends the gateway's error frame under status
+    200, "early end" ends the stream after the first chunk, "no usage" sends no usage chunk, "busy" is a 503."""
+
+    def __init__(self, *troubles):
+        self.troubles, self.requests = list(troubles), []
+
+    async def chat(self, request):
+        body = await request.json()
+        self.requests.append(body)
+        trouble = self.troubles.pop(0) if self.troubles else None
+        if trouble == "busy":
+            return web.json_response({"error": {"message": "no capacity", "type": "server_error"}}, status=503)
+        head = {"id": "chatcmpl-streamed", "created": 0, "model": body["model"]}
+        if not body.get("stream"):
+            return web.json_response({**head, "object": "chat.completion", "usage": STREAM_USAGE, "choices": [
+                {"index": 0, "message": {"role": "assistant", "content": "Checking both.", "thinking": "Let me check."}, "finish_reason": "stop"}]})
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        first = {"index": 0, "id": "call_0", "type": "function", "function": {"name": "first", "arguments": '{"a": '}}
+        second = {"index": 1, "id": "call_1", "type": "function", "function": {"name": "second", "arguments": "{}"}}
+        deltas = [{"role": "assistant", "content": "Checking ", "thinking": "Let me "}, {"thinking": "check."}, {"content": "both."},
+                  {"tool_calls": [first]}, {"tool_calls": [{"index": 0, "function": {"arguments": "1}"}}]}, {"tool_calls": [second]}]
+        events = [{"choices": [{"index": 0, "delta": delta}]} for delta in deltas]
+        events += [{"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}]
+        events += [] if trouble == "no usage" else [{"choices": [], "usage": STREAM_USAGE}]
+        for number, event in enumerate(events):
+            await response.write(f"data: {json.dumps({**head, 'object': 'chat.completion.chunk', **event})}\n\n".encode())
+            if number == 0 and trouble == "stall":
+                await asyncio.sleep(3)
+                return response
+            if number == 0 and trouble == "error frame":
+                error = {"type": "server_error", "message": "the vendor went silent", "status_code": "503", "source": "gateway"}
+                await response.write(f"data: {json.dumps({'error': error})}\n\n".encode())
+                return response
+            if number == 0 and trouble == "early end":
+                break
+        await response.write(b"data: [DONE]\n\n")
+        return response
+
+
+def test_a_streamed_answer_reaches_the_agent_as_one_message_and_is_recorded_as_one_not_streamed(tmp_path, monkeypatch, credentials):
+    """The inspector model streams each answer: the agent receives one message with both tool calls, and run.json records
+    the streamed call with the prompt and completion tokens and the cost a call that does not stream records."""
+    run = new_run(tmp_path, monkeypatch, credentials)
+    endpoint = StreamedAnswers()
+
+    async def ask():
+        async with serve(endpoint) as base:
+            config = run.record.models["inspector"].model_copy(update={"api_base": base})
+            with run_state.model_calls(run, "inspector", "hack-session-1"):
+                message = await inspector.chat_model(config, run.keys["inspector"]).ainvoke("hi")
+                await inspector.litellm.acompletion(model=config.model, api_base=base, api_key=run.keys["inspector"],
+                                                    messages=[{"role": "user", "content": "hi"}])
+            return message
+
+    message = asyncio.run(ask())
+    assert message.content == "Checking both."
+    assert [(call["name"], call["args"]) for call in message.tool_calls] == [("first", {"a": 1}), ("second", {})]
+    assert [bool(request.get("stream")) for request in endpoint.requests] == [True, False]
+    fields = ("prompt_tokens", "completion_tokens", "cost", "cost_source", "provider_cost", "error")
+    streamed, whole = ([call[name] for name in fields] for call in json.loads((run.config.output_dir / "run.json").read_text())["calls"])
+    assert streamed == whole == [1200, 85, 0.0031, PROVIDER_REPORTED, 0.0031, None]
+
+
+def test_a_streamed_answer_keeps_the_reasoning_text_an_answer_that_does_not_stream_keeps(tmp_path, monkeypatch, credentials):
+    """The gateway names its reasoning text `thinking`. LiteLLM keeps it under provider_specific_fields only for an answer
+    that does not stream, so the streamed pieces are joined into the same field."""
+    from langchain_litellm import ChatLiteLLM
+
+    run = new_run(tmp_path, monkeypatch, credentials)
+
+    async def ask():
+        async with serve(StreamedAnswers()) as base:
+            config = run.record.models["inspector"].model_copy(update={"api_base": base})
+            with run_state.model_calls(run, "inspector", "hack-session-1"):
+                streamed = await inspector.chat_model(config, run.keys["inspector"]).ainvoke("hi")
+            whole = await ChatLiteLLM(model=config.model, api_base=base, api_key=run.keys["inspector"]).ainvoke("hi")
+            return streamed, whole
+
+    streamed, whole = asyncio.run(ask())
+    assert streamed.additional_kwargs["provider_specific_fields"]["thinking"] == "Let me check."
+    assert whole.additional_kwargs["provider_specific_fields"]["thinking"] == "Let me check."
+
+
+@pytest.mark.parametrize(("trouble", "failure"), [("stall", "MidStreamFallbackError"), ("error frame", "MidStreamFallbackError"),
+                                                  ("early end", "APIConnectionError"), ("busy", "ServiceUnavailableError")])
+def test_a_try_that_stalls_or_fails_is_tried_again_whole_and_recorded_once(tmp_path, monkeypatch, credentials, trouble, failure):
+    """A stream silent past the read timeout, carrying the gateway's error frame under status 200, or ending before the
+    answer finished, fails its try midway; a 503 fails it at once, with no hidden retry of the SDK. nudi tries the whole
+    call again with its line, and run.json holds the failed try once and the answer once."""
+    monkeypatch.setattr(run_state, "RETRY_WAITS", (0,))
+    monkeypatch.setattr(inspector, "READ_TIMEOUT", 0.2)
+    run = new_run(tmp_path, monkeypatch, credentials)
+    endpoint = StreamedAnswers(trouble)
+
+    async def ask():
+        async with serve(endpoint) as base:
+            config = run.record.models["inspector"].model_copy(update={"api_base": base})
+            started = time.monotonic()
+            with run_state.model_calls(run, "inspector", "hack-session-1"):
+                message = await asyncio.wait_for(inspector.chat_model(config, run.keys["inspector"]).ainvoke("hi"), 10)
+            return message, time.monotonic() - started
+
+    message, took = asyncio.run(ask())
+    assert took < 2, "the stalled try is cut at the read timeout, not when the stream ends"
+    assert message.content == "Checking both." and len(message.tool_calls) == 2 and len(endpoint.requests) == 2
+    events = [json.loads(line) for line in (run.config.output_dir / "events.jsonl").read_text().splitlines()]
+    assert [item["text"].split(" ", 2)[2] for item in events if item["kind"] == "retry"] == [
+        f"hack-session-1: a model call failed with {failure}; trying again in 0 s"]
+    calls = json.loads((run.config.output_dir / "run.json").read_text())["calls"]
+    assert [(call["error"] is not None, call["prompt_tokens"], call["cost"]) for call in calls] == [(True, None, None), (False, 1200, 0.0031)]
+
+
+def test_a_stalled_native_gemini_stream_is_cut_at_the_read_timeout(tmp_path, monkeypatch, credentials):
+    """LiteLLM's native Gemini route streams through a client of its own, without the call's timeout. The first try goes
+    silent after its first chunk and is cut at the read timeout; the next try answers."""
+    monkeypatch.setattr(run_state, "RETRY_WAITS", (0,))
+    monkeypatch.setattr(inspector, "READ_TIMEOUT", 0.2)
+    run = new_run(tmp_path, monkeypatch, credentials)
+    tries = []
+
+    async def stream(request):
+        tries.append(request.path)
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        part = {"candidates": [{"index": 0, "content": {"role": "model", "parts": [{"text": "Checked."}]}}]}
+        await response.write(f"data: {json.dumps(part)}\n\n".encode())
+        if len(tries) == 1:
+            await asyncio.sleep(3)
+            return response
+        end = {"candidates": [{"index": 0, "content": {"role": "model", "parts": [{"text": ""}]}, "finishReason": "STOP"}],
+               "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 2, "totalTokenCount": 12}}
+        await response.write(f"data: {json.dumps(end)}\n\n".encode())
+        return response
+
+    async def ask():
+        app = web.Application()
+        app.router.add_post("/models/{call}", stream)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        config = run.record.models["inspector"].model_copy(update={
+            "model": "gemini/gemini-2.5-flash", "api_base": f"http://127.0.0.1:{runner.addresses[0][1]}", "reasoning_effort": None})
+        started = time.monotonic()
+        try:
+            with run_state.model_calls(run, "inspector", "hack-session-1"):
+                message = await asyncio.wait_for(inspector.chat_model(config, run.keys["inspector"]).ainvoke("hi"), 10)
+            return message, time.monotonic() - started
+        finally:
+            await runner.cleanup()
+
+    message, took = asyncio.run(ask())
+    assert message.content == "Checked." and len(tries) == 2
+    assert took < 2, "the stalled try is cut at the read timeout, not when the stream ends"
+
+
+def test_a_stream_without_usage_records_the_answer_with_unknown_cost_not_an_estimate(tmp_path, monkeypatch, credentials):
+    run = new_run(tmp_path, monkeypatch, credentials)
+    endpoint = StreamedAnswers("no usage")
+
+    async def ask():
+        async with serve(endpoint) as base:
+            config = run.record.models["inspector"].model_copy(update={"api_base": base})
+            with run_state.model_calls(run, "inspector", "hack-session-1"):
+                return await inspector.chat_model(config, run.keys["inspector"]).ainvoke("hi")
+
+    assert asyncio.run(ask()).content == "Checking both." and len(endpoint.requests) == 1
+    [call] = json.loads((run.config.output_dir / "run.json").read_text())["calls"]
+    assert [call[name] for name in ("prompt_tokens", "completion_tokens", "cost", "cost_source", "error")] == [
+        None, None, None, "unknown: the stream reported no usage", None]
+    assert run.record.unknown_cost_calls == 1
+
+
+def test_a_tool_call_cut_at_the_length_limit_is_invalid_as_in_an_answer_that_does_not_stream(tmp_path, monkeypatch, credentials):
+    """The streamed answer is built into the message the way an answer that does not stream is, so a tool call whose
+    arguments were cut off is an invalid tool call, never a call with arguments missing."""
+    from langchain_litellm import ChatLiteLLM
+
+    run = new_run(tmp_path, monkeypatch, credentials)
+
+    class Cut:
+        async def chat(self, request):
+            body = await request.json()
+            call = {"id": "call_0", "type": "function", "function": {"name": "first", "arguments": '{"a": '}}
+            return web.json_response({"id": "chatcmpl-cut", "object": "chat.completion", "created": 0, "model": body["model"],
+                                      "usage": STREAM_USAGE, "choices": [{"index": 0, "finish_reason": "length", "message": {
+                                          "role": "assistant", "content": None, "tool_calls": [call]}}]})
+
+    async def ask():
+        async with serve(Cut()) as base:
+            config = run.record.models["inspector"].model_copy(update={"api_base": base})
+            with run_state.model_calls(run, "inspector", "hack-session-1"):
+                streamed = await inspector.chat_model(config, run.keys["inspector"]).ainvoke("hi")
+            whole = await ChatLiteLLM(model=config.model, api_base=base, api_key=run.keys["inspector"]).ainvoke("hi")
+            return streamed, whole
+
+    streamed, whole = asyncio.run(ask())
+    assert streamed.tool_calls == [] and [call["name"] for call in streamed.invalid_tool_calls] == ["first"]
+    # The OpenAI SDK's whole answer names an empty refusal, which a stream leaves out.
+    assert whole.additional_kwargs.pop("provider_specific_fields") == {"refusal": None}
+    assert streamed.model_dump(exclude={"id"}) == whole.model_dump(exclude={"id"})
+
+
+def test_a_stream_litellm_opens_only_when_read_still_gets_its_answer(tmp_path, monkeypatch, credentials):
+    """LiteLLM's native Gemini route opens its stream only when it is first read; that stream is read as LiteLLM's own."""
+    run = new_run(tmp_path, monkeypatch, credentials)
+    requests, lazy, opening = [], [], inspector.litellm.acompletion
+
+    async def generate(request):
+        requests.append(request.path)
+        event = {"candidates": [{"index": 0, "finishReason": "STOP", "content": {"role": "model", "parts": [{"text": "Checking both."}]}}],
+                 "usageMetadata": {"promptTokenCount": 1200, "candidatesTokenCount": 85, "totalTokenCount": 1285}}
+        return web.Response(text=f"data: {json.dumps(event)}\n\n", content_type="text/event-stream")
+
+    async def opened(**request):
+        stream = await opening(**request)
+        lazy.append(stream.completion_stream is None)
+        return stream
+
+    monkeypatch.setattr(inspector.litellm, "acompletion", opened)
+
+    async def ask():
+        app = web.Application()
+        app.router.add_post("/{path:.*}", generate)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        try:
+            config = run.record.models["inspector"].model_copy(update={
+                "model": "gemini/gemini-2.5-flash", "reasoning_effort": None, "api_base": f"http://127.0.0.1:{runner.addresses[0][1]}"})
+            with run_state.model_calls(run, "inspector", "hack-session-1"):
+                return await inspector.chat_model(config, run.keys["inspector"]).ainvoke("hi")
+        finally:
+            await runner.cleanup()
+
+    assert asyncio.run(ask()).content == "Checking both."
+    assert lazy == [True] and requests == ["/models/gemini-2.5-flash:streamGenerateContent"]
+    [call] = json.loads((run.config.output_dir / "run.json").read_text())["calls"]
+    assert (call["prompt_tokens"], call["completion_tokens"], call["error"]) == (1200, 85, None)
 
 
 def test_targeted_probe_dispatch_keeps_privilege_out_of_later_ordinary_episode(tmp_path, monkeypatch, credentials):
@@ -2249,8 +2498,8 @@ def test_a_session_end_keeps_category_status_out_of_its_text(tmp_path, monkeypat
 
 
 def test_a_session_end_names_only_the_category_after_a_repeated_case(tmp_path, monkeypatch, credentials, unit_sandboxes):
-    """A repeated case leaves the attempt duplicate_case, which did not end the session, so its end line does not name it;
-    its later finding still shows in the category's status."""
+    """A repeated case did not end the session, so its end line does not name it; the later finding makes the attempt
+    evidenced and shows in the category's status."""
     no_native_actor(monkeypatch)
     repeated = {"category": "package_oracles", "case": "one", "setup_program": "first case"}
     inspector_responses(monkeypatch, [{"probes": [repeated, repeated, {**repeated, "case": "two", "setup_program": "second case"}]}])
@@ -2263,7 +2512,7 @@ def test_a_session_end_names_only_the_category_after_a_repeated_case(tmp_path, m
     run = new_run(tmp_path, monkeypatch, credentials)
     result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"]))
     assert session_ends(run) == [("hack inspector hack-session-1 ended after T; searched package_oracles",
-                                  {"status": "duplicate_case", "category": "package_oracles", "category_status": "evidenced_issue"})]
+                                  {"status": "evidenced_issue", "category": "package_oracles", "category_status": "evidenced_issue"})]
     assert result.categories == {"package_oracles": "evidenced_issue"}
 
 
@@ -2412,6 +2661,43 @@ def test_a_repeated_case_leaves_its_category_settled(tmp_path, monkeypatch, cred
     result = inspect()
     assert replies[0]["status"] == "duplicate_case" and replies[1]["open"] == []
     assert result.categories == {"package_oracles": "no_evidenced_issue"} and result.status == "complete"
+
+
+@pytest.mark.parametrize("then", ["truncated", "evidenced"])
+def test_an_attempt_that_repeated_a_case_takes_a_later_truncation_or_finding(tmp_path, monkeypatch, credentials, unit_sandboxes, then):
+    """A repeated case marks its attempt `duplicate_case`; truncated check output after it still leaves the attempt
+    unobservable with its reason, and a finding after it still makes it evidenced."""
+    async def later(tools):
+        if then == "truncated":
+            return await tools["run_experiment"].ainvoke({"probe": setup_probe(
+                location="/app/other.txt", program=f"print('x' * {inspector_sandbox.OUTPUT_LIMIT + 1})\n")})
+        receipt = await tools["run_experiment"].ainvoke({"probe": setup_probe()})
+        return await tools["interpret_experiment"].ainvoke({"experiment": receipt["id"], **VIOLATED})
+
+    run, replies, inspect = consistent_session(tmp_path, monkeypatch, credentials,
+                                               lambda tools: tools["run_experiment"].ainvoke({"probe": deserved_probe()}),
+                                               later)
+    attempt = inspect().attempts[0]
+    assert replies[0]["status"] == "duplicate_case"
+    assert (attempt.status, attempt.error) == (
+        ("unobservable", "experiment-0001: check output was truncated") if then == "truncated" else ("evidenced_issue", None))
+
+
+def test_a_finding_outside_every_listed_family_keeps_its_attempt_evidenced_past_truncated_output(
+        tmp_path, monkeypatch, credentials, unit_sandboxes):
+    """A finding of an `other` experiment makes its attempt evidenced as a listed family's does, so truncated check output
+    after it does not make the attempt unobservable."""
+    async def other(tools):
+        receipt = await tools["run_experiment"].ainvoke({"probe": setup_probe(category="other")})
+        return await tools["interpret_experiment"].ainvoke(
+            {"experiment": receipt["id"], "claim": {**VIOLATED["claim"], "family": "trusted cache file"}})
+
+    run, replies, inspect = consistent_session(tmp_path, monkeypatch, credentials, other, lambda tools: tools["run_experiment"].ainvoke(
+        {"probe": setup_probe(location="/app/other.txt", program=f"print('x' * {inspector_sandbox.OUTPUT_LIMIT + 1})\n")}))
+    result = inspect()
+    assert replies[0]["investigation_result"]["outcome"] == "accepted_invalid"
+    assert [(item["category"], item["status"]) for item in result.experiments][1:] == [("other", "assessed"), ("package_oracles", "incomplete")]
+    assert [(attempt.status, attempt.error) for attempt in result.attempts] == [("evidenced_issue", None)]
 
 
 def test_a_tool_error_the_session_continued_past_does_not_keep_completed_work_unknown(tmp_path, monkeypatch, credentials, unit_sandboxes):
@@ -2691,8 +2977,13 @@ def test_guidance_names_only_steps_an_attacker_can_follow(tmp_path, monkeypatch,
     context = inspection_module.task_context(new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path)))
     # What an Attacker can reach, so guidance names only steps it can follow.
     assert context["agent_view"] == "task image only; /tests arrives at grading; no /solution or /nudi/package"
-    prompts = [" ".join(inspection_module.inspector_prompt(job).split()) for job in ("hack", "grader")]
-    assert all("concrete steps that reproduce it that an agent can follow from `agent_view`" in prompt for prompt in prompts)
+    grader, hack = (" ".join(inspection_module.inspector_prompt(job).split()) for job in ("grader", "hack"))
+    assert "concrete steps that reproduce it that an agent can follow from `agent_view`" in grader
+    # The hack inspector's guidance field says what the Attacker lacks, which its prompt leaves to the field.
+    assert "agent_view" not in hack and "`full_guidance`, the steps its field describes" in hack
+    assert inspection_module.claim_model("hack").model_fields["full_guidance"].description == (
+        "Steps sent verbatim to the Attacker. Use only its normal task tools and files: no reference solution, grader tests "
+        "or nudi copy. Explain how to produce any required setup without those files.")
 
 
 def test_no_inspector_is_asked_for_a_restriction():
@@ -3021,8 +3312,8 @@ def test_provider_refusal_is_distinct_from_model_declared_inability(tmp_path, mo
     assert model.attempts[0].status == "model_inability" and model.categories["package_oracles"] == "unknown"
 
     async def provider(**request):
-        return inspector.litellm.ModelResponse(choices=[{"index": 0, "finish_reason": "content_filter",
-                                                     "message": {"role": "assistant", "content": None}}])
+        return streamed(inspector.litellm.ModelResponse(choices=[{"index": 0, "finish_reason": "content_filter",
+                                                              "message": {"role": "assistant", "content": None}}]))
 
     monkeypatch.setattr(inspector.litellm, "acompletion", provider)
     refused = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"]))
@@ -5841,8 +6132,9 @@ def test_truncated_setup_output_never_closes_public_coverage(tmp_path, monkeypat
     requests = inspector_responses(monkeypatch, [{"probes": [setup_probe()]}, VIOLATED])
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
     result = asyncio.run(inspection_module.inspect_hacks(run, categories=["package_oracles"]))
-    # A nonzero setup exit the session continued past, with a valid check, is a limit only.
-    assert (result.status, result.attempts[0].status) == (("unresolved", "unobservable") if setup_failure == "truncated" else ("complete", "evidenced_issue"))
+    # A nonzero setup exit the session continued past, with a valid check, is a limit only. Truncated setup output keeps
+    # its experiment open, and the evidence the session found keeps its attempt evidenced.
+    assert (result.status, result.attempts[0].status) == ("unresolved" if setup_failure == "truncated" else "complete", "evidenced_issue")
     if setup_failure == "truncated":
         assert result.attempts[0].error == "experiment-0000: setup output was truncated; uncaptured bytes are unavailable."
     assert result.assessments[0].outcome == "accepted_invalid", "independent measured evidence is still retained"
@@ -6406,20 +6698,27 @@ def test_tool_error_the_session_recovers_from_is_a_limit(tmp_path, monkeypatch, 
         assert any("grep timed out" in text for text in public["limits"] + warnings)
 
 
-@pytest.mark.parametrize("repeated", [True, False])
-def test_truncated_checker_output_stays_unobservable(tmp_path, monkeypatch, credentials, unit_sandboxes, repeated):
-    """Truncated checker output leaves its attempt unobservable and a limit. It measured nothing, so a repeat that
-    evidences the issue settles the category; without one the category stays unknown."""
+@pytest.mark.parametrize("evidence", [None, "after", "before"])
+def test_truncated_checker_output_leaves_only_an_attempt_that_found_nothing_unobservable(tmp_path, monkeypatch, credentials, unit_sandboxes, evidence):
+    """Truncated checker output is a limit and measured nothing, so it leaves its attempt unobservable only while that
+    attempt found nothing: evidence before or after it settles the category and the attempt; without any the category
+    stays unknown."""
     no_native_actor(monkeypatch)
-    truncating = setup_probe(category="accepted_invalid", program=f"print('x' * {inspector_sandbox.OUTPUT_LIMIT + 1})\n")
-    inspector_responses(monkeypatch, [{"probes": [truncating] + [setup_probe(category="accepted_invalid")] * repeated}] + [VIOLATED] * repeated)
+    # An evidenced category takes no more probes, so truncation after evidence is measured in the other category.
+    other = "rejected_valid" if evidence == "before" else "accepted_invalid"
+    truncating = setup_probe(category=other, location="/app/other.txt", program=f"print('x' * {inspector_sandbox.OUTPUT_LIMIT + 1})\n")
+    evidencing = setup_probe(category="accepted_invalid")
+    probes = {None: [truncating], "after": [truncating, evidencing], "before": [evidencing, truncating]}[evidence]
+    inspector_responses(monkeypatch, [{"probes": probes}] + [VIOLATED] * bool(evidence))
     run = new_run(tmp_path, monkeypatch, credentials, task_dir=explained_task(tmp_path))
-    result = asyncio.run(inspection_module.inspect_grader(run, [], categories=["accepted_invalid"], focused_attempts=0))
-    assert [check.exit_code for check in run.record.checks] == [125, 0][:1 + repeated]
-    assert (result.status, result.attempts[0].status) == ("complete" if repeated else "unresolved", "unobservable")
-    assert result.attempts[0].error == "experiment-0000: check output was truncated"
-    assert result.categories["accepted_invalid"] == ("evidenced_issue" if repeated else "unknown")
-    assert any("experiment-0000" in limit and "truncated" in limit for limit in result.limits)
+    result = asyncio.run(inspection_module.inspect_grader(run, [], categories=list(dict.fromkeys(["accepted_invalid", other])), focused_attempts=0))
+    assert [check.exit_code for check in run.record.checks] == {None: [125], "after": [125, 0], "before": [0, 125]}[evidence]
+    assert result.attempts[0].status == ("evidenced_issue" if evidence else "unobservable")
+    if evidence is None:
+        assert result.attempts[0].error == "experiment-0000: check output was truncated"
+    assert result.categories["accepted_invalid"] == ("evidenced_issue" if evidence else "unknown")
+    assert result.status == ("complete" if evidence == "after" else "unresolved")
+    assert any("truncated" in limit for limit in result.limits)
 
 
 def test_failed_then_repeated_experiment_settles_on_its_evidence(tmp_path, monkeypatch, credentials, unit_sandboxes):
