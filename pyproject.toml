@@ -1,6 +1,6 @@
 [project]
 name = "nudi-cli"
-version = "0.6.0"
+version = "0.6.1"
 description = "Pre-hack and simulate Harbor RL environments"
 readme = "readme.md"
 license = "MIT"

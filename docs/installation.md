@@ -44,12 +44,12 @@ Without Python 3.12, install it first, for example with `uv python install 3.12`
 
 ### Install from a git tag
 
-To install a version straight from its git tag, for example `v0.6.0`, use a virtual environment:
+To install a version straight from its git tag, for example `v0.6.1`, use a virtual environment:
 
 ```sh
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install "nudi-cli[modal] @ git+https://github.com/standardnormal-ai/nudi.git@v0.6.0"
+python -m pip install "nudi-cli[modal] @ git+https://github.com/standardnormal-ai/nudi.git@v0.6.1"
 nudi --version
 ```
 
