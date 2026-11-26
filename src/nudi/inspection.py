@@ -1341,10 +1341,13 @@ async def inspect(run, mode: str, pool: list[str], focused_attempts: int, catego
             if review is not None:
                 review.status, review.error, review.assessment = "assessed", None, len(report.assessments) - 1
             target = item.get("category")
-            if target in categories and evidenced(assessment) and (mode != "hack" or assessment.outcome == "accepted_invalid"):
-                report.categories[target] = "evidenced_issue"
-                completed[target] = state.index
-                if (target in requested or current.episode) and current.status in ("no_evidenced_issue", "duplicate_case", "unobservable"):
+            if evidenced(assessment) and (mode != "hack" or assessment.outcome == "accepted_invalid"):
+                if target in categories:
+                    report.categories[target] = "evidenced_issue"
+                    completed[target] = state.index
+                # A hack finding of any family is its attempt's, a listed one or not.
+                if (mode == "hack" or target in requested or current.episode) and current.status in (
+                        "no_evidenced_issue", "duplicate_case", "unobservable"):
                     current.status = "evidenced_issue"
             # A finding this reading withdraws or corrects is announced once saved, so the report so far shows the correction.
             if mode != "attack" and before is not None and evidenced(before):

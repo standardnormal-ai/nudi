@@ -2640,6 +2640,23 @@ def test_an_attempt_that_repeated_a_case_takes_a_later_truncation_or_finding(tmp
         ("unobservable", "experiment-0001: check output was truncated") if then == "truncated" else ("evidenced_issue", None))
 
 
+def test_a_finding_outside_every_listed_family_keeps_its_attempt_evidenced_past_truncated_output(
+        tmp_path, monkeypatch, credentials, unit_sandboxes):
+    """A finding of an `other` experiment makes its attempt evidenced as a listed family's does, so truncated check output
+    after it does not make the attempt unobservable."""
+    async def other(tools):
+        receipt = await tools["run_experiment"].ainvoke({"probe": setup_probe(category="other")})
+        return await tools["interpret_experiment"].ainvoke(
+            {"experiment": receipt["id"], "claim": {**VIOLATED["claim"], "family": "trusted cache file"}})
+
+    run, replies, inspect = consistent_session(tmp_path, monkeypatch, credentials, other, lambda tools: tools["run_experiment"].ainvoke(
+        {"probe": setup_probe(location="/app/other.txt", program=f"print('x' * {inspector_sandbox.OUTPUT_LIMIT + 1})\n")}))
+    result = inspect()
+    assert replies[0]["investigation_result"]["outcome"] == "accepted_invalid"
+    assert [(item["category"], item["status"]) for item in result.experiments][1:] == [("other", "assessed"), ("package_oracles", "incomplete")]
+    assert [(attempt.status, attempt.error) for attempt in result.attempts] == [("evidenced_issue", None)]
+
+
 def test_a_tool_error_the_session_continued_past_does_not_keep_completed_work_unknown(tmp_path, monkeypatch, credentials, unit_sandboxes):
     """A recovered tool error, such as the SDK refusing a second write to one path, stays as a limit."""
     run, _, inspect = consistent_session(tmp_path, monkeypatch, credentials)
