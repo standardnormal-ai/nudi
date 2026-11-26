@@ -30,6 +30,7 @@ from langchain.agents.structured_output import ToolStrategy
 from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage, message_to_dict
 from langchain_litellm import ChatLiteLLM
+from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.errors import GraphRecursionError
@@ -87,6 +88,10 @@ class InspectorModel(ChatLiteLLM):
         async def whole():
             call = str(uuid4())
             request = {**kwargs, "stream": True, "stream_options": {"include_usage": True}}
+            # LiteLLM's native Gemini stream reads through a client of its own without the call's timeout, so it gets the
+            # client LiteLLM gives the call that does not stream.
+            if self.model.startswith("gemini/"):
+                request["client"] = get_async_httpx_client(litellm.LlmProviders.VERTEX_AI, {"timeout": READ_TIMEOUT})
             stream = await self.client.acompletion(**request, litellm_call_id=call)
             kept, provider = {"refusal": [], "thinking": []}, stream.completion_stream
 

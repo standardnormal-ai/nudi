@@ -1577,6 +1577,49 @@ def test_a_try_that_stalls_or_fails_is_tried_again_whole_and_recorded_once(tmp_p
     assert [(call["error"] is not None, call["prompt_tokens"], call["cost"]) for call in calls] == [(True, None, None), (False, 1200, 0.0031)]
 
 
+def test_a_stalled_native_gemini_stream_is_cut_at_the_read_timeout(tmp_path, monkeypatch, credentials):
+    """LiteLLM's native Gemini route streams through a client of its own, without the call's timeout. The first try goes
+    silent after its first chunk and is cut at the read timeout; the next try answers."""
+    monkeypatch.setattr(run_state, "RETRY_WAITS", (0,))
+    monkeypatch.setattr(inspector, "READ_TIMEOUT", 0.2)
+    run = new_run(tmp_path, monkeypatch, credentials)
+    tries = []
+
+    async def stream(request):
+        tries.append(request.path)
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        part = {"candidates": [{"index": 0, "content": {"role": "model", "parts": [{"text": "Checked."}]}}]}
+        await response.write(f"data: {json.dumps(part)}\n\n".encode())
+        if len(tries) == 1:
+            await asyncio.sleep(3)
+            return response
+        end = {"candidates": [{"index": 0, "content": {"role": "model", "parts": [{"text": ""}]}, "finishReason": "STOP"}],
+               "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 2, "totalTokenCount": 12}}
+        await response.write(f"data: {json.dumps(end)}\n\n".encode())
+        return response
+
+    async def ask():
+        app = web.Application()
+        app.router.add_post("/models/{call}", stream)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        config = run.record.models["inspector"].model_copy(update={
+            "model": "gemini/gemini-2.5-flash", "api_base": f"http://127.0.0.1:{runner.addresses[0][1]}", "reasoning_effort": None})
+        started = time.monotonic()
+        try:
+            with run_state.model_calls(run, "inspector", "hack-session-1"):
+                message = await asyncio.wait_for(inspector.chat_model(config, run.keys["inspector"]).ainvoke("hi"), 10)
+            return message, time.monotonic() - started
+        finally:
+            await runner.cleanup()
+
+    message, took = asyncio.run(ask())
+    assert message.content == "Checked." and len(tries) == 2
+    assert took < 2, "the stalled try is cut at the read timeout, not when the stream ends"
+
+
 def test_a_stream_without_usage_records_the_answer_with_unknown_cost_not_an_estimate(tmp_path, monkeypatch, credentials):
     run = new_run(tmp_path, monkeypatch, credentials)
     endpoint = StreamedAnswers("no usage")
