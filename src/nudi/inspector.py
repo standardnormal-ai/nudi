@@ -15,7 +15,6 @@ import shutil
 import stat
 import sys
 from contextlib import asynccontextmanager
-from functools import partial
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
@@ -39,7 +38,7 @@ from langsmith import tracing_context
 
 from nudi import checks, inspection, inspector_sandbox
 from nudi.records import ErrorRecord, InfrastructureAbort, write_private
-from nudi.run_state import SpendingCapReached, account_refusal, again, current, model_calls, notice
+from nudi.run_state import SpendingCapReached, account_refusal, again, current, model_calls, notice, settle
 
 # The profile identity is private to nudi; LiteLLM still receives the configured route.
 register_harness_profile("nudi-inspector", HarnessProfile(
@@ -62,6 +61,9 @@ DRAIN_TIMEOUT = 10
 # bound it tells the inspector about. A model turn takes two graph steps, the model and then its tools, so a request has
 # RECURSION_LIMIT // 2 model turns, the last of which can only return the summary.
 RECURSION_LIMIT = 9_999
+# Seconds a streamed answer may send no byte before its read fails and is tried again: the model gateway's documented
+# minimum, so its own cut after 120 s of silence normally comes first. Every answer measured took under 600 s in all.
+READ_TIMEOUT = 300
 
 
 def brief(error: Exception) -> bool:
@@ -76,21 +78,60 @@ class InspectorModel(ChatLiteLLM):
         return {**super()._get_ls_params(*args, **kwargs), "ls_provider": "nudi-inspector"}
 
     async def acompletion_with_retry(self, run_manager=None, **kwargs):
-        """LiteLLM's call, tried again while it fails briefly. ChatLiteLLM's own retry is off at its default of one attempt
-        and never covers a 500, 502 or 503."""
+        """LiteLLM's call, streamed on the wire so a silent answer fails at the read timeout, and read whole into the one
+        response a call that does not stream returns. It is tried again while it fails briefly, a stall, an error frame or
+        an early end midway included. ChatLiteLLM's own retry is off at its default of one attempt and never covers a 500,
+        502 or 503."""
         run, _, name = current.get()
-        return await again(run, f"{name}: a model call failed", partial(self.client.acompletion, **kwargs), brief)
+
+        async def whole():
+            call = str(uuid4())
+            request = {**kwargs, "stream": True, "stream_options": {"include_usage": True}}
+            stream = await self.client.acompletion(**request, litellm_call_id=call)
+            kept, provider = {"refusal": [], "thinking": []}, stream.completion_stream
+
+            async def read():
+                # LiteLLM drops a streamed delta.refusal and the gateway's delta.thinking, its reasoning text, which an
+                # answer that does not stream keeps under provider_specific_fields.
+                async for chunk in provider:
+                    for name, texts in kept.items():
+                        texts.extend(text for choice in getattr(chunk, "choices", None) or () if (text := getattr(choice.delta, name, None)))
+                    yield chunk
+
+            # A stream LiteLLM opens only when it is first read stays its own.
+            if provider is not None:
+                stream.completion_stream = read()
+            try:
+                chunks = [chunk async for chunk in stream]
+                if stream.received_finish_reason is None and stream.intermittent_finish_reason is None:
+                    raise litellm.APIConnectionError("the stream ended before the answer finished", stream.custom_llm_provider,
+                                                     kwargs["model"])
+            except Exception as error:
+                settle(call, exception=error)
+                raise
+            response = litellm.stream_chunk_builder(chunks, messages=kwargs["messages"])
+            if joined := {name: "".join(texts) for name, texts in kept.items() if texts}:
+                message = response.choices[0].message
+                message.provider_specific_fields = {**(message.provider_specific_fields or {}), **joined}
+            # LiteLLM records no streamed answer, so it is recorded here. LiteLLM keeps the provider's usage chunks in
+            # `chunks`; without one, the usage of the rebuilt response is LiteLLM's estimate and is not counted.
+            reported = any(getattr(chunk, "usage", None) is not None for chunk in stream.chunks)
+            settle(call, response, unknown=None if reported else "unknown: the stream reported no usage")
+            return response
+
+        return await again(run, f"{name}: a model call failed", whole, brief)
 
 
 def chat_model(config, key: str, callbacks=()) -> InspectorModel:
     """The inspector role's configured model, reasoning effort and route."""
-    kwargs = {}
+    # The OpenAI SDK's own retries are off, so nudi's are the only ones.
+    kwargs = {"max_retries": 0}
     if config.reasoning_effort is not None:
         kwargs["reasoning_effort"] = config.reasoning_effort
     if config.model.startswith("xiaomi_mimo/") and config.reasoning_effort not in (None, "none"):
         kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
     return InspectorModel(model=config.model, api_base=config.api_base, api_key=key, model_kwargs=kwargs, streaming=False,
-                          cache=False, callbacks=list(callbacks))
+                          request_timeout=READ_TIMEOUT, cache=False, callbacks=list(callbacks))
 
 
 class HarborBackend(BaseSandbox):

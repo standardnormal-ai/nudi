@@ -20,6 +20,7 @@ from pathlib import Path
 
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
+import litellm
 import pytest
 from aiohttp import web
 from harbor.models.task.config import EnvironmentConfig as TaskEnvironment, TaskConfig
@@ -95,9 +96,47 @@ class TerminusScript:
         return [str(body["messages"][-1]["content"]) for body in self.requests[1:]]
 
 
+@web.middleware
+async def streams(request, handler):
+    """A scripted chat completion, sent as server-sent events when the request streams it: its message in one chunk,
+    then its usage, as a provider streams."""
+    response = await handler(request)
+    if response.content_type != "application/json" or not (await request.json()).get("stream"):
+        return response
+    completion = json.loads(response.text)
+    if "choices" not in completion:
+        return response
+    choice = completion["choices"][0]
+    head = {key: value for key, value in completion.items() if key not in ("choices", "usage")} | {"object": "chat.completion.chunk"}
+    events = [{**head, "choices": [{"index": 0, "delta": choice["message"], "finish_reason": choice["finish_reason"]}]},
+              {**head, "choices": [], "usage": completion.get("usage")}]
+    text = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    return web.Response(text=text + "data: [DONE]\n\n", content_type="text/event-stream")
+
+
+class streamed:
+    """A scripted LiteLLM answer as LiteLLM's stream wrapper gives it: its message in one chunk, then its usage, read
+    from its `completion_stream`, with the finish reason and the usage chunk it keeps."""
+
+    def __init__(self, response):
+        choice = response.choices[0]
+        self.received_finish_reason, self.intermittent_finish_reason = choice.finish_reason, None
+        self.chunks = [litellm.ModelResponseStream(choices=[{"index": 0, "delta": choice.message.model_dump(exclude_none=True),
+                                                             "finish_reason": choice.finish_reason}]),
+                       litellm.ModelResponseStream(choices=[], usage=getattr(response, "usage", None))]
+        self.completion_stream = self.read()
+
+    async def read(self):
+        for chunk in self.chunks:
+            yield chunk
+
+    def __aiter__(self):
+        return self.completion_stream
+
+
 @contextlib.asynccontextmanager
 async def serve(script: TerminusScript):
-    app = web.Application()
+    app = web.Application(middlewares=[streams])
     app.router.add_post("/v1/chat/completions", script.chat)
     runner = web.AppRunner(app)
     await runner.setup()

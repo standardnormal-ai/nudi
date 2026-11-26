@@ -37,6 +37,7 @@ from nudi.records import (DEFAULT_MODELS, Assessment, Capacity, Check, Claim, Co
                           Derivation, SandboxResult, Simulation, StateCopy)
 from nudi.run_state import Run
 from test_metrics import RULE, TASK, basis, checked
+from test_runner import streamed
 
 SECRET = "sk-live-api-0123456789"
 # Each progress line begins with the clock time.
@@ -728,8 +729,8 @@ def judge_replies(monkeypatch, replies, order=None):
         if isinstance(reply, BaseException):
             raise reply
         call = {"id": "call_0", "type": "function", "function": {"name": "SameCause", "arguments": json.dumps(reply)}}
-        return litellm.ModelResponse(choices=[{"index": 0, "finish_reason": "tool_calls",
-                                               "message": {"role": "assistant", "content": None, "tool_calls": [call]}}])
+        return streamed(litellm.ModelResponse(choices=[{"index": 0, "finish_reason": "tool_calls",
+                                                        "message": {"role": "assistant", "content": None, "tool_calls": [call]}}]))
 
     monkeypatch.setattr(litellm, "acompletion", completion)
     return requests
